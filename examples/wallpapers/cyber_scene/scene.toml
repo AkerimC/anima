@@ -1,0 +1,24 @@
+title = "Fireflies & Embers Scene"
+resolution = [1920.0, 1080.0]
+clear_color = [0.03, 0.05, 0.09]
+parallax = 1.2
+
+[[particles]]
+preset = "stars"
+count = 160
+parallax_depth = [0.05, 0.05]
+audio_reactive = false
+
+[[particles]]
+preset = "fireflies"
+count = 90
+color = [0.45, 0.95, 0.65]
+parallax_depth = [0.18, 0.18]
+audio_reactive = true
+
+[[particles]]
+preset = "embers"
+count = 70
+color = [1.0, 0.52, 0.18]
+parallax_depth = [0.28, 0.25]
+audio_reactive = true

@@ -1,0 +1,25 @@
+{
+  "title": "Neon Audio Clock HUD",
+  "type": "web",
+  "file": "index.html",
+  "tags": ["Audio Visualizer", "Clock", "Customizable"],
+  "general": {
+    "properties": {
+      "schemecolor": {
+        "text": "Accent Color",
+        "type": "color",
+        "value": "0.22 0.68 0.98"
+      },
+      "clock": {
+        "text": "Show Digital Clock",
+        "type": "bool",
+        "value": true
+      },
+      "bars": {
+        "text": "Show 64-Band Audio Spectrum",
+        "type": "bool",
+        "value": true
+      }
+    }
+  }
+}

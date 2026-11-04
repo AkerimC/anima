@@ -1,0 +1,19 @@
+[Unit]
+Description=Anima live wallpaper daemon
+Documentation=file:%h/Projects/anima/README.md
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/anima/target/release/animad
+Restart=always
+RestartSec=2
+# Hyprland session variables must reach the user manager:
+#   systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR \
+#     XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
