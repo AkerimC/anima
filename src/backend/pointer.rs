@@ -46,6 +46,9 @@ pub static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// over a character; the estimate snaps to it.
 pub static SYNC: Mutex<Option<(f32, f32)>> = Mutex::new(None);
 
+/// Every left click (keeps a pat going).
+pub static CLICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Focused output: logical rect (x, y, w, h) and connector name.
 pub type Bounds = Arc<Mutex<((f32, f32, f32, f32), String)>>;
 
@@ -60,6 +63,7 @@ struct Shared {
 
 impl Shared {
     fn click(&self) {
+        CLICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = Instant::now();
         let mut last = self.last_click.lock().unwrap();
         if last.is_some_and(|t| now - t < Duration::from_millis(400)) {

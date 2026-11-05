@@ -228,6 +228,8 @@ struct FrontOverlayCtx {
     gl_context: Option<glutin::context::PossiblyCurrentContext>,
     gl: Option<glow::Context>,
     character: Option<CharacterOverlay>,
+    // character boxes drawn last frame (they must be repainted when they move)
+    prev_rects: Vec<[f32; 4]>,
 }
 
 struct OutputCtx {
@@ -372,7 +374,11 @@ impl App {
                         fo.character.is_some() && !self.outputs[idx].overlay_hidden
                     }));
             if !wallpaper_animated && character_active {
-                fps = fps.min(self.config.character.fps.clamp(1, 144));
+                // nothing else animates: the character's own fps decides
+                fps = self.config.character.fps.clamp(1, 360);
+                if self.on_battery {
+                    fps = fps.min(self.config.general.battery_fps.max(1));
+                }
             }
         }
         fps.clamp(1, 360)
@@ -454,6 +460,7 @@ impl App {
                     gl_context: None,
                     gl: None,
                     character: None,
+                    prev_rects: Vec::new(),
                 });
             } else {
                 let (w, h) = (self.outputs[idx].width, self.outputs[idx].height);
@@ -920,7 +927,40 @@ impl App {
                             }
                             fo.layer.wl_surface().set_input_region(Some(region.wl_region()));
                         }
-                        let _ = fo_surf.swap_buffers(fo_ctx);
+                        // tell niri only the character boxes changed, not the whole
+                        // screen, so it doesn't recomposite everything each frame
+                        let rects = ch.hit_rects();
+                        let (bw, bh) = (info.width as f32, info.height as f32);
+                        let damage: Vec<glutin::surface::Rect> = rects
+                            .iter()
+                            .chain(fo.prev_rects.iter())
+                            .filter(|r| r[2] > r[0] && r[3] > r[1])
+                            .map(|r| {
+                                // margin for sway/squash; EGL rects start bottom-left
+                                const M: f32 = 32.0;
+                                let x0 = (r[0] - M).clamp(0.0, bw);
+                                let x1 = (r[2] + M).clamp(0.0, bw);
+                                let y0 = (r[1] - M).clamp(0.0, bh);
+                                let y1 = (r[3] + M).clamp(0.0, bh);
+                                glutin::surface::Rect::new(
+                                    x0 as i32,
+                                    (bh - y1) as i32,
+                                    (x1 - x0).ceil() as i32,
+                                    (y1 - y0).ceil() as i32,
+                                )
+                            })
+                            .filter(|r| r.width > 0 && r.height > 0)
+                            .collect();
+                        fo.prev_rects = rects;
+                        let swapped = match (fo_surf, fo_ctx) {
+                            (
+                                glutin::surface::Surface::Egl(s),
+                                glutin::context::PossiblyCurrentContext::Egl(c),
+                            ) if !damage.is_empty() => s.swap_buffers_with_damage(c, &damage),
+                            #[allow(unreachable_patterns)]
+                            _ => fo_surf.swap_buffers(fo_ctx),
+                        };
+                        let _ = swapped;
                         keep_going = true;
                     }
                 }

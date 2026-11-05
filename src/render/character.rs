@@ -841,6 +841,8 @@ pub struct CharacterOverlay {
     press: Option<(f32, Option<usize>)>,
     // notifications seen so far
     notified: u32,
+    // left clicks seen so far
+    clicks: u32,
     // niri strip scroll, smoothed: (view offset, extra strip width) in clip units
     view: [f32; 2],
     smooth_look: [f32; 2],
@@ -894,6 +896,8 @@ struct WalkState {
 }
 
 const PAT_DUR: f32 = 1.4;
+// each click while petting keeps it going at least this long
+const PAT_KEEP: f32 = 0.6;
 
 const JUMP_DUR: f32 = 0.9;
 const JUMP_AMP: f32 = 2.0;
@@ -936,7 +940,7 @@ impl WalkState {
 
     fn start_pat(&mut self) {
         self.act = Act::Pat;
-        self.timer = PAT_DUR;
+        self.timer = PAT_KEEP;
         self.jump = 0.0;
     }
 
@@ -1062,6 +1066,7 @@ impl CharacterOverlay {
             hit_rect: [0.0; 4],
             press: None,
             notified: crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            clicks: 0,
             view: [0.0; 2],
             smooth_look: [0.0, 0.0],
             smooth_bounce: 0.0,
@@ -1344,6 +1349,23 @@ impl CharacterOverlay {
             crate::backend::pointer::DRAGGING.store(held, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // clicking on a character that is being petted keeps the petting going
+        if self.actor == 0 {
+            let n = crate::backend::pointer::CLICKS.load(std::sync::atomic::Ordering::Relaxed);
+            if n != self.clicks {
+                self.clicks = n;
+                let [mx, my] = info.mouse;
+                let hit = |r: &[f32; 4]| mx >= r[0] && mx <= r[2] && my >= r[1] && my <= r[3];
+                let keep = |a: &mut CharacterOverlay| {
+                    if a.walk.act == Act::Pat && hit(&a.hit_rect) {
+                        a.walk.timer = a.walk.timer.max(PAT_KEEP);
+                    }
+                };
+                keep(self);
+                self.extras.iter_mut().for_each(keep);
+            }
+        }
+
         // double click on a character: pet it (topmost one wins)
         if self.actor == 0
             && crate::backend::pointer::DOUBLE_CLICK.swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -1547,7 +1569,7 @@ impl CharacterOverlay {
                     (center_clip[0] + walk_x + half_clip[0] + 1.0) * 0.5 * w,
                     (1.0 - (center_clip[1] - half_clip[1] + lift_now)) * 0.5 * h,
                 ];
-                // stop the petting once the cursor leaves the character
+                // petting stops as soon as the cursor leaves the character
                 let [mx, my] = info.mouse;
                 let r = self.hit_rect;
                 const M: f32 = 12.0;
