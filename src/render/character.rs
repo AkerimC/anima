@@ -992,7 +992,7 @@ impl WalkState {
                 let d = self.target - self.x;
                 // close enough counts as caught, or a cursor circling fast
                 // keeps flipping the target left and right
-                let catch = if chase { 0.12 } else { 0.0 };
+                let catch = if chase { 0.05 } else { 0.0 };
                 if d.abs() <= speed * dt + catch {
                     if !chase {
                         self.x = self.target;
@@ -1006,7 +1006,10 @@ impl WalkState {
                 } else if chase && self.timer <= 0.0 {
                     self.pick(min, max, false);
                 } else {
-                    self.left = d < 0.0;
+                    // only turn around when the target is clearly on the other side
+                    if !chase || d.abs() > 0.1 {
+                        self.left = d < 0.0;
+                    }
                     self.x += d.signum() * speed * dt;
                     moving = true;
                 }
