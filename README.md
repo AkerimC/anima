@@ -178,8 +178,11 @@ Runtime changes via the CLI are persisted back to this file.
   supported yet.
 - **Scenes** — `scene.toml` with layers and particle presets (`stars`,
   `fireflies`, `embers`, `sakura`, …), parallax and audio reactivity.
-  Wallpaper Engine `scene.pkg` archives are partially supported by the native
-  reader.
+  Wallpaper Engine `scene.pkg` archives are supported for 2D image-layer
+  scenes: model/material resolution, texture decoding (RGBA, DXT1/3/5, LZ4),
+  screen-space layout, blend modes, layer effects and preset-driven particles
+  (rain, snow, sakura, fog, embers, stars). 3D/perspective meshes and
+  `application` wallpapers are not implemented.
 - **Web** — metadata-driven HUD (see below).
 
 ## Limitations
@@ -195,9 +198,9 @@ These are deliberate, documented gaps rather than bugs:
 3. **Wayland only.** X11 and Windows/macOS are out of scope.
 4. **Fullscreen detection uses Hyprland's IPC socket.** On other compositors
    the wallpaper still renders, but pause-on-fullscreen is a no-op.
-5. **Wallpaper Engine compatibility is partial.** Scene `.pkg` parsing covers
-   the common layout; not every Workshop item will load. `application`
-   wallpapers are unsupported on Linux.
+5. **Wallpaper Engine compatibility is partial.** Common 2D scene and video
+   wallpapers work. 3D/perspective meshes, multi-pass shader materials and
+   `application` wallpapers are unsupported on Linux.
 6. **Audio analysis is PulseAudio/PipeWire only** (loaded dynamically; the
    daemon still runs without it).
 7. **No per-wallpaper sandboxing.** Shaders and scenes are trusted input.

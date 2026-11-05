@@ -224,12 +224,19 @@ enum ParticleKind {
     Fireflies,
     Stars,
     Sakura,
+    Fog,
 }
 
 impl ParticleKind {
     fn from_hint(s: &str) -> Self {
         let lower = s.to_ascii_lowercase();
-        if lower.contains("rain") || lower.contains("storm") {
+        if lower.contains("fog")
+            || lower.contains("mist")
+            || lower.contains("smoke")
+            || lower.contains("cloud")
+        {
+            ParticleKind::Fog
+        } else if lower.contains("rain") || lower.contains("storm") {
             ParticleKind::Rain
         } else if lower.contains("ember") || lower.contains("fire") || lower.contains("spark") {
             ParticleKind::Embers
@@ -237,7 +244,13 @@ impl ParticleKind {
             ParticleKind::Fireflies
         } else if lower.contains("star") || lower.contains("twinkle") {
             ParticleKind::Stars
-        } else if lower.contains("sakura") || lower.contains("petal") || lower.contains("leaf") {
+        } else if lower.contains("sakura")
+            || lower.contains("petal")
+            || lower.contains("blossom")
+            || lower.contains("flower")
+            || lower.contains("leaf")
+            || lower.contains("leave")
+        {
             ParticleKind::Sakura
         } else {
             ParticleKind::Snow
@@ -337,6 +350,14 @@ impl ParticleEmitter {
                     [1.0, 0.72 + rng() * 0.15, 0.82],
                     rng() * std::f32::consts::PI,
                 ),
+                ParticleKind::Fog => (
+                    (rng() - 0.5) * 0.02,
+                    (rng() - 0.5) * 0.006,
+                    0.30 + rng() * 0.35,
+                    0.012 + rng() * 0.028,
+                    [0.78, 0.81, 0.86],
+                    0.0,
+                ),
             };
             particles.push(Particle {
                 x,
@@ -403,6 +424,10 @@ impl ParticleEmitter {
                     p.y += (p.vy + (time * 1.1 + p.phase).sin() * 0.04) * dt_clamped;
                 }
                 ParticleKind::Stars => {}
+                ParticleKind::Fog => {
+                    p.x += (p.vx + (time * 0.25 + p.phase).sin() * 0.006) * dt_clamped;
+                    p.y += p.vy * dt_clamped;
+                }
                 ParticleKind::Sakura => {
                     p.x += (p.vx + (time * 1.7 + p.phase).sin() * 0.06) * dt_clamped;
                     p.y += p.vy * dt_clamped;
@@ -724,15 +749,44 @@ impl SceneRenderer {
                 .unwrap_or("object")
                 .to_string();
 
-            // Particle object?
+            // Particle object? Wallpaper Engine stores these as references to a
+            // particle preset (`particles/presets/*.json`).
             if let Some(particle_path) = obj.get("particle").and_then(|v| v.as_str()) {
                 let kind = ParticleKind::from_hint(&format!("{name} {particle_path}"));
-                let col = obj.get("color").map(|c| parse_vec3_value(c, [1.0, 1.0, 1.0]));
+
+                // Pull the particle count (and a color hint) from the preset so
+                // heavier effects (rain, fog) behave like the original.
+                let preset = pkg
+                    .read_to_string(particle_path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+                let count = preset
+                    .as_ref()
+                    .and_then(|p| p.get("maxcount"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(120)
+                    .clamp(1, 1200) as usize;
+                // Fog presets stack many huge billboards; keep them sparse.
+                let count = if kind == ParticleKind::Fog {
+                    count.min(24)
+                } else {
+                    count
+                };
+
+                let override_obj = obj.get("instanceoverride");
+                let col = override_obj
+                    .and_then(|o| o.get("colorn"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| parse_vec3_str(s, [1.0, 1.0, 1.0]))
+                    .or_else(|| {
+                        obj.get("color")
+                            .map(|c| parse_vec3_value(c, [1.0, 1.0, 1.0]))
+                    });
                 let par = obj
                     .get("parallaxDepth")
                     .map(|p| parse_vec2_value(p, [0.15, 0.15]))
                     .unwrap_or([0.15, 0.15]);
-                let mut emitter = ParticleEmitter::new(kind, 120, col, true);
+                let mut emitter = ParticleEmitter::new(kind, count, col, true);
                 emitter.parallax = par;
                 self.emitters.push(emitter);
                 continue;
@@ -762,7 +816,7 @@ impl SceneRenderer {
 
             let origin = obj
                 .get("origin")
-                .map(|v| parse_vec3_value(v, [self.ortho_size[0] * 0.5, self.ortho_size[1] * 0.5, 0.0]))
+                .map(|v| parse_vec3_plain(v, [self.ortho_size[0] * 0.5, self.ortho_size[1] * 0.5, 0.0]))
                 .unwrap_or([self.ortho_size[0] * 0.5, self.ortho_size[1] * 0.5, 0.0]);
             let size = obj
                 .get("size")
@@ -771,11 +825,11 @@ impl SceneRenderer {
                 .unwrap_or([tex_w, tex_h]);
             let scale3 = obj
                 .get("scale")
-                .map(|v| parse_vec3_value(v, [1.0, 1.0, 1.0]))
+                .map(|v| parse_vec3_plain(v, [1.0, 1.0, 1.0]))
                 .unwrap_or([1.0, 1.0, 1.0]);
             let angles = obj
                 .get("angles")
-                .map(|v| parse_vec3_value(v, [0.0, 0.0, 0.0]))
+                .map(|v| parse_vec3_plain(v, [0.0, 0.0, 0.0]))
                 .unwrap_or([0.0, 0.0, 0.0]);
             let rgb = obj
                 .get("color")
@@ -846,6 +900,15 @@ impl SceneRenderer {
             });
         }
 
+        log::debug!(
+            "scene: ortho={:?} surface={}x{} layers={} emitters={}",
+            self.ortho_size,
+            self.width,
+            self.height,
+            self.layers.len(),
+            self.emitters.len()
+        );
+
         // Sort back-to-front by Z coordinate (`origin[2]`) if layers specify depth.
         self.layers.sort_by(|a, b| {
             a.origin[2]
@@ -865,7 +928,10 @@ impl SceneRenderer {
     pub fn apply_property(&mut self, key: &str, value: &str) {
         self.properties.insert(key.to_string(), value.to_string());
         match key.to_ascii_lowercase().as_str() {
-            "schemecolor" | "clearcolor" => {
+            // `schemecolor` is the Workshop browser/loading accent color in
+            // Wallpaper Engine, not the scene clear color. Only honor an
+            // explicit `clearcolor` property here.
+            "clearcolor" => {
                 let c = parse_vec3_str(value, self.clear_color);
                 self.clear_color = c;
             }
@@ -1231,6 +1297,28 @@ fn parse_vec3_value(v: &serde_json::Value, default: [f32; 3]) -> [f32; 3] {
     if let Some(obj) = v.as_object() {
         if let Some(inner) = obj.get("value") {
             return parse_vec3_value(inner, default);
+        }
+    }
+    default
+}
+
+/// Parse a generic three-component vector (`origin`, `scale`, `angles`) without
+/// the color normalization performed by [`parse_vec3_str`].
+fn parse_vec3_plain(v: &serde_json::Value, default: [f32; 3]) -> [f32; 3] {
+    if let Some(s) = v.as_str() {
+        let mut it = s
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.parse::<f32>().ok());
+        return [
+            it.next().unwrap_or(default[0]),
+            it.next().unwrap_or(default[1]),
+            it.next().unwrap_or(default[2]),
+        ];
+    }
+    if let Some(obj) = v.as_object() {
+        if let Some(inner) = obj.get("value") {
+            return parse_vec3_plain(inner, default);
         }
     }
     default

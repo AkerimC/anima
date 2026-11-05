@@ -1907,10 +1907,10 @@ impl App {
                     return;
                 }
             };
-            let _ = gl_surface.set_swap_interval(
-                &gl_context,
-                SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
-            );
+            // Pacing is driven by `wl_surface.frame` callbacks, so never block
+            // inside `eglSwapBuffers` (headless/virtual outputs may never
+            // deliver a VSync event, which would stall the whole event loop).
+            let _ = gl_surface.set_swap_interval(&gl_context, SwapInterval::DontWait);
 
             let gl = unsafe {
                 let display = &self.egl_display;
