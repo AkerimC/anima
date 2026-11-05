@@ -20,6 +20,7 @@ path = "src/bin/anima.rs"
 [dependencies]
 smithay-client-toolkit = "0.19.1"
 wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 calloop = "0.14"
 calloop-wayland-source = "0.4"

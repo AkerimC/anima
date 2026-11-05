@@ -32,8 +32,12 @@ use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
+use smithay_client_toolkit::reexports::client::protocol::{wl_pointer, wl_seat};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, registry_handlers,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, registry_handlers,
 };
 
 use crate::audio::AudioAnalyzer;
@@ -82,6 +86,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
     )?;
     let output_state = OutputState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
+    let seat_state = SeatState::new(&globals, &qh);
 
     let display_ptr = conn.backend().display_ptr() as *mut c_void;
     if display_ptr.is_null() {
@@ -106,6 +111,8 @@ pub fn run(opts: RunOptions) -> Result<()> {
     let socket = util::socket_path();
     let mut app = App {
         registry: registry_state,
+        seat_state,
+        pointer: None,
         compositor,
         layer_shell,
         output_state,
@@ -288,6 +295,8 @@ impl OutputCtx {
 
 pub struct App {
     registry: RegistryState,
+    seat_state: SeatState,
+    pointer: Option<wl_pointer::WlPointer>,
     compositor: CompositorState,
     layer_shell: LayerShell,
     output_state: OutputState,
@@ -606,6 +615,9 @@ impl App {
         let name = oc.name.clone().unwrap_or_default();
 
         let built: Result<Box<dyn Renderer>> = match &oc.wallpaper {
+            None if oc.error.is_none() => Ok(Box::new(
+                crate::render::shader::TransparentRenderer::new(w, h),
+            ) as Box<dyn Renderer>),
             None => FallbackRenderer::new(
                 gl,
                 w,
@@ -804,6 +816,7 @@ impl App {
         let fused_mouth = fuse_mouth_visemes(audio_snap.mouth, &lyric_snap);
         let cursor = self.cursor_pos;
         let active_win = self.active_window;
+        let compositor = &self.compositor;
         let oc = &mut self.outputs[idx];
         let (Some(gl), Some(ctx), Some(gl_surface)) =
             (oc.gl.as_ref(), oc.gl_context.as_ref(), oc.gl_surface.as_ref())
@@ -895,6 +908,18 @@ impl App {
                             fo_gl.clear(glow::COLOR_BUFFER_BIT);
                         }
                         let _ = ch.render(fo_gl, &info, active_win);
+                        // only the characters take clicks, the rest passes through
+                        if let Ok(region) = Region::new(compositor) {
+                            let sc = oc.scale.max(1) as f32;
+                            for r in ch.hit_rects() {
+                                let (x, y) = ((r[0] / sc) as i32, (r[1] / sc) as i32);
+                                let (w, h) = (((r[2] - r[0]) / sc) as i32, ((r[3] - r[1]) / sc) as i32);
+                                if w > 0 && h > 0 {
+                                    region.add(x, y, w, h);
+                                }
+                            }
+                            fo.layer.wl_surface().set_input_region(Some(region.wl_region()));
+                        }
                         let _ = fo_surf.swap_buffers(fo_ctx);
                         keep_going = true;
                     }
@@ -972,6 +997,10 @@ impl App {
         let Some(fo) = self.outputs[idx].front_overlay.as_mut() else {
             return;
         };
+        // hidden characters must not swallow clicks
+        if let Ok(empty) = Region::new(&self.compositor) {
+            fo.layer.wl_surface().set_input_region(Some(empty.wl_region()));
+        }
         if !fo.configured {
             return;
         }
@@ -1783,7 +1812,7 @@ impl ProvidesRegistryState for App {
         &mut self.registry
     }
 
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 impl App {
@@ -1865,7 +1894,7 @@ impl App {
                 .with_context_api(ContextApi::Gles(None))
                 .build(Some(raw_window));
             let not_current =
-                match unsafe { self.egl_display.create_context(&self.egl_config, &attrs) } {
+                match unsafe { self.egl_display.create_context(&self.egl_alpha_config, &attrs) } {
                     Ok(ctx) => ctx,
                     Err(err) => {
                         log::error!(
@@ -1886,7 +1915,7 @@ impl App {
                 SurfaceAttributesBuilder::<WindowSurface>::new().build(raw_window, w, h);
             let gl_surface = match unsafe {
                 self.egl_display
-                    .create_window_surface(&self.egl_config, &surface_attrs)
+                    .create_window_surface(&self.egl_alpha_config, &surface_attrs)
             } {
                 Ok(s) => s,
                 Err(err) => {
@@ -1960,6 +1989,55 @@ fn read_battery() -> (bool, Option<u8>) {
 }
 
 delegate_compositor!(App);
+delegate_seat!(App);
+delegate_pointer!(App);
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
+    }
+
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Pointer {
+            if let Some(p) = self.pointer.take() {
+                p.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for App {
+    // the pointer only reaches us over a character: use the exact position
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for ev in events {
+            if !matches!(ev.kind, PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }) {
+                continue;
+            }
+            let Some(oc) = self.outputs.iter().find(|oc| {
+                oc.front_overlay.as_ref().is_some_and(|fo| fo.layer.wl_surface() == &ev.surface)
+            }) else {
+                continue;
+            };
+            let (ox, oy) = self
+                .output_state
+                .info(&oc.output)
+                .and_then(|i| i.logical_position)
+                .unwrap_or((0, 0));
+            let p = (ox as f32 + ev.position.0 as f32, oy as f32 + ev.position.1 as f32);
+            *crate::backend::pointer::SYNC.lock().unwrap() = Some(p);
+        }
+    }
+}
 delegate_output!(App);
 delegate_layer!(App);
 delegate_registry!(App);

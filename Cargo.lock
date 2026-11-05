@@ -40,6 +40,7 @@ dependencies = [
  "toml",
  "wayland-backend",
  "wayland-client",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]
