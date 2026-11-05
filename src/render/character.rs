@@ -267,325 +267,458 @@ void blendOver(inout vec4 dst, vec3 rgb, float alpha) {
     dst.a = max(dst.a, a);
 }
 
+// ---------------------------------------------------------------------------
+// Shared procedural helpers (character primitives)
+// ---------------------------------------------------------------------------
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// Tapered hair lock: distance to a segment whose radius shrinks from wa to wb,
+// with a lateral "curve" offset towards the tip.
+float sdStrand(vec2 p, vec2 a, vec2 b, float wa, float wb, float curve) {
+    vec2 pa = p - a, ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    vec2 c = a + ba * h;
+    c.x += curve * h * h;
+    // wide for most of the lock, then a sharp point
+    return length(p - c) - mix(wa, wb, smoothstep(0.25, 1.0, h));
+}
+
+void drawHairStrand(inout vec4 col, vec2 p, vec2 a, vec2 b,
+                    float wa, float wb, float curve,
+                    vec3 root, vec3 tip, vec3 edge, vec3 shine) {
+    float h = clamp(dot(p - a, b - a) / max(dot(b - a, b - a), 1e-6), 0.0, 1.0);
+
+    // dark under-layer so neighbouring locks read as separate strands
+    float dEdge = sdStrand(p, a, b, wa * 1.13 + 0.004, wb + 0.005, curve);
+    blendOver(col, edge,
+              smoothstep(0.004, -0.005, dEdge) * smoothstep(0.10, 0.40, h) * 0.55);
+
+    float d = sdStrand(p, a, b, wa, wb, curve);
+    float m = smoothstep(0.0045, -0.0045, d);
+    if (m > 0.002) {
+        vec3 c = mix(root, tip, smoothstep(0.10, 0.95, h));
+        float sh = exp(-abs(h - 0.26) * 7.0) * smoothstep(0.05, 0.22, h);
+        c = mix(c, shine, sh * 0.40);
+        blendOver(col, c, m);
+    }
+}
+
 // ============================================================================
-// REZE (Chainsaw Man — Bomb Girl Arc) Procedural Live2D-style Shader
+// REZE (Chainsaw Man — Bomb Girl Arc) procedural portrait
+// Eggplant bob with a side-parted fringe, jade eyes, black choker,
+// white collared blouse and a small black ribbon bow.
 // ============================================================================
 vec4 render_reze(vec2 uv) {
-    // Coordinate space: x in -0.85..0.85, y in -1.0..1.0 (bottom is -1.0)
-    vec2 p = (uv * 2.0 - 1.0) * vec2(0.88, 1.0);
+    // design space, then a 1.35x bust framing anchored to the quad bottom
+    vec2 q = (uv * 2.0 - 1.0) * vec2(0.88, 1.0);
+    vec2 p = q * 0.7692 - vec2(0.0, 0.1308);
 
-    float sway = sin(u_time * 1.9) * 0.018 + u_look.x * 0.045;
-    float head_bob = sin(u_time * 3.1) * 0.012 + u_beat * 0.025;
-    vec2 hp = p - vec2(sway, head_bob);
+    float t = u_time;
+    float sway = sin(t * 1.6) * 0.009 + u_look.x * 0.032;
+    float nod  = sin(t * 2.8) * 0.006 + u_beat * 0.016;
+    vec2 hp = p - vec2(sway, nod);
+    vec2 bp = p - vec2(sway * 0.32, 0.0);
 
-    // Palette inspired by MAPPA's Chainsaw Man: Reze Arc
-    vec3 hairDark   = vec3(0.13, 0.10, 0.23); // Near-black indigo shadow
-    vec3 hairBase   = vec3(0.30, 0.23, 0.44); // Dark violet-purple base (not pastel)
-    vec3 hairLight  = vec3(0.50, 0.40, 0.72); // Soft lavender shine
-    vec3 skinBase   = vec3(0.99, 0.92, 0.89); // Soft warm porcelain skin
-    vec3 skinShadow = vec3(0.93, 0.80, 0.78); // Neck/chin soft anime shading
-    vec3 eyeEmerald = vec3(0.12, 0.78, 0.52); // Vibrant emerald green iris
-    vec3 eyeDeep    = vec3(0.04, 0.36, 0.28); // Upper iris emerald shadow
-    vec3 eyeGlow    = vec3(0.55, 0.98, 0.74); // Lower iris bright green highlight
-    vec3 shirtWhite = vec3(0.96, 0.97, 0.99);
-    vec3 shirtShade = vec3(0.84, 0.86, 0.92);
-    vec3 ribbonDark = vec3(0.11, 0.11, 0.15);
-    vec3 outlineCol = vec3(0.12, 0.08, 0.16);
+    // --- palette (MAPPA Reze arc: eggplant bob, jade eyes, warm pale skin) ---
+    vec3 ink        = vec3(0.055, 0.040, 0.085);
+    vec3 hairDeep   = vec3(0.075, 0.055, 0.125);
+    vec3 hairBase   = vec3(0.195, 0.145, 0.300);
+    vec3 hairMid    = vec3(0.300, 0.225, 0.445);
+    vec3 hairShine  = vec3(0.520, 0.430, 0.705);
+    vec3 skin       = vec3(0.995, 0.925, 0.885);
+    vec3 skinShade  = vec3(0.905, 0.765, 0.745);
+    vec3 skinDeep   = vec3(0.780, 0.590, 0.605);
+    vec3 eyeDark    = vec3(0.020, 0.165, 0.125);
+    vec3 eyeMid     = vec3(0.070, 0.480, 0.300);
+    vec3 eyeLight   = vec3(0.390, 0.930, 0.570);
+    vec3 shirt      = vec3(0.965, 0.975, 0.995);
+    vec3 shirtShade = vec3(0.800, 0.820, 0.890);
+    vec3 ribbon     = vec3(0.060, 0.060, 0.090);
+    vec3 silver     = vec3(0.860, 0.890, 0.960);
 
     vec4 col = vec4(0.0);
 
-    // 0. Subtle Bomb Devil spark / fuse aura when audio beat or bass plays
-    float spark_intensity = clamp(u_audio.x * 0.85 + u_beat * 1.1, 0.0, 1.0);
-    if (spark_intensity > 0.02) {
-        for (float i = 0.0; i < 6.0; i += 1.0) {
-            float ang = i * 1.047 + u_time * (1.4 + i * 0.2);
-            float rad = 0.48 + 0.12 * sin(u_time * 3.0 + i * 2.1);
-            vec2 sp = hp - vec2(cos(ang) * rad * 0.85, sin(ang) * rad + 0.05);
-            float d = length(sp);
-            float glow = exp(-d * 28.0) * spark_intensity;
-            vec3 sparkCol = mix(vec3(1.0, 0.38, 0.12), vec3(1.0, 0.82, 0.35), fract(i * 0.37));
-            col.rgb += sparkCol * glow * 0.8;
-            col.a = max(col.a, glow * 0.7);
+    // 0. Bomb Devil fuse sparks, driven by the beat / bass
+    float spark = clamp(u_audio.x * 0.8 + u_beat * 1.2, 0.0, 1.0);
+    if (spark > 0.02) {
+        for (float i = 0.0; i < 7.0; i += 1.0) {
+            float ang = i * 0.897 + t * (1.2 + i * 0.15);
+            float rad = 0.55 + 0.10 * sin(t * 2.6 + i * 2.3);
+            vec2 sp = hp - vec2(cos(ang) * rad * 0.9, sin(ang) * rad + 0.14);
+            float glow = exp(-length(sp) * 26.0) * spark;
+            vec3 sc = mix(vec3(1.0, 0.35, 0.10), vec3(1.0, 0.85, 0.40), fract(i * 0.41));
+            col.rgb += sc * glow * 0.85;
+            col.a = max(col.a, glow * 0.65);
         }
     }
 
-    // 1. Back hair: Reze's shoulder-length bob (no bun). The ends tuck in toward the neck.
-    float d_dome = sdEllipse(hp - vec2(0.0, 0.26), vec2(0.37, 0.32));
-    vec2 bob_p = hp - vec2(0.0, -0.10);
-    float bob_taper = smoothstep(0.10, -0.25, bob_p.y);
-    bob_p.x *= 1.0 + 0.20 * bob_taper;
-    float d_bob = min(d_dome, sdRoundedBox(bob_p, vec2(0.37, 0.25), 0.13));
-    blendOver(col, hairDark, smoothstep(0.008, -0.006, d_bob));
+    // ------------------------------------------------------------------
+    // 1. Back hair — chin-length bob: straight sides, rounded crown.
+    // ------------------------------------------------------------------
+    vec2 bob = hp - vec2(0.0, 0.075);
+    float d_bobBody  = sdRoundedBox(bob - vec2(0.0, 0.010), vec2(0.322, 0.330), 0.100);
+    float d_bobCrown = sdEllipse(bob - vec2(0.0, 0.250), vec2(0.334, 0.230));
+    float d_bob = min(d_bobBody, d_bobCrown);
 
-    // 2. Bare shoulders, neck & sleeveless torso (anchored at bottom y = -1.0)
-    vec2 body_p = p - vec2(sway * 0.45, -0.72);
+    blendOver(col, ink,     smoothstep(0.008, -0.005, d_bob - 0.007));
+    blendOver(col, hairDeep, smoothstep(0.006, -0.005, d_bob));
+    if (d_bob < 0.014) {
+        float ba = smoothstep(0.011, -0.006, d_bob);
+        float lift = smoothstep(0.02, 0.44, bob.y);
+        blendOver(col, hairBase, lift * 0.55 * ba);
+        blendOver(col, hairMid, lift * lift * 0.30 * ba);
 
-    // Bare shoulders (soft rounded capsule across shoulders)
-    float d_shoulders = sdRoundedBox(body_p - vec2(0.0, 0.02), vec2(0.41, 0.32), 0.18);
-    if (d_shoulders < 0.01) {
-        float sa = smoothstep(0.008, -0.006, d_shoulders);
-        vec3 shCol = mix(skinBase, skinShadow, smoothstep(-0.1, 0.25, abs(body_p.x) - 0.18));
-        blendOver(col, shCol, sa);
-        // Subtle collarbone lines
-        float collar_line = sdSegment(vec2(abs(body_p.x), body_p.y), vec2(0.07, 0.20), vec2(0.24, 0.23));
-        blendOver(col, skinShadow, smoothstep(0.009, 0.002, collar_line) * 0.65 * sa);
+        float band = exp(-abs(bob.y - 0.315 + bob.x * bob.x * 0.9) * 20.0);
+        blendOver(col, hairShine,
+                  band * smoothstep(0.30, 0.13, abs(bob.x)) * 0.45 * ba);
+
+        blendOver(col, hairDeep, smoothstep(0.16, 0.33, abs(bob.x)) * 0.45 * ba);
+        blendOver(col, ink, smoothstep(-0.09, -0.25, bob.y) * 0.45 * ba);
     }
 
-    // Slender neck + chin shadow
-    vec2 neck_p = p - vec2(sway * 0.75, -0.25);
-    float d_neck = sdRoundedBox(neck_p, vec2(0.105, 0.19), 0.04);
-    if (d_neck < 0.01) {
+    // ------------------------------------------------------------------
+    // 2. Neck (drawn before the blouse, which hides its base)
+    // ------------------------------------------------------------------
+    vec2 nq = bp - vec2(0.0, -0.312);
+    float d_neck = sdRoundedBox(nq, vec2(0.112, 0.132), 0.044);
+    if (d_neck < 0.012) {
         float na = smoothstep(0.008, -0.006, d_neck);
-        // Cast shadow under chin
-        float chin_sh = smoothstep(0.01, 0.12, neck_p.y);
-        vec3 nCol = mix(skinBase, skinShadow, chin_sh * 0.85);
+        float chin_sh = smoothstep(-0.085, 0.055, nq.y);
+        vec3 nCol = mix(skin, skinShade, chin_sh * 0.90);
+        nCol = mix(nCol, skinDeep, smoothstep(0.040, 0.092, abs(nq.x)) * 0.55);
         blendOver(col, nCol, na);
     }
 
-    // 3. Reze's signature black choker with the grenade pull-pin and ring
-    vec2 choker_p = neck_p - vec2(0.0, -0.075);
-    float d_choker = sdRoundedBox(choker_p, vec2(0.112, 0.030), 0.012);
-    blendOver(col, ribbonDark, smoothstep(0.007, -0.005, d_choker));
+    // ------------------------------------------------------------------
+    // 3. White blouse — sloping shoulders, filled chest, collar, ribbon.
+    // ------------------------------------------------------------------
+    float d_torso = sdRoundedBox(bp - vec2(0.0, -0.900), vec2(0.378, 0.380), 0.110);
+    float d_shL = sdStrand(bp, vec2(-0.080, -0.372), vec2(-0.348, -0.520), 0.098, 0.098, 0.0);
+    float d_shR = sdStrand(bp, vec2( 0.080, -0.372), vec2( 0.348, -0.520), 0.098, 0.098, 0.0);
+    float d_armL = sdStrand(bp, vec2(-0.348, -0.520), vec2(-0.376, -1.100), 0.108, 0.108, 0.0);
+    float d_armR = sdStrand(bp, vec2( 0.348, -0.520), vec2( 0.376, -1.100), 0.108, 0.108, 0.0);
+    // chest yoke keeps the neckline solid instead of leaving a hole
+    float d_yoke = sdRoundedBox(bp - vec2(0.0, -0.590), vec2(0.250, 0.205), 0.070);
+    float d_shirt = min(min(d_torso, d_yoke), min(min(d_shL, d_shR), min(d_armL, d_armR)));
 
-    // Pin shaft threaded through the front of the choker, ring dangling on the collarbone
-    vec3 silver = vec3(0.85, 0.89, 0.95) + vec3(1.0, 0.65, 0.25) * spark_intensity * 0.6;
-    vec2 pin_p = choker_p - vec2(0.052, 0.0);
-    float d_pin = sdSegment(pin_p, vec2(0.0, 0.004), vec2(0.004, -0.048)) - 0.0045;
-    blendOver(col, vec3(0.70, 0.74, 0.82), smoothstep(0.005, -0.003, d_pin));
-    vec2 ring_p = pin_p - vec2(0.006, -0.076);
-    float d_ring = abs(sdCircle(ring_p, 0.028)) - 0.0055;
-    blendOver(col, silver, smoothstep(0.005, -0.003, d_ring));
-
-    // 4. White Sleeveless Collared Blouse + Black Ribbon Tie
-    float d_shirt = sdRoundedBox(body_p - vec2(0.0, -0.03), vec2(0.28, 0.33), 0.08);
-    if (d_shirt < 0.01) {
-        float sha = smoothstep(0.008, -0.006, d_shirt);
-        vec3 sCol = mix(shirtWhite, shirtShade, smoothstep(0.12, 0.28, abs(body_p.x)));
+    if (d_shirt < 0.012) {
+        float sha = smoothstep(0.009, -0.006, d_shirt);
+        float side_shade = smoothstep(0.14, 0.62, abs(bp.x));
+        vec3 sCol = mix(shirt, shirtShade, side_shade * 0.60);
+        sCol = mix(sCol, shirtShade, smoothstep(-0.34, -0.48, bp.y) * 0.22);
+        sCol = mix(sCol, shirtShade, smoothstep(-0.70, -1.05, bp.y) * 0.45);
         blendOver(col, sCol, sha);
 
-        // Crisp V-neck collar flaps
-        vec2 col_p = vec2(abs(body_p.x), body_p.y - 0.22);
-        float d_flap = sdTriangleIsosceles(col_p - vec2(0.08, 0.05), vec2(0.085, -0.14));
-        blendOver(col, shirtWhite, smoothstep(0.007, -0.005, d_flap));
-        blendOver(col, shirtShade, smoothstep(0.006, 0.0, abs(d_flap) - 0.003) * 0.7);
+        // sleeve seams between torso and upper arms
+        float seamL = sdStrand(bp, vec2(-0.300, -0.470), vec2(-0.360, -1.060), 0.0035, 0.0035, 0.0);
+        float seamR = sdStrand(bp, vec2( 0.300, -0.470), vec2( 0.360, -1.060), 0.0035, 0.0035, 0.0);
+        blendOver(col, shirtShade, smoothstep(0.006, 0.0, min(seamL, seamR)) * 0.55 * sha);
 
-        // Small black bow & short tails at the collar
-        vec2 rib_p = body_p - vec2(0.0, 0.22);
-        // Knot
-        float d_knot = sdRoundedBox(rib_p, vec2(0.028, 0.026), 0.01);
-        // Bow loops
-        vec2 loop_p = vec2(abs(rib_p.x) - 0.065, rib_p.y + rib_p.x * sign(rib_p.x) * 0.15);
-        float d_loop = sdRoundedBox(loop_p, vec2(0.055, 0.026), 0.012);
-        // Two hanging black ribbon tails swaying slightly with music/movement
-        vec2 tail_p = rib_p - vec2(sin(u_time * 2.5 + rib_p.y * 6.0) * 0.012, 0.0);
-        float d_tail_l = sdSegment(tail_p, vec2(-0.015, -0.01), vec2(-0.045, -0.17));
-        float d_tail_r = sdSegment(tail_p, vec2( 0.015, -0.01), vec2( 0.045, -0.15));
-        float d_ribbon = min(min(d_knot, d_loop), min(d_tail_l - 0.014, d_tail_r - 0.014));
-        blendOver(col, ribbonDark, smoothstep(0.007, -0.005, d_ribbon) * sha);
+        // gentle chest folds
+        float foldA = sdStrand(bp, vec2(-0.230, -0.650), vec2(-0.140, -0.900), 0.006, 0.006, 0.0);
+        float foldB = sdStrand(bp, vec2( 0.230, -0.670), vec2( 0.150, -0.920), 0.006, 0.006, 0.0);
+        blendOver(col, shirtShade, smoothstep(0.012, 0.0, min(foldA, foldB)) * 0.35 * sha);
+
+        // ---- pointed shirt collar around the neck ----
+        // soft shaded hollow around the neckline (so the white collar reads)
+        float d_hollow = sdEllipse(bp - vec2(0.0, -0.470), vec2(0.210, 0.150));
+        blendOver(col, shirtShade, smoothstep(0.085, -0.030, d_hollow) * 0.38 * sha);
+
+        // skin V of the open collar
+        float d_v = sdTriangleIsosceles(bp - vec2(0.0, -0.350), vec2(0.058, 0.082));
+        blendOver(col, mix(skin, skinShade, 0.45), smoothstep(0.005, -0.004, d_v) * 0.96);
+
+        // ---- pointed shirt collar (white flaps over the shaded hollow) ----
+        float d_collarL = sdStrand(bp, vec2(-0.078, -0.374), vec2(-0.128, -0.498), 0.048, 0.006, -0.020);
+        float d_collarR = sdStrand(bp, vec2( 0.078, -0.374), vec2( 0.128, -0.498), 0.048, 0.006,  0.020);
+        float d_collar = min(d_collarL, d_collarR);
+        // drop shadow under the flaps
+        blendOver(col, shirtShade, smoothstep(0.014, -0.002, d_collar - 0.012) * 0.55 * sha);
+        blendOver(col, vec3(0.995, 0.995, 1.000), smoothstep(0.005, -0.004, d_collar) * sha);
+        // seam along the outer edge only
+        blendOver(col, mix(shirtShade, ink, 0.12),
+                  smoothstep(0.0038, 0.0, abs(d_collar) - 0.0032) * 0.45 * sha);
+
+        // shirt placket down the chest
+        float d_placket = sdStrand(bp, vec2(0.0, -0.470), vec2(0.0, -1.050), 0.0025, 0.0025, 0.0);
+        blendOver(col, shirtShade, smoothstep(0.004, 0.0, d_placket) * 0.45 * sha);
+
+        // ---- black ribbon bow ----
+        vec2 rib = bp - vec2(0.0, -0.432);
+        float d_loopL = sdEllipse(rib - vec2(-0.040, 0.006), vec2(0.036, 0.018));
+        float d_loopR = sdEllipse(rib - vec2( 0.040, 0.006), vec2(0.036, 0.018));
+        float d_knot  = sdRoundedBox(rib, vec2(0.016, 0.014), 0.005);
+        float d_tailL = sdStrand(rib, vec2(-0.009, -0.010), vec2(-0.033, -0.110), 0.012, 0.003, -0.007);
+        float d_tailR = sdStrand(rib, vec2( 0.009, -0.010), vec2( 0.029, -0.104), 0.011, 0.003,  0.006);
+        float d_bow = min(min(d_loopL, d_loopR), min(d_knot, min(d_tailL, d_tailR)));
+        blendOver(col, ribbon, smoothstep(0.005, -0.004, d_bow));
+        blendOver(col, vec3(0.26, 0.26, 0.34),
+                  smoothstep(0.004, 0.0, abs(d_knot) - 0.003) * 0.45
+                  + smoothstep(0.004, 0.0, abs(d_loopL) - 0.006) * 0.25
+                  + smoothstep(0.004, 0.0, abs(d_loopR) - 0.006) * 0.25);
     }
 
-    // 5. Head & Anime Face Contour (tapered chin + soft cheeks + dynamic jaw movement)
-    vec2 face_p = hp - vec2(0.0, 0.14);
-    float jaw_drop = u_mouth.x * 0.018;
-    vec2 jaw_face_p = face_p;
-    if (jaw_face_p.y < -0.04) {
-        jaw_face_p.y += jaw_drop * smoothstep(-0.04, -0.26, jaw_face_p.y);
+    // ------------------------------------------------------------------
+    // 4. Signature black choker with the silver ring
+    // ------------------------------------------------------------------
+    vec2 chq = bp - vec2(0.0, -0.306);
+    float d_choker = sdRoundedBox(chq, vec2(0.120, 0.0175), 0.0065);
+    if (d_choker < 0.006) {
+        blendOver(col, ribbon, smoothstep(0.005, -0.004, d_choker));
+        float hi = sdRoundedBox(chq - vec2(0.0, 0.008), vec2(0.104, 0.0030), 0.0015);
+        blendOver(col, vec3(0.22, 0.22, 0.30), smoothstep(0.003, 0.0, hi) * 0.75);
+        float ring = abs(sdCircle(chq - vec2(0.0, -0.026), 0.0125)) - 0.0027;
+        blendOver(col, silver, smoothstep(0.004, -0.002, ring));
+        float pin = sdRoundedBox(chq - vec2(0.0, -0.026), vec2(0.0024, 0.0145), 0.002);
+        blendOver(col, silver, smoothstep(0.003, 0.0, pin) * 0.9);
     }
-    // Taper width towards chin for an authentic anime jawline
-    float jaw_taper = clamp((jaw_face_p.y + 0.30) * 1.4, 0.0, 1.0);
-    vec2 shaped_face = vec2(jaw_face_p.x / mix(0.68, 1.02, jaw_taper), jaw_face_p.y);
-    float d_head = sdRoundedBox(shaped_face, vec2(0.31, 0.29), 0.22);
 
-    if (d_head < 0.01) {
-        float ha = smoothstep(0.008, -0.006, d_head);
-        vec3 fCol = mix(skinShadow, skinBase, smoothstep(-0.28, -0.14, face_p.y));
-        blendOver(col, fCol, ha);
-        // Thin anime jawline contour
-        blendOver(col, outlineCol, smoothstep(0.006, 0.0, abs(d_head) - 0.003) * 0.45);
+    // ------------------------------------------------------------------
+    // 5. Face — egg shaped with a soft, small chin
+    // ------------------------------------------------------------------
+    vec2 fp = hp - vec2(0.0, 0.075);
+    float jaw_drop = u_mouth.x * 0.016;
+    vec2 fq = fp;
+    fq.y += jaw_drop * smoothstep(-0.06, -0.28, fp.y);
 
-        // Soft warm cheek blush
-        vec2 blush_p = vec2(abs(face_p.x) - 0.165, face_p.y + 0.045);
-        float blush = exp(-dot(blush_p * vec2(1.0, 1.8), blush_p * vec2(1.0, 1.8)) * 190.0);
-        col.rgb = mix(col.rgb, vec3(0.98, 0.52, 0.58), blush * (0.55 + u_beat * 0.25) * ha);
+    float d_cran = sdEllipse(fq - vec2(0.0, 0.055), vec2(0.240, 0.270));
+    float d_jaw  = sdEllipse(fq - vec2(0.0, -0.136), vec2(0.154, 0.162));
+    float d_face = smin(d_cran, d_jaw, 0.062);
 
-        // Subtle anime nose shadow/dot
-        vec2 nose_p = face_p - vec2(u_look.x * 0.015, -0.045);
-        float d_nose = sdSegment(nose_p, vec2(0.0, 0.012), vec2(-0.006, -0.008));
-        blendOver(col, skinShadow * 0.85, smoothstep(0.007, 0.001, d_nose) * 0.85);
+    if (d_face < 0.014) {
+        float fa = smoothstep(0.011, -0.006, d_face);
+        vec3 fCol = mix(skinShade, skin, smoothstep(-0.30, -0.05, fp.y));
+        fCol = mix(fCol, skinShade, smoothstep(0.02, 0.24, fp.x) * 0.26);
+        blendOver(col, fCol, fa);
+        blendOver(col, skinDeep, smoothstep(0.005, 0.0, abs(d_face) - 0.0022) * 0.30);
 
-        // 6. Expressive Emerald Green Eyes with Mouse Tracking & Blinking
-        float blink_cycle = mod(u_time, 4.5);
-        float blink = smoothstep(0.0, 0.065, abs(blink_cycle - 4.1));
-        vec2 look_shift = clamp(u_look, vec2(-1.0), vec2(1.0)) * vec2(0.032, 0.022);
+        // fringe shadow on the forehead
+        float fh = smoothstep(0.26, 0.10, fp.y) * smoothstep(0.00, 0.12, fp.y);
+        col.rgb = mix(col.rgb, skinShade, fh * 0.32 * fa);
 
-        float side = sign(face_p.x);
-        vec2 ep = vec2(abs(face_p.x) - 0.135, face_p.y - 0.005);
-        ep.y += ep.x * 0.25; // soft droopy (tareme) outer corners
-        float eye_h = max(0.005, 0.060 * blink);
-        float d_sclera = sdRoundedBox(ep, vec2(0.062, eye_h), 0.030);
+        // warm cheek blush
+        vec2 bl = vec2(abs(fp.x) - 0.150, fp.y + 0.150);
+        float blush = exp(-dot(bl * vec2(1.0, 2.0), bl * vec2(1.0, 2.0)) * 95.0);
+        col.rgb = mix(col.rgb, vec3(0.975, 0.560, 0.610), blush * (0.30 + u_beat * 0.12) * fa);
 
-        if (d_sclera < 0.006 && blink > 0.18) {
-            float ea = smoothstep(0.006, -0.005, d_sclera);
-            // White sclera with subtle top lash shadow
-            vec3 scleraCol = mix(vec3(0.98, 0.99, 1.0), vec3(0.84, 0.85, 0.92), smoothstep(0.0, eye_h, ep.y));
+        // small nose shadow
+        vec2 np = fp - vec2(u_look.x * 0.008, -0.128);
+        float d_nose = sdEllipse(np, vec2(0.0075, 0.0040));
+        blendOver(col, skinDeep, smoothstep(0.005, 0.0, d_nose) * 0.55);
+
+        // ---------------- 6. Emerald eyes ----------------
+        float blink_cycle = mod(t, 4.6);
+        float blink = smoothstep(0.0, 0.065, abs(blink_cycle - 4.18));
+        vec2 look = clamp(u_look, vec2(-1.0), vec2(1.0)) * vec2(0.026, 0.018);
+        float side = sign(fp.x);
+        vec2 ep = vec2(abs(fp.x) - 0.126, fp.y + 0.030);
+        ep.y += ep.x * 0.16;
+        float eye_h = max(0.004, 0.060 * blink);
+
+        float d_sclera = sdEllipse(ep, vec2(0.063, eye_h * 0.94));
+        if (d_sclera < 0.008 && blink > 0.15) {
+            float ea = smoothstep(0.008, -0.005, d_sclera);
+            vec3 scleraCol = mix(vec3(0.99, 1.0, 1.0),
+                                 vec3(0.78, 0.80, 0.88),
+                                 smoothstep(-eye_h * 0.2, eye_h, ep.y));
             blendOver(col, scleraCol, ea);
 
-            // Emerald green iris following mouse cursor
-            vec2 iris_center = vec2(side * look_shift.x, look_shift.y);
-            vec2 ip = ep - iris_center;
-            float d_iris = sdEllipse(ip, vec2(0.042, 0.050));
-            if (d_iris < 0.005) {
-                float ia = smoothstep(0.005, -0.004, d_iris) * ea;
-                // Gradient from deep emerald at top to bright jade at bottom
-                float igrad = clamp((ip.y + 0.045) / 0.09, 0.0, 1.0);
-                vec3 irisCol = mix(eyeGlow, mix(eyeEmerald, eyeDeep, igrad), igrad);
+            vec2 ip = ep - vec2(side * look.x, look.y + 0.013);
+            float d_iris = sdEllipse(ip, vec2(0.045, 0.053));
+            if (d_iris < 0.007) {
+                float ia = smoothstep(0.006, -0.004, d_iris) * ea;
+                float igrad = clamp((ip.y + 0.053) / 0.106, 0.0, 1.0);
+                vec3 irisCol = mix(eyeLight, mix(eyeMid, eyeDark, igrad), igrad);
                 blendOver(col, irisCol, ia);
+                // lid shadow across the top of the iris
+                blendOver(col, eyeDark,
+                          smoothstep(0.020, 0.062, ip.y) * ia * 0.55);
 
-                // Dark pupil
-                float d_pupil = sdCircle(ip, 0.017);
-                blendOver(col, vec3(0.03, 0.14, 0.12), smoothstep(0.005, -0.003, d_pupil) * ia);
+                float rim = smoothstep(0.007, 0.0, abs(d_iris) - 0.004);
+                blendOver(col, eyeDark, rim * ia * 0.90);
 
-                // Dual anime catchlights
-                float hl1 = sdCircle(ip - vec2(-0.015 * side, 0.018), 0.012);
-                float hl2 = sdCircle(ip - vec2( 0.014 * side, -0.016), 0.006);
+                float d_pupil = sdEllipse(ip, vec2(0.0160, 0.021));
+                blendOver(col, vec3(0.02, 0.08, 0.06), smoothstep(0.004, -0.003, d_pupil) * ia);
+
+                float hl1 = sdCircle(ip - vec2(-0.014 * side, 0.018), 0.0105);
+                float hl2 = sdCircle(ip - vec2(0.012 * side, -0.016), 0.0052);
                 blendOver(col, vec3(1.0), smoothstep(0.004, -0.003, min(hl1, hl2)) * ia);
+
+                float iglow = exp(-length(ip - vec2(0.0, -0.040)) * 30.0);
+                blendOver(col, eyeLight, iglow * ia * 0.35);
             }
         }
 
-        // Upper thick dark-purple eyelash arch
-        vec2 lash_p = ep - vec2(0.0, eye_h - 0.004);
-        lash_p.y += (lash_p.x * lash_p.x) * 3.2;
-        float d_lash = sdRoundedBox(lash_p, vec2(0.068, 0.011), 0.006);
-        blendOver(col, outlineCol, smoothstep(0.006, -0.004, d_lash));
+        // upper lid: thick curved lash hugging the top of the eye
+        float lashMask = smoothstep(0.014, 0.0, abs(d_sclera))
+                       * smoothstep(-0.014, 0.014, ep.y);
+        blendOver(col, ink, lashMask);
+        // outer wing
+        vec2 wp = vec2(abs(ep.x), ep.y);
+        float d_wing = sdStrand(wp, vec2(0.044, 0.012), vec2(0.088, 0.026), 0.0080, 0.002, 0.0);
+        blendOver(col, ink, smoothstep(0.004, -0.003, d_wing));
+        // eyelid crease
+        float crease = abs(sdEllipse(ep - vec2(0.0, 0.008), vec2(0.060, 0.062))) - 0.0032;
+        blendOver(col, skinDeep, smoothstep(0.005, 0.001, crease)
+                  * smoothstep(0.006, 0.028, ep.y) * 0.30);
 
-        // Delicate arched eyebrows
-        vec2 brow_p = ep - vec2(0.0, 0.088 + u_beat * 0.008);
-        brow_p.y += (brow_p.x + 0.01) * (brow_p.x + 0.01) * 2.5;
-        float d_brow = sdRoundedBox(brow_p, vec2(0.060, 0.005), 0.003);
-        blendOver(col, hairDark, smoothstep(0.005, -0.003, d_brow) * 0.85);
+        // lower lash line
+        float d_lower = sdSegment(vec2(abs(ep.x), ep.y),
+                                  vec2(0.022, -eye_h * 0.88),
+                                  vec2(0.060, -eye_h * 0.58)) - 0.0030;
+        blendOver(col, hairDeep, smoothstep(0.003, 0.0, d_lower) * 0.45 * smoothstep(0.0, 0.4, blink));
 
-        // 7. Multi-Viseme (A, I, U, E, O + M/B/P Closure + Sibilant Teeth) Mouth
+        // delicate eyebrows
+        vec2 br = ep - vec2(0.0, 0.098);
+        br.y += (br.x + 0.004) * (br.x + 0.004) * 2.2;
+        float d_brow = sdRoundedBox(br, vec2(0.046, 0.0038), 0.0024);
+        blendOver(col, hairDeep, smoothstep(0.004, -0.003, d_brow) * 0.80);
+
+        // ---------------- 7. Viseme mouth ----------------
         float m_open = clamp(u_mouth.x, 0.0, 1.0);
-        float m_form = clamp(u_mouth.y, -1.0, 1.0); // -1 = rounded O/U, 0 = open A, +1 = spread I/E
+        float m_form = clamp(u_mouth.y, -1.0, 1.0);
         float m_sib  = clamp(u_mouth.z, 0.0, 1.0);
         float m_act  = clamp(u_mouth.w, 0.0, 1.0);
 
-        vec2 mp = face_p - vec2(look_shift.x * 0.35, -0.145 - jaw_drop * 0.45);
+        vec2 mp = fp - vec2(look.x * 0.24, -0.180 - jaw_drop * 0.45);
         if (m_open > 0.035) {
-            // Width expands on spread vowels (I, E) and narrows on rounded vowels (O, U)
-            float mw = clamp(0.032 + m_form * 0.015 + m_open * 0.007, 0.016, 0.052);
-            // Height opens on A/O/E and compresses slightly on close vowels (I) or sibilants (S/Ş)
-            float mh = clamp(0.004 + m_open * 0.040 * (1.0 - max(m_form, 0.0) * 0.22), 0.005, 0.045);
+            float mw = clamp(0.030 + m_form * 0.014 + m_open * 0.006, 0.015, 0.048);
+            float mh = clamp(0.004 + m_open * 0.036 * (1.0 - max(m_form, 0.0) * 0.22), 0.005, 0.041);
 
-            // Shape distortion: smile arch for I/E, neutral trapezoid for A, rounded oval for O/U
-            vec2 q = mp;
-            q.y -= (q.x * q.x) * (m_form * 2.8);
-            float roundness = clamp(0.010 + max(-m_form, 0.0) * 0.012 + m_open * 0.008, 0.004, min(mw, mh));
+            vec2 mq = mp;
+            mq.y -= (mq.x * mq.x) * (m_form * 2.8);
+            float roundness = clamp(0.009 + max(-m_form, 0.0) * 0.011 + m_open * 0.007,
+                                    0.004, min(mw, mh));
             float d_mouth = mix(
-                sdRoundedBox(q, vec2(mw, mh), roundness),
-                sdEllipse(q, vec2(mw, mh)),
+                sdRoundedBox(mq, vec2(mw, mh), roundness),
+                sdEllipse(mq, vec2(mw, mh)),
                 clamp(-m_form * 0.85, 0.0, 0.85)
             );
 
             if (d_mouth < 0.005) {
                 float ma = smoothstep(0.004, -0.003, d_mouth);
-                // Deep oral cavity base
                 vec3 mCol = vec3(0.36, 0.09, 0.15);
 
-                // Warm coral-pink tongue in the lower oral cavity
-                vec2 tp = q - vec2(m_form * 0.003, -mh * 0.55);
+                vec2 tp = mq - vec2(m_form * 0.003, -mh * 0.55);
                 float d_tongue = sdEllipse(tp, vec2(mw * 0.78, mh * 0.72));
                 if (d_tongue < 0.0) {
-                    vec3 tongueCol = mix(vec3(0.94, 0.44, 0.52), vec3(0.76, 0.26, 0.36), clamp(-tp.y * 18.0, 0.0, 1.0));
+                    vec3 tongueCol = mix(vec3(0.94, 0.44, 0.52),
+                                         vec3(0.76, 0.26, 0.36),
+                                         clamp(-tp.y * 18.0, 0.0, 1.0));
                     mCol = mix(mCol, tongueCol, smoothstep(0.003, -0.003, d_tongue));
                 }
 
-                // Crisp white upper teeth row along top of mouth (especially prominent on I/E & sibilants S/Ş/Ç)
                 float teeth_drop = mh * (0.52 - 0.28 * max(m_sib, max(m_form, 0.0)));
-                float d_teeth = q.y - teeth_drop;
-                if (d_teeth > -0.005 && abs(q.x) < mw * 0.86) {
+                float d_teeth = mq.y - teeth_drop;
+                if (d_teeth > -0.005 && abs(mq.x) < mw * 0.86) {
                     float ta = smoothstep(-0.003, 0.002, d_teeth);
                     mCol = mix(mCol, vec3(0.98, 0.97, 0.99), ta);
                 }
 
                 blendOver(col, mCol, ma);
-                // Crisp anime lip outline
-                blendOver(col, vec3(0.32, 0.14, 0.20), smoothstep(0.0045, 0.0, abs(d_mouth) - 0.0018) * 0.85);
+                blendOver(col, vec3(0.32, 0.14, 0.20),
+                          smoothstep(0.0045, 0.0, abs(d_mouth) - 0.0018) * 0.85);
             }
-            // Subtle lower-lip gloss highlight
             vec2 lip_hl = mp - vec2(0.0, -mh - 0.005);
             float d_lip_hl = sdSegment(lip_hl, vec2(-mw * 0.38, 0.0), vec2(mw * 0.38, 0.0));
-            blendOver(col, skinShadow * 0.88, smoothstep(0.005, 0.001, d_lip_hl) * 0.55);
+            blendOver(col, skinShade * 0.88, smoothstep(0.005, 0.001, d_lip_hl) * 0.55);
         } else if (m_act > 0.22) {
-            // Bilabial consonant closure (M / B / P): lips pressed neatly together mid-phrase
-            vec2 bp_m = mp;
-            float d_closed = sdSegment(bp_m, vec2(-0.027, 0.0), vec2(0.027, 0.0));
+            vec2 bpm = mp;
+            float d_closed = sdSegment(bpm, vec2(-0.025, 0.0), vec2(0.025, 0.0));
             blendOver(col, vec3(0.40, 0.20, 0.26), smoothstep(0.0055, 0.001, d_closed));
-            float d_phil = sdSegment(bp_m - vec2(0.0, -0.006), vec2(-0.010, 0.0), vec2(0.010, 0.0));
-            blendOver(col, skinShadow * 0.86, smoothstep(0.0045, 0.001, d_phil) * 0.55);
+            float d_phil = sdSegment(bpm - vec2(0.0, -0.006), vec2(-0.010, 0.0), vec2(0.010, 0.0));
+            blendOver(col, skinShade * 0.86, smoothstep(0.0045, 0.001, d_phil) * 0.55);
         } else {
-            // Reze's signature gentle curved smile with a tiny playful corner when idle
+            // Reze's soft closed-mouth smile
             vec2 sp = mp;
-            sp.y -= (sp.x * sp.x) * 4.5;
-            float d_smile = sdSegment(sp, vec2(-0.036, 0.0), vec2(0.038, 0.003));
-            blendOver(col, vec3(0.42, 0.22, 0.28), smoothstep(0.006, 0.001, d_smile));
+            sp.y -= (sp.x * sp.x) * 4.0;
+            float d_smile = sdSegment(sp, vec2(-0.036, 0.0), vec2(0.038, 0.005));
+            blendOver(col, vec3(0.38, 0.17, 0.24), smoothstep(0.0060, 0.001, d_smile));
+            float d_corner = sdCircle(sp - vec2(0.034, 0.004), 0.0023);
+            blendOver(col, vec3(0.42, 0.22, 0.28), smoothstep(0.004, 0.0, d_corner) * 0.8);
         }
     }
 
-    // 8. Hair in front of the face: long parted bangs + short bob sidelocks
-    // Crown / top hair dome. Its lower edge hides the eyebrows (hair-over-brows look).
-    vec2 crown_p = hp - vec2(0.0, 0.36);
-    float d_crown = sdEllipse(crown_p, vec2(0.36, 0.16));
-    if (d_crown < 0.008) {
-        float ca = smoothstep(0.007, -0.005, d_crown);
-        float shine = exp(-abs(crown_p.y + 0.02 + crown_p.x * crown_p.x * 1.4) * 38.0);
-        vec3 cCol = mix(hairBase, hairLight, shine * 0.45);
-        blendOver(col, cCol, ca);
-    }
-
-    // Long wispy bangs with the part just left of center. Tips point down and sweep
-    // away from the part; the center strand falls between the eyes.
-    for (float i = -3.0; i <= 3.0; i += 1.0) {
-        float bx = i * 0.072 - 0.02;
-        float dir = (bx > -0.03) ? 1.0 : -1.0;
-        float len = 0.135 + sin(i * 2.7) * 0.012;
-        if (i == 0.0) {
-            len = 0.20;
-        } else if (abs(i) > 2.5) {
-            len = 0.175;
-        }
-        float sway_b = sin(u_time * 2.2 + i * 0.7) * 0.006 + u_look.x * 0.012;
-        vec2 bp = hp - vec2(bx + sway_b, 0.31 - len); // origin = strand tip
-        float depth_b = clamp(1.0 - bp.y / len, 0.0, 1.0);
-        bp.x -= dir * depth_b * depth_b * 0.03;
-        float d_strand = sdTriangleIsosceles(bp, vec2(0.048, len)); // tip down
-        if (d_strand < 0.007) {
-            float sa = smoothstep(0.006, -0.005, d_strand);
-            vec3 bCol = mix(hairBase, hairDark, depth_b * 0.55);
-            blendOver(col, bCol, sa);
-        }
-    }
-
-    // Short bob sidelocks: end around the jaw/neck and curl inward, swaying slightly
+    // ------------------------------------------------------------------
+    // 8. Front hair — face-framing locks, fringe, root cap
+    // ------------------------------------------------------------------
     for (float s = -1.0; s <= 1.0; s += 2.0) {
-        vec2 lp = hp - vec2(s * 0.295, 0.30);
-        float depth = clamp(-lp.y / 0.56, 0.0, 1.0);
-        float lock_sway = (sin(u_time * 2.4 + s * 0.8) * 0.020 + u_look.x * 0.030) * depth * depth;
-        lp.x += s * depth * depth * 0.06; // inward curl at the ends
-        lp.x -= lock_sway;
-        float lock_r = mix(0.075, 0.040, depth);
-        float d_lock = sdSegment(lp, vec2(0.0, 0.0), vec2(0.0, -0.56)) - lock_r;
-        if (d_lock < 0.007) {
-            float la = smoothstep(0.006, -0.005, d_lock);
-            float h_shine = exp(-abs(lp.y + 0.18) * 22.0) * 0.45;
-            vec3 lCol = mix(mix(hairBase, hairDark, depth * 0.7), hairLight, h_shine);
-            blendOver(col, lCol, la);
-        }
+        float lock_sway = (sin(t * 2.2 + s * 0.9) * 0.008 + u_look.x * 0.018);
+        // main jaw-length lock
+        drawHairStrand(col, hp,
+            vec2(s * 0.280, 0.330),
+            vec2(s * 0.292 + lock_sway, -0.272),
+            0.050, 0.011, s * 0.030,
+            hairMid, hairDeep, ink, hairShine);
+        // thinner inner lock hugging the cheek
+        drawHairStrand(col, hp,
+            vec2(s * 0.228, 0.352),
+            vec2(s * 0.244 + lock_sway * 0.7, -0.195),
+            0.034, 0.008, s * 0.012,
+            hairBase, hairDeep, ink, hairShine);
     }
+
+    // fringe base: solid bang mass under the individual locks
+    float fsway = sin(t * 1.9) * 0.004 + u_look.x * 0.008;
+    float frLine = hp.y - (0.152 + 0.026 * sin(hp.x * 7.0 + 2.4) + 0.04 * hp.x);
+    float d_frBase = max(sdEllipse(hp - vec2(0.0, 0.290), vec2(0.300, 0.208)), -frLine);
+    if (d_frBase < 0.012) {
+        float fba = smoothstep(0.010, -0.006, d_frBase);
+        vec3 fbCol = mix(hairBase, hairMid, smoothstep(0.16, 0.34, hp.y) * 0.7);
+        fbCol = mix(fbCol, hairDeep, smoothstep(0.20, 0.15, hp.y) * 0.35);
+        blendOver(col, fbCol, fba);
+    }
+
+    // side-parted fringe: every lock roots inside the crown, tapers to a point
+    drawHairStrand(col, hp, vec2(-0.290 + fsway, 0.320), vec2(-0.322 + fsway, 0.022),
+                   0.056, 0.007, -0.012, hairBase, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2(-0.238 + fsway, 0.352), vec2(-0.280 + fsway, 0.048),
+                   0.058, 0.006, -0.016, hairBase, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2(-0.186 + fsway, 0.372), vec2(-0.244 + fsway, 0.020),
+                   0.060, 0.005, -0.020, hairBase, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2(-0.128 + fsway, 0.388), vec2(-0.176 + fsway, 0.058),
+                   0.062, 0.005, -0.012, hairMid, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2(-0.066 + fsway, 0.396), vec2(-0.098 + fsway, 0.096),
+                   0.060, 0.005, -0.006, hairMid, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2( 0.000 + fsway, 0.398), vec2( 0.056 + fsway, 0.092),
+                   0.062, 0.005,  0.014, hairMid, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2( 0.070 + fsway, 0.392), vec2( 0.146 + fsway, 0.090),
+                   0.062, 0.006,  0.018, hairMid, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2( 0.140 + fsway, 0.382), vec2( 0.222 + fsway, 0.066),
+                   0.062, 0.006,  0.020, hairMid, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2( 0.210 + fsway, 0.362), vec2( 0.292 + fsway, 0.038),
+                   0.060, 0.007,  0.016, hairBase, hairDeep, ink, hairShine);
+    drawHairStrand(col, hp, vec2( 0.272 + fsway, 0.330), vec2( 0.318 + fsway, 0.018),
+                   0.056, 0.007,  0.012, hairBase, hairDeep, ink, hairShine);
+
+    // root cap: covers the fringe roots and forms the hairline mass
+    float d_capCrown = sdEllipse(hp - vec2(0.0, 0.250), vec2(0.322, 0.238));
+    float capLine = hp.y - (0.322 + 0.016 * sin(hp.x * 13.0 + 1.0));
+    float d_cap = max(d_capCrown, -capLine);
+    if (d_cap < 0.012) {
+        float ca = smoothstep(0.010, -0.006, d_cap);
+        // identical shading to the back-hair crown so the seam disappears
+        float lift = smoothstep(0.02, 0.44, bob.y);
+        blendOver(col, hairBase, lift * 0.55 * ca);
+        blendOver(col, hairMid, lift * lift * 0.30 * ca);
+        float band = exp(-abs(bob.y - 0.315 + bob.x * bob.x * 0.9) * 20.0);
+        blendOver(col, hairShine, band * smoothstep(0.30, 0.13, abs(bob.x)) * 0.35 * ca);
+        blendOver(col, hairDeep, smoothstep(0.19, 0.32, abs(bob.x)) * 0.45 * ca);
+        // soft shadow under the hairline onto the skin
+        blendOver(col, ink, smoothstep(0.025, 0.0, abs(d_cap)) * 0.16 * ca);
+    }
+
+    // part line
+    float d_part = sdStrand(hp, vec2(0.006, 0.520), vec2(-0.014, 0.340), 0.0020, 0.0032, 0.0);
+    blendOver(col, ink, smoothstep(0.004, -0.001, d_part) * 0.40);
 
     col.a *= u_opacity;
     return col;
 }
+
 
 vec4 render_neko(vec2 uv, int style) {
     vec2 p = uv * 2.0 - 1.0;

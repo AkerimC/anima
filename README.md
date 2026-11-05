@@ -1,8 +1,7 @@
 # Anima
 
 A lightweight, native live wallpaper engine for Linux (Wayland), combining
-[Anima Engine](https://github.com/) style desktop characters with Wallpaper
-Engine style wallpapers.
+Anima-style desktop characters with Wallpaper Engine style wallpapers.
 
 Written in Rust, rendering directly on the `wlr-layer-shell` background layer
 with EGL / OpenGL ES 3.0. No Electron, no Chromium, no XWayland.
@@ -235,4 +234,4 @@ docs/                  design notes (web renderer plan)
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
