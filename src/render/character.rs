@@ -839,6 +839,8 @@ pub struct CharacterOverlay {
     hit_rect: [f32; 4],
     // left button press: when, and which actor (0 = main) was under it
     press: Option<(f32, Option<usize>)>,
+    // notifications seen so far
+    notified: u32,
     // niri strip scroll, smoothed: (view offset, extra strip width) in clip units
     view: [f32; 2],
     smooth_look: [f32; 2],
@@ -887,6 +889,8 @@ struct WalkState {
     held_prev: Option<(f32, f32)>,
     // where the cursor grabbed the sprite, relative to its centre (clip)
     grab: Option<[f32; 2]>,
+    // seconds until a jump queued by a notification
+    notify_jump: Option<f32>,
 }
 
 const PAT_DUR: f32 = 1.4;
@@ -950,6 +954,15 @@ impl WalkState {
         if matches!(self.act, Act::Held | Act::Fall) {
             return (self.x, false, 0.0);
         }
+        if let Some(t) = self.notify_jump.as_mut() {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.notify_jump = None;
+                if !matches!(self.act, Act::Pat | Act::Jump) {
+                    self.start_jump(JUMP_AMP);
+                }
+            }
+        }
         let mut moving = false;
         // circle drawn with the pointer: drop everything and chase it
         if std::mem::take(&mut self.circle)
@@ -977,8 +990,13 @@ impl WalkState {
                 }
                 let speed = if chase { 0.4 } else { 0.12 };
                 let d = self.target - self.x;
-                if d.abs() <= speed * dt {
-                    self.x = self.target;
+                // close enough counts as caught, or a cursor circling fast
+                // keeps flipping the target left and right
+                let catch = if chase { 0.12 } else { 0.0 };
+                if d.abs() <= speed * dt + catch {
+                    if !chase {
+                        self.x = self.target;
+                    }
                     if chase {
                         // caught it: jump up to the cursor, chase is over
                         self.start_jump(reach.max(JUMP_AMP));
@@ -1040,6 +1058,7 @@ impl CharacterOverlay {
             extras: Vec::new(),
             hit_rect: [0.0; 4],
             press: None,
+            notified: crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed),
             view: [0.0; 2],
             smooth_look: [0.0, 0.0],
             smooth_bounce: 0.0,
@@ -1259,6 +1278,18 @@ impl CharacterOverlay {
             return Ok(());
         }
 
+        // a notification arrived: everyone hops, one after another
+        if self.actor == 0 {
+            let n = crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            if n != self.notified {
+                self.notified = n;
+                self.walk.notify_jump = Some(0.0);
+                for (i, e) in self.extras.iter_mut().enumerate() {
+                    e.walk.notify_jump = Some(0.12 * (i + 1) as f32);
+                }
+            }
+        }
+
         // circle gesture: the main character hands it to a random team member
         if self.actor == 0
             && crate::backend::pointer::CIRCLE_GESTURE.swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -1288,6 +1319,12 @@ impl CharacterOverlay {
                 if now - t0 > 0.15 {
                     let a = if i == 0 { &mut *self } else { &mut self.extras[i - 1] };
                     if a.walk.act != Act::Held {
+                        // caught mid-jump: keep it at the height it is drawn at
+                        if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
+                            let t = 1.0 - (a.walk.jump / a.walk.jump_dur).clamp(0.0, 1.0);
+                            a.walk.air += 4.0 * t * (1.0 - t) * a.walk.jump_amp;
+                            a.walk.jump = 0.0;
+                        }
                         a.walk.act = Act::Held;
                         a.walk.grab = None;
                         a.walk.held_prev = None;
@@ -1333,7 +1370,8 @@ impl CharacterOverlay {
             let target = strip.map_or([0.0, 0.0], |st| {
                 [st.view_x * to_clip, ((st.width - w) * to_clip).max(0.0)]
             });
-            let k = (dt * 12.0).min(1.0);
+            let exact = strip.is_some_and(|st| st.exact);
+            let k = if exact { 1.0 } else { (dt * 20.0).min(1.0) };
             self.view[0] += (target[0] - self.view[0]) * k;
             self.view[1] = target[1];
             let view = self.view;

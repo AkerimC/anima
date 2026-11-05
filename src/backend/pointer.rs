@@ -241,6 +241,9 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
     let mut buf = [0u8; 24 * 64];
     let (mut last_x, mut last_y): (Option<i32>, Option<i32>) = (None, None);
     let mut multi = false;
+    // three fingers: niri's horizontal swipe scrolls its strip
+    let mut three = false;
+    let mut gx = 0.0f32;
     // motion collected until the next SYN_REPORT (one hardware frame)
     let (mut fx, mut fy) = (0.0f32, 0.0f32);
     let mut last_frame: Option<f64> = None;
@@ -263,6 +266,16 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
                 (EV_REL, REL_X) => fx += value as f32,
                 (EV_REL, REL_Y) => fy += value as f32,
                 (EV_SYN, 0) => {
+                    if gx != 0.0 {
+                        let mm = gx / res_x;
+                        let t_ms = sec as f64 * 1000.0 + usec as f64 / 1000.0;
+                        let dt = last_frame.map(|l| (t_ms - l) as f32).unwrap_or(8.0).clamp(1.0, 100.0);
+                        last_frame = Some(t_ms);
+                        let v = mm.abs() / dt;
+                        speed = if dt > 50.0 { v } else { speed * 0.5 + v * 0.5 };
+                        super::governor::niri_gesture_scroll(mm * touchpad_accel(speed * 1000.0));
+                        gx = 0.0;
+                    }
                     if fx == 0.0 && fy == 0.0 {
                         continue;
                     }
@@ -310,7 +323,20 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
                 // two+ fingers = scrolling/gestures, not pointer motion
                 (EV_KEY, c) if (BTN_TOOL_DOUBLETAP..=BTN_TOOL_DOUBLETAP + 3).contains(&c) || c == 0x14f => {
                     multi = value != 0;
+                    // three or four fingers: niri's swipe
+                    if c == BTN_TOOL_DOUBLETAP + 1 || c == BTN_TOOL_DOUBLETAP + 2 {
+                        three = value != 0;
+                        log::debug!("pointer: swipe fingers {} {}", c - BTN_TOOL_DOUBLETAP + 2, if three { "down" } else { "up" });
+                        super::governor::niri_gesture(three);
+                    }
                     (last_x, last_y) = (None, None);
+                    last_frame = None;
+                }
+                (EV_ABS, ABS_X) if touchpad && three => {
+                    if let Some(l) = last_x {
+                        gx += (value - l) as f32;
+                    }
+                    last_x = Some(value);
                 }
                 (EV_ABS, ABS_X) if touchpad => {
                     if let (Some(l), false) = (last_x, multi) {

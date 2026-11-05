@@ -28,6 +28,7 @@ pub enum GovernorEvent {
 }
 
 pub fn spawn_governor(tx: Sender<GovernorEvent>) {
+    super::notify::spawn();
     std::thread::Builder::new()
         .name("anima-governor".into())
         .spawn(move || run(tx))
@@ -278,6 +279,77 @@ pub struct NiriStrip {
     pub view_x: f32,
     /// total width of all columns
     pub width: f32,
+    pub screen_w: f32,
+    pub ws: u64,
+    /// view_x comes straight from niri (no smoothing needed)
+    pub exact: bool,
+}
+
+// tiled windows on the active workspace: (id, x of its column on our strip, tile width),
+// so a WindowLayoutsChanged event alone gives the scroll position
+static NIRI_WIN_X: std::sync::Mutex<Vec<(u64, f32, f32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Fast path for the per-frame layout events niri sends while scrolling.
+/// False if the event needs a full refresh (unknown window, resize, ...).
+fn niri_layouts_changed(line: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
+    let Some(changes) = v["WindowLayoutsChanged"]["changes"].as_array() else { return false };
+    let wins = NIRI_WIN_X.lock().unwrap();
+    let mut view = None;
+    for c in changes {
+        let (Some(id), layout) = (c[0].as_u64(), &c[1]) else { return false };
+        let Some(&(_, col_x, width)) = wins.iter().find(|w| w.0 == id) else { continue };
+        let w = layout["tile_size"][0].as_f64().unwrap_or(0.0) as f32;
+        if (w - width).abs() > 0.5 {
+            return false;
+        }
+        if let Some(x) = layout["tile_pos_in_workspace_view"][0].as_f64() {
+            view.get_or_insert(col_x - x as f32);
+        }
+    }
+    let Some(view) = view else { return false };
+    if let Some(st) = NIRI_STRIP.lock().unwrap().as_mut() {
+        st.view_x = view;
+    }
+    true
+}
+
+// niri reports tiled window positions (patched niri): no guessing needed
+static NIRI_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// a three-finger swipe is moving the strip; don't recompute it meanwhile
+static NIRI_GESTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// view when the swipe started, and whether it just ended (niri then snaps)
+static GESTURE_START: std::sync::Mutex<Option<f32>> = std::sync::Mutex::new(None);
+static GESTURE_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// finger -> strip correction on top of niri's formula, measured on this
+// touchpad (our libinput acceleration estimate runs a bit low)
+const GESTURE_SCALE: f32 = 1.2;
+
+pub fn niri_gesture(active: bool) {
+    if active {
+        *GESTURE_START.lock().unwrap() = NIRI_STRIP.lock().unwrap().map(|s| s.view_x);
+    } else {
+        GESTURE_ENDED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    NIRI_GESTURE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Follow niri's touchpad swipe: the strip moves by the (accelerated) finger
+/// travel times output width / 1200, like niri's view_offset_gesture_update.
+pub fn niri_gesture_scroll(dx: f32) {
+    if !NIRI_GESTURE.load(std::sync::atomic::Ordering::Relaxed)
+        || NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let mut strip = NIRI_STRIP.lock().unwrap();
+    let Some(st) = strip.as_mut() else { return };
+    st.view_x = (st.view_x + dx * st.screen_w / 1200.0 * GESTURE_SCALE).clamp(-st.screen_w * 0.2, st.width - st.screen_w * 0.8);
+    if let Some(v) = NIRI_VIEWS.lock().unwrap().iter_mut().find(|v| v.0 == st.ws) {
+        v.1 = st.view_x;
+    }
 }
 
 pub static NIRI_STRIP: std::sync::Mutex<Option<NiriStrip>> = std::sync::Mutex::new(None);
@@ -288,6 +360,11 @@ static NIRI_VIEWS: std::sync::Mutex<Vec<(u64, f32)>> = std::sync::Mutex::new(Vec
 /// niri doesn't report the scroll position, so follow its rule: scroll as
 /// little as needed to show the focused column in full.
 fn update_niri_strip(sock: &Path) {
+    if NIRI_GESTURE.load(std::sync::atomic::Ordering::Relaxed)
+        && !NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
     let Some(ws) = query_niri_workspaces(sock) else { return };
     let Some(windows) = niri_request(sock, "\"Windows\"")
         .and_then(|v| v.get("Windows").and_then(|w| w.as_array()).cloned())
@@ -299,6 +376,8 @@ fn update_niri_strip(sock: &Path) {
     // column index -> width, and the focused column
     let mut cols: Vec<(u64, f32)> = Vec::new();
     let mut focused_col = None;
+    // (column, x on screen) of a tiled window, when niri reports it
+    let mut seen_pos: Option<(u64, f32)> = None;
     for w in &windows {
         if w.get("workspace_id").and_then(|v| v.as_u64()) != Some(ws.active)
             || w.get("is_floating").and_then(|v| v.as_bool()) == Some(true)
@@ -315,28 +394,77 @@ fn update_niri_strip(sock: &Path) {
         if w.get("is_focused").and_then(|v| v.as_bool()) == Some(true) {
             focused_col = Some(col);
         }
+        if let Some(x) = layout["tile_pos_in_workspace_view"].get(0).and_then(|v| v.as_f64()) {
+            seen_pos.get_or_insert((col, x as f32));
+        }
     }
     cols.sort_by_key(|c| c.0);
+    {
+        let mut col_x = Vec::new();
+        let mut x = gap;
+        for (col, w) in &cols {
+            col_x.push((*col, x, *w));
+            x += w + gap;
+        }
+        let mut cache = NIRI_WIN_X.lock().unwrap();
+        cache.clear();
+        for w in &windows {
+            if w.get("workspace_id").and_then(|v| v.as_u64()) != Some(ws.active) {
+                continue;
+            }
+            let (Some(id), Some(col)) = (w["id"].as_u64(), w["layout"]["pos_in_scrolling_layout"][0].as_u64()) else {
+                continue;
+            };
+            if let Some(&(_, x, cw)) = col_x.iter().find(|c| c.0 == col) {
+                cache.push((id, x, cw));
+            }
+        }
+    }
     let width = cols.iter().map(|c| c.1 + gap).sum::<f32>() + gap;
     let mut views = NIRI_VIEWS.lock().unwrap();
     let mut view = views.iter().find(|v| v.0 == ws.active).map(|v| v.1).unwrap_or(0.0);
-    if let Some(fc) = focused_col {
+    let ended = GESTURE_ENDED.swap(false, std::sync::atomic::Ordering::Relaxed);
+    if let Some((pc, px)) = seen_pos {
+        // exact: our x of that column minus where niri shows it
+        NIRI_EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut x = gap;
+        for (col, w) in &cols {
+            if *col == pc {
+                view = x - px;
+                break;
+            }
+            x += w + gap;
+        }
+    } else if let Some(fc) = focused_col {
         let mut x = gap;
         for (col, w) in &cols {
             if *col == fc {
-                // smallest scroll that shows [x - gap, x + w + gap]
-                view = view.min(x - gap).max(x + w + gap - screen_w);
+                let (left, right) = (x - gap, x + w + gap - screen_w);
+                if ended {
+                    // after a swipe niri snaps the focused column to one edge:
+                    // take the one nearest to our estimate
+                    let est = view;
+                    view = if (left - est).abs() <= (right - est).abs() { left } else { right };
+                    if let Some(start) = GESTURE_START.lock().unwrap().take() {
+                        log::debug!("niri swipe: est {:.0} real {:.0}", est - start, view - start);
+                    }
+                } else {
+                    // smallest scroll that shows [x - gap, x + w + gap]
+                    view = view.min(left).max(right);
+                }
                 break;
             }
             x += w + gap;
         }
     }
-    view = view.clamp(0.0, (width - screen_w).max(0.0));
+    if seen_pos.is_none() {
+        view = view.clamp(0.0, (width - screen_w).max(0.0));
+    }
     match views.iter_mut().find(|v| v.0 == ws.active) {
         Some(v) => v.1 = view,
         None => views.push((ws.active, view)),
     }
-    let new = NiriStrip { view_x: view, width: width.max(screen_w) };
+    let new = NiriStrip { view_x: view, width: width.max(screen_w), screen_w, ws: ws.active, exact: seen_pos.is_some() };
     let mut strip = NIRI_STRIP.lock().unwrap();
     if strip.is_none_or(|o| o.view_x != new.view_x || o.width != new.width) {
         log::debug!("niri strip: view {:.0} of {:.0}", new.view_x, new.width);
@@ -462,7 +590,10 @@ fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
             let mut last = None;
             let mut ticks = 0u32;
             loop {
-                update_niri_strip(&sock_poll);
+                // with exact positions the event stream keeps it current
+                if !NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
+                    update_niri_strip(&sock_poll);
+                }
                 let state = query_niri_window(&sock_poll);
                 if state != last {
                     last = state;
@@ -502,6 +633,11 @@ fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
             .iter()
             .any(|k| line.starts_with(&format!("{{\"{k}\"")));
         if !relevant {
+            continue;
+        }
+        // while scrolling niri sends one of these per frame: read the
+        // position straight from it instead of asking niri again
+        if line.starts_with("{\"WindowLayoutsChanged\"") && niri_layouts_changed(&line) {
             continue;
         }
         update_niri_strip(sock);
