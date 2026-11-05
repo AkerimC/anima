@@ -52,6 +52,19 @@ pub static SYNC: Mutex<Option<(f32, f32)>> = Mutex::new(None);
 /// Every left click (keeps a pat going).
 pub static CLICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// A three- or four-finger touchpad swipe in progress, in pixels after libinput's
+/// acceleration (what the compositor's gesture sees).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Swipe {
+    /// horizontal travel so far
+    pub dx: f32,
+    /// sum of |per-frame travel| and frame count, for the average speed
+    pub path: f32,
+    pub frames: u32,
+}
+
+pub static SWIPE: Mutex<Option<Swipe>> = Mutex::new(None);
+
 /// Focused output: logical rect (x, y, w, h) and connector name.
 pub type Bounds = Arc<Mutex<((f32, f32, f32, f32), String)>>;
 
@@ -98,17 +111,22 @@ impl Shared {
     }
 }
 
-pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
+/// `exact`: the compositor reports the real cursor (fed in through `SYNC`),
+/// so there is no need to centre it first.
+pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds, exact: bool) {
     let devices = find_devices();
     if devices.is_empty() {
         log::info!("pointer: no readable mouse/touchpad (install contrib/70-anima-pointer.rules)");
         return;
     }
     let (bx, by, bw, bh) = bounds.lock().unwrap().0;
-    // patched niri tells us where the pointer is; otherwise estimate from evdev
-    let exact = super::governor::niri_cursor().is_some();
-    if exact {
+    // patched niri tells us where the pointer is (polled below), Hyprland
+    // feeds it through SYNC; otherwise estimate from evdev
+    let niri = super::governor::niri_cursor().is_some();
+    if niri {
         log::info!("pointer: position from niri");
+    } else if exact {
+        log::info!("pointer: position comes from the compositor");
     } else if super::warp::warp(bw / 2.0, bh / 2.0, bw, bh) {
         // start from a known spot: put the real cursor in the middle of the output
         log::info!("pointer: cursor moved to the centre to start in sync");
@@ -155,11 +173,11 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
         .name("anima-pointer-pub".into())
         .spawn(move || {
             let mut last = (f32::NAN, f32::NAN);
-            let mut warper = if exact { None } else { super::warp::Warper::new() };
+            let mut warper = if niri || exact { None } else { super::warp::Warper::new() };
             let mut last_ask = Instant::now() - Duration::from_secs(1);
             let exact_trail: Mutex<std::collections::VecDeque<(Instant, f32, f32)>> = Mutex::new(Default::default());
             loop {
-                if exact {
+                if niri {
                     // ask often while the pointer moves, rarely when it doesn't
                     let moving = shared.moved.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_millis(400));
                     if moving || last_ask.elapsed() > Duration::from_millis(250) {
@@ -183,7 +201,7 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
                 {
                     let mut t = shared.trail.lock().unwrap();
                     let mut et = exact_trail.lock().unwrap();
-                    let found = if exact { is_circle(&et) } else { is_circle(&t.2) };
+                    let found = if niri { is_circle(&et) } else { is_circle(&t.2) };
                     if let Some((dx, dy, r)) = found {
                         // the circle's centre is offset from where the pointer is now
                         let p = *shared.pos.lock().unwrap();
@@ -332,7 +350,13 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
                         last_frame = Some(t_ms);
                         let v = mm.abs() / dt;
                         speed = if dt > 50.0 { v } else { speed * 0.5 + v * 0.5 };
-                        super::governor::niri_gesture_scroll(mm * touchpad_accel(speed * 1000.0));
+                        let d = mm * touchpad_accel(speed * 1000.0);
+                        super::governor::niri_gesture_scroll(d);
+                        if let Some(sw) = SWIPE.lock().unwrap().as_mut() {
+                            sw.dx += d;
+                            sw.path += d.abs();
+                            sw.frames += 1;
+                        }
                         gx = 0.0;
                     }
                     if fx == 0.0 && fy == 0.0 {
@@ -387,6 +411,7 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
                         three = value != 0;
                         log::debug!("pointer: swipe fingers {} {}", c - BTN_TOOL_DOUBLETAP + 2, if three { "down" } else { "up" });
                         super::governor::niri_gesture(three);
+                        *SWIPE.lock().unwrap() = three.then(Swipe::default);
                     }
                     (last_x, last_y) = (None, None);
                     last_frame = None;
