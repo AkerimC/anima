@@ -1,8 +1,66 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 0aa3cb4..2e18d23 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -119,6 +119,8 @@ pub enum Request {
+     OverviewState,
+     /// Request information about screencasts.
+     Casts,
++    /// Request the pointer position.
++    CursorPosition,
+ }
+ 
+ /// Reply from niri to client.
+@@ -165,6 +167,20 @@ pub enum Response {
+     OverviewState(Overview),
+     /// Information about screencasts.
+     Casts(Vec<Cast>),
++    /// Pointer position.
++    CursorPosition(Option<CursorPosition>),
++}
++
++/// Pointer position.
++#[derive(Serialize, Deserialize, Debug, Clone)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++pub struct CursorPosition {
++    /// Name of the output under the pointer.
++    pub output: String,
++    /// Position within that output, in logical pixels.
++    pub x: f64,
++    /// Position within that output, in logical pixels.
++    pub y: f64,
+ }
+ 
+ /// Overview information.
 diff --git a/src/ipc/server.rs b/src/ipc/server.rs
-index db71da6..050ef45 100644
+index db71da6..8d337c3 100644
 --- a/src/ipc/server.rs
 +++ b/src/ipc/server.rs
-@@ -699,6 +699,10 @@ impl State {
+@@ -455,6 +455,23 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+             let casts = state.casts.casts.values().cloned().collect();
+             Response::Casts(casts)
+         }
++        Request::CursorPosition => {
++            let (tx, rx) = async_channel::bounded(1);
++            ctx.event_loop.insert_idle(move |state| {
++                let pos = state.niri.seat.get_pointer().unwrap().current_location();
++                let cursor = state.niri.output_under(pos).map(|(output, p)| {
++                    niri_ipc::CursorPosition {
++                        output: output.name(),
++                        x: p.x,
++                        y: p.y,
++                    }
++                });
++                let _ = tx.send_blocking(cursor);
++            });
++            let result = rx.recv().await;
++            let cursor = result.map_err(|_| String::from("error getting cursor position"))?;
++            Response::CursorPosition(cursor)
++        }
+     };
+ 
+     Ok(response)
+@@ -699,6 +716,10 @@ impl State {
          let layout = &self.niri.layout;
  
          let mut batch_change_layouts: Vec<(u64, WindowLayout)> = Vec::new();
@@ -13,7 +71,7 @@ index db71da6..050ef45 100644
  
          // Check for window changes.
          let mut seen = HashSet::new();
-@@ -732,7 +736,16 @@ impl State {
+@@ -732,7 +753,16 @@ impl State {
              }
  
              if ipc_win.layout != window_layout {
@@ -31,7 +89,7 @@ index db71da6..050ef45 100644
              }
  
              if mapped.is_focused() && !ipc_win.is_focused {
-@@ -786,6 +799,12 @@ impl State {
+@@ -786,6 +816,12 @@ impl State {
              state.apply(event.clone());
              server.send_event(event);
          }

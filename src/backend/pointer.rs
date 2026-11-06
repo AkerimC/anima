@@ -27,6 +27,9 @@ const BTN_LEFT: u16 = 0x110;
 const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
 const EV_SYN: u16 = 0x00;
 
+/// Centre and radius (logical px) of the last circle drawn with the pointer.
+pub static CIRCLE_AT: Mutex<Option<(f32, f32, f32)>> = Mutex::new(None);
+
 /// Set when the user draws a circle with the pointer; the character
 /// consumes it and runs after the cursor.
 pub static CIRCLE_GESTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -102,8 +105,12 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
         return;
     }
     let (bx, by, bw, bh) = bounds.lock().unwrap().0;
-    // start from a known spot: put the real cursor in the middle of the output
-    if super::warp::warp(bw / 2.0, bh / 2.0, bw, bh) {
+    // patched niri tells us where the pointer is; otherwise estimate from evdev
+    let exact = super::governor::niri_cursor().is_some();
+    if exact {
+        log::info!("pointer: position from niri");
+    } else if super::warp::warp(bw / 2.0, bh / 2.0, bw, bh) {
+        // start from a known spot: put the real cursor in the middle of the output
         log::info!("pointer: cursor moved to the centre to start in sync");
     } else {
         log::info!("pointer: can't move the cursor, estimate starts unsynced");
@@ -129,12 +136,27 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
         .name("anima-pointer-pub".into())
         .spawn(move || {
             let mut last = (f32::NAN, f32::NAN);
-            let mut warper = super::warp::Warper::new();
+            let mut warper = if exact { None } else { super::warp::Warper::new() };
+            let mut last_ask = Instant::now() - Duration::from_secs(1);
             loop {
+                if exact {
+                    // ask often while the pointer moves, rarely when it doesn't
+                    let moving = shared.moved.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+                    if moving || last_ask.elapsed() > Duration::from_millis(250) {
+                        last_ask = Instant::now();
+                        if let Some(Some((x, y))) = super::governor::niri_cursor() {
+                            let ((bx, by, _, _), _) = shared.bounds.lock().unwrap().clone();
+                            *shared.pos.lock().unwrap() = (bx + x, by + y);
+                        }
+                    }
+                }
                 {
                     let mut t = shared.trail.lock().unwrap();
-                    if is_circle(&t.2) {
-                        log::debug!("pointer: circle gesture");
+                    if let Some((dx, dy, r)) = is_circle(&t.2) {
+                        // trail is relative: the circle's centre is offset from where the pointer is now
+                        let p = *shared.pos.lock().unwrap();
+                        *CIRCLE_AT.lock().unwrap() = Some((p.0 - dx, p.1 - dy, r));
+                        log::debug!("pointer: circle gesture at {:?}", (p.0 - dx, p.1 - dy, r));
                         CIRCLE_GESTURE.store(true, std::sync::atomic::Ordering::Relaxed);
                         t.2.clear();
                     }
@@ -361,9 +383,10 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
 }
 
 /// Roughly a full turn around the path's centre, at a fairly even radius.
-fn is_circle(trail: &std::collections::VecDeque<(Instant, f32, f32)>) -> bool {
+/// Returns (last point - centre, radius).
+fn is_circle(trail: &std::collections::VecDeque<(Instant, f32, f32)>) -> Option<(f32, f32, f32)> {
     if trail.len() < 20 {
-        return false;
+        return None;
     }
     // thin out: high-rate mice send many tiny steps
     let pts: Vec<(f32, f32)> = trail.iter().step_by((trail.len() / 60).max(1)).map(|p| (p.1, p.2)).collect();
@@ -373,11 +396,11 @@ fn is_circle(trail: &std::collections::VecDeque<(Instant, f32, f32)>) -> bool {
     let radii: Vec<f32> = pts.iter().map(|p| ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()).collect();
     let mean = radii.iter().sum::<f32>() / n;
     if !(25.0..=700.0).contains(&mean) {
-        return false;
+        return None;
     }
     let var = radii.iter().map(|r| (r - mean).powi(2)).sum::<f32>() / n;
     if var.sqrt() / mean > 0.4 {
-        return false;
+        return None;
     }
     let mut turn = 0.0f32;
     let mut prev = (pts[0].1 - cy).atan2(pts[0].0 - cx);
@@ -392,5 +415,6 @@ fn is_circle(trail: &std::collections::VecDeque<(Instant, f32, f32)>) -> bool {
         turn += d;
         prev = a;
     }
-    turn.abs() > std::f32::consts::TAU * 0.9
+    let last = pts[pts.len() - 1];
+    (turn.abs() > std::f32::consts::TAU * 0.9).then_some((last.0 - cx, last.1 - cy, mean))
 }

@@ -882,6 +882,8 @@ struct WalkState {
     jump_dur: f32,
     // picked to answer a circle gesture
     circle: bool,
+    // centre of that circle (surface px): run there and jump into it
+    circle_target: Option<[f32; 2]>,
     // height above the ground while held/falling (half-heights), fall speed
     air: f32,
     vy: f32,
@@ -1303,10 +1305,14 @@ impl CharacterOverlay {
             && crate::backend::pointer::CIRCLE_GESTURE.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             let pick = (self.walk.rand() * (self.extras.len() + 1) as f32) as usize;
-            match pick.checked_sub(1).and_then(|i| self.extras.get_mut(i)) {
-                Some(e) => e.walk.circle = true,
-                None => self.walk.circle = true,
-            }
+            // logical px == surface px at scale 1
+            let at = crate::backend::pointer::CIRCLE_AT.lock().unwrap().take().map(|c| [c.0, c.1]);
+            let wk = match pick.checked_sub(1).and_then(|i| self.extras.get_mut(i)) {
+                Some(e) => &mut e.walk,
+                None => &mut self.walk,
+            };
+            wk.circle = true;
+            wk.circle_target = at;
         }
 
         // press and hold on a character: pick it up
@@ -1488,12 +1494,23 @@ impl CharacterOverlay {
             let (walk_x, moving, jump) = if self.config.walk {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
-                let mouse = (self.config.look_at_mouse && info.mouse != [0.0, 0.0])
-                    .then(|| (info.mouse[0] / w) * 2.0 - 1.0 - center_clip[0] + view);
-                // jump height (in half-heights) needed for the head to touch the cursor
-                let cursor_y = 1.0 - (info.mouse[1] / h) * 2.0;
-                let reach = (cursor_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.3;
-                self.walk.step(dt, left_room, right_room, mouse, reach)
+                // a drawn circle: aim for its centre, otherwise for the cursor
+                let circle = self.walk.circle_target.filter(|_| self.walk.circle || self.walk.act == Act::Chase);
+                let aim = circle.unwrap_or(info.mouse);
+                let mouse = (self.config.look_at_mouse && aim != [0.0, 0.0])
+                    .then(|| (aim[0] / w) * 2.0 - 1.0 - center_clip[0] + view);
+                let aim_y = 1.0 - (aim[1] / h) * 2.0;
+                // jump height (half-heights): head to the cursor, or body into the circle
+                let reach = if circle.is_some() {
+                    (aim_y - center_clip[1]) / half_clip[1]
+                } else {
+                    (aim_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.3
+                };
+                let r = self.walk.step(dt, left_room, right_room, mouse, reach);
+                if !self.walk.circle && self.walk.act != Act::Chase {
+                    self.walk.circle_target = None;
+                }
+                r
             } else {
                 (0.0, false, 0.0)
             };

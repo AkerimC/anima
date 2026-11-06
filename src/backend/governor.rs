@@ -548,6 +548,18 @@ fn niri_socket() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+/// Exact pointer position from niri (patched niri only): Some(None) when the
+/// pointer is on no output, None when niri can't tell.
+pub(super) fn niri_cursor() -> Option<Option<(f32, f32)>> {
+    let sock = niri_socket()?;
+    let v = niri_request(&sock, "\"CursorPosition\"")?;
+    let c = v.get("CursorPosition")?;
+    if c.is_null() {
+        return Some(None);
+    }
+    Some(Some((c["x"].as_f64()? as f32, c["y"].as_f64()? as f32)))
+}
+
 fn niri_request(sock: &Path, req: &str) -> Option<serde_json::Value> {
     let mut stream = UnixStream::connect(sock).ok()?;
     stream.set_read_timeout(Some(Duration::from_millis(200))).ok()?;
