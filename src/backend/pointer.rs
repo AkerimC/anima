@@ -138,6 +138,7 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
             let mut last = (f32::NAN, f32::NAN);
             let mut warper = if exact { None } else { super::warp::Warper::new() };
             let mut last_ask = Instant::now() - Duration::from_secs(1);
+            let exact_trail: Mutex<std::collections::VecDeque<(Instant, f32, f32)>> = Mutex::new(Default::default());
             loop {
                 if exact {
                     // ask often while the pointer moves, rarely when it doesn't
@@ -146,19 +147,32 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
                         last_ask = Instant::now();
                         if let Some(Some((x, y))) = super::governor::niri_cursor() {
                             let ((bx, by, _, _), _) = shared.bounds.lock().unwrap().clone();
-                            *shared.pos.lock().unwrap() = (bx + x, by + y);
+                            let p = (bx + x, by + y);
+                            *shared.pos.lock().unwrap() = p;
+                            // gestures from real positions too, the evdev trail is only an estimate
+                            let now = Instant::now();
+                            let mut t = exact_trail.lock().unwrap();
+                            if t.back().is_none_or(|q: &(Instant, f32, f32)| (q.1, q.2) != p) {
+                                t.push_back((now, p.0, p.1));
+                            }
+                            while t.front().is_some_and(|q| now - q.0 > Duration::from_millis(1500)) {
+                                t.pop_front();
+                            }
                         }
                     }
                 }
                 {
                     let mut t = shared.trail.lock().unwrap();
-                    if let Some((dx, dy, r)) = is_circle(&t.2) {
-                        // trail is relative: the circle's centre is offset from where the pointer is now
+                    let mut et = exact_trail.lock().unwrap();
+                    let found = if exact { is_circle(&et) } else { is_circle(&t.2) };
+                    if let Some((dx, dy, r)) = found {
+                        // the circle's centre is offset from where the pointer is now
                         let p = *shared.pos.lock().unwrap();
                         *CIRCLE_AT.lock().unwrap() = Some((p.0 - dx, p.1 - dy, r));
                         log::debug!("pointer: circle gesture at {:?}", (p.0 - dx, p.1 - dy, r));
                         CIRCLE_GESTURE.store(true, std::sync::atomic::Ordering::Relaxed);
                         t.2.clear();
+                        et.clear();
                     }
                 }
                 if let Some(p) = SYNC.lock().unwrap().take() {
