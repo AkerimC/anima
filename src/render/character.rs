@@ -1576,8 +1576,11 @@ impl CharacterOverlay {
                 if self.walk.act == Act::Jump && self.walk.catch_jump {
                     let [mx, my] = info.mouse;
                     let r = self.hit_rect;
-                    let head = r[1] + (r[3] - r[1]) * 0.4;
-                    if mx >= r[0] - 10.0 && mx <= r[2] + 10.0 && my >= r[1] - 10.0 && my <= head {
+                    // only right at the head, the sprite box has transparent margins
+                    let size = r[3] - r[1];
+                    let (hx, hy) = ((r[0] + r[2]) * 0.5, r[1] + size * 0.28);
+                    let reach = size * 0.12;
+                    if (mx - hx).powi(2) + (my - hy).powi(2) <= reach * reach {
                         let wk = &mut self.walk;
                         let t = 1.0 - (wk.jump / wk.jump_dur.max(0.001)).clamp(0.0, 1.0);
                         wk.air += 4.0 * t * (1.0 - t) * wk.jump_amp;
