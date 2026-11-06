@@ -314,6 +314,39 @@ fn niri_layouts_changed(line: &str) -> bool {
     true
 }
 
+// last time something that can scroll the strip happened (niri event, swipe)
+static NIRI_ACTIVITY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn niri_activity() {
+    *NIRI_ACTIVITY.lock().unwrap() = Some(std::time::Instant::now());
+}
+
+/// Ask niri for the windows and take the scroll position from any tiled one
+/// we know. The patched niri updates positions without sending events (that
+/// flooded other clients), so we poll while it reports them.
+fn niri_poll_view(sock: &Path) -> bool {
+    let Some(windows) = niri_request(sock, "\"Windows\"")
+        .and_then(|v| v.get("Windows").and_then(|w| w.as_array()).cloned())
+    else {
+        return false;
+    };
+    let wins = NIRI_WIN_X.lock().unwrap();
+    for w in &windows {
+        let Some(&(_, col_x, width)) = wins.iter().find(|c| Some(c.0) == w["id"].as_u64()) else { continue };
+        let layout = &w["layout"];
+        if (layout["tile_size"][0].as_f64().unwrap_or(0.0) as f32 - width).abs() > 0.5 {
+            return false;
+        }
+        if let Some(x) = layout["tile_pos_in_workspace_view"][0].as_f64() {
+            if let Some(st) = NIRI_STRIP.lock().unwrap().as_mut() {
+                st.view_x = col_x - x as f32;
+            }
+            return true;
+        }
+    }
+    false
+}
+
 // niri reports tiled window positions (patched niri): no guessing needed
 static NIRI_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -328,6 +361,7 @@ static GESTURE_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 const GESTURE_SCALE: f32 = 1.2;
 
 pub fn niri_gesture(active: bool) {
+    niri_activity();
     if active {
         *GESTURE_START.lock().unwrap() = NIRI_STRIP.lock().unwrap().map(|s| s.view_x);
     } else {
@@ -339,6 +373,7 @@ pub fn niri_gesture(active: bool) {
 /// Follow niri's touchpad swipe: the strip moves by the (accelerated) finger
 /// travel times output width / 1200, like niri's view_offset_gesture_update.
 pub fn niri_gesture_scroll(dx: f32) {
+    niri_activity();
     if !NIRI_GESTURE.load(std::sync::atomic::Ordering::Relaxed)
         || NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -624,10 +659,36 @@ fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
     )));
     super::pointer::spawn(tx.clone(), bounds.clone());
 
+    // exact scroll position: poll about once per frame
+    let sock_view = sock.to_path_buf();
+    std::thread::Builder::new()
+        .name("anima-niri-view".into())
+        .spawn(move || loop {
+            if NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
+                niri_poll_view(&sock_view);
+                // fast only while the strip may be moving: every request costs niri a bit
+                let busy = NIRI_ACTIVITY
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(1500));
+                std::thread::sleep(Duration::from_millis(if busy { 7 } else { 250 }));
+            } else {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+        .ok();
+
     log::info!("listening to niri events at {}", sock.display());
     let mut last_output = String::new();
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
+        // things that can scroll the strip (title changes etc. can't)
+        if ["WindowFocusChanged", "WindowLayoutsChanged", "WorkspaceActivated", "WindowClosed", "WindowsChanged"]
+            .iter()
+            .any(|k| line.starts_with(&format!("{{\"{k}\"")))
+        {
+            niri_activity();
+        }
         let relevant = ["WindowFocusChanged", "WindowOpenedOrChanged", "WindowClosed",
             "WorkspaceActivated", "WindowLayoutsChanged", "WindowsChanged"]
             .iter()
