@@ -893,8 +893,6 @@ struct WalkState {
     grab: Option<[f32; 2]>,
     // seconds until a jump queued by a notification
     notify_jump: Option<f32>,
-    // catch jump: keep steering under the cursor while in the air
-    homing: bool,
 }
 
 const PAT_DUR: f32 = 1.4;
@@ -947,7 +945,6 @@ impl WalkState {
     }
 
     fn start_jump(&mut self, amp: f32) {
-        self.homing = false;
         self.act = Act::Jump;
         self.jump_amp = amp;
         // higher jumps hang in the air a bit longer
@@ -1007,7 +1004,6 @@ impl WalkState {
                     if chase {
                         // caught it: jump up to the cursor, chase is over
                         self.start_jump(reach.max(JUMP_AMP));
-                        self.homing = true;
                     } else {
                         self.pick(min, max, mouse.is_some());
                     }
@@ -1020,13 +1016,6 @@ impl WalkState {
                     }
                     self.x += d.signum() * speed * dt;
                     moving = true;
-                }
-            }
-            Act::Jump if self.homing => {
-                if let Some(m) = mouse {
-                    let k = (dt * 10.0).min(1.0);
-                    self.x += (m.clamp(min, max) - self.x) * k;
-                    self.target = self.x;
                 }
             }
             Act::Jump | Act::Held | Act::Fall => {}
@@ -1044,7 +1033,6 @@ impl WalkState {
             let t = 1.0 - (self.jump / self.jump_dur).max(0.0);
             height = 4.0 * t * (1.0 - t);
             if self.jump <= 0.0 {
-                self.homing = false;
                 self.act = Act::Idle;
                 self.timer = 0.5 + self.rand();
             }
