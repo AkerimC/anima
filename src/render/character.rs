@@ -882,8 +882,8 @@ struct WalkState {
     jump_dur: f32,
     // picked to answer a circle gesture
     circle: bool,
-    // centre of that circle (surface px): run there and jump into it
-    circle_target: Option<[f32; 2]>,
+    // centre and radius of that circle (surface px): run there and jump into it
+    circle_target: Option<[f32; 3]>,
     // height above the ground while held/falling (half-heights), fall speed
     air: f32,
     vy: f32,
@@ -1304,9 +1304,17 @@ impl CharacterOverlay {
         if self.actor == 0
             && crate::backend::pointer::CIRCLE_GESTURE.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            let pick = (self.walk.rand() * (self.extras.len() + 1) as f32) as usize;
             // logical px == surface px at scale 1
-            let at = crate::backend::pointer::CIRCLE_AT.lock().unwrap().take().map(|c| [c.0, c.1]);
+            let at = crate::backend::pointer::CIRCLE_AT.lock().unwrap().take().map(|c| [c.0, c.1, c.2]);
+            // one character answers circles at a time: if one is already on its way, re-aim it
+            let busy = |w: &WalkState| w.circle_target.is_some() && (w.circle || w.act == Act::Chase);
+            let pick = if busy(&self.walk) {
+                0
+            } else if let Some(i) = self.extras.iter().position(|e| busy(&e.walk)) {
+                i + 1
+            } else {
+                (self.walk.rand() * (self.extras.len() + 1) as f32) as usize
+            };
             let wk = match pick.checked_sub(1).and_then(|i| self.extras.get_mut(i)) {
                 Some(e) => &mut e.walk,
                 None => &mut self.walk,
@@ -1495,7 +1503,18 @@ impl CharacterOverlay {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
                 // a drawn circle: aim for its centre, otherwise for the cursor
-                let circle = self.walk.circle_target.filter(|_| self.walk.circle || self.walk.act == Act::Chase);
+                // the cursor wandered off from the circle: follow the cursor instead
+                if let Some([cx, cy, cr]) = self.walk.circle_target {
+                    let far = cr.max(60.0) * 3.0;
+                    if (info.mouse[0] - cx).powi(2) + (info.mouse[1] - cy).powi(2) > far * far {
+                        self.walk.circle_target = None;
+                    }
+                }
+                let circle = self
+                    .walk
+                    .circle_target
+                    .filter(|_| self.walk.circle || self.walk.act == Act::Chase)
+                    .map(|c| [c[0], c[1]]);
                 let aim = circle.unwrap_or(info.mouse);
                 let mouse = (self.config.look_at_mouse && aim != [0.0, 0.0])
                     .then(|| (aim[0] / w) * 2.0 - 1.0 - center_clip[0] + view);
