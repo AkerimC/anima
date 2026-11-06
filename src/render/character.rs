@@ -893,10 +893,6 @@ struct WalkState {
     grab: Option<[f32; 2]>,
     // seconds until a jump queued by a notification
     notify_jump: Option<f32>,
-    // jumping at the cursor after a chase
-    catch_jump: bool,
-    // hanging on to the cursor: seconds left
-    hang: f32,
 }
 
 const PAT_DUR: f32 = 1.4;
@@ -949,7 +945,6 @@ impl WalkState {
     }
 
     fn start_jump(&mut self, amp: f32) {
-        self.catch_jump = false;
         self.act = Act::Jump;
         self.jump_amp = amp;
         // higher jumps hang in the air a bit longer
@@ -1001,7 +996,7 @@ impl WalkState {
                 let d = self.target - self.x;
                 // close enough counts as caught, or a cursor circling fast
                 // keeps flipping the target left and right
-                let catch = if chase { 0.015 } else { 0.0 };
+                let catch = if chase { 0.05 } else { 0.0 };
                 if d.abs() <= speed * dt + catch {
                     if !chase {
                         self.x = self.target;
@@ -1009,7 +1004,6 @@ impl WalkState {
                     if chase {
                         // caught it: jump up to the cursor, chase is over
                         self.start_jump(reach.max(JUMP_AMP));
-                        self.catch_jump = true;
                     } else {
                         self.pick(min, max, mouse.is_some());
                     }
@@ -1351,9 +1345,7 @@ impl CharacterOverlay {
         }
 
         if self.actor == 0 {
-            // pin the cursor only for characters carried by the mouse, not hanging on it
-            let carried = |w: &WalkState| w.act == Act::Held && w.hang <= 0.0;
-            let held = carried(&self.walk) || self.extras.iter().any(|e| carried(&e.walk));
+            let held = self.walk.act == Act::Held || self.extras.iter().any(|e| e.walk.act == Act::Held);
             crate::backend::pointer::DRAGGING.store(held, std::sync::atomic::Ordering::Relaxed);
         }
 
@@ -1511,10 +1503,7 @@ impl CharacterOverlay {
                 let my = 1.0 - (info.mouse[1] / h) * 2.0;
                 let down = crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
                 match self.walk.act {
-                    Act::Held if down || self.walk.hang > 0.0 => {
-                        if !down {
-                            self.walk.hang -= dt;
-                        }
+                    Act::Held if down => {
                         let grab = *self.walk.grab.get_or_insert([
                             mx - (center_clip[0] + self.walk.x - view),
                             my - (center_clip[1] + self.walk.air * half_clip[1]),
@@ -1572,28 +1561,6 @@ impl CharacterOverlay {
             self.program
                 .set_vec2(gl, "u_center", center_clip[0] + walk_x, center_clip[1]);
             {
-                // the catch jump reached the cursor: grab on to it for a while
-                if self.walk.act == Act::Jump && self.walk.catch_jump {
-                    let [mx, my] = info.mouse;
-                    let r = self.hit_rect;
-                    // only right at the head, the sprite box has transparent margins
-                    let size = r[3] - r[1];
-                    let (hx, hy) = ((r[0] + r[2]) * 0.5, r[1] + size * 0.28);
-                    let reach = size * 0.12;
-                    if (mx - hx).powi(2) + (my - hy).powi(2) <= reach * reach {
-                        let wk = &mut self.walk;
-                        let t = 1.0 - (wk.jump / wk.jump_dur.max(0.001)).clamp(0.0, 1.0);
-                        wk.air += 4.0 * t * (1.0 - t) * wk.jump_amp;
-                        wk.jump = 0.0;
-                        wk.catch_jump = false;
-                        wk.act = Act::Held;
-                        wk.hang = 2.0;
-                        wk.grab = None;
-                        wk.held_prev = None;
-                        wk.vx = 0.0;
-                        wk.vy = 0.0;
-                    }
-                }
                 // sprite box for click hit-testing (surface pixels)
                 let lift_now = (jump * self.walk.jump_amp) * half_clip[1] + air;
                 self.hit_rect = [
