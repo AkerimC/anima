@@ -314,6 +314,32 @@ fn niri_layouts_changed(line: &str) -> bool {
     true
 }
 
+/// Ask niri for the windows and take the scroll position from any tiled one
+/// we know. The patched niri updates positions without sending events (that
+/// flooded other clients), so we poll while it reports them.
+fn niri_poll_view(sock: &Path) -> bool {
+    let Some(windows) = niri_request(sock, "\"Windows\"")
+        .and_then(|v| v.get("Windows").and_then(|w| w.as_array()).cloned())
+    else {
+        return false;
+    };
+    let wins = NIRI_WIN_X.lock().unwrap();
+    for w in &windows {
+        let Some(&(_, col_x, width)) = wins.iter().find(|c| Some(c.0) == w["id"].as_u64()) else { continue };
+        let layout = &w["layout"];
+        if (layout["tile_size"][0].as_f64().unwrap_or(0.0) as f32 - width).abs() > 0.5 {
+            return false;
+        }
+        if let Some(x) = layout["tile_pos_in_workspace_view"][0].as_f64() {
+            if let Some(st) = NIRI_STRIP.lock().unwrap().as_mut() {
+                st.view_x = col_x - x as f32;
+            }
+            return true;
+        }
+    }
+    false
+}
+
 // niri reports tiled window positions (patched niri): no guessing needed
 static NIRI_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -623,6 +649,20 @@ fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
             .unwrap_or_default(),
     )));
     super::pointer::spawn(tx.clone(), bounds.clone());
+
+    // exact scroll position: poll about once per frame
+    let sock_view = sock.to_path_buf();
+    std::thread::Builder::new()
+        .name("anima-niri-view".into())
+        .spawn(move || loop {
+            if NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
+                niri_poll_view(&sock_view);
+                std::thread::sleep(Duration::from_millis(7));
+            } else {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+        .ok();
 
     log::info!("listening to niri events at {}", sock.display());
     let mut last_output = String::new();

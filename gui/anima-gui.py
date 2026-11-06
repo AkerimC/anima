@@ -72,21 +72,36 @@ def write_char_config(**values):
 
 # --- daemon ---------------------------------------------------------------
 
+def has_service():
+    # started at login by the systemd user unit when it's enabled
+    return subprocess.run(["systemctl", "--user", "is-enabled", "animad"],
+                          capture_output=True).returncode == 0
+
+
 def daemon_running():
     return subprocess.run(["pgrep", "-x", "animad"], capture_output=True).returncode == 0
 
 
 def start_daemon():
+    if has_service():
+        subprocess.run(["systemctl", "--user", "start", "animad"])
+        return
     DATA.mkdir(parents=True, exist_ok=True)
     log = open(LOG, "w")
     subprocess.Popen([ANIMAD], stdout=log, stderr=log, start_new_session=True)
 
 
 def stop_daemon():
+    if has_service():
+        subprocess.run(["systemctl", "--user", "stop", "animad"])
     subprocess.run(["pkill", "-x", "animad"])
 
 
 def restart_daemon():
+    if has_service():
+        subprocess.run(["pkill", "-x", "animad"])
+        subprocess.run(["systemctl", "--user", "restart", "animad"])
+        return
     if daemon_running():
         stop_daemon()
         for _ in range(20):

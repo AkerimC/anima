@@ -1,3 +1,49 @@
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index db71da6..050ef45 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -699,6 +699,10 @@ impl State {
+         let layout = &self.niri.layout;
+ 
+         let mut batch_change_layouts: Vec<(u64, WindowLayout)> = Vec::new();
++        // Changes where only the position in the workspace view moved (scrolling). These happen
++        // every frame during scroll animations, so they update the state for requests but don't
++        // go out as events, which would flood event stream clients.
++        let mut silent_layouts: Vec<(u64, WindowLayout)> = Vec::new();
+ 
+         // Check for window changes.
+         let mut seen = HashSet::new();
+@@ -732,7 +736,16 @@ impl State {
+             }
+ 
+             if ipc_win.layout != window_layout {
+-                batch_change_layouts.push((id, window_layout));
++                let only_moved = WindowLayout {
++                    tile_pos_in_workspace_view: ipc_win.layout.tile_pos_in_workspace_view,
++                    ..window_layout.clone()
++                } == ipc_win.layout
++                    && ipc_win.layout.pos_in_scrolling_layout.is_some();
++                if only_moved {
++                    silent_layouts.push((id, window_layout));
++                } else {
++                    batch_change_layouts.push((id, window_layout));
++                }
+             }
+ 
+             if mapped.is_focused() && !ipc_win.is_focused {
+@@ -786,6 +799,12 @@ impl State {
+             state.apply(event.clone());
+             server.send_event(event);
+         }
++
++        if !silent_layouts.is_empty() {
++            state.apply(Event::WindowLayoutsChanged {
++                changes: silent_layouts,
++            });
++        }
+     }
+ 
+     pub fn ipc_refresh_overview(&mut self) {
 diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
 index 007bcaf..3b3c412 100644
 --- a/src/layout/scrolling.rs
