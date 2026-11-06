@@ -314,6 +314,13 @@ fn niri_layouts_changed(line: &str) -> bool {
     true
 }
 
+// last time something that can scroll the strip happened (niri event, swipe)
+static NIRI_ACTIVITY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn niri_activity() {
+    *NIRI_ACTIVITY.lock().unwrap() = Some(std::time::Instant::now());
+}
+
 /// Ask niri for the windows and take the scroll position from any tiled one
 /// we know. The patched niri updates positions without sending events (that
 /// flooded other clients), so we poll while it reports them.
@@ -354,6 +361,7 @@ static GESTURE_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 const GESTURE_SCALE: f32 = 1.2;
 
 pub fn niri_gesture(active: bool) {
+    niri_activity();
     if active {
         *GESTURE_START.lock().unwrap() = NIRI_STRIP.lock().unwrap().map(|s| s.view_x);
     } else {
@@ -365,6 +373,7 @@ pub fn niri_gesture(active: bool) {
 /// Follow niri's touchpad swipe: the strip moves by the (accelerated) finger
 /// travel times output width / 1200, like niri's view_offset_gesture_update.
 pub fn niri_gesture_scroll(dx: f32) {
+    niri_activity();
     if !NIRI_GESTURE.load(std::sync::atomic::Ordering::Relaxed)
         || NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -657,7 +666,12 @@ fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
         .spawn(move || loop {
             if NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
                 niri_poll_view(&sock_view);
-                std::thread::sleep(Duration::from_millis(7));
+                // fast only while the strip may be moving: every request costs niri a bit
+                let busy = NIRI_ACTIVITY
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(1500));
+                std::thread::sleep(Duration::from_millis(if busy { 7 } else { 250 }));
             } else {
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -668,6 +682,13 @@ fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
     let mut last_output = String::new();
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
+        // things that can scroll the strip (title changes etc. can't)
+        if ["WindowFocusChanged", "WindowLayoutsChanged", "WorkspaceActivated", "WindowClosed", "WindowsChanged"]
+            .iter()
+            .any(|k| line.starts_with(&format!("{{\"{k}\"")))
+        {
+            niri_activity();
+        }
         let relevant = ["WindowFocusChanged", "WindowOpenedOrChanged", "WindowClosed",
             "WorkspaceActivated", "WindowLayoutsChanged", "WindowsChanged"]
             .iter()
