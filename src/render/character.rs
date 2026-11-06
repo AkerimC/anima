@@ -1003,7 +1003,7 @@ impl WalkState {
                 let d = self.target - self.x;
                 // close enough counts as caught, or a cursor circling fast
                 // keeps flipping the target left and right
-                let catch = if chase { 0.05 } else { 0.0 };
+                let catch = if chase { 0.015 } else { 0.0 };
                 if d.abs() <= speed * dt + catch {
                     if !chase {
                         self.x = self.target;
@@ -1534,7 +1534,7 @@ impl CharacterOverlay {
                 let reach = if circle.is_some() {
                     (aim_y - center_clip[1]) / half_clip[1]
                 } else {
-                    (aim_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.3
+                    (aim_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.1
                 };
                 let r = self.walk.step(dt, left_room, right_room, mouse, reach);
                 if !self.walk.circle && self.walk.act != Act::Chase {
@@ -1617,7 +1617,7 @@ impl CharacterOverlay {
                     let r = self.hit_rect;
                     let size = r[3] - r[1];
                     let (hx, hy) = ((r[0] + r[2]) * 0.5, r[1] + size * 0.28);
-                    let near = size * 0.15;
+                    let near = size * 0.22;
                     if (mx - hx).powi(2) + (my - hy).powi(2) <= near * near {
                         let wk = &mut self.walk;
                         let t = 1.0 - (wk.jump / wk.jump_dur.max(0.001)).clamp(0.0, 1.0);
