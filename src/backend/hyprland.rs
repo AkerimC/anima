@@ -466,7 +466,6 @@ mod hypr_plugin {
         if p == libc::MAP_FAILED {
             return None;
         }
-        log::info!("hyprland plugin: reading workspace offsets");
         m.0 = p as usize;
         Some(p as *const u8)
     }
@@ -482,7 +481,12 @@ mod hypr_plugin {
             let inst = std::slice::from_raw_parts(p.add(8), 120);
             let inst = &inst[..inst.iter().position(|&b| b == 0).unwrap_or(120)];
             let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-            (inst == sig.as_bytes()).then_some(p)
+            if inst != sig.as_bytes() {
+                return None;
+            }
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| log::info!("hyprland plugin: loaded, using its workspace offsets"));
+            Some(p)
         }
     }
 
