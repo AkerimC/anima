@@ -98,17 +98,22 @@ impl Shared {
     }
 }
 
-pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
+/// `exact`: the compositor reports the real cursor (fed in through `SYNC`),
+/// so there is no need to centre it first.
+pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds, exact: bool) {
     let devices = find_devices();
     if devices.is_empty() {
         log::info!("pointer: no readable mouse/touchpad (install contrib/70-anima-pointer.rules)");
         return;
     }
     let (bx, by, bw, bh) = bounds.lock().unwrap().0;
-    // patched niri tells us where the pointer is; otherwise estimate from evdev
-    let exact = super::governor::niri_cursor().is_some();
-    if exact {
-        log::info!("pointer: position from niri");
+    // some compositors can be asked where the pointer is (polled below),
+    // Hyprland feeds it through SYNC; otherwise estimate from evdev
+    let polled = super::compositor::current().cursor().is_some();
+    if polled {
+        log::info!("pointer: position from {}", super::compositor::current().name());
+    } else if exact {
+        log::info!("pointer: position comes from the compositor");
     } else if super::warp::warp(bw / 2.0, bh / 2.0, bw, bh) {
         // start from a known spot: put the real cursor in the middle of the output
         log::info!("pointer: cursor moved to the centre to start in sync");
@@ -155,16 +160,16 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
         .name("anima-pointer-pub".into())
         .spawn(move || {
             let mut last = (f32::NAN, f32::NAN);
-            let mut warper = if exact { None } else { super::warp::Warper::new() };
+            let mut warper = if polled || exact { None } else { super::warp::Warper::new() };
             let mut last_ask = Instant::now() - Duration::from_secs(1);
             let exact_trail: Mutex<std::collections::VecDeque<(Instant, f32, f32)>> = Mutex::new(Default::default());
             loop {
-                if exact {
+                if polled {
                     // ask often while the pointer moves, rarely when it doesn't
                     let moving = shared.moved.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_millis(400));
                     if moving || last_ask.elapsed() > Duration::from_millis(250) {
                         last_ask = Instant::now();
-                        if let Some(Some((x, y))) = super::governor::niri_cursor() {
+                        if let Some(Some((x, y))) = super::compositor::current().cursor() {
                             let ((bx, by, _, _), _) = shared.bounds.lock().unwrap().clone();
                             let p = (bx + x, by + y);
                             *shared.pos.lock().unwrap() = p;
@@ -183,7 +188,7 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
                 {
                     let mut t = shared.trail.lock().unwrap();
                     let mut et = exact_trail.lock().unwrap();
-                    let found = if exact { is_circle(&et) } else { is_circle(&t.2) };
+                    let found = if polled { is_circle(&et) } else { is_circle(&t.2) };
                     if let Some((dx, dy, r)) = found {
                         // the circle's centre is offset from where the pointer is now
                         let p = *shared.pos.lock().unwrap();
@@ -300,7 +305,7 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
     let mut buf = [0u8; 24 * 64];
     let (mut last_x, mut last_y): (Option<i32>, Option<i32>) = (None, None);
     let mut multi = false;
-    // three fingers: niri's horizontal swipe scrolls its strip
+    // three/four fingers: the compositor's workspace or strip swipe
     let mut three = false;
     let mut gx = 0.0f32;
     // motion collected until the next SYN_REPORT (one hardware frame)
@@ -332,7 +337,7 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
                         last_frame = Some(t_ms);
                         let v = mm.abs() / dt;
                         speed = if dt > 50.0 { v } else { speed * 0.5 + v * 0.5 };
-                        super::governor::niri_gesture_scroll(mm * touchpad_accel(speed * 1000.0));
+                        super::compositor::current().swipe_scroll(mm * touchpad_accel(speed * 1000.0));
                         gx = 0.0;
                     }
                     if fx == 0.0 && fy == 0.0 {
@@ -382,11 +387,11 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
                 // two+ fingers = scrolling/gestures, not pointer motion
                 (EV_KEY, c) if (BTN_TOOL_DOUBLETAP..=BTN_TOOL_DOUBLETAP + 3).contains(&c) || c == 0x14f => {
                     multi = value != 0;
-                    // three or four fingers: niri's swipe
+                    // three or four fingers: the compositor's swipe
                     if c == BTN_TOOL_DOUBLETAP + 1 || c == BTN_TOOL_DOUBLETAP + 2 {
                         three = value != 0;
                         log::debug!("pointer: swipe fingers {} {}", c - BTN_TOOL_DOUBLETAP + 2, if three { "down" } else { "up" });
-                        super::governor::niri_gesture(three);
+                        super::compositor::current().swipe(three);
                     }
                     (last_x, last_y) = (None, None);
                     last_frame = None;

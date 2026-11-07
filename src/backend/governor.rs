@@ -1,14 +1,13 @@
-//! Smart Governor: compositor fullscreen/maximized detection, active window
-//! geometry tracking (for `window-inside` / `window-outside` character placement),
-//! and cursor tracking.
+//! Smart Governor: the thread that watches the compositor (fullscreen /
+//! maximized state, active window geometry for `window-inside` /
+//! `window-outside` placement, cursor) and reports `GovernorEvent`s. What it
+//! watches comes from `compositor::current()`.
 //!
-//! Uses Hyprland's UNIX sockets (`.socket.sock` and `.socket2.sock`) directly
-//! without spawning subprocesses, keeping CPU overhead at ~0.0%.
+//! niri's implementation still lives in this file (see `backend/niri.rs`).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use calloop::channel::Sender;
@@ -44,114 +43,11 @@ fn run(tx: Sender<GovernorEvent>) {
         });
     }
 
-    if let Some(sock) = niri_socket() {
-        run_niri(tx, &sock);
-        return;
-    }
-
-    let Some(path) = hypr_socket2() else {
-        poll_forever(tx);
-        return;
-    };
-
-    let stream = match UnixStream::connect(&path) {
-        Ok(stream) => stream,
-        Err(err) => {
-            log::debug!("cannot connect to Hyprland IPC ({}): {err}", path.display());
-            poll_forever(tx);
-            return;
-        }
-    };
-
-    // Lightweight cursor + active window geometry tracker (handles dragging/resizing windows smoothly).
-    let tx_poll = tx.clone();
-    std::thread::Builder::new()
-        .name("anima-cursor".into())
-        .spawn(move || {
-            let mut ticks = 0u32;
-            let mut last_pos = (-1.0f32, -1.0f32);
-            let mut last_rect: Option<WindowRect> = None;
-            loop {
-                if let Some((x, y)) = query_hypr_cursor() {
-                    if (x - last_pos.0).abs() > 1.0 || (y - last_pos.1).abs() > 1.0 {
-                        last_pos = (x, y);
-                        if tx_poll.send(GovernorEvent::CursorPos(x, y)).is_err() {
-                            return;
-                        }
-                    }
-                }
-                if ticks % 3 == 0 {
-                    if let Some((fs, max, rect)) = query_hypr_active_window() {
-                        if rect != last_rect {
-                            last_rect = rect;
-                            if tx_poll
-                                .send(GovernorEvent::WindowState {
-                                    fullscreen: fs,
-                                    maximized: max,
-                                    active_rect: rect,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                }
-                ticks = ticks.wrapping_add(1);
-                if ticks % 60 == 0 {
-                    if tx_poll.send(GovernorEvent::Power).is_err() {
-                        return;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(45));
-            }
-        })
-        .ok();
-
-    log::info!("listening to Hyprland events at {}", path.display());
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-
-        if let Some(rest) = line.strip_prefix("focusedmon>>") {
-            if let Some((name, _workspace)) = rest.split_once(',') {
-                if tx
-                    .send(GovernorEvent::FocusedMonitor(name.to_string()))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            continue;
-        }
-
-        let relevant = line.starts_with("fullscreen>>")
-            || line.starts_with("activewindow>>")
-            || line.starts_with("workspace>>")
-            || line.starts_with("createwindow>>")
-            || line.starts_with("closewindow>>")
-            || line.starts_with("movewindow>>")
-            || line.starts_with("openwindow>>")
-            || line.starts_with("changefloatingmode>>");
-
-        if relevant {
-            if let Some((fs, max, rect)) = query_window_state() {
-                if tx
-                    .send(GovernorEvent::WindowState {
-                        fullscreen: fs,
-                        maximized: max,
-                        active_rect: rect,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        }
-    }
+    super::compositor::current().run(tx);
 }
 
-fn poll_forever(tx: Sender<GovernorEvent>) {
+/// Window state every 2 s, for compositors without an event stream.
+pub(super) fn poll_forever(tx: Sender<GovernorEvent>) {
     let mut last = None;
     loop {
         let state = query_window_state();
@@ -177,87 +73,9 @@ fn poll_forever(tx: Sender<GovernorEvent>) {
     }
 }
 
-fn hypr_dir() -> Option<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
-    Some(PathBuf::from(runtime).join("hypr").join(signature))
-}
-
-fn hypr_socket1() -> Option<PathBuf> {
-    let p = hypr_dir()?.join(".socket.sock");
-    p.exists().then_some(p)
-}
-
-fn hypr_socket2() -> Option<PathBuf> {
-    let p = hypr_dir()?.join(".socket2.sock");
-    p.exists().then_some(p)
-}
-
-fn hypr_request(sock1: &Path, cmd: &[u8]) -> Option<String> {
-    let mut stream = UnixStream::connect(sock1).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(30))).ok()?;
-    stream.write_all(cmd).ok()?;
-    let mut out = String::new();
-    stream.read_to_string(&mut out).ok()?;
-    Some(out)
-}
-
-fn query_hypr_cursor() -> Option<(f32, f32)> {
-    let sock1 = hypr_socket1()?;
-    let s = hypr_request(&sock1, b"cursorpos")?;
-    let (xs, ys) = s.trim().split_once(',')?;
-    let x = xs.trim().parse::<f32>().ok()?;
-    let y = ys.trim().parse::<f32>().ok()?;
-    Some((x, y))
-}
-
-fn query_hypr_active_window() -> Option<(bool, bool, Option<WindowRect>)> {
-    let sock1 = hypr_socket1()?;
-    let json_str = hypr_request(&sock1, b"j/activewindow")?;
-    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-    let fs_mode = value.get("fullscreen").and_then(|v| v.as_i64()).unwrap_or(0);
-
-    let at = value.get("at").and_then(|v| v.as_array());
-    let size = value.get("size").and_then(|v| v.as_array());
-    let rect = match (at, size) {
-        (Some(at), Some(sz)) if at.len() >= 2 && sz.len() >= 2 => {
-            let x = at[0].as_f64().unwrap_or(0.0) as f32;
-            let y = at[1].as_f64().unwrap_or(0.0) as f32;
-            let w = sz[0].as_f64().unwrap_or(0.0) as f32;
-            let h = sz[1].as_f64().unwrap_or(0.0) as f32;
-            if w > 0.0 && h > 0.0 {
-                Some(WindowRect { x, y, w, h })
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-
-    Some((fs_mode >= 2, fs_mode == 1, rect))
-}
-
-fn query_window_state() -> Option<(bool, bool, Option<WindowRect>)> {
-    if let Some(res) = query_hypr_active_window() {
-        return Some(res);
-    }
-    if let Some(sock) = niri_socket() {
-        return query_niri_window(&sock);
-    }
-
-    if std::env::var_os("SWAYSOCK").is_some() {
-        let output = Command::new("swaymsg")
-            .args(["-t", "get_tree"])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let fs = text.contains("\"focused\": true") && text.contains("\"fullscreen_mode\": 1");
-            return Some((fs, false, None));
-        }
-    }
-
-    None
+/// Fullscreen / maximized state and the active window, from the compositor.
+pub(super) fn query_window_state() -> Option<(bool, bool, Option<WindowRect>)> {
+    super::compositor::current().window_state()
 }
 
 // niri: $NIRI_SOCKET, one JSON request per line
@@ -272,9 +90,10 @@ pub struct NiriWorkspaces {
 }
 
 
-/// niri's scrolling strip on the focused output, logical pixels.
+/// What characters walk along on the focused output, logical pixels: niri's
+/// scrolling strip, or Hyprland's open workspaces side by side.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NiriStrip {
+pub struct Strip {
     /// how far the strip is scrolled (left edge of the screen in strip coords)
     pub view_x: f32,
     /// total width of all columns
@@ -308,7 +127,7 @@ fn niri_layouts_changed(line: &str) -> bool {
         }
     }
     let Some(view) = view else { return false };
-    if let Some(st) = NIRI_STRIP.lock().unwrap().as_mut() {
+    if let Some(st) = STRIP.lock().unwrap().as_mut() {
         st.view_x = view;
     }
     true
@@ -338,7 +157,7 @@ fn niri_poll_view(sock: &Path) -> bool {
             return false;
         }
         if let Some(x) = layout["tile_pos_in_workspace_view"][0].as_f64() {
-            if let Some(st) = NIRI_STRIP.lock().unwrap().as_mut() {
+            if let Some(st) = STRIP.lock().unwrap().as_mut() {
                 st.view_x = col_x - x as f32;
             }
             return true;
@@ -360,10 +179,10 @@ static GESTURE_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 // touchpad (our libinput acceleration estimate runs a bit low)
 const GESTURE_SCALE: f32 = 1.2;
 
-pub fn niri_gesture(active: bool) {
+pub(super) fn niri_gesture(active: bool) {
     niri_activity();
     if active {
-        *GESTURE_START.lock().unwrap() = NIRI_STRIP.lock().unwrap().map(|s| s.view_x);
+        *GESTURE_START.lock().unwrap() = STRIP.lock().unwrap().map(|s| s.view_x);
     } else {
         GESTURE_ENDED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -372,14 +191,14 @@ pub fn niri_gesture(active: bool) {
 
 /// Follow niri's touchpad swipe: the strip moves by the (accelerated) finger
 /// travel times output width / 1200, like niri's view_offset_gesture_update.
-pub fn niri_gesture_scroll(dx: f32) {
+pub(super) fn niri_gesture_scroll(dx: f32) {
     niri_activity();
     if !NIRI_GESTURE.load(std::sync::atomic::Ordering::Relaxed)
         || NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed)
     {
         return;
     }
-    let mut strip = NIRI_STRIP.lock().unwrap();
+    let mut strip = STRIP.lock().unwrap();
     let Some(st) = strip.as_mut() else { return };
     st.view_x = (st.view_x + dx * st.screen_w / 1200.0 * GESTURE_SCALE).clamp(-st.screen_w * 0.2, st.width - st.screen_w * 0.8);
     if let Some(v) = NIRI_VIEWS.lock().unwrap().iter_mut().find(|v| v.0 == st.ws) {
@@ -387,7 +206,7 @@ pub fn niri_gesture_scroll(dx: f32) {
     }
 }
 
-pub static NIRI_STRIP: std::sync::Mutex<Option<NiriStrip>> = std::sync::Mutex::new(None);
+pub static STRIP: std::sync::Mutex<Option<Strip>> = std::sync::Mutex::new(None);
 
 // remembered scroll position per workspace
 static NIRI_VIEWS: std::sync::Mutex<Vec<(u64, f32)>> = std::sync::Mutex::new(Vec::new());
@@ -499,8 +318,8 @@ fn update_niri_strip(sock: &Path) {
         Some(v) => v.1 = view,
         None => views.push((ws.active, view)),
     }
-    let new = NiriStrip { view_x: view, width: width.max(screen_w), screen_w, ws: ws.active, exact: seen_pos.is_some() };
-    let mut strip = NIRI_STRIP.lock().unwrap();
+    let new = Strip { view_x: view, width: width.max(screen_w), screen_w, ws: ws.active, exact: seen_pos.is_some() };
+    let mut strip = STRIP.lock().unwrap();
     if strip.is_none_or(|o| o.view_x != new.view_x || o.width != new.width) {
         log::debug!("niri strip: view {:.0} of {:.0}", new.view_x, new.width);
     }
@@ -543,7 +362,7 @@ fn query_niri_workspaces(sock: &Path) -> Option<NiriWorkspaces> {
     Some(ws)
 }
 
-fn niri_socket() -> Option<PathBuf> {
+pub(super) fn niri_socket() -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var_os("NIRI_SOCKET")?);
     p.exists().then_some(p)
 }
@@ -575,7 +394,7 @@ fn niri_focused_output(sock: &Path) -> Option<serde_json::Value> {
     niri_request(sock, "\"FocusedOutput\"")?.get("FocusedOutput").cloned()
 }
 
-fn query_niri_window(sock: &Path) -> Option<(bool, bool, Option<WindowRect>)> {
+pub(super) fn query_niri_window(sock: &Path) -> Option<(bool, bool, Option<WindowRect>)> {
     let win = niri_request(sock, "\"FocusedWindow\"")?.get("FocusedWindow").cloned()?;
     if win.is_null() {
         return Some((false, false, None));
@@ -618,7 +437,7 @@ fn query_niri_window(sock: &Path) -> Option<(bool, bool, Option<WindowRect>)> {
     Some((fullscreen, maximized, rect))
 }
 
-fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
+pub(super) fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
     let Ok(mut stream) = UnixStream::connect(sock) else {
         poll_forever(tx);
         return;
@@ -669,7 +488,7 @@ fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
             .and_then(|o| o.get("name").and_then(|n| n.as_str()).map(String::from))
             .unwrap_or_default(),
     )));
-    super::pointer::spawn(tx.clone(), bounds.clone());
+    super::pointer::spawn(tx.clone(), bounds.clone(), false);
 
     // exact scroll position: poll about once per frame
     let sock_view = sock.to_path_buf();

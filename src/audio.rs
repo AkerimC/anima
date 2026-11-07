@@ -265,6 +265,8 @@ fn audio_worker(inner: Arc<(Mutex<SharedState>, Condvar)>) {
     let mut vocal_floor_env = 0.0f32;
     let mut prev_vocal_raw = 0.0f32;
     let mut smooth_mouth = [0.0f32; 4];
+    // tempo and beat phase from the raw samples, at the sample rate
+    let mut tempo = crate::tempo::Tracker::new(SAMPLE_RATE as f32);
 
     let (lock, cvar) = &*inner;
     let mut stream: Option<*mut c_void> = None;
@@ -299,6 +301,8 @@ fn audio_worker(inner: Arc<(Mutex<SharedState>, Condvar)>) {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
+            // a gap in the audio: start the tempo over
+            tempo = crate::tempo::Tracker::new(SAMPLE_RATE as f32);
         }
 
         let s = stream.unwrap();
@@ -317,6 +321,10 @@ fn audio_worker(inner: Arc<(Mutex<SharedState>, Condvar)>) {
             std::thread::sleep(Duration::from_millis(500));
             continue;
         }
+
+        // our own voice lines are on this audio too: they're not the music's beat
+        tempo.feed(&pcm, crate::voice::sounding());
+        crate::tempo::publish(tempo.beat());
 
         // Apply Hann window, compute RMS and Zero-Crossing Rate (ZCR for sibilants).
         let mut rms = 0.0f32;
@@ -479,8 +487,8 @@ fn avg_slice(slice: &[f32]) -> f32 {
 }
 
 /// In-place Radix-2 Cooley-Tukey FFT (`N` must be a power of 2).
-fn fft_in_place(re: &mut [f32; FFT_SIZE], im: &mut [f32; FFT_SIZE]) {
-    let n = FFT_SIZE;
+pub(crate) fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
+    let n = re.len();
     let mut j = 0usize;
     for i in 1..n {
         let mut bit = n >> 1;

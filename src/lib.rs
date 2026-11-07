@@ -10,12 +10,15 @@
 
 pub mod audio;
 pub mod backend;
+pub mod blue_archive;
 pub mod config;
 pub mod ipc;
 pub mod lyrics;
 pub mod pkg;
 pub mod render;
+pub mod tempo;
 pub mod util;
+pub mod voice;
 pub mod wallpaper;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
