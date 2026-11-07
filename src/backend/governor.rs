@@ -208,6 +208,17 @@ pub(super) fn niri_gesture_scroll(dx: f32) {
 
 pub static STRIP: std::sync::Mutex<Option<Strip>> = std::sync::Mutex::new(None);
 
+/// Columns of tiled windows on the active niri workspace: (x on the strip, width), logical px.
+pub fn niri_columns() -> Vec<(f32, f32)> {
+    let mut cols: Vec<(f32, f32)> = Vec::new();
+    for &(_, x, w) in NIRI_WIN_X.lock().unwrap().iter() {
+        if !cols.iter().any(|c| c.0 == x) {
+            cols.push((x, w));
+        }
+    }
+    cols
+}
+
 // remembered scroll position per workspace
 static NIRI_VIEWS: std::sync::Mutex<Vec<(u64, f32)>> = std::sync::Mutex::new(Vec::new());
 

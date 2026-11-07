@@ -72,6 +72,8 @@ pub enum Request {
         always_on_top: Option<bool>,
     },
     Reload,
+    /// Walking characters gather and race each other.
+    Race,
     Quit,
 }
 

@@ -143,6 +143,8 @@ enum Cmd {
     Tui,
     /// Reload the configuration from disk.
     Reload,
+    /// Make the walking characters race each other.
+    Race,
     /// Show daemon and monitor status.
     Status {
         #[arg(long)]
@@ -357,6 +359,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Reload => Request::Reload,
+        Cmd::Race => Request::Race,
         Cmd::Status { monitor, .. } => Request::Status { monitor },
         Cmd::Monitors => Request::ListMonitors,
         Cmd::List { .. }

@@ -1306,6 +1306,10 @@ impl App {
         let Command { request, reply } = cmd;
         let response = match request {
             Request::Ping => Response::ok(format!("anima {} is running", crate::VERSION)),
+            Request::Race => {
+                crate::render::character::RACE_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
+                Response::ok("race started")
+            }
             Request::Quit => {
                 self.exit = true;
                 Response::ok("shutting down")

@@ -220,6 +220,10 @@ class Window(Adw.ApplicationWindow):
         controls.append(self.walk)
         controls.append(Gtk.Label(label="Fare takibi"))
         controls.append(self.follow)
+        # they race on their own now and then (rarely); this starts one now
+        race = Gtk.Button(label="Yarış başlat")
+        race.connect("clicked", lambda _: subprocess.Popen([ANIMA, "race"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        controls.append(race)
 
         # saved groups: pick one and load it, or save the current team under a name
         self.groups = Gtk.DropDown(hexpand=True)
