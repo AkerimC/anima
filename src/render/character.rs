@@ -193,6 +193,10 @@ pub struct CharacterConfig {
     /// supports placing them (Hyprland with contrib/hyprland-plugin), so
     /// they move with the workspaces natively.
     pub windows: bool,
+    /// Light 3D characters from the colours on screen around them (a small
+    /// screen capture once a second, which compositors report as a
+    /// screencast).
+    pub screen_light: bool,
 }
 
 impl CharacterConfig {
@@ -224,6 +228,7 @@ impl Default for CharacterConfig {
             source_happy: String::new(),
             extra: Vec::new(),
             windows: true,
+            screen_light: true,
         }
     }
 }
@@ -1598,12 +1603,12 @@ impl CharacterOverlay {
             };
             // light around where the character was drawn last frame
             let [x0, y0, x1, y1] = self.hit_rect;
-            let light = crate::backend::envlight::light_at(
+            let light = self.config.screen_light.then(|| crate::backend::envlight::light_at(
                 (info.width.max(1) as u32, info.height.max(1) as u32),
                 (x0 + x1) * 0.5,
                 (y0 + y1) * 0.5,
             )
-            .unwrap_or_default();
+            ).flatten().unwrap_or_default();
             let mirrored = self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right);
             model.draw(gl, std::mem::take(&mut self.walk.model_dt), pose, light, mirrored);
         }
