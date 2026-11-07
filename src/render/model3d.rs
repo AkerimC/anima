@@ -129,6 +129,34 @@ pub enum Pose {
     Fall,
 }
 
+/// Clip names to look for, by role. Basic roles take an exact name, else
+/// the first clip whose name contains one; the rest only exact names.
+pub struct ClipNames {
+    pub idle: &'static [&'static str],
+    pub walk: &'static [&'static str],
+    pub pat: &'static [&'static str],
+    pub held: &'static [&'static str],
+    pub more_idle: &'static [&'static str],
+    pub more_pat: &'static [&'static str],
+    pub run: &'static [&'static str],
+    pub fall: &'static [&'static str],
+    /// gestures while idling: (clip, optional follow-up)
+    pub flourishes: &'static [(&'static str, Option<&'static str>)],
+}
+
+/// For models that aren't Blue Archive chibis (`crate::blue_archive`).
+const GENERIC_CLIPS: ClipNames = ClipNames {
+    idle: &["idle"],
+    walk: &["walk", "run", "move"],
+    pat: &["reaction", "react", "wave"],
+    held: &["pickup", "pick", "hang", "fall"],
+    more_idle: &[],
+    more_pat: &[],
+    run: &["run", "Run"],
+    fall: &["fall", "Fall"],
+    flourishes: &[],
+};
+
 /// The model's clips by role. Extras (idle variants, gestures, run, panic)
 /// are only used where they stay inside the framing of the basic ones.
 #[derive(Default)]
@@ -200,6 +228,8 @@ struct Prim {
     color: [f32; 4],
     alpha_mode: i32,
     cutoff: f32,
+    /// a weapon or shield: left out of the body's framing
+    weapon: bool,
 }
 
 /// Parsed glTF scene without any GL objects.
@@ -368,12 +398,28 @@ pub struct Model3d {
     textures: Vec<glow::Texture>,
     white: glow::Texture,
     roles: Roles,
+    // frame height / body height, and the part of the frame below the feet
+    framing: [f32; 2],
+    // swaying chains: root bone and every node under it
+    sway_chains: Vec<(usize, Vec<usize>)>,
+    // their swing (radians, around the view's z) and its speed
+    sway: f32,
+    sway_v: f32,
+    // upper body and head (bone and everything under it), and how far to
+    // lean / nod them: moving to music
+    spine: Option<(usize, Vec<usize>)>,
+    head: Option<(usize, Vec<usize>)>,
+    groove: [f32; 2],
+    // file name, for logs
+    name: String,
     pose: Pose,
     clip: Option<usize>,
     playing: Playing,
     time: f32,
     // idle seconds until the next gesture
     next_flourish: f32,
+    // a gesture that just started, until `take_gesture`
+    gesture: Option<usize>,
     seed: u32,
     // crossfade from the previous clip: (clip, its time, remaining fade)
     fade: Option<(Option<usize>, f32, f32)>,
@@ -393,21 +439,7 @@ pub struct Model3d {
 
 const FADE: f32 = 0.25;
 
-/// Gestures played while idling (start, optional follow-up), if the model has
-/// them and they fit its framing.
-const FLOURISHES: [(&str, Option<&str>); 8] = [
-    ("Victory_Start", Some("Victory_End")),
-    ("Victory_Start_Random", Some("Victory_End_Random")),
-    ("Public01", None),
-    ("Public01_globefish", None),
-    ("Normal_Callsign", None),
-    ("Move_Callsign", None),
-    ("Stand_Callsign", None),
-    ("Exs", None),
-];
 
-/// BA mouth shapes, happiest first: open grin, open smile, closed smiles.
-const HAPPY_MOUTHS: [&str; 6] = ["Mouth_701", "Mouth_703", "Mouth_700", "Mouth_705", "Mouth_704", "Mouth_405"];
 
 /// Three-quarter view turned toward the walking direction (screen right;
 /// the overlay mirrors the texture for the other way), seen a bit from above.
@@ -421,11 +453,15 @@ pub fn is_model_path(path: &Path) -> bool {
 }
 
 impl Model3d {
-    /// Load a model. `height` is the offscreen texture height in pixels.
-    pub fn load(gl: &glow::Context, path: &Path, height: u32) -> Result<Self> {
+    /// Load a model. `height` is the offscreen texture height in pixels;
+    /// `weapons`: keep weapon and shield meshes (each clip shows, places or
+    /// hides them itself).
+    pub fn load(gl: &glow::Context, path: &Path, height: u32, weapons: bool) -> Result<Self> {
         let (doc, buffers, images) = gltf::import(path)?;
         let asset = Asset::parse(&doc, &buffers)?;
 
+        let ba = crate::blue_archive::is_chibi(asset.clips.iter().map(|c| c.name.as_str()));
+        let names = if ba { &crate::blue_archive::CLIPS } else { &GENERIC_CLIPS };
         // basic roles fall back to anything with a similar name
         let pick = |keys: &[&str]| {
             keys.iter().find_map(|k| {
@@ -436,10 +472,10 @@ impl Model3d {
             })
         };
         let exact = |k: &str| asset.clips.iter().position(|c| c.name.eq_ignore_ascii_case(k));
-        let idle = pick(&["Cafe_Idle", "Normal_Idle", "idle"]).or((!asset.clips.is_empty()).then_some(0));
-        let walk = pick(&["Cafe_Walk", "Move_Ing", "walk", "run", "move_ing", "move"]).or(idle);
-        let pat = pick(&["Cafe_Reaction", "reaction", "react"]).or(idle);
-        let held = pick(&["Formation_Pickup", "pickup", "pick"]).or(pat);
+        let idle = pick(names.idle).or((!asset.clips.is_empty()).then_some(0));
+        let walk = pick(names.walk).or(idle);
+        let pat = pick(names.pat).or(idle);
+        let held = pick(names.held).or(pat);
         let basic = [idle, walk, pat, held];
 
         let get = |b: gltf::Buffer| buffers.get(b.index()).map(|d| &d.0[..]);
@@ -447,9 +483,9 @@ impl Model3d {
         let mut geometry = Vec::new();
         for node in doc.nodes() {
             let Some(mesh) = node.mesh() else { continue };
-            // a desktop pet doesn't carry guns or shields around
             let name = format!("{} {}", node.name().unwrap_or(""), mesh.name().unwrap_or("")).to_ascii_lowercase();
-            if name.contains("weapon") || name.contains("shield") {
+            let weapon = crate::blue_archive::is_weapon(&name);
+            if !weapons && weapon {
                 continue;
             }
             let skin = node.skin().map(|s| s.index());
@@ -502,6 +538,7 @@ impl Model3d {
                     color: pbr.base_color_factor(),
                     alpha_mode,
                     cutoff,
+                    weapon,
                 });
                 geometry.push(Geometry { pos, morph, joints, weights });
             }
@@ -529,18 +566,25 @@ impl Model3d {
         // the basic ones, so no character shrinks or gets cut off for them
         let view = Mat4::from_rotation_x(PITCH) * Mat4::from_rotation_y(YAW);
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        // the body alone in the basic clips: what the character's size means
+        let (mut body_lo, mut body_hi) = (lo, hi);
         for clip in basic.iter().copied().collect::<std::collections::BTreeSet<_>>() {
-            let (a, b) = clip_bounds(&asset, &prims, &geometry, view, clip);
+            let (a, b) = clip_bounds(&asset, &prims, &geometry, view, clip, false);
             (lo, hi) = (lo.min(a), hi.max(b));
+            let (a, b) = clip_bounds(&asset, &prims, &geometry, view, clip, true);
+            (body_lo, body_hi) = (body_lo.min(a), body_hi.max(b));
         }
         if lo.x > hi.x {
             (lo, hi) = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        }
+        if body_lo.x > body_hi.x {
+            (body_lo, body_hi) = (lo, hi);
         }
         let slack = (hi - lo) * 0.15;
         let (lim_lo, lim_hi) = (lo - slack, hi + slack);
         let mut fits = |clip: Option<usize>| {
             let Some(c) = clip else { return None };
-            let (a, b) = clip_bounds(&asset, &prims, &geometry, view, Some(c));
+            let (a, b) = clip_bounds(&asset, &prims, &geometry, view, Some(c), false);
             let ok = a.x >= lim_lo.x && a.y >= lim_lo.y && b.x <= lim_hi.x && b.y <= lim_hi.y;
             if ok {
                 (lo, hi) = (lo.min(a), hi.max(b));
@@ -554,11 +598,11 @@ impl Model3d {
             idle: idle.into_iter().collect(),
             ..Default::default()
         };
-        roles.idle.extend(["Formation_Idle", "Rearrange_Idle"].iter().filter_map(|k| fits(exact(k))));
-        roles.pat.extend(["Rearrange_Reaction"].iter().filter_map(|k| fits(exact(k))));
-        roles.run = ["Move_Ing", "Move_Ing01"].iter().find_map(|k| fits(exact(k)));
-        roles.fall = ["Vital_Panic", "Vital_Panic01"].iter().find_map(|k| fits(exact(k)));
-        for (start, end) in FLOURISHES {
+        roles.idle.extend(names.more_idle.iter().filter_map(|k| fits(exact(k))));
+        roles.pat.extend(names.more_pat.iter().filter_map(|k| fits(exact(k))));
+        roles.run = names.run.iter().find_map(|k| fits(exact(k)));
+        roles.fall = names.fall.iter().find_map(|k| fits(exact(k)));
+        for (start, end) in names.flourishes {
             if let Some(s) = fits(exact(start)) {
                 let then = end.and_then(|e| fits(exact(e)));
                 roles.flourish.push((s, then));
@@ -580,6 +624,11 @@ impl Model3d {
         );
         let pad = (hi - lo) * Vec3::new(0.04, 0.03, 0.05);
         let (lo, hi) = (lo - pad, hi + pad);
+        // how much taller the frame is than the body (weapons, wide
+        // gestures), and how much of it is below the feet
+        let body_pad = (body_hi.y - body_lo.y) * 0.03;
+        let body_h = (body_hi.y - body_lo.y + 2.0 * body_pad).max(1e-3);
+        let framing = [((hi.y - lo.y) / body_h).max(1.0), ((body_lo.y - body_pad - lo.y) / (hi.y - lo.y)).max(0.0)];
         // orthographic; y flipped since the overlay samples sprites top row
         // first, and nearer (larger view z) gets the smaller depth
         let d = hi - lo;
@@ -589,12 +638,58 @@ impl Model3d {
         let size = (((height as f32 * aspect).round() as u32).max(16), height.max(16));
 
         let (fbo, color, depth) = create_target(gl, size.0, size.1)?;
-        // BA faces: one mesh per mouth shape, shown by morph weight 0. Keep
-        // the widest grin the model has instead of what the clips switch to.
+        // chains that sway: the topmost swaying bone of each, with everything
+        // under it (Blue Archive's secondary bones; none for other models)
+        let sway_bone: Vec<bool> = doc
+            .nodes()
+            .map(|n| ba && n.name().is_some_and(crate::blue_archive::is_sway_bone))
+            .collect();
+        let mut sway_chains: Vec<(usize, Vec<usize>)> = Vec::new();
+        for i in 0..sway_bone.len() {
+            let mut root = None;
+            let mut p = Some(i);
+            while let Some(n) = p {
+                if sway_bone[n] {
+                    root = Some(n);
+                }
+                p = asset.parents[n];
+            }
+            let Some(root) = root else { continue };
+            match sway_chains.iter_mut().find(|c| c.0 == root) {
+                Some(c) => c.1.push(i),
+                None => sway_chains.push((root, vec![i])),
+            }
+        }
+
+        // the bone ending in "spine" / "head" (Bip001 Spine, mixamorig:Head),
+        // with everything under it
+        let node_names: Vec<String> = doc.nodes().map(|n| n.name().unwrap_or("").to_ascii_lowercase()).collect();
+        let subtree = |suffix: &str| {
+            let root = node_names.iter().position(|n| n.ends_with(suffix))?;
+            let under = (0..node_names.len())
+                .filter(|&i| {
+                    let mut p = Some(i);
+                    while let Some(n) = p {
+                        if n == root {
+                            return true;
+                        }
+                        p = asset.parents[n];
+                    }
+                    false
+                })
+                .collect();
+            Some((root, under))
+        };
+        let (spine, head) = (subtree("spine"), subtree("head"));
+
+        // Blue Archive faces: one mesh per mouth shape, shown by morph
+        // weight 0. Keep the widest grin the model has instead of what the
+        // clips switch to.
+        use crate::blue_archive::{HAPPY_MOUTHS, MOUTH_PREFIX};
         let mouths: Vec<(usize, String)> = doc
             .nodes()
             .filter_map(|n| Some((n.index(), n.name()?.to_string())))
-            .filter(|(_, name)| name.starts_with("Mouth_"))
+            .filter(|(_, name)| name.starts_with(MOUTH_PREFIX))
             .collect();
         let smile = HAPPY_MOUTHS
             .iter()
@@ -616,6 +711,7 @@ impl Model3d {
             playing: Playing::Loop,
             time: 0.0,
             next_flourish: 0.0,
+            gesture: None,
             seed: path.as_os_str().len() as u32 ^ (std::process::id() << 3) ^ 0x9e37_79b9,
             fade: None,
             view,
@@ -624,6 +720,14 @@ impl Model3d {
             color,
             depth,
             size,
+            framing,
+            sway_chains,
+            sway: 0.0,
+            sway_v: 0.0,
+            spine,
+            head,
+            groove: [0.0; 2],
+            name: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             local: Vec::new(),
             local_b: Vec::new(),
             globals: Vec::new(),
@@ -653,18 +757,47 @@ impl Model3d {
         }
     }
 
+    /// (frame height / body height, fraction of the frame below the feet):
+    /// the sprite is that much taller and that much lower, so every
+    /// character's body has the same size and stands on the ground whatever
+    /// it holds.
+    pub fn framing(&self) -> (f32, f32) {
+        (self.framing[0], self.framing[1])
+    }
+
+    /// Name of the gesture that started since the last call.
+    pub fn take_gesture(&mut self) -> Option<String> {
+        self.gesture.take().map(|c| self.asset.clips[c].name.clone())
+    }
+
     fn clip_len(&self) -> f32 {
         self.clip.map_or(1.0, |c| self.asset.clips[c].dur.max(1e-3))
     }
 
     /// Switch clips with a crossfade.
     fn play(&mut self, clip: Option<usize>, playing: Playing) {
+        let name = |c: Option<usize>| c.map_or("-", |c| self.asset.clips[c].name.as_str());
+        log::debug!(
+            "{}: {:?} {} -> {} {}",
+            self.name,
+            self.pose,
+            name(self.clip),
+            name(clip),
+            if matches!(playing, Playing::Loop) { "loop" } else { "once" }
+        );
         if clip != self.clip || playing != self.playing {
             self.fade = Some((self.clip, self.time, FADE));
             self.clip = clip;
             self.time = 0.0;
         }
         self.playing = playing;
+    }
+
+    /// Play a random gesture now, if idling in a loop and it has any.
+    pub fn gesture_now(&mut self) {
+        if self.pose == Pose::Idle && self.playing == Playing::Loop && !self.roles.flourish.is_empty() {
+            self.next_flourish = 0.0;
+        }
     }
 
     /// Idling: switch idle loops now and then, and play a gesture every few
@@ -689,6 +822,7 @@ impl Model3d {
                     let i = ((self.rand() * n as f32) as usize).min(n - 1);
                     let (start, then) = self.roles.flourish[i];
                     self.play(Some(start), Playing::Once { then });
+                    self.gesture = Some(start);
                 } else if self.time >= len && self.roles.idle.len() > 1 && self.rand() < 0.35 {
                     // at the end of a loop, sometimes a different idle
                     let idle = self.roles.idle.clone();
@@ -697,6 +831,71 @@ impl Model3d {
                 } else if self.time >= len {
                     self.time -= len;
                 }
+            }
+        }
+    }
+
+    /// Lean the upper body sideways (radians, around the view's z) and nod
+    /// the head forward, on top of the clip; applied on the next draw.
+    pub fn set_groove(&mut self, lean: f32, nod: f32) {
+        self.groove = [lean, nod];
+    }
+
+    fn apply_groove(&mut self, lean: f32) {
+        let nod = self.groove[1];
+        let turn = |globals: &mut [Mat4], (root, nodes): &(usize, Vec<usize>), q: Quat| {
+            let pivot = globals[*root].w_axis.truncate();
+            let m = Mat4::from_translation(pivot) * Mat4::from_quat(q) * Mat4::from_translation(-pivot);
+            for &n in nodes {
+                globals[n] = m * globals[n];
+            }
+        };
+        if lean.abs() > 1e-3 {
+            if let Some(spine) = &self.spine {
+                let axis = self.view.inverse().transform_vector3(Vec3::Z).normalize();
+                turn(&mut self.globals, spine, Quat::from_axis_angle(axis, lean));
+            }
+        }
+        // the head nods around the model's sideways axis (models face +z)
+        if nod.abs() > 1e-3 {
+            if let Some(head) = &self.head {
+                turn(&mut self.globals, head, Quat::from_axis_angle(Vec3::X, nod));
+            }
+        }
+    }
+
+    /// Swaying parts trail behind the sprite's movement: a damped spring
+    /// pulls their swing toward an angle opposite to the motion, and each
+    /// chain turns about its root around the view's z axis, on top of
+    /// whatever the clip does.
+    fn swing(&mut self, dt: f32, motion: f32) {
+        const GAIN: f32 = 0.9; // radians per screen width per second
+        const MAX: f32 = 0.9;
+        const STIFF: f32 = 90.0;
+        const DAMP: f32 = 7.0;
+        if self.sway_chains.is_empty() {
+            return;
+        }
+        let target = (-motion * GAIN).clamp(-MAX, MAX);
+        let steps = (dt / (1.0 / 120.0)).ceil().clamp(1.0, 30.0);
+        let h = dt / steps;
+        for _ in 0..steps as usize {
+            let a = -STIFF * (self.sway - target) - DAMP * self.sway_v;
+            self.sway_v += a * h;
+            self.sway += self.sway_v * h;
+        }
+        self.sway = self.sway.clamp(-MAX * 1.3, MAX * 1.3);
+        if self.sway.abs() < 1e-3 {
+            return;
+        }
+        // the view's z axis in model space (the view is a pure rotation)
+        let axis = self.view.inverse().transform_vector3(Vec3::Z).normalize();
+        let turn = Mat4::from_quat(Quat::from_axis_angle(axis, self.sway));
+        for (root, nodes) in &self.sway_chains {
+            let pivot = self.globals[*root].w_axis.truncate();
+            let m = Mat4::from_translation(pivot) * turn * Mat4::from_translation(-pivot);
+            for &n in nodes {
+                self.globals[n] = m * self.globals[n];
             }
         }
     }
@@ -730,7 +929,9 @@ impl Model3d {
     /// `light` is the environment around the character; `mirrored` when the
     /// overlay flips the texture (walking left), so light from the right
     /// still lands on the right.
-    pub fn draw(&mut self, gl: &glow::Context, dt: f32, pose: Pose, light: Light, mirrored: bool) {
+    /// `motion`: the sprite's speed on screen (screen widths per second,
+    /// x right), which swings swaying parts behind it.
+    pub fn draw(&mut self, gl: &glow::Context, dt: f32, pose: Pose, light: Light, mirrored: bool, motion: f32) {
         self.ease_light(dt, light, mirrored);
         if pose != self.pose {
             self.pose = pose;
@@ -757,10 +958,20 @@ impl Model3d {
             } else {
                 let k = *left / FADE;
                 self.asset.sample(*clip, *t, &mut self.local_b);
-                for (a, b) in self.local.iter_mut().zip(&self.local_b) {
-                    a.t = a.t.lerp(b.t, k);
-                    a.r = a.r.slerp(b.r, k);
-                    a.s = a.s.lerp(b.s, k);
+                // props are hidden by scaling a bone to zero (and some clips
+                // hang the body from one): if the clips disagree on what's
+                // hidden, any blend shows a half-grown prop or flings the
+                // body, so switch at once instead
+                let hidden = |s: Vec3| s.min_element() < 0.01;
+                let props_differ = self.local.iter().zip(&self.local_b).any(|(a, b)| hidden(a.s) != hidden(b.s));
+                if props_differ {
+                    self.fade = None;
+                } else {
+                    for (a, b) in self.local.iter_mut().zip(&self.local_b) {
+                        a.t = a.t.lerp(b.t, k);
+                        a.r = a.r.slerp(b.r, k);
+                        a.s = a.s.lerp(b.s, k);
+                    }
                 }
             }
         }
@@ -770,6 +981,8 @@ impl Model3d {
             }
         }
         self.asset.globals(&self.local, &mut self.globals);
+        self.swing(dt, if mirrored { -motion } else { motion });
+        self.apply_groove(if mirrored { -self.groove[0] } else { self.groove[0] });
 
         unsafe {
             let prev_fbo = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
@@ -871,7 +1084,8 @@ impl Model3d {
 /// View rotation plus view-space bounds of the model over sampled frames of
 /// every clip in use, skinned on the CPU.
 /// View-space bounds of the model over a clip (8 samples).
-fn clip_bounds(asset: &Asset, prims: &[Prim], geometry: &[Geometry], view: Mat4, clip: Option<usize>) -> (Vec3, Vec3) {
+/// `body_only`: without weapons.
+fn clip_bounds(asset: &Asset, prims: &[Prim], geometry: &[Geometry], view: Mat4, clip: Option<usize>, body_only: bool) -> (Vec3, Vec3) {
     let mut local = Vec::new();
     let mut globals = Vec::new();
     let mut joints = Vec::new();
@@ -882,6 +1096,9 @@ fn clip_bounds(asset: &Asset, prims: &[Prim], geometry: &[Geometry], view: Mat4,
             asset.sample(clip, dur * k as f32 / 8.0, &mut local);
             asset.globals(&local, &mut globals);
             for (p, g) in prims.iter().zip(geometry) {
+                if body_only && p.weapon {
+                    continue;
+                }
                 let w = local[p.node].w;
                 // hidden shapes (BA mouths) collapse under their morph target
                 if w > 0.99 && g.morph.iter().any(|m| *m != Vec3::ZERO) {
@@ -1050,11 +1267,12 @@ mod tests {
         let gl = unsafe {
             glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s) as *const _)
         };
-        let mut model = Model3d::load(&gl, Path::new(&path), 512).unwrap();
+        let weapons = std::env::var_os("ANIMA_TEST_WEAPONS").is_some();
+        let mut model = Model3d::load(&gl, Path::new(&path), 512, weapons).unwrap();
         let (_, w, h) = model.texture();
         for (pose, t) in [(Pose::Idle, 1.0), (Pose::Walk, 0.4), (Pose::Run, 0.3), (Pose::Pat, 0.8), (Pose::Held, 1.5), (Pose::Fall, 0.6)] {
             for _ in 0..(t / 0.05) as usize {
-                model.draw(&gl, 0.05, pose, Light::default(), false);
+                model.draw(&gl, 0.05, pose, Light::default(), false, 0.0);
             }
             let mut px = vec![0u8; (w * h * 4) as usize];
             unsafe {
@@ -1087,7 +1305,8 @@ mod tests {
         let ctx = unsafe { config.display().create_context(&config, &attrs) }.unwrap();
         let _ctx = ctx.make_current_surfaceless().unwrap();
         let gl = unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s) as *const _) };
-        let mut model = Model3d::load(&gl, Path::new(&path), 384).unwrap();
+        let weapons = std::env::var_os("ANIMA_TEST_WEAPONS").is_some();
+        let mut model = Model3d::load(&gl, Path::new(&path), 384, weapons).unwrap();
         let (_, w, h) = model.texture();
         for name in names.split(',') {
             let Some(c) = model.asset.clips.iter().position(|c| c.name == name) else { continue };
@@ -1097,7 +1316,7 @@ mod tests {
                 model.playing = Playing::Loop;
                 model.time = dur * k as f32 / 4.0;
                 model.fade = None;
-                model.draw(&gl, 0.0, Pose::Idle, Light::default(), false);
+                model.draw(&gl, 0.0, Pose::Idle, Light::default(), false, 0.0);
                 let mut px = vec![0u8; (w * h * 4) as usize];
                 unsafe {
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(model.fbo));
@@ -1107,6 +1326,64 @@ mod tests {
                 image::RgbaImage::from_raw(w, h, px).unwrap().save(format!("{out}/{name}_{k}.png")).unwrap();
             }
             println!("{name} {dur:.2}s");
+        }
+    }
+
+
+    /// Frames through a sequence of poses, to look at transitions:
+    /// `ANIMA_TEST_MODEL=... ANIMA_TEST_OUT=/dir ANIMA_TEST_SEQ=Walk:1.0,Held:0.6,Fall:0.4,Idle:0.5 cargo test pose_sequence`
+    #[test]
+    fn pose_sequence() {
+        use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
+        use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
+        use glutin::display::{GlDisplay, GetGlDisplay};
+        let (Ok(path), Ok(out), Ok(seq)) =
+            (std::env::var("ANIMA_TEST_MODEL"), std::env::var("ANIMA_TEST_OUT"), std::env::var("ANIMA_TEST_SEQ"))
+        else {
+            return;
+        };
+        let device = glutin::api::egl::device::Device::query_devices().unwrap().next().unwrap();
+        let display = unsafe { glutin::api::egl::display::Display::with_device(&device, None) }.unwrap();
+        let config = unsafe { display.find_configs(ConfigTemplateBuilder::new().with_surface_type(ConfigSurfaceTypes::empty()).build()) }.unwrap().next().unwrap();
+        let attrs = ContextAttributesBuilder::new().with_context_api(ContextApi::Gles(Some(Version::new(3, 0)))).build(None);
+        let ctx = unsafe { config.display().create_context(&config, &attrs) }.unwrap();
+        let _ctx = ctx.make_current_surfaceless().unwrap();
+        let gl = unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s) as *const _) };
+        let weapons = std::env::var_os("ANIMA_TEST_WEAPONS").is_some();
+        let mut model = Model3d::load(&gl, Path::new(&path), 256, weapons).unwrap();
+        let (_, w, h) = model.texture();
+        let mut n = 0;
+        for step in seq.split(',') {
+            let (pose, secs) = step.split_once(':').unwrap();
+            let pose = match pose {
+                "Walk" => Pose::Walk,
+                "Run" => Pose::Run,
+                "Pat" => Pose::Pat,
+                "Held" => Pose::Held,
+                "Fall" => Pose::Fall,
+                _ => Pose::Idle,
+            };
+            // ANIMA_TEST_GROOVE=<lean>,<nod>
+            if let Some((l, n)) = std::env::var("ANIMA_TEST_GROOVE").ok().and_then(|v| {
+                let (l, n) = v.split_once(',')?;
+                Some((l.parse::<f32>().ok()?, n.parse::<f32>().ok()?))
+            }) {
+                model.set_groove(l, n);
+            }
+            // ANIMA_TEST_SWING=<speed>: dragged back and forth while held
+            let swing: f32 = std::env::var("ANIMA_TEST_SWING").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            for k in 0..(secs.parse::<f32>().unwrap() / 0.05) as usize {
+                let motion = if pose == Pose::Held && (k / 6) % 2 == 0 { swing } else if pose == Pose::Held { -swing } else { 0.0 };
+                model.draw(&gl, 0.05, pose, Light::default(), false, motion);
+                let mut px = vec![0u8; (w * h * 4) as usize];
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(model.fbo));
+                    gl.read_pixels(0, 0, w as i32, h as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut px)));
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                }
+                image::RgbaImage::from_raw(w, h, px).unwrap().save(format!("{out}/{n:03}_{pose:?}.png")).unwrap();
+                n += 1;
+            }
         }
     }
 

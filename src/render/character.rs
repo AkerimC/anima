@@ -197,6 +197,13 @@ pub struct CharacterConfig {
     /// screen capture once a second, which compositors report as a
     /// screencast).
     pub screen_light: bool,
+    /// Say voice lines from a `voice/` folder next to the character's file
+    /// (contrib/ba-voice.py fetches Blue Archive's), and play sound effects
+    /// from ~/.local/share/anima/sounds/ (picking up, letting go).
+    pub voice: bool,
+    pub voice_volume: f32,
+    /// Show 3D characters' weapons where their animations hold them.
+    pub weapons: bool,
 }
 
 impl CharacterConfig {
@@ -229,6 +236,9 @@ impl Default for CharacterConfig {
             extra: Vec::new(),
             windows: true,
             screen_light: true,
+            voice: true,
+            voice_volume: 0.6,
+            weapons: false,
         }
     }
 }
@@ -897,10 +907,96 @@ pub struct CharacterOverlay {
     walk: WalkState,
     // re-pose at most every this many frames (crowd budget, set by actor 0)
     pose_every: u64,
+    voice: Option<crate::voice::Voice>,
+    // said hello (only the main character keeps trying until it can)
+    greeted: bool,
+    // horizontal speed on screen (screen widths/s, smoothed) and where the
+    // sprite was last frame, for swaying hair
+    screen_speed: f32,
+    last_x: Option<f32>,
+    // clicked again while being petted: another pat line
+    patted_again: bool,
+    vibe: Vibe,
+    // where its sounds come from, and whether the last throw was hard
+    spot: crate::voice::Spot,
+    thrown_hard: bool,
+    // behaviour last frame, to notice what just started
+    last_act: Act,
+}
+
+/// Music on the desktop: the characters stop talking and wandering and move
+/// to it instead: a side-to-side groove on slow songs, a nod on each beat on
+/// fast ones, a mix in between.
+#[derive(Default)]
+struct Vibe {
+    on: bool,
+    // seconds the audio has been loud / quiet
+    loud: f32,
+    quiet: f32,
+    // the tracker's beat count last time one started here
+    last_beat: i64,
+    // beats so far, and whether one started this frame
+    beats: u32,
+    beat_now: bool,
+    // how much to move: eases in when the music starts, out when it stops
+    amount: f32,
+    // the motion: sideways lean and forward nod
+    sway: f32,
+    nod: f32,
+}
+
+/// Music: loud enough this long (level 0..1, seconds); over after this much
+/// quiet.
+const MUSIC_LEVEL: f32 = 0.06;
+const MUSIC_AFTER: f32 = 2.0;
+const SILENCE_AFTER: f32 = 3.0;
+
+impl Vibe {
+    fn listen(&mut self, level: f32, dt: f32, actor: usize) {
+        // our own voice lines are on the same desktop audio: they're not music
+        if !crate::voice::sounding() {
+            if level > MUSIC_LEVEL {
+                self.loud += dt;
+                self.quiet = 0.0;
+            } else {
+                self.quiet += dt;
+                self.loud = 0.0;
+            }
+            let on = if self.on { self.quiet < SILENCE_AFTER } else { self.loud > MUSIC_AFTER };
+            if on != self.on && actor == 0 {
+                log::info!("music {}", if on { "playing" } else { "stopped" });
+            }
+            self.on = on;
+        }
+        // the beat tracked on the audio thread (crate::tempo)
+        let beat = crate::tempo::current();
+        let pos = beat.position(std::time::Instant::now());
+        let whole = pos.floor() as i64;
+        // a beat starts when the count goes up; the tracker nudging it back
+        // a little doesn't start the same one twice
+        self.beat_now = whole > self.last_beat && self.on;
+        if whole > self.last_beat || whole < self.last_beat - 4 {
+            self.last_beat = whole;
+        }
+        if self.beat_now {
+            self.beats = self.beats.wrapping_add(1);
+        }
+        self.amount += (f32::from(self.on) - self.amount) * (dt * 3.0).min(1.0);
+        let t = pos.rem_euclid(1.0) as f32;
+        // slow songs: a smooth lean that crosses over each beat (sides by the
+        // tracker's count, so it stays smooth when the phase is corrected)
+        let side = if whole.rem_euclid(2) == 0 { 1.0 } else { -1.0 };
+        let groove = side * (std::f32::consts::PI * (t - 0.5)).sin();
+        // fast ones: a nod right on the beat that eases out
+        let bop = (1.0 - t).powi(3);
+        let fast = ((beat.bpm - 100.0) / 30.0).clamp(0.0, 1.0);
+        self.sway = groove * 0.7 * (1.0 - fast * 0.6) * self.amount;
+        self.nod = -bop * 0.55 * fast * self.amount;
+    }
 }
 
 /// What the character is doing right now.
-#[derive(Default, Clone, Copy, PartialEq)]
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
 enum Act {
     #[default]
     Idle,
@@ -962,6 +1058,9 @@ const CONTENT_HZ: f32 = 40.0;
 /// Most 3D re-poses per frame, all characters together.
 const POSE_BUDGET: usize = 24;
 const MIN_POSE_HZ: f32 = 12.0;
+/// A throw this fast (clip units/s sideways, half-heights/s up) makes the
+/// character say ouch when it lands.
+const HARD_THROW: (f32, f32) = (2.0, 6.0);
 
 const JUMP_DUR: f32 = 0.9;
 const JUMP_AMP: f32 = 2.0;
@@ -1140,6 +1239,15 @@ impl CharacterOverlay {
             smooth_pos: None,
             start: Instant::now(),
             pose_every: 1,
+            voice: None,
+            greeted: false,
+            screen_speed: 0.0,
+            last_x: None,
+            patted_again: false,
+            vibe: Vibe::default(),
+            spot: Default::default(),
+            thrown_hard: false,
+            last_act: Act::Idle,
             walk: WalkState {
                 seed: (std::process::id() + actor as u32 * 7919).wrapping_mul(2654435761),
                 ..Default::default()
@@ -1180,10 +1288,11 @@ impl CharacterOverlay {
         }
 
         let path = crate::util::expand_path(src, std::env::current_dir().ok().as_deref());
+        self.voice = if self.config.voice { crate::voice::Voice::load(&path) } else { None };
         if path.is_file() && super::model3d::is_model_path(&path) {
             // render at ~1.5x the on-screen height for smooth edges
             let px = (540.0 * self.config.scale.clamp(0.2, 4.0)).clamp(256.0, 1024.0) as u32;
-            let model = super::model3d::Model3d::load(gl, &path, px)?;
+            let model = super::model3d::Model3d::load(gl, &path, px, self.config.weapons)?;
             self.sprite_tex = Some(model.texture());
             // drawn turned to the right, mirrored when walking left
             self.faces_right = true;
@@ -1251,7 +1360,10 @@ impl CharacterOverlay {
         scale_factor: f32,
         active_window: Option<WindowRect>,
     ) -> (f32, f32, f32, f32) {
-        let base_h = (360.0 * self.config.scale.clamp(0.2, 4.0) * scale_factor).max(64.0);
+        // a 3D frame bigger than the body (a weapon) makes the sprite bigger,
+        // and lower by the part below the feet, so bodies keep one size
+        let (frame, below) = self.model.as_ref().map_or((1.0, 0.0), |m| m.framing());
+        let base_h = (360.0 * self.config.scale.clamp(0.2, 4.0) * scale_factor * frame).max(64.0);
         let aspect = if let Some((_, tw, th)) = self.sprite_tex {
             (tw.max(1) as f32) / (th.max(1) as f32)
         } else {
@@ -1259,7 +1371,7 @@ impl CharacterOverlay {
         };
         let base_w = (base_h * aspect).max(64.0);
         let ox = self.config.offset[0] * scale_factor;
-        let oy = self.config.offset[1] * scale_factor;
+        let oy = self.config.offset[1] * scale_factor - below * base_h;
         let sw = out_w as f32;
         let sh = out_h as f32;
 
@@ -1350,6 +1462,80 @@ impl CharacterOverlay {
             Corner::BottomCenter => ((sw - base_w) * 0.5 + ox, sh - base_h - oy),
         };
         (x, y, base_w, base_h)
+    }
+
+    /// Sound for what just started: effects for picking up and letting go,
+    /// voice lines for petting, a chase, a gesture or landing after a hard
+    /// throw; a greeting at first and a monologue now and then. All of it
+    /// comes from where the character is on screen.
+    fn speak(&mut self, info: &FrameInfo) {
+        use crate::voice::{Cue, Effect};
+        let [x0, y0, x1, y1] = self.hit_rect;
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let distance = (cx - info.mouse[0]).hypot(cy - info.mouse[1]) / info.scale.max(1.0);
+        self.spot.set(cx / info.width.max(1) as f32, distance);
+
+        let act = self.walk.act;
+        let started = (act != self.last_act).then_some(act);
+        if started.is_some() {
+            log::debug!(
+                "actor {}: {:?} -> {:?} (x {:.2} air {:.2} vx {:.2} vy {:.2})",
+                self.actor, self.last_act, act, self.walk.x, self.walk.air, self.walk.vx, self.walk.vy
+            );
+        }
+        let released = self.last_act == Act::Held && act != Act::Held;
+        let landed = self.last_act == Act::Fall && act != Act::Fall;
+        self.last_act = act;
+        let volume = self.config.voice_volume;
+        if !self.config.voice {
+            return;
+        }
+        if started == Some(Act::Held) {
+            crate::voice::effect(Effect::PickUp, volume, &self.spot);
+        } else if released {
+            crate::voice::effect(Effect::Release, volume, &self.spot);
+            self.thrown_hard = self.walk.vx.abs() > HARD_THROW.0 || self.walk.vy > HARD_THROW.1;
+        }
+        let hurt = landed && std::mem::take(&mut self.thrown_hard);
+        // dancing to music: no talking over it
+        if self.vibe.on {
+            return;
+        }
+        let gesture = self.model.as_mut().and_then(|m| m.take_gesture());
+        let chase_roll = self.walk.rand();
+        let Some(voice) = self.voice.as_mut() else { return };
+        let spot = &self.spot;
+        if hurt {
+            voice.say(Cue::Hurt, volume, spot);
+        }
+        if let Some(name) = gesture {
+            let cue = if name.contains("Victory") {
+                Cue::Victory
+            } else if name.starts_with("Exs") {
+                Cue::Ex
+            } else {
+                Cue::Gesture
+            };
+            voice.say(cue, volume, spot);
+        }
+        let patted = std::mem::take(&mut self.patted_again);
+        match started {
+            Some(Act::Pat) => {
+                voice.say(Cue::Pat, volume, spot);
+            }
+            _ if patted => {
+                voice.say(Cue::Pat, volume, spot);
+            }
+            Some(Act::Chase) if chase_roll < 0.4 => {
+                voice.say(Cue::Chase, volume, spot);
+            }
+            _ => {}
+        }
+        if !self.greeted {
+            self.greeted = voice.say(Cue::Hello, volume, spot) || self.actor > 0;
+        } else if act == Act::Idle {
+            voice.idle(volume, spot);
+        }
     }
 
     pub fn render(
@@ -1449,6 +1635,7 @@ impl CharacterOverlay {
                 let keep = |a: &mut CharacterOverlay| {
                     if a.walk.act == Act::Pat && hit(&a.hit_rect) {
                         a.walk.timer = a.walk.timer.max(PAT_KEEP);
+                        a.patted_again = true;
                     }
                 };
                 keep(self);
@@ -1574,6 +1761,13 @@ impl CharacterOverlay {
         // With a crowd on screen, at most POSE_BUDGET re-poses per frame
         // (the GPU's limit), but never slower than MIN_POSE_HZ.
         let offscreen = self.hit_rect[2] < 0.0 || self.hit_rect[0] > w;
+        self.vibe.listen(info.audio[3], dt, self.actor);
+        // horizontal speed on screen, for swaying hair (lightly smoothed)
+        let x = (self.hit_rect[0] + self.hit_rect[2]) * 0.5 / w;
+        if let Some(last) = self.last_x.replace(x) {
+            let v = ((x - last) / dt).clamp(-20.0, 20.0);
+            self.screen_speed += (v - self.screen_speed) * (dt * 20.0).min(1.0);
+        }
         if self.actor == 0 {
             let on_screen = std::iter::once(self.hit_rect)
                 .chain(self.extras.iter().map(|e| e.hit_rect))
@@ -1609,7 +1803,10 @@ impl CharacterOverlay {
             )
             ).flatten().unwrap_or_default();
             let mirrored = self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right);
-            model.draw(gl, std::mem::take(&mut self.walk.model_dt), pose, light, mirrored);
+            // moving to music: lean the upper body, nod the head
+            let (lean, nod) = if self.walk.act == Act::Idle { (self.vibe.sway * 0.35, self.vibe.nod * -0.6) } else { (0.0, 0.0) };
+            model.set_groove(lean, nod);
+            model.draw(gl, std::mem::take(&mut self.walk.model_dt), pose, light, mirrored, self.screen_speed);
         }
 
         unsafe {
@@ -1658,6 +1855,19 @@ impl CharacterOverlay {
                     (aim_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.1
                 };
                 let r = self.walk.step(dt, left_room, right_room, mouse, reach);
+                // music: stay put instead of strolling or chasing, a gesture
+                // every eight beats
+                if self.vibe.on && matches!(self.walk.act, Act::Walk | Act::Chase) {
+                    self.walk.act = Act::Idle;
+                    self.walk.target = self.walk.x;
+                }
+                if self.vibe.on && self.vibe.beat_now && self.walk.act == Act::Idle {
+                    if self.vibe.beats % 8 == 0 {
+                        if let Some(m) = self.model.as_mut() {
+                            m.gesture_now();
+                        }
+                    }
+                }
                 if !self.walk.circle && self.walk.act != Act::Chase {
                     self.walk.circle_target = None;
                 }
@@ -1778,7 +1988,8 @@ impl CharacterOverlay {
                 let p = (self.walk.timer / PAT_DUR * std::f32::consts::PI * 5.0).sin().abs();
                 (0.0, 0.0, p * 5.0)
             } else if mode == 0 && self.model.is_some() {
-                // the rig animates itself: only lift for jumps and drags
+                // the rig animates itself: only lift for jumps and drags,
+                // and sway and bob to the music
                 (0.0, jump * self.walk.jump_amp * half_clip[1] + air, 0.0)
             } else if mode == 0 {
                 let (freq, amp) = if moving { (7.0, 0.10) } else { (3.0, 0.05) };
@@ -1828,6 +2039,8 @@ impl CharacterOverlay {
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.disable(glow::BLEND);
         }
+
+        self.speak(info);
 
         for e in &mut self.extras {
             e.render(gl, info, active_window, target)?;
