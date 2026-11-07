@@ -45,6 +45,11 @@ pub static BUTTON_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// so the two can't drift apart.
 pub static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A character follows the cursor closely right now (carried, chasing,
+/// clinging, running to a circle): ask the compositor for it every frame.
+/// Otherwise a slower rate does (each ask costs the compositor a little).
+pub static CURSOR_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Exact cursor position reported by the compositor while the pointer is
 /// over a character; the estimate snaps to it.
 pub static SYNC: Mutex<Option<(f32, f32)>> = Mutex::new(None);
@@ -167,7 +172,16 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds, exact: bool) {
                 if polled {
                     // ask often while the pointer moves, rarely when it doesn't
                     let moving = shared.moved.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_millis(400));
-                    if moving || last_ask.elapsed() > Duration::from_millis(250) {
+                    // moving: every 8 ms when a character needs it, else every 25 ms
+                    // (still plenty of points for circles); still: every 250 ms
+                    let wanted = CURSOR_WANTED.load(std::sync::atomic::Ordering::Relaxed)
+                        || BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
+                    let every = match (moving, wanted) {
+                        (true, true) => 0,
+                        (true, false) => 25,
+                        (false, _) => 250,
+                    };
+                    if last_ask.elapsed() >= Duration::from_millis(every) {
                         last_ask = Instant::now();
                         if let Some(Some((x, y))) = super::compositor::current().cursor() {
                             let ((bx, by, _, _), _) = shared.bounds.lock().unwrap().clone();

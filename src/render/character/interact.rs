@@ -92,6 +92,9 @@ impl CharacterOverlay {
             let carried = |w: &WalkState| w.act == Act::Held && w.hang <= 0.0;
             let held = carried(&self.walk) || self.extras.iter().any(|e| carried(&e.walk));
             crate::backend::pointer::DRAGGING.store(held, std::sync::atomic::Ordering::Relaxed);
+            let follows = |w: &WalkState| matches!(w.act, Act::Held | Act::Chase) || w.catch_jump || w.circle;
+            let wanted = follows(&self.walk) || self.extras.iter().any(|e| follows(&e.walk));
+            crate::backend::pointer::CURSOR_WANTED.store(wanted, std::sync::atomic::Ordering::Relaxed);
         }
 
         // clicking on a character that is being petted keeps the petting going
