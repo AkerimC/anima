@@ -9,7 +9,7 @@
 //    ever touched.
 //
 // Layout of $XDG_RUNTIME_DIR/anima-hyprland.shm, 20480 bytes (mirrored in
-// src/backend/governor.rs):
+// src/backend/hyprland.rs):
 //   0    u32  magic, 0 when the plugin is unloaded
 //   4    u32  version
 //   8    char instance[120]  HYPRLAND_INSTANCE_SIGNATURE

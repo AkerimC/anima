@@ -5,7 +5,7 @@
 //! window gets its slice of it, with damage hints so the compositor only
 //! recomposites around the characters.
 //! Wayland clients can't place their own windows: a compositor-specific
-//! placer does that (Hyprland: `governor::hypr_place_workspace` + the plugin
+//! placer does that (`Compositor::place_workspace_window`; Hyprland: the plugin
 //! in contrib/hyprland-plugin). See docs/character-windows.md.
 
 use std::num::NonZeroU32;
@@ -24,7 +24,7 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{Window, WindowDecorations};
 
-use super::governor::Row;
+use super::compositor::Row;
 use super::wayland::App;
 use crate::render::character::ActorTarget;
 

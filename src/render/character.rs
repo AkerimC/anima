@@ -1481,11 +1481,10 @@ impl CharacterOverlay {
         let w = info.width.max(1) as f32;
         let h = info.height.max(1) as f32;
         let dt = (info.delta as f32).clamp(0.001, 0.1);
-        // strip: Hyprland's row is replayed exactly; niri's scroll is
-        // approximated like niri's own animation
+        // the compositor's strip: followed directly when exact, eased when
+        // estimated
         if self.actor == 0 {
-            let hypr = crate::backend::governor::hypr_view();
-            let strip = hypr.or(*crate::backend::governor::STRIP.lock().unwrap());
+            let strip = crate::backend::compositor::current().strip();
             // logical px -> clip units (assumes output scale 1)
             let to_clip = 2.0 / w;
             let target = strip.map_or([0.0, 0.0], |st| {

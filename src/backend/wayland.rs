@@ -57,7 +57,8 @@ use crate::util;
 use crate::wallpaper::{self, Wallpaper, WallpaperKind};
 
 use self::super::charwin::WorkspaceWindows;
-use self::super::governor::{self, GovernorEvent, spawn_governor};
+use self::super::compositor;
+use self::super::governor::{GovernorEvent, spawn_governor};
 
 /// Options passed from the CLI to the daemon.
 #[derive(Debug, Clone, Default)]
@@ -447,10 +448,10 @@ impl App {
                 let windowed = ch_cfg.windows
                     && ch_cfg.walk
                     && self.xdg_shell.is_some()
-                    && governor::can_place_windows();
-                governor::WINDOW_MODE.store(windowed, std::sync::atomic::Ordering::Relaxed);
+                    && compositor::current().can_place_windows();
+                compositor::current().set_window_mode(windowed);
                 if windowed {
-                    log::info!("characters: one window per workspace, placed by the Hyprland plugin");
+                    log::info!("characters: one window per workspace ({})", compositor::current().name());
                 }
                 let surface = self.compositor.create_surface(&self.qh);
                 // Set an empty 0x0 input region so clicks pass straight through!
@@ -944,14 +945,14 @@ impl App {
                             fo_gl.clear(glow::COLOR_BUFFER_BIT);
                         }
                         if fo.windowed {
-                            if let (Some(xdg), Some(row)) = (xdg, governor::hypr_row()) {
+                            if let (Some(xdg), Some(row)) = (xdg, compositor::current().row()) {
                                 let size = (info.width, info.height);
                                 fo.windows.sync(fo_gl, row, size, oc.scale, xdg, compositor, qh, egl_display, egl_config, fo_ctx);
                                 let _ = fo_ctx.make_current(fo_surf);
                             }
                             if let Some(mut target) = fo.windows.begin_frame(fo_gl) {
                                 let _ = ch.render(fo_gl, &info, active_win, &mut target);
-                                let mut place = |slot| governor::hypr_place_workspace(slot);
+                                let mut place = |slot| compositor::current().place_workspace_window(slot);
                                 fo.windows.present(fo_gl, fo_ctx, compositor, &ch.hit_rects(), &mut place);
                             }
                             let _ = fo_ctx.make_current(fo_surf);

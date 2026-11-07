@@ -11,7 +11,7 @@ The overlay mode draws them on one layer-shell surface, which belongs to the
 output, not a workspace. So during a swipe or workspace animation, animad has
 to know exactly where the compositor draws each workspace on every frame, and
 nonlinear easing and gesture acceleration make that hard to guess.
-`governor::hypr_view` replays Hyprland's gesture and bezier logic for the
+Hyprland's `strip()` replays its gesture and bezier logic for the
 plugin-less fallback, and it is never quite exact.
 
 ## Window mode: let the compositor do it
@@ -69,14 +69,15 @@ workspace costs about what one overlay costs.
 
 ## What a compositor backend provides
 
-Only these are compositor-specific (Hyprland's are in `backend/governor.rs`):
+Only these are compositor-specific. They're methods of the `Compositor`
+trait (`backend/compositor.rs`, overview in `docs/compositors.md`):
 
-| Piece | Hyprland |
+| Method | Hyprland (`backend/hyprland.rs`) |
 |---|---|
-| Is window mode possible? | `can_place_windows()`: IPC socket + plugin loaded |
-| The row (`Row { count, active, step, sliding }`) | `hypr_row()`: workspaces with real windows (not ours) plus the active one, by id; `step` = monitor width + `gaps_workspaces`; active and sliding come from the plugin each frame |
-| Put window `slot` on workspace `slot` at the monitor's top-left | `hypr_place_workspace(slot)`, which writes a record the plugin applies before each frame (`contrib/hyprland-plugin`) |
-| Strip view for the character code | `hypr_view()` returns the active workspace's slot, without the slide offset, while `WINDOW_MODE` is set |
+| `can_place_windows()` | the plugin is loaded |
+| `row()` → `Row { count, active, step, sliding }` | workspaces with real windows (not ours) plus the active one, by id; `step` = monitor width + `gaps_workspaces`; active and sliding come from the plugin each frame |
+| `place_workspace_window(slot)` | writes a record the plugin applies before each frame (`contrib/hyprland-plugin`) |
+| `set_window_mode(on)` + `strip()` | while on, `strip()` returns the active workspace's slot without the slide offset |
 | Window rules | float, no animation, no focus stealing, no decorations (see the plugin README) |
 
 Windows are identified by app_id `anima-character` and title
