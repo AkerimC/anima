@@ -1054,11 +1054,9 @@ impl App {
             if self.outputs[idx].front_overlay.is_some() {
                 let was_hidden = self.outputs[idx].overlay_hidden;
                 if hide_overlay && !was_hidden {
-                    log::debug!("overlay hidden (paused={desired}, fullscreen={})", self.any_fullscreen);
                     self.hide_front_overlay(idx);
                     self.outputs[idx].overlay_hidden = true;
                 } else if !hide_overlay && was_hidden {
-                    log::debug!("overlay shown");
                     self.outputs[idx].overlay_hidden = false;
                 }
             }
