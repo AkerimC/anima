@@ -494,17 +494,24 @@ pub(super) fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
     let sock_view = sock.to_path_buf();
     std::thread::Builder::new()
         .name("anima-niri-view".into())
-        .spawn(move || loop {
+        .spawn(move || {
+            let mut last = std::time::Instant::now();
+            loop {
             if NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
-                niri_poll_view(&sock_view);
-                // fast only while the strip may be moving: every request costs niri a bit
+                // ask every frame while the strip may be moving, rarely otherwise (each
+                // request costs niri a bit); check often so a scroll is caught at once
                 let busy = NIRI_ACTIVITY
                     .lock()
                     .unwrap()
                     .is_some_and(|t| t.elapsed() < Duration::from_millis(1500));
-                std::thread::sleep(Duration::from_millis(if busy { 7 } else { 250 }));
+                if busy || last.elapsed() > Duration::from_millis(250) {
+                    niri_poll_view(&sock_view);
+                    last = std::time::Instant::now();
+                }
+                std::thread::sleep(Duration::from_millis(7));
             } else {
                 std::thread::sleep(Duration::from_millis(200));
+            }
             }
         })
         .ok();
