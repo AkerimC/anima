@@ -1038,6 +1038,9 @@ struct WalkState {
     grab: Option<[f32; 2]>,
     // seconds until a jump queued by a notification
     notify_jump: Option<f32>,
+    // visible part of the strip (same units as x); off-screen characters run back
+    vis: (f32, f32),
+    run: bool,
     // jumping at the cursor after a chase
     catch_jump: bool,
     // hanging on to the cursor: seconds left
@@ -1072,6 +1075,17 @@ impl WalkState {
     }
 
     fn pick(&mut self, min: f32, max: f32, can_chase: bool) {
+        self.run = false;
+        // somewhere else on niri's strip: come back to where the user looks
+        if self.vis.1 > self.vis.0 && (self.x < self.vis.0 || self.x > self.vis.1) {
+            let (a, b) = (self.vis.0.max(min), self.vis.1.min(max));
+            if b > a {
+                self.target = a + self.rand() * (b - a);
+                self.act = Act::Walk;
+                self.run = true;
+                return;
+            }
+        }
         let r = self.rand();
         if r < 0.27 {
             // short or long stroll in a random direction
@@ -1142,6 +1156,10 @@ impl WalkState {
         }
         match self.act {
             Act::Idle => {
+                // don't idle off screen for long
+                if self.x < self.vis.0 || self.x > self.vis.1 {
+                    self.timer = self.timer.min(0.3);
+                }
                 self.timer -= dt;
                 if self.timer <= 0.0 {
                     self.pick(min, max, mouse.is_some());
@@ -1156,8 +1174,9 @@ impl WalkState {
                         None => self.timer = 0.0,
                     }
                 }
-                let speed = if chase { 0.4 } else { 0.12 };
                 let d = self.target - self.x;
+                // coming back from far along the strip: get there in about 1.5 s
+                let speed = if self.run { (d.abs() / 1.5).max(0.4) } else if chase { 0.4 } else { 0.12 };
                 // close enough counts as caught, or a cursor circling fast
                 // keeps flipping the target left and right
                 let catch = if chase { 0.015 } else { 0.0 };
@@ -1854,6 +1873,10 @@ impl CharacterOverlay {
                 } else {
                     (aim_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.1
                 };
+                self.walk.vis = (
+                    -(center_clip[0] - half_clip[0] + 1.0) + view,
+                    1.0 - (center_clip[0] + half_clip[0]) + view,
+                );
                 let r = self.walk.step(dt, left_room, right_room, mouse, reach);
                 // music: stay put instead of strolling or chasing, a gesture
                 // every eight beats
