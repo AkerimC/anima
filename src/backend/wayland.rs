@@ -1084,6 +1084,18 @@ impl App {
     /// compositor treats that as an unmap and rejects the next buffer until a
     /// fresh configure arrives. Clearing to alpha 0 hides the character while
     /// keeping the surface mapped and cheap to re-show.
+    /// The new config differs from the running one only in `character.extra`.
+    fn only_team_changed(&self, new: &Config) -> bool {
+        let strip = |c: &Config| {
+            let mut v = serde_json::to_value(c).unwrap_or_default();
+            if let Some(ch) = v.get_mut("character").and_then(|c| c.as_object_mut()) {
+                ch.remove("extra");
+            }
+            v
+        };
+        self.config.character.extra != new.character.extra && strip(&self.config) == strip(new)
+    }
+
     fn hide_front_overlay(&mut self, idx: usize) {
         let (width, height) = (self.outputs[idx].width, self.outputs[idx].height);
         let Some(fo) = self.outputs[idx].front_overlay.as_mut() else {
@@ -1639,6 +1651,31 @@ impl App {
                 )
             }
             Request::Reload => match Config::load(&self.config_path) {
+                Ok(config) if self.only_team_changed(&config) => {
+                    // only characters added/removed: keep the others where they are
+                    let extra = config.character.extra.clone();
+                    self.config = config;
+                    for oc in &mut self.outputs {
+                        let (w, h) = (oc.width, oc.height);
+                        if let Some(fo) = oc.front_overlay.as_mut() {
+                            if let (Some(ctx), Some(surf), Some(gl), Some(ch)) =
+                                (&fo.gl_context, &fo.gl_surface, &fo.gl, fo.character.as_mut())
+                            {
+                                if ctx.make_current(surf).is_ok() {
+                                    ch.update_extras(gl, &extra, w, h);
+                                }
+                            }
+                        }
+                        if let (Some(ctx), Some(surf), Some(gl), Some(ch)) =
+                            (&oc.gl_context, &oc.gl_surface, &oc.gl, oc.character.as_mut())
+                        {
+                            if ctx.make_current(surf).is_ok() {
+                                ch.update_extras(gl, &extra, w, h);
+                            }
+                        }
+                    }
+                    Response::ok("characters updated")
+                }
                 Ok(config) => {
                     self.config = config;
                     for idx in 0..self.outputs.len() {

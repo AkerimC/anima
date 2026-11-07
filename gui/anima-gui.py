@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Anima: pick the desktop character and start/stop the daemon."""
 
+import json
 import os
 import re
 import shutil
@@ -29,6 +30,26 @@ def find_bin(name):
 
 
 ANIMAD = find_bin("animad")
+ANIMA = find_bin("anima")
+# team (with on/off state) and saved groups
+TEAM = Path.home() / ".config/anima/team.json"
+
+
+def load_team():
+    try:
+        data = json.loads(TEAM.read_text())
+    except (OSError, ValueError):
+        cfg = read_char_config()
+        paths = ([cfg["source"]] if cfg.get("source") else []) + list(cfg.get("extra", []))
+        data = {"team": [{"path": p, "on": True} for p in paths], "groups": {}}
+    data.setdefault("team", [])
+    data.setdefault("groups", {})
+    return data
+
+
+def save_team(data):
+    TEAM.parent.mkdir(parents=True, exist_ok=True)
+    TEAM.write_text(json.dumps(data, ensure_ascii=False, indent=1))
 
 
 # --- config ---------------------------------------------------------------
@@ -141,6 +162,8 @@ class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Anima", default_width=900, default_height=620)
         self.cfg = read_char_config()
+        self.data = load_team()
+        self.group_names = []
         self.pending_restart = 0
 
         # header: on/off switch
@@ -198,7 +221,25 @@ class Window(Adw.ApplicationWindow):
         controls.append(Gtk.Label(label="Fare takibi"))
         controls.append(self.follow)
 
+        # saved groups: pick one and load it, or save the current team under a name
+        self.groups = Gtk.DropDown(hexpand=True)
+        self.group_name = Gtk.Entry(placeholder_text="Yeni grup adı", hexpand=True)
+        self.group_name.connect("activate", self.save_group)
+        gbar = Gtk.Box(spacing=6, margin_start=12, margin_end=12, margin_top=8)
+        gbar.append(Gtk.Label(label="Grup"))
+        gbar.append(self.groups)
+        for label, cb in (("Yükle", self.load_group), ("Sil", self.delete_group)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", cb)
+            gbar.append(b)
+        gbar.append(self.group_name)
+        save = Gtk.Button(label="Ekibi kaydet")
+        save.connect("clicked", self.save_group)
+        gbar.append(save)
+        self.refresh_groups()
+
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        right.append(gbar)
         right.append(self.current)
         right.append(Gtk.ScrolledWindow(child=self.team, vscrollbar_policy=Gtk.PolicyType.NEVER, min_content_height=96))
         right.append(Gtk.Separator())
@@ -260,32 +301,81 @@ class Window(Adw.ApplicationWindow):
             self.grid.append(card)
 
     def pick(self, calm, name):
-        self.apply(source=str(calm), source_happy="", enabled=True)
-        self.update_current()
+        # main character: first in the team
+        self.data["team"] = [t for t in self.data["team"] if t["path"] != str(calm)]
+        self.data["team"].insert(0, {"path": str(calm), "on": True})
+        self.apply_team()
         self.toast.add_toast(Adw.Toast(title=f"{calm.parent.name} · {name}", timeout=2))
 
     def add_extra(self, calm, name):
-        cfg = read_char_config()
-        extra = list(cfg.get("extra", []))
-        if not cfg.get("source"):
-            return self.pick(calm, name)
-        extra.append(str(calm))
-        self.apply(extra=extra, enabled=True)
-        self.update_current()
+        self.data["team"].append({"path": str(calm), "on": True})
+        self.apply_team()
         self.toast.add_toast(Adw.Toast(title=f"Eklendi: {calm.parent.name} · {name}", timeout=2))
 
     def remove(self, index):
+        self.data["team"].pop(index)
+        self.apply_team()
+
+    def toggle(self, index, on):
+        self.data["team"][index]["on"] = on
+        self.apply_team()
+
+    def apply_team(self):
+        """Write the enabled characters to the config. Only the extras changing
+        is applied live; a new main character needs a restart."""
+        save_team(self.data)
+        on = [t["path"] for t in self.data["team"] if t["on"]]
         cfg = read_char_config()
-        extra = list(cfg.get("extra", []))
-        if index == 0:
-            # removing the main one promotes the first extra
-            if not extra:
-                return
-            self.apply(source=extra.pop(0), source_happy="", extra=extra)
+        if not on:
+            write_char_config(enabled=False)
+            restart = cfg.get("enabled", True)
         else:
-            extra.pop(index - 1)
-            self.apply(extra=extra)
+            restart = cfg.get("source") != on[0] or not cfg.get("enabled", True)
+            write_char_config(source=on[0], source_happy="", extra=on[1:], enabled=True)
+        if self.power.get_active():
+            if restart:
+                restart_daemon()
+            else:
+                subprocess.run([ANIMA, "reload"], capture_output=True)
         self.update_current()
+
+    # --- groups ---
+
+    def refresh_groups(self):
+        names = sorted(self.data["groups"])
+        self.group_names = names
+        self.groups.set_model(Gtk.StringList.new(names or ["(grup yok)"]))
+        self.groups.set_sensitive(bool(names))
+
+    def save_group(self, *_):
+        name = self.group_name.get_text().strip()
+        if not name or not self.data["team"]:
+            return
+        self.data["groups"][name] = [dict(t) for t in self.data["team"]]
+        save_team(self.data)
+        self.group_name.set_text("")
+        self.refresh_groups()
+        self.toast.add_toast(Adw.Toast(title=f"Grup kaydedildi: {name}", timeout=2))
+
+    def selected_group(self):
+        i = self.groups.get_selected()
+        return self.group_names[i] if self.group_names and i < len(self.group_names) else None
+
+    def load_group(self, *_):
+        name = self.selected_group()
+        if not name:
+            return
+        self.data["team"] = [dict(t) for t in self.data["groups"][name]]
+        self.apply_team()
+        self.toast.add_toast(Adw.Toast(title=f"Grup yüklendi: {name}", timeout=2))
+
+    def delete_group(self, *_):
+        name = self.selected_group()
+        if not name:
+            return
+        del self.data["groups"][name]
+        save_team(self.data)
+        self.refresh_groups()
 
     def on_scale(self, scale):
         # wait until the slider settles before restarting
@@ -314,21 +404,23 @@ class Window(Adw.ApplicationWindow):
         return True
 
     def update_current(self):
-        cfg = read_char_config()
-        src = cfg.get("source", "")
-        team = ([src] if src else []) + list(cfg.get("extra", []))
-        self.current.set_label(f"Ekip: {len(team)} karakter · ilki ana karakter" if team else "Karakter seçilmedi")
+        team = self.data["team"]
+        on = sum(t["on"] for t in team)
+        self.current.set_label(f"Ekip: {on}/{len(team)} karakter açık · ilk açık olan ana karakter" if team else "Karakter seçilmedi")
         while (c := self.team.get_first_child()) is not None:
             self.team.remove(c)
-        for i, path in enumerate(team):
-            pic = thumb(path, 64)
-            rm = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Çıkar", halign=Gtk.Align.CENTER)
+        for i, t in enumerate(team):
+            pic = thumb(t["path"], 64)
+            pic.set_opacity(1.0 if t["on"] else 0.35)
+            sw = Gtk.Switch(active=t["on"], halign=Gtk.Align.CENTER, tooltip_text="Aç/kapat")
+            sw.connect("notify::active", lambda w, _p, i=i: self.toggle(i, w.get_active()))
+            rm = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Ekipten çıkar", halign=Gtk.Align.CENTER)
             rm.add_css_class("circular")
             rm.add_css_class("flat")
             rm.connect("clicked", lambda _b, i=i: self.remove(i))
-            rm.set_sensitive(len(team) > 1)
-            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, tooltip_text=Path(path).parent.name)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, tooltip_text=Path(t["path"]).parent.name)
             col.append(pic)
+            col.append(sw)
             col.append(rm)
             self.team.append(col)
 

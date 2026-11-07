@@ -922,6 +922,8 @@ pub struct CharacterOverlay {
     thrown_hard: bool,
     // behaviour last frame, to notice what just started
     last_act: Act,
+    // placed at a random spot along the strip yet
+    spawned: bool,
 }
 
 /// Music on the desktop: the characters stop talking and wandering and move
@@ -1248,6 +1250,7 @@ impl CharacterOverlay {
             spot: Default::default(),
             thrown_hard: false,
             last_act: Act::Idle,
+            spawned: false,
             walk: WalkState {
                 seed: (std::process::id() + actor as u32 * 7919).wrapping_mul(2654435761),
                 ..Default::default()
@@ -1255,6 +1258,29 @@ impl CharacterOverlay {
         };
         this.reload_source(gl, width, height)?;
         Ok(this)
+    }
+
+    /// Swap the extra characters without touching the ones that stay.
+    pub fn update_extras(&mut self, gl: &glow::Context, extra: &[String], width: i32, height: i32) {
+        let mut old = std::mem::take(&mut self.extras);
+        for src in extra {
+            let n = self.extras.len() + 1;
+            if let Some(i) = old.iter().position(|e| &e.config.source == src) {
+                let mut e = old.remove(i);
+                e.actor = n;
+                self.extras.push(e);
+                continue;
+            }
+            let mut cfg = self.config.clone();
+            cfg.source = src.clone();
+            cfg.source_happy = String::new();
+            cfg.extra = Vec::new();
+            match Self::new_actor(gl, cfg, width, height, n) {
+                Ok(e) => self.extras.push(e),
+                Err(err) => log::warn!("character {src}: {err:#}"),
+            }
+        }
+        self.config.extra = extra.to_vec();
     }
 
     pub fn reload_source(&mut self, gl: &glow::Context, _width: i32, _height: i32) -> Result<()> {
@@ -1854,6 +1880,12 @@ impl CharacterOverlay {
                 } else {
                     (aim_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.1
                 };
+                // start somewhere random along niri's strip, not all on the first column
+                if !self.spawned {
+                    self.spawned = true;
+                    self.walk.x = left_room + self.walk.rand() * (right_room - left_room).max(0.0);
+                    self.walk.target = self.walk.x;
+                }
                 let r = self.walk.step(dt, left_room, right_room, mouse, reach);
                 // music: stay put instead of strolling or chasing, a gesture
                 // every eight beats
