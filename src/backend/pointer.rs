@@ -122,15 +122,34 @@ pub fn spawn(tx: Sender<GovernorEvent>, bounds: Bounds) {
         last_click: Mutex::new(None),
         trail: Mutex::new((0.0, 0.0, Default::default())),
     });
-    for (path, touchpad) in devices {
-        let Ok(file) = File::open(&path) else { continue };
-        log::info!("pointer: reading {}", path.display());
-        let s = shared.clone();
-        std::thread::Builder::new()
-            .name("anima-pointer".into())
-            .spawn(move || read_device(file, touchpad, &s))
-            .ok();
-    }
+    // read every mouse/touchpad, including ones plugged in later
+    let sh = shared.clone();
+    std::thread::Builder::new()
+        .name("anima-pointer-scan".into())
+        .spawn(move || {
+            let open: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+            loop {
+                for (path, touchpad) in find_devices() {
+                    if open.lock().unwrap().contains(&path) {
+                        continue;
+                    }
+                    let Ok(file) = File::open(&path) else { continue };
+                    log::info!("pointer: reading {}", path.display());
+                    open.lock().unwrap().push(path.clone());
+                    let (s, open) = (sh.clone(), open.clone());
+                    std::thread::Builder::new()
+                        .name("anima-pointer".into())
+                        .spawn(move || {
+                            read_device(file, touchpad, &s);
+                            // unplugged: allow reopening
+                            open.lock().unwrap().retain(|p| p != &path);
+                        })
+                        .ok();
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        })
+        .ok();
     // publish at ~120 Hz, only on change
     std::thread::Builder::new()
         .name("anima-pointer-pub".into())
