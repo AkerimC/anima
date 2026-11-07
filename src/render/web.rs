@@ -380,6 +380,16 @@ impl Renderer for WebRenderer {
     fn describe(&self) -> String {
         format!("web {}", self.entry.display())
     }
+
+    fn destroy(&mut self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_texture(self.bg_texture);
+            gl.delete_texture(self.spectrum_texture);
+            gl.delete_vertex_array(self.triangle.vao);
+            gl.delete_buffer(self.triangle.vbo);
+        }
+        self.program.destroy(gl);
+    }
 }
 
 fn find_web_background(root: &Path, _html: &str) -> Option<PathBuf> {

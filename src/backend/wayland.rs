@@ -599,7 +599,13 @@ impl App {
         if let (Some(ctx), Some(surf)) = (&oc.gl_context, &oc.gl_surface) {
             let _ = ctx.make_current(surf);
         }
-        oc.renderer = None;
+        // Destroy the previous renderer's GL objects while the context is
+        // current; `Box<dyn Renderer>` has no context-aware Drop.
+        if let Some(mut old) = oc.renderer.take() {
+            if let Some(gl) = oc.gl.as_ref() {
+                old.destroy(gl);
+            }
+        }
 
         let gl = oc.gl.as_ref().unwrap();
         let (w, h) = (oc.width, oc.height);
@@ -1803,7 +1809,11 @@ impl App {
         if let (Some(c), Some(s)) = (ctx.gl_context.as_ref(), ctx.gl_surface.as_ref()) {
             let _ = c.make_current(s);
         }
-        ctx.renderer = None;
+        if let Some(mut old) = ctx.renderer.take() {
+            if let Some(gl) = ctx.gl.as_ref() {
+                old.destroy(gl);
+            }
+        }
         ctx.character = None;
         ctx.gl = None;
         drop(ctx.gl_surface.take());

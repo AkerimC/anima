@@ -230,6 +230,15 @@ impl Renderer for ImageRenderer {
     fn is_animated(&self) -> bool {
         self.gif.is_some()
     }
+
+    fn destroy(&mut self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_texture(self.texture);
+            gl.delete_vertex_array(self.triangle.vao);
+            gl.delete_buffer(self.triangle.vbo);
+        }
+        self.program.destroy(gl);
+    }
 }
 
 fn is_gif(path: &Path) -> bool {

@@ -848,6 +848,9 @@ impl CharacterOverlay {
     }
 
     pub fn reload_source(&mut self, gl: &glow::Context, _width: i32, _height: i32) -> Result<()> {
+        if let Some((old, _, _)) = self.sprite_tex.take() {
+            unsafe { gl.delete_texture(old) };
+        }
         self.sprite_tex = None;
         self.sprite_renderer = None;
 

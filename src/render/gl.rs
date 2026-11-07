@@ -88,6 +88,11 @@ impl Program {
             unsafe { gl.uniform_4_f32(Some(&loc), v[0], v[1], v[2], v[3]) };
         }
     }
+
+    /// Delete the GL program.  Requires a current context.
+    pub fn destroy(&self, gl: &glow::Context) {
+        unsafe { gl.delete_program(self.id) };
+    }
 }
 
 impl Drop for Program {
@@ -167,6 +172,18 @@ pub fn create_texture(
     filter: Filter,
     mipmaps: bool,
 ) -> Result<glow::Texture> {
+    create_texture_ex(gl, width, height, pixels, filter, mipmaps, true)
+}
+
+pub fn create_texture_ex(
+    gl: &glow::Context,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    filter: Filter,
+    mipmaps: bool,
+    clamp_uvs: bool,
+) -> Result<glow::Texture> {
     unsafe {
         let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
@@ -196,16 +213,13 @@ pub fn create_texture(
                 Filter::Nearest => glow::NEAREST,
             } as i32,
         );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
+        let wrap = if clamp_uvs {
+            glow::CLAMP_TO_EDGE
+        } else {
+            glow::REPEAT
+        } as i32;
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, wrap);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, wrap);
         if mipmaps {
             gl.generate_mipmap(glow::TEXTURE_2D);
         }
