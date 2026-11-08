@@ -975,7 +975,7 @@ impl App {
                         // tell the compositor only the character boxes changed, not
                         // the whole screen, so it doesn't recomposite everything each
                         // frame (window mode damages its own windows)
-                        let rects = if fo.windowed { Vec::new() } else { ch.hit_rects() };
+                        let rects = if fo.windowed { Vec::new() } else { ch.damage_rects() };
                         let (bw, bh) = (info.width as f32, info.height as f32);
                         let damage: Vec<glutin::surface::Rect> = rects
                             .iter()
@@ -1090,10 +1090,12 @@ impl App {
             let mut v = serde_json::to_value(c).unwrap_or_default();
             if let Some(ch) = v.get_mut("character").and_then(|c| c.as_object_mut()) {
                 ch.remove("extra");
+                ch.remove("tuning");
             }
             v
         };
-        self.config.character.extra != new.character.extra && strip(&self.config) == strip(new)
+        (self.config.character.extra != new.character.extra || self.config.character.tuning != new.character.tuning)
+            && strip(&self.config) == strip(new)
     }
 
     fn hide_front_overlay(&mut self, idx: usize) {
@@ -1309,6 +1311,10 @@ impl App {
             Request::Race => {
                 crate::render::character::RACE_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
                 Response::ok("race started")
+            }
+            Request::Game { name } => {
+                *crate::render::character::GAME_NOW.lock().unwrap() = Some(name);
+                Response::ok("game started")
             }
             Request::Quit => {
                 self.exit = true;
@@ -1658,8 +1664,10 @@ impl App {
                 Ok(config) if self.only_team_changed(&config) => {
                     // only characters added/removed: keep the others where they are
                     let extra = config.character.extra.clone();
+                    let team_changed = extra != self.config.character.extra;
+                    crate::render::tuning::set(config.character.tuning);
                     self.config = config;
-                    for oc in &mut self.outputs {
+                    for oc in self.outputs.iter_mut().filter(|_| team_changed) {
                         let (w, h) = (oc.width, oc.height);
                         if let Some(fo) = oc.front_overlay.as_mut() {
                             if let (Some(ctx), Some(surf), Some(gl), Some(ch)) =

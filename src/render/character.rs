@@ -28,6 +28,7 @@ use crate::pkg::decode_tex;
 
 mod interact;
 mod race;
+mod rope;
 mod social;
 mod uma;
 mod walk;
@@ -35,6 +36,7 @@ mod walk;
 use race::Race;
 use social::Chat;
 pub use race::RACE_NOW;
+pub use social::GAME_NOW;
 use walk::{Act, PAT_DUR, WalkState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +215,8 @@ pub struct CharacterConfig {
     /// from ~/.local/share/anima/sounds/ (picking up, letting go).
     pub voice: bool,
     pub voice_volume: f32,
+    /// Every number behind the behaviour, see `tuning.rs`.
+    pub tuning: super::tuning::Tuning,
     /// Show 3D characters' weapons where their animations hold them.
     pub weapons: bool,
 }
@@ -249,6 +253,7 @@ impl Default for CharacterConfig {
             screen_light: true,
             voice: true,
             voice_volume: 0.6,
+            tuning: Default::default(),
             weapons: false,
         }
     }
@@ -266,6 +271,10 @@ uniform float u_breath;   // breathing scale Y
 uniform float u_bounce;   // audio bounce Y offset
 uniform int u_flip_x;
 uniform vec4 u_clip;      // target clip space: xy scale, zw offset
+uniform float u_rot;      // turned about its centre (tumbling, planted)
+uniform float u_sink;     // pushed down into the ground
+uniform float u_aspect;   // output width / height
+uniform float u_pivot;    // 0: turns about its middle, 1: about its feet
 
 void main() {
     vec2 uv = a_pos * 0.5 + 0.5;
@@ -281,8 +290,16 @@ void main() {
     p.x += height_factor * u_tilt.x * 0.055;
     p.y += height_factor * u_tilt.y * 0.025;
 
-    vec2 clip = u_center + p * u_half_size;
-    clip.y += u_bounce;
+    vec2 d = p * u_half_size;
+    d.x *= u_aspect;
+    float c = cos(u_rot), s = sin(u_rot);
+    vec2 piv = vec2(0.0, -u_half_size.y * u_pivot);
+    d -= piv;
+    d = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
+    d += piv;
+    d.x /= u_aspect;
+    vec2 clip = u_center + d;
+    clip.y += u_bounce - u_sink;
     gl_Position = vec4(clip * u_clip.xy + u_clip.zw, 0.0, 1.0);
 }
 "#;
@@ -913,6 +930,9 @@ pub struct CharacterOverlay {
     chats: Vec<Chat>,
     social_tick: f32,
     chat_id: u32,
+    rope: Option<rope::RopeGl>,
+    // groups that split off this frame
+    new_chats: Vec<Chat>,
     // who starts the race a big chat set off
     race_first: Option<usize>,
     view_w: f32,
@@ -1031,6 +1051,7 @@ const HARD_THROW: (f32, f32) = (2.0, 6.0);
 
 impl CharacterOverlay {
     pub fn new(gl: &glow::Context, config: CharacterConfig, width: i32, height: i32) -> Result<Self> {
+        super::tuning::set(config.tuning);
         Self::new_actor(gl, config, width, height, 0)
     }
 
@@ -1058,6 +1079,8 @@ impl CharacterOverlay {
             chats: Vec::new(),
             social_tick: 0.0,
             chat_id: 0,
+            rope: None,
+            new_chats: Vec::new(),
             race_first: None,
             view_w: 1.0,
             notified: crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed),
@@ -1200,6 +1223,20 @@ impl CharacterOverlay {
         let mut v = vec![self.hit_rect];
         v.extend(self.extras.iter().map(|e| e.hit_rect));
         v
+    }
+
+    /// Boxes that must be repainted: a turned character reaches past its box.
+    pub fn damage_rects(&self) -> Vec<[f32; 4]> {
+        std::iter::once(self)
+            .chain(self.extras.iter())
+            .map(|a| {
+                let [x0, y0, x1, y1] = a.hit_rect;
+                let pad = if a.walk.rot.abs() > 0.01 { y1 - y0 } else { 0.0 };
+                [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
+            })
+            // the rope spans the gap between the two sides
+            .chain(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0]))
+            .collect()
     }
 
     pub fn uses_audio(&self) -> bool {
@@ -1428,7 +1465,7 @@ impl CharacterOverlay {
             }
             if self.config.walk {
                 self.run_race(dt, w);
-                self.run_social(dt);
+                self.run_social(dt, info.mouse);
             }
         }
         let (tx, ty, pw, ph) = self.target_bounds(info.width, info.height, 1.0, active_window);
@@ -1572,6 +1609,7 @@ impl CharacterOverlay {
                 if !self.walk.placed {
                     // everyone at once, anywhere along the strip
                     self.walk.placed = true;
+                    self.walk.energy = self.walk.rand();
                     self.walk.x = left_room + self.walk.rand() * (right_room - left_room);
                     self.walk.target = self.walk.x;
                     self.walk.timer = self.walk.rand() * 1.5;
@@ -1608,6 +1646,7 @@ impl CharacterOverlay {
                 if let Some(r) = self.walk.race.as_mut() {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
+                self.walk.reach = reach;
                 if let Some(r) = self.walk.social.as_mut() {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
@@ -1685,6 +1724,10 @@ impl CharacterOverlay {
             );
             self.program.set_f32(gl, "u_breath", breath - squash);
             self.program.set_f32(gl, "u_bounce", self.smooth_bounce + hop);
+            self.program.set_f32(gl, "u_rot", self.walk.rot);
+            self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
+            self.program.set_f32(gl, "u_aspect", w / h);
+            self.program.set_f32(gl, "u_pivot", f32::from(u8::from(self.walk.feet)));
             self.program
                 .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right)));
             self.program.set_i32(gl, "u_mode", mode);
@@ -1723,6 +1766,9 @@ impl CharacterOverlay {
 
         for e in &mut self.extras {
             e.render(gl, info, active_window, target)?;
+        }
+        if self.actor == 0 {
+            self.draw_ropes(gl, info, target);
         }
         Ok(())
     }

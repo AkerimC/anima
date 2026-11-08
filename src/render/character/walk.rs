@@ -1,6 +1,7 @@
 //! How the walking characters get about on their own: strolling, idling,
 //! hopping, running after the cursor or into a drawn circle.
 
+use crate::render::tuning::get as tn;
 use super::race::Racer;
 use super::social::Social;
 
@@ -59,16 +60,24 @@ pub(super) struct WalkState {
     pub(super) social_cool: f32,
     // play a gesture now (3D characters)
     pub(super) gesture: bool,
+    // social energy, see social.rs
+    pub(super) energy: f32,
+    // turned (radians) and sunk into the ground (half-heights)
+    pub(super) rot: f32,
+    // turned about the feet instead of the middle
+    pub(super) feet: bool,
+    pub(super) sink: f32,
+    // seconds of no new chats after a race or a big gathering
+    pub(super) crowd_rest: f32,
+    // seconds since it landed from being carried or thrown, counting down
+    pub(super) dropped: f32,
+    // how far a jump must go to reach the cursor (half-heights), last frame
+    pub(super) reach: f32,
     // animation time not yet given to the 3D model (skipped frames)
     pub(super) model_dt: f32,
 }
 
 pub(super) const PAT_DUR: f32 = 1.4;
-// each click while petting keeps it going at least this long
-pub(super) const PAT_KEEP: f32 = 0.6;
-
-pub(super) const JUMP_DUR: f32 = 0.9;
-pub(super) const JUMP_AMP: f32 = 2.0;
 
 impl WalkState {
     pub(super) fn rand(&mut self) -> f32 {
@@ -77,38 +86,58 @@ impl WalkState {
     }
 
     pub(super) fn pick(&mut self, min: f32, max: f32, can_chase: bool) {
-        let r = self.rand();
-        if r < 0.30 {
+        let t = tn();
+        // the four chances count relative to each other
+        let r = self.rand() * (t.walk_chance + t.idle_chance + t.jump_chance + t.chase_chance).max(0.001);
+        if r < t.walk_chance {
             // short or long stroll in a random direction
             let d = self.rand();
-            let dist = if d < 0.4 {
-                0.05 + self.rand() * 0.25
-            } else if d < 0.8 {
-                0.3 + self.rand() * 0.9
+            let dist = if d < t.short_share {
+                t.short_min + self.rand() * t.short_rand
+            } else if d < t.short_share + t.mid_share {
+                t.mid_min + self.rand() * t.mid_rand
             } else {
                 // a trip somewhere along niri's strip
                 self.rand() * (max - min)
             };
-            let mut dir = if self.rand() < 0.5 { -1.0 } else { 1.0 };
-            if (self.x + dir * dist).clamp(min, max) == self.x {
-                dir = -dir;
-            }
-            self.target = (self.x + dir * dist).clamp(min, max);
+            let dir = if self.rand() < 0.5 { -1.0 } else { 1.0 };
+            self.target = self.stroll_target(dir * dist, min, max);
             self.act = Act::Walk;
-        } else if r < 0.93 {
+        } else if r < t.walk_chance + t.idle_chance {
             self.act = Act::Idle;
-            self.timer = 1.0 + self.rand() * 3.0;
-        } else if r < 0.98 || !can_chase {
-            self.start_jump(JUMP_AMP);
+            self.timer = t.idle_min + self.rand() * t.idle_rand;
+        } else if r < t.walk_chance + t.idle_chance + t.jump_chance || !can_chase {
+            self.start_jump(tn().jump_height);
         } else {
             self.act = Act::Chase;
-            self.timer = 6.0; // give up if the cursor can't be reached
+            self.timer = tn().chase_give_up; // give up if the cursor can't be reached
+        }
+    }
+
+    /// Where a walk of `step` ends. Walks that would run off the end of the
+    /// area turn around instead of all piling up on its edge; only now and
+    /// then does one go all the way there.
+    fn stroll_target(&mut self, step: f32, min: f32, max: f32) -> f32 {
+        let margin = ((max - min) * 0.1).min(tn().edge_margin);
+        let (lo, hi) = (min + margin, max - margin);
+        let t = self.x + step;
+        if (lo..=hi).contains(&t) {
+            return t;
+        }
+        if self.rand() < tn().edge_trip {
+            return t.clamp(min, max);
+        }
+        let back = self.x - step;
+        if (lo..=hi).contains(&back) {
+            back
+        } else {
+            lo + self.rand() * (hi - lo).max(0.0)
         }
     }
 
     pub(super) fn start_pat(&mut self) {
         self.act = Act::Pat;
-        self.timer = PAT_KEEP;
+        self.timer = tn().pat_keep;
         self.jump = 0.0;
     }
 
@@ -117,7 +146,7 @@ impl WalkState {
         self.act = Act::Jump;
         self.jump_amp = amp;
         // higher jumps hang in the air a bit longer
-        self.jump_dur = JUMP_DUR * (amp / JUMP_AMP).sqrt().max(1.0);
+        self.jump_dur = tn().jump_time * (amp / tn().jump_height).sqrt().max(1.0);
         self.jump = self.jump_dur;
     }
 
@@ -132,7 +161,7 @@ impl WalkState {
             if *t <= 0.0 {
                 self.notify_jump = None;
                 if !matches!(self.act, Act::Pat | Act::Jump) {
-                    self.start_jump(JUMP_AMP);
+                    self.start_jump(tn().jump_height);
                 }
             }
         }
@@ -149,7 +178,7 @@ impl WalkState {
             && self.act != Act::Jump
         {
             self.act = Act::Chase;
-            self.timer = 6.0;
+            self.timer = tn().chase_give_up;
         }
         match self.act {
             Act::Idle => {
@@ -167,18 +196,18 @@ impl WalkState {
                         None => self.timer = 0.0,
                     }
                 }
-                let speed = if chase { 0.4 } else { 0.12 };
+                let speed = if chase { tn().chase_speed } else { tn().walk_speed };
                 let d = self.target - self.x;
                 // close enough counts as caught, or a cursor circling fast
                 // keeps flipping the target left and right
-                let catch = if chase { 0.015 } else { 0.0 };
+                let catch = if chase { tn().catch_radius } else { 0.0 };
                 if d.abs() <= speed * dt + catch {
                     if !chase {
                         self.x = self.target;
                     }
                     if chase {
                         // caught it: jump up to the cursor, chase is over
-                        self.start_jump(reach.max(JUMP_AMP));
+                        self.start_jump(reach.max(tn().jump_height));
                         self.catch_jump = true;
                     } else {
                         self.pick(min, max, mouse.is_some());
@@ -191,6 +220,7 @@ impl WalkState {
                         self.left = d < 0.0;
                     }
                     self.x += d.signum() * speed * dt;
+                    self.energy = (self.energy + speed * dt / tn().energy_walk.max(0.01)).min(1.0);
                     moving = true;
                 }
             }
@@ -199,7 +229,7 @@ impl WalkState {
                 self.timer -= dt;
                 if self.timer <= 0.0 {
                     // happy little hop afterwards
-                    self.start_jump(JUMP_AMP * 0.5);
+                    self.start_jump(tn().jump_height * 0.5);
                 }
             }
         }

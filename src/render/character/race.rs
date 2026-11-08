@@ -1,8 +1,9 @@
 //! Races: now and then one character wants to race, the others catch the
 //! mood one by one, gather at one end of a big window and set off together.
 
+use crate::render::tuning::get as tn;
 use super::CharacterOverlay;
-use super::walk::{Act, JUMP_AMP, WalkState};
+use super::walk::{Act, WalkState};
 
 /// Set over IPC (`anima race`): start a race now.
 pub static RACE_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -93,7 +94,7 @@ impl CharacterOverlay {
         let asked = RACE_NOW.swap(false, std::sync::atomic::Ordering::Relaxed);
         if self.race.is_none() {
             // about once every two hours
-            if n < 2 || !(asked || self.walk.rand() < dt / 7200.0) {
+            if n < 2 || !(asked || self.walk.rand() < dt / tn().race_every.max(1.0)) {
                 return;
             }
             let view_px = self.view[0] * w * 0.5;
@@ -110,10 +111,10 @@ impl CharacterOverlay {
             self.race = Some(Race {
                 start_px,
                 finish_px,
-                zone: (len * 0.25).max(220.0),
+                zone: (len * tn().race_zone).max(220.0),
                 phase: Phase::Gather,
                 next_join: 0.0,
-                countdown: 0.6,
+                countdown: tn().race_countdown,
                 winner: None,
                 order: Vec::new(),
                 cheer: 0.0,
@@ -148,16 +149,16 @@ impl CharacterOverlay {
                     if let Some(i) = pick {
                         let wk = self.walk_of(i);
                         let goal_px = lo + wk.rand() * (hi - lo);
-                        let speed = 0.22 + wk.rand() * 0.08;
+                        let speed = tn().race_gather_speed + wk.rand() * tn().race_gather_rand;
                         wk.race = Some(Racer { leg: Leg::ToStart, goal_px, goal: 0.0, speed, wait: 0.0, greeted: false, pace: 0.0, next_pace: 0.0, hop_cool: 0.0 });
                         wk.circle = false;
                         wk.social = None;
                         // a little hop: "let's race!"
                         if grounded(wk) {
-                            wk.start_jump(JUMP_AMP * 0.5);
+                            wk.start_jump(tn().jump_height * 0.5);
                         }
                     }
-                    race.next_join = 1.5 + self.walk.rand() * 2.5;
+                    race.next_join = tn().race_join_min + self.walk.rand() * tn().race_join_rand;
                 }
                 for i in 0..n {
                     let x = self.strip_px(i);
@@ -167,7 +168,7 @@ impl CharacterOverlay {
                     if !r.greeted && x >= lo && x <= hi {
                         r.greeted = true;
                         if grounded(wk) {
-                            wk.start_jump(JUMP_AMP * 0.6);
+                            wk.start_jump(tn().jump_height * 0.6);
                         }
                     }
                     // wander about the spot
@@ -175,7 +176,7 @@ impl CharacterOverlay {
                         r.wait -= dt;
                         if r.wait <= 0.0 {
                             r.goal_px = lo + wk.rand() * (hi - lo);
-                            r.speed = 0.06 + wk.rand() * 0.06;
+                            r.speed = tn().race_mill_speed + wk.rand() * tn().race_mill_rand;
                             r.wait = 1.5 + wk.rand() * 2.5;
                         }
                     }
@@ -188,7 +189,7 @@ impl CharacterOverlay {
                     })
                     .count();
                 // stragglers far along the strip don't hold it up forever
-                if here == n || (race.age > 90.0 && here >= 2) {
+                if here == n || (race.age > tn().race_wait && here >= 2) {
                     for i in 0..n {
                         let start = race.start_px;
                         let wk = self.walk_of(i);
@@ -225,7 +226,7 @@ impl CharacterOverlay {
                     for (k, &i) in runners.iter().enumerate() {
                         let finish = race.finish_px;
                         let wk = self.walk_of(i);
-                        let pace = 0.2 + k as f32 / m * 0.14;
+                        let pace = tn().race_pace + k as f32 / m * tn().race_pace_range;
                         let next_pace = 1.0 + wk.rand() * 1.5;
                         if let Some(r) = wk.race.as_mut() {
                             r.leg = Leg::Run;
@@ -259,8 +260,8 @@ impl CharacterOverlay {
                     // bursts and lulls
                     r.next_pace -= dt;
                     if r.next_pace <= 0.0 {
-                        r.pace = 0.2 + wk.rand() * 0.14;
-                        r.next_pace = 0.8 + wk.rand() * 1.7;
+                        r.pace = tn().race_pace + wk.rand() * tn().race_pace_range;
+                        r.next_pace = tn().race_pace_gap + wk.rand() * 1.7;
                     }
                     r.hop_cool -= dt;
                     let mut want = r.pace;
@@ -269,8 +270,8 @@ impl CharacterOverlay {
                         if r.hop_cool <= 0.0 {
                             r.hop_cool = 1.5;
                             // only the front runners fight for it by hopping over
-                            if lead < 3 && wk.rand() < 0.5 && grounded(wk) {
-                                wk.start_jump(JUMP_AMP * 0.55);
+                            if lead < tn().race_leaders as usize && wk.rand() < tn().race_hop_chance && grounded(wk) {
+                                wk.start_jump(tn().jump_height * 0.55);
                                 r.pace = r.pace.max(their + 0.06);
                                 r.speed = r.pace;
                             }
@@ -279,7 +280,7 @@ impl CharacterOverlay {
                             want = want.min(their - 0.02);
                         }
                     }
-                    r.speed = (r.speed + (want - r.speed) * (dt * 3.0).min(1.0)).clamp(0.15, 0.42);
+                    r.speed = (r.speed + (want - r.speed) * (dt * 3.0).min(1.0)).clamp(tn().race_pace * 0.75, tn().race_pace + tn().race_pace_range * 1.6);
                     wk.race = Some(r);
                 }
                 for i in 0..n {
@@ -289,7 +290,7 @@ impl CharacterOverlay {
                             race.winner = Some(i);
                             let wk = self.walk_of(i);
                             if grounded(wk) {
-                                wk.start_jump(JUMP_AMP * 1.2);
+                                wk.start_jump(tn().jump_height * 1.2);
                             }
                         }
                     }
@@ -314,7 +315,7 @@ impl CharacterOverlay {
                         }
                     }
                     race.phase = Phase::Cheer;
-                    race.cheer = 5.0;
+                    race.cheer = tn().race_cheer;
                 } else {
                     over = race.age > 60.0;
                 }
@@ -324,7 +325,7 @@ impl CharacterOverlay {
                 if let Some(i) = race.winner {
                     let wk = self.walk_of(i);
                     if race.cheer > 0.0 && grounded(wk) && wk.race.is_some_and(|r| r.leg == Leg::Lined) {
-                        wk.start_jump(JUMP_AMP * 0.9);
+                        wk.start_jump(tn().jump_height * 0.9);
                     }
                 }
                 over = race.cheer <= 0.0;
@@ -334,8 +335,12 @@ impl CharacterOverlay {
             log::debug!("race: over, winner {:?}", race.winner);
             for i in 0..n {
                 let wk = self.walk_of(i);
-                if wk.race.take().is_some() && Some(i) != race.winner && grounded(wk) {
-                    wk.start_jump(JUMP_AMP * 0.4);
+                let raced = wk.race.take().is_some();
+                if raced {
+                    wk.crowd_rest = tn().crowd_rest_base + wk.rand() * tn().crowd_rest_rand;
+                }
+                if raced && Some(i) != race.winner && grounded(wk) {
+                    wk.start_jump(tn().jump_height * 0.4);
                 }
             }
             return;

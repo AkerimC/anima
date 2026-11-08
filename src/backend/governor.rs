@@ -135,6 +135,10 @@ fn niri_layouts_changed(line: &str) -> bool {
 
 // last time something that can scroll the strip happened (niri event, swipe)
 static NIRI_ACTIVITY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+// after such an event keep asking this long, a new window may take a moment to start the scroll
+const NIRI_WAKE: Duration = Duration::from_millis(500);
+// the strip counts as stopped after not moving for this long
+const NIRI_SETTLE: Duration = Duration::from_millis(150);
 
 fn niri_activity() {
     *NIRI_ACTIVITY.lock().unwrap() = Some(std::time::Instant::now());
@@ -507,17 +511,28 @@ pub(super) fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
         .name("anima-niri-view".into())
         .spawn(move || {
             let mut last = std::time::Instant::now();
+            let mut last_view = f32::NAN;
+            let mut moved_at = std::time::Instant::now() - Duration::from_secs(1);
             loop {
             if NIRI_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
-                // ask every frame while the strip may be moving, rarely otherwise (each
-                // request costs niri a bit); check often so a scroll is caught at once
-                let busy = NIRI_ACTIVITY
+                // each request costs niri a bit, and it's busy animating right then: ask
+                // every frame only just after something happened or while the strip is
+                // really moving; check often so a scroll is caught at once
+                let woken = NIRI_ACTIVITY
                     .lock()
                     .unwrap()
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(1500));
+                    .is_some_and(|t| t.elapsed() < NIRI_WAKE);
+                let busy = woken
+                    || moved_at.elapsed() < NIRI_SETTLE
+                    || NIRI_GESTURE.load(std::sync::atomic::Ordering::Relaxed);
                 if busy || last.elapsed() > Duration::from_millis(250) {
                     niri_poll_view(&sock_view);
                     last = std::time::Instant::now();
+                    let view = STRIP.lock().unwrap().map_or(f32::NAN, |s| s.view_x);
+                    if (view - last_view).abs() > 0.01 {
+                        moved_at = last;
+                    }
+                    last_view = view;
                 }
                 std::thread::sleep(Duration::from_millis(7));
             } else {
