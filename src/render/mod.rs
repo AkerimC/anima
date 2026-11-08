@@ -7,8 +7,11 @@ pub mod model3d;
 pub mod scene;
 pub mod shader;
 pub mod tuning;
+pub mod text;
 pub mod video;
 pub mod web;
+pub mod we_effect;
+pub mod we_model;
 
 /// Per-frame state handed to every renderer.
 #[derive(Debug, Clone)]
@@ -69,4 +72,8 @@ pub trait Renderer {
     fn is_animated(&self) -> bool {
         true
     }
+
+    /// Release GPU resources.  Called before the renderer is dropped while the
+    /// GL context is still current; the default is a no-op.
+    fn destroy(&mut self, _gl: &glow::Context) {}
 }

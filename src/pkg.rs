@@ -73,7 +73,8 @@ impl PackageFs {
         v
     }
 
-    /// Read a relative path from disk first, falling back to the `.pkg` archive.
+    /// Read a relative path from disk first, falling back to the `.pkg` archive
+    /// and finally Wallpaper Engine's global `assets/` directory.
     pub fn read(&self, rel: &str) -> Result<Vec<u8>> {
         let key = normalize_key(rel);
         let disk_path = self.root.join(&key);
@@ -91,6 +92,11 @@ impl PackageFs {
                 return Ok(v.clone());
             }
         }
+        if let Some(we_path) = resolve_we_asset(&key) {
+            if let Ok(bytes) = fs::read(&we_path) {
+                return Ok(bytes);
+            }
+        }
         bail!("asset not found in package or disk: {rel}")
     }
 
@@ -105,9 +111,14 @@ impl PackageFs {
             return true;
         }
         let lower = key.to_ascii_lowercase();
-        self.entries
+        if self
+            .entries
             .keys()
             .any(|k| k.to_ascii_lowercase() == lower)
+        {
+            return true;
+        }
+        resolve_we_asset(&key).is_some()
     }
 
     /// Load an image or `.tex` texture by relative path (or material path).
@@ -118,6 +129,8 @@ impl PackageFs {
             format!("materials/{key}"),
             format!("materials/{key}.tex"),
             format!("{key}.tex"),
+            format!("materials/{key}.png"),
+            format!("{key}.png"),
         ];
 
         for cand in &candidates {
@@ -132,6 +145,8 @@ impl PackageFs {
                 return Ok(DecodedTex {
                     image: img,
                     spritesheet: None,
+                    clamp_uvs: false,
+                    no_interpolation: false,
                 });
             }
         }
@@ -181,6 +196,51 @@ fn normalize_key(path: &str) -> String {
         .trim_start_matches("./")
         .trim_start_matches('/')
         .to_string()
+}
+
+pub fn resolve_we_asset(rel: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let home = Path::new(&home);
+    let roots = [
+        home.join(".local/share/Steam/steamapps/common/wallpaper_engine/assets"),
+        home.join(".steam/steam/steamapps/common/wallpaper_engine/assets"),
+    ];
+    for base in &roots {
+        if !base.is_dir() {
+            continue;
+        }
+        let direct = base.join(rel);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        // Check presets/*/<rel> and effects/*/<rel> when Wallpaper Engine groups
+        // built-in preset/effect assets into subdirectories.
+        if rel.starts_with("particles/presets/") || rel.starts_with("materials/presets/") {
+            if let Ok(entries) = fs::read_dir(base.join("presets")) {
+                for entry in entries.flatten() {
+                    let cand = entry.path().join(rel);
+                    if cand.is_file() {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+        if rel.starts_with("materials/effects/") || rel.starts_with("shaders/effects/") {
+            if let Ok(entries) = fs::read_dir(base.join("effects")) {
+                for entry in entries.flatten() {
+                    let cand = entry.path().join(rel);
+                    if cand.is_file() {
+                        return Some(cand);
+                    }
+                    let cand_prev = entry.path().join("preview").join(rel);
+                    if cand_prev.is_file() {
+                        return Some(cand_prev);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parse a Wallpaper Engine `PKGV` file into `(path, bytes)` entries.
@@ -242,6 +302,8 @@ pub struct SpritesheetMeta {
 pub struct DecodedTex {
     pub image: RgbaImage,
     pub spritesheet: Option<SpritesheetMeta>,
+    pub clamp_uvs: bool,
+    pub no_interpolation: bool,
 }
 
 /// Decode a Wallpaper Engine `.tex` binary buffer into an `RgbaImage`.
@@ -263,6 +325,8 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
     let img_width = r.read_u32()?;
     let img_height = r.read_u32()?;
     let _unk = r.read_u32()?;
+    let no_interpolation = (flags & 1) != 0;
+    let clamp_uvs = (flags & 2) != 0;
 
     let texb = r.read_c_magic(9)?;
     if !texb.starts_with("TEXB") {
@@ -311,9 +375,13 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
         let decoded = image::load_from_memory(&payload)
             .context("decoding embedded image in .tex")?
             .to_rgba8();
+        let cropped = crop_if_needed(decoded, img_width, img_height, flags);
+        let spritesheet = parse_texs_spritesheet(data, cropped.width(), cropped.height());
         return Ok(DecodedTex {
-            image: crop_if_needed(decoded, img_width, img_height, flags),
-            spritesheet: None,
+            image: cropped,
+            spritesheet,
+            clamp_uvs,
+            no_interpolation,
         });
     }
 
@@ -336,10 +404,52 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
     let full = RgbaImage::from_raw(mip_width, mip_height, rgba)
         .context("constructing RgbaImage from decoded .tex")?;
     let _ = (tex_width, tex_height);
+    let cropped = crop_if_needed(full, img_width, img_height, flags);
+    let spritesheet = parse_texs_spritesheet(data, cropped.width(), cropped.height());
 
     Ok(DecodedTex {
-        image: crop_if_needed(full, img_width, img_height, flags),
-        spritesheet: None,
+        image: cropped,
+        spritesheet,
+        clamp_uvs,
+        no_interpolation,
+    })
+}
+
+fn parse_texs_spritesheet(data: &[u8], img_w: u32, img_h: u32) -> Option<SpritesheetMeta> {
+    let idx = data.windows(7).position(|w| w == b"TEXS000")?;
+    if idx + 13 > data.len() {
+        return None;
+    }
+    let ver = data.get(idx + 7).copied().unwrap_or(b'2');
+    let frames = u32::from_le_bytes(data[idx + 9..idx + 13].try_into().ok()?);
+    if frames == 0 || frames > 4096 {
+        return None;
+    }
+    let frame0_off = if ver >= b'3' { idx + 21 } else { idx + 13 };
+    if frame0_off + 28 > data.len() {
+        return None;
+    }
+    let f = |off: usize| -> f32 {
+        f32::from_le_bytes(data[off..off + 4].try_into().unwrap_or([0; 4]))
+    };
+    let dt = f(frame0_off + 4);
+    let xax_x = f(frame0_off + 16);
+    let xax_y = f(frame0_off + 20);
+    let yax_x = f(frame0_off + 24);
+    let yax_y = f(frame0_off + 28);
+    let fw = xax_x.hypot(xax_y);
+    let fh = yax_x.hypot(yax_y);
+    if fw < 1.0 || fh < 1.0 {
+        return None;
+    }
+    let cols = (img_w as f32 / fw).round().max(1.0) as u32;
+    let rows = (img_h as f32 / fh).round().max(1.0) as u32;
+    let frame_time = if dt > 0.0001 { dt } else { 1.0 / 30.0 };
+    Some(SpritesheetMeta {
+        cols,
+        rows,
+        frames,
+        duration: (frame_time * frames as f32).max(0.01),
     })
 }
 
@@ -453,8 +563,8 @@ fn decode_rg88(data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(pixels * 4);
     for i in 0..pixels {
         let r = data[i * 2];
-        let a = data[i * 2 + 1];
-        out.extend_from_slice(&[r, r, r, a]);
+        let g = data[i * 2 + 1];
+        out.extend_from_slice(&[r, g, g, g]);
     }
     Ok(out)
 }

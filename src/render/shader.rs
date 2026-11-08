@@ -289,6 +289,16 @@ impl Renderer for ShaderRenderer {
     fn describe(&self) -> String {
         format!("shader {}", self.path.display())
     }
+
+    fn destroy(&mut self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_texture(self.spectrum_tex);
+            gl.delete_texture(self.noise_tex);
+            gl.delete_vertex_array(self.triangle.vao);
+            gl.delete_buffer(self.triangle.vbo);
+        }
+        self.program.destroy(gl);
+    }
 }
 
 fn detect_audio_usage(source: &str) -> bool {
@@ -447,6 +457,14 @@ impl Renderer for FallbackRenderer {
 
     fn is_animated(&self) -> bool {
         true
+    }
+
+    fn destroy(&mut self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_vertex_array(self.triangle.vao);
+            gl.delete_buffer(self.triangle.vbo);
+        }
+        self.program.destroy(gl);
     }
 }
 

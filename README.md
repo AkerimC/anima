@@ -21,7 +21,7 @@ with EGL / OpenGL ES 3.0. No Electron, no Chromium, no XWayland.
 | Animated GIF | ✅ native |
 | Video (mp4/webm/mkv/mov/avi/m4v/ogv) | ✅ libmpv + hardware decode |
 | GLSL shader wallpapers (`.frag`) | ✅ native |
-| Scene wallpapers (`scene.toml`, Wallpaper Engine `.pkg`) | ✅ native particle/scene renderer |
+| Scene wallpapers (`scene.toml`, Wallpaper Engine `.pkg`) | ✅ native renderer: image/text/particle layers, layer effects, puppet skeletons |
 | Web wallpapers (HTML/CSS/JS) | ⚠️ approximated — see [Limitations](#limitations) |
 | Desktop character / mascot | ✅ procedural presets + sprite images |
 | Audio-reactive wallpapers & characters | ✅ PulseAudio/PipeWire monitor + FFT |
@@ -48,6 +48,10 @@ The engine is built around "do nothing when nothing changes":
   or character is audio-reactive.
 - **Fullscreen / maximized / battery** pause is event-driven, not polled. The
   character overlay is hidden while a fullscreen window is focused.
+- **Switching wallpapers reclaims GPU resources.** Render targets, programs,
+  textures, meshes and VAOs are deleted explicitly while the EGL context is
+  current, so RAM and GTT stay flat across repeated scene/video/web switches.
+
 
 ## Requirements
 
@@ -197,11 +201,26 @@ then `source = "~/.local/share/anima/ba/Airi/Airi.glb"`, or pick it in
   supported yet.
 - **Scenes** — `scene.toml` with layers and particle presets (`stars`,
   `fireflies`, `embers`, `sakura`, …), parallax and audio reactivity.
-  Wallpaper Engine `scene.pkg` archives are supported for 2D image-layer
-  scenes: model/material resolution, texture decoding (RGBA, DXT1/3/5, LZ4),
-  screen-space layout, blend modes, layer effects and preset-driven particles
-  (rain, snow, sakura, fog, embers, stars). 3D/perspective meshes and
-  `application` wallpapers are not implemented.
+  Wallpaper Engine `scene.pkg` archives are supported: model/material
+  resolution, texture decoding (RGBA, DXT1/3/5, LZ4), the full layered scene
+  graph (element order is draw order), parallax, blend modes, text/clock/date
+  layers, skeletal puppet meshes (`MDLV`/`MDLS`/`MDLA` animation layers) and
+  per-layer effect stacks.
+
+  Puppet meshes use the skeleton's assembled reference pose (the extra MDLS
+  matrix array) or, when absent, the first keyframe of the first clip as the
+  neutral pose; animation layers are applied as relative motion tracks on top
+  of it. This keeps modelled parts that are stored in an exploded texture-sheet
+  layout assembled on screen.
+
+  Wallpaper Engine effects are shipped as HLSL-flavoured GLSL. The engine
+  translates them at load time (preprocessor, combo defines, implicit
+  int/float and vector-width coercion, global initializer hoisting, builtin
+  redefinitions, `%`/array-index rules, return-value truncation) rather than
+  patching individual shaders, so community effects keep working as new
+  wallpapers are downloaded. The bundled 19-scene Workshop test library
+  currently compiles with zero shader failures.
+
 - **Web** — metadata-driven HUD (see below).
 
 ## Limitations
@@ -217,9 +236,14 @@ These are deliberate, documented gaps rather than bugs:
 3. **Wayland only.** X11 and Windows/macOS are out of scope.
 4. **Fullscreen detection uses Hyprland's IPC socket.** On other compositors
    the wallpaper still renders, but pause-on-fullscreen is a no-op.
-5. **Wallpaper Engine compatibility is partial.** Common 2D scene and video
-   wallpapers work. 3D/perspective meshes, multi-pass shader materials and
-   `application` wallpapers are unsupported on Linux.
+5. **Wallpaper Engine compatibility is partial.** Common 2D scene, video and
+   effect-heavy wallpapers work. Not yet implemented: scene render-target
+   composition (`_rt_imageLayerComposite_*` / `copybackground` instanced solid
+   layers such as day-night composites — these are skipped instead of being
+   drawn as white rectangles), 3D/perspective meshes, Wallpaper Engine's native
+   particle systems beyond the generic emitter model, and `application`
+   wallpapers. Custom effect math may still differ visually from the original.
+
 6. **Audio analysis is PulseAudio/PipeWire only** (loaded dynamically; the
    daemon still runs without it).
 7. **No per-wallpaper sandboxing.** Shaders and scenes are trusted input.
