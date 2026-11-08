@@ -188,12 +188,18 @@ Runtime changes via the CLI are persisted back to this file.
   layers, skeletal puppet meshes (`MDLV`/`MDLS`/`MDLA` animation layers) and
   per-layer effect stacks.
 
+  Puppet meshes use the skeleton's assembled reference pose (the extra MDLS
+  matrix array) or, when absent, the first keyframe of the first clip as the
+  neutral pose; animation layers are applied as relative motion tracks on top
+  of it. This keeps modelled parts that are stored in an exploded texture-sheet
+  layout assembled on screen.
+
   Wallpaper Engine effects are shipped as HLSL-flavoured GLSL. The engine
   translates them at load time (preprocessor, combo defines, implicit
   int/float and vector-width coercion, global initializer hoisting, builtin
   redefinitions, `%`/array-index rules, return-value truncation) rather than
   patching individual shaders, so community effects keep working as new
-  wallpapers are downloaded. The bundled 18-scene Workshop test library
+  wallpapers are downloaded. The bundled 19-scene Workshop test library
   currently compiles with zero shader failures.
 
 - **Web** — metadata-driven HUD (see below).
