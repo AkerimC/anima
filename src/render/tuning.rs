@@ -198,6 +198,9 @@ tuning! {
         tug_time: "En uzun süre (sn)" = 16.0, 3.0, 120.0, 1.0, 0;
         tug_pull: "Çekiş gücü" = 90.0, 5.0, 500.0, 5.0, 0;
         tug_speed: "En yüksek hız (piksel/sn)" = 90.0, 5.0, 800.0, 5.0, 0;
+        tug_cursor: "İmleçle çekme gücü" = 1.0, 0.0, 5.0, 0.1, 1;
+        tug_resist_time: "İmlece direnme süresi (sn)" = 4.0, 0.1, 30.0, 0.5, 1;
+        tug_cut_clicks: "Halatın kopması için tıklama" = 6.0, 2.0, 30.0, 1.0, 0;
         tug_lean: "Geriye yaslanma" = 0.22, 0.0, 0.8, 0.02, 2;
         tug_fling_min: "Kaybedenin savrulması (piksel)" = 400.0, 0.0, 3000.0, 50.0, 0;
         tug_fling_rand: "Savrulmaya eklenen rastgele (piksel)" = 350.0, 0.0, 3000.0, 50.0, 0;
@@ -205,8 +208,11 @@ tuning! {
     "Oyunlar", "Ebelemece" {
         tag_time_min: "Süre (sn)" = 18.0, 3.0, 180.0, 1.0, 0;
         tag_time_rand: "Eklenen rastgele (sn)" = 7.0, 0.0, 180.0, 1.0, 0;
-        tag_arena: "Oyun alanı (piksel, iki yana; en büyük = tüm şerit)" = 20000.0, 100.0, 20000.0, 100.0, 0;
         tag_pace: "Hızlanıp yavaşlama" = 0.45, 0.0, 0.9, 0.05, 2;
+        tag_wait: "Ebenin başlamadan beklemesi (sn)" = 2.0, 0.0, 15.0, 0.5, 1;
+        tag_delay: "Ebenin geri dönme gecikmesi (sn)" = 0.45, 0.0, 3.0, 0.05, 2;
+        tag_leap_range: "Köşeden zıplayarak kaçma mesafesi (piksel)" = 350.0, 0.0, 2000.0, 25.0, 0;
+        tag_leap_pace: "Zıplamak için gereken hız (normale göre)" = 1.05, 0.5, 2.0, 0.05, 2;
         tag_run: "Kaçma hızı" = 0.26, 0.02, 2.0, 0.01, 2;
         tag_it: "Ebenin hızı" = 0.34, 0.02, 2.0, 0.01, 2;
     }
@@ -224,7 +230,7 @@ tuning! {
         race_gather_rand: "Eklenen rastgele hız" = 0.08, 0.0, 2.0, 0.01, 2;
         race_mill_speed: "Alanda dolaşma hızı" = 0.06, 0.01, 1.0, 0.01, 2;
         race_mill_rand: "Eklenen rastgele hız" = 0.06, 0.0, 1.0, 0.01, 2;
-        race_zone: "Toplanma alanı (pistin oranı)" = 0.25, 0.05, 1.0, 0.05, 2;
+        race_zone: "Toplanma alanı (pistin oranı, en çok 600 piksel)" = 0.25, 0.05, 1.0, 0.05, 2;
         race_wait: "Gelmeyenleri bekleme (sn)" = 90.0, 5.0, 600.0, 5.0, 0;
         race_countdown: "Başlamadan önce (sn)" = 0.6, 0.0, 10.0, 0.1, 1;
     }
@@ -234,6 +240,9 @@ tuning! {
         race_pace_gap: "Hız değişme aralığı (sn)" = 0.8, 0.1, 10.0, 0.1, 1;
         race_hop_chance: "Üstünden zıplama şansı" = 0.5, 0.0, 1.0, 0.05, 2;
         race_leaders: "Zıplayabilen öndekiler" = 3.0, 0.0, 12.0, 1.0, 0;
+        race_hit_chance: "Öndekine vurup fırlatma şansı" = 0.15, 0.0, 1.0, 0.05, 2;
+        race_hit_min: "Vurulanın savrulması (piksel)" = 200.0, 0.0, 3000.0, 25.0, 0;
+        race_hit_rand: "Savrulmaya eklenen rastgele (piksel)" = 300.0, 0.0, 3000.0, 25.0, 0;
         race_cheer: "Kazananın sevinmesi (sn)" = 5.0, 0.0, 30.0, 0.5, 1;
     }
 }

@@ -1239,6 +1239,13 @@ impl CharacterOverlay {
             .collect()
     }
 
+    /// Where the cursor belongs to us: the characters, and a rope in play.
+    pub fn input_rects(&self) -> Vec<[f32; 4]> {
+        let mut v = self.hit_rects();
+        v.extend(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 16.0, x1, y0.max(y1) + 16.0]));
+        v
+    }
+
     pub fn uses_audio(&self) -> bool {
         self.config.enabled && self.config.audio_reactive
     }

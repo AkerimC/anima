@@ -963,7 +963,7 @@ impl App {
                         if fo.windowed {
                         } else if let Ok(region) = Region::new(compositor) {
                             let sc = oc.scale.max(1) as f32;
-                            for r in ch.hit_rects() {
+                            for r in ch.input_rects() {
                                 let (x, y) = ((r[0] / sc) as i32, (r[1] / sc) as i32);
                                 let (w, h) = (((r[2] - r[0]) / sc) as i32, ((r[3] - r[1]) / sc) as i32);
                                 if w > 0 && h > 0 {

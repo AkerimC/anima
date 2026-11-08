@@ -15,9 +15,14 @@ impl CharacterOverlay {
             let n = crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
             if n != self.notified {
                 self.notified = n;
-                self.walk.notify_jump = Some(0.0);
+                let free = |w: &WalkState| !w.social.is_some_and(|s| s.no_touch);
+                if free(&self.walk) {
+                    self.walk.notify_jump = Some(0.0);
+                }
                 for (i, e) in self.extras.iter_mut().enumerate() {
-                    e.walk.notify_jump = Some(0.12 * (i + 1) as f32);
+                    if free(&e.walk) {
+                        e.walk.notify_jump = Some(0.12 * (i + 1) as f32);
+                    }
                 }
             }
         }
@@ -41,8 +46,10 @@ impl CharacterOverlay {
                 Some(e) => &mut e.walk,
                 None => &mut self.walk,
             };
-            wk.circle = true;
-            wk.circle_target = at;
+            if !wk.social.is_some_and(|s| s.no_touch) {
+                wk.circle = true;
+                wk.circle_target = at;
+            }
         }
 
         // press and hold on a character: pick it up
@@ -53,11 +60,14 @@ impl CharacterOverlay {
                 self.press = None;
             } else if self.press.is_none() {
                 let [mx, my] = info.mouse;
-                let hit = |r: &[f32; 4]| mx >= r[0] && mx <= r[2] && my >= r[1] && my <= r[3];
+                let hit = |a: &CharacterOverlay| {
+                    let r = a.hit_rect;
+                    mx >= r[0] && mx <= r[2] && my >= r[1] && my <= r[3] && !a.walk.social.is_some_and(|s| s.no_touch)
+                };
                 let target = (1..=self.extras.len())
                     .rev()
-                    .find(|&i| hit(&self.extras[i - 1].hit_rect))
-                    .or_else(|| hit(&self.hit_rect).then_some(0));
+                    .find(|&i| hit(&self.extras[i - 1]))
+                    .or_else(|| hit(self).then_some(0));
                 // measure the grab point now: the cursor may be far away by pick-up time
                 let target = target.map(|i| {
                     let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
@@ -130,7 +140,7 @@ impl CharacterOverlay {
                 self.extras.iter().map(|e| e.hit_rect.map(|v| v.round())).collect::<Vec<_>>()
             );
             // only on the ground: petting mid-jump or while carried breaks the motion
-            let grounded = |w: &WalkState| !matches!(w.act, Act::Jump | Act::Held | Act::Fall);
+            let grounded = |w: &WalkState| !matches!(w.act, Act::Jump | Act::Held | Act::Fall) && !w.social.is_some_and(|s| s.no_touch);
             if let Some(e) = self.extras.iter_mut().rev().find(|e| hit(&e.hit_rect)) {
                 if grounded(&e.walk) {
                     e.walk.start_pat();
@@ -196,6 +206,7 @@ impl CharacterOverlay {
                     self.walk.air = 0.0;
                     self.walk.vx = 0.0;
                     self.walk.vy = 0.0;
+                    self.walk.tumble = 0.0;
                     if self.walk.social.is_some_and(|s| s.flying) {
                         self.walk.plant();
                     } else {

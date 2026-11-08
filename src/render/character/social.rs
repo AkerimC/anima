@@ -45,6 +45,12 @@ pub(super) struct Social {
     pace: f32,
     pace_goal: f32,
     pace_wait: f32,
+    // tag: jumping over "it" to get out of a corner, moving through the air
+    leaping: bool,
+    // tag: has reached the playing window, and only now keeps inside it
+    inside: bool,
+    // on the rope: nothing but the rope itself can be touched
+    pub(super) no_touch: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -77,7 +83,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new() }
+        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false }
     }
 }
 
@@ -147,8 +153,22 @@ pub(super) struct Chat {
     regroup: bool,
     // started from the settings window: play this as soon as they're lined up
     forced: Option<Game>,
-    // tag: who was "it" just now and can't be tagged straight back
+    // tag: who was "it" just now and can't be tagged straight back, and for
+    // how much longer
     recent: Vec<usize>,
+    tag_free: f32,
+    // how long the one being chased has been on the other side
+    tag_turn: f32,
+    // the rope held with the cursor: where the cursor and the rope were then
+    tug_grab: Option<(f32, f32)>,
+    // seconds it's been held like that
+    tug_held: f32,
+    // clicks seen so far, and those landing on the middle of the rope lately
+    tug_clicks: u32,
+    cuts: u32,
+    cut_timer: f32,
+    // a game that ends with everyone hopping, no winner
+    all_cheer: bool,
 }
 
 /// How many in one chat set off a race: a minimum, and in a bigger team a
@@ -201,6 +221,7 @@ impl WalkState {
             return None;
         }
         let r = self.social.as_mut()?;
+        r.leaping = false;
         if r.moving {
             let d = r.goal - self.x;
             let s = r.speed * dt;
@@ -246,6 +267,11 @@ impl WalkState {
     /// Spin in the air, stay as planted, otherwise get back upright.
     fn update_pose(&mut self, dt: f32) {
         use std::f32::consts::{PI, TAU};
+        if self.tumble != 0.0 {
+            self.rot += self.tumble * dt;
+            self.feet = false;
+            return;
+        }
         match self.social {
             Some(s) if s.flying => {
                 self.rot += s.spin * dt;
@@ -267,6 +293,22 @@ impl WalkState {
                     self.feet = false;
                 }
             }
+        }
+    }
+
+    /// Leaping over someone: keeps moving while in the air.
+    pub(super) fn social_hop(&mut self, dt: f32) {
+        let Some(r) = self.social.as_mut().filter(|r| r.leaping && r.moving) else { return };
+        let d = r.goal - self.x;
+        let s = r.speed * dt;
+        if d.abs() > 1e-4 {
+            self.left = d < 0.0;
+        }
+        if d.abs() <= s {
+            self.x = r.goal;
+            r.moving = false;
+        } else {
+            self.x += d.signum() * s;
         }
     }
 
@@ -416,7 +458,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0 });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false });
     }
 
     /// Two standing close, on screen and free: maybe they notice each other.
@@ -636,7 +678,7 @@ impl CharacterOverlay {
         self.walk_ref(i).social.map_or(0.0, |s| s.goal_px)
     }
 
-    fn strip_width(&self) -> f32 {
+    pub(super) fn strip_width(&self) -> f32 {
         crate::backend::compositor::current().strip().map_or(self.view_w, |s| s.width.max(self.view_w))
     }
 
@@ -674,9 +716,14 @@ impl CharacterOverlay {
         let gap = size * 0.72;
         for (k, &(i, _)) in row.iter().enumerate() {
             let happy = self.walk_ref(i).social.is_some_and(|r| r.happy);
-            self.go(i, mid + (k as f32 - (count - 1.0) * 0.5) * gap, 0.16);
+            let slot = mid + (k as f32 - (count - 1.0) * 0.5) * gap;
+            self.go(i, slot, 0.16);
             if let Some(r) = self.walk_of(i).social.as_mut() {
                 r.happy = happy;
+                // waiting for the others: towards the middle of the row
+                if (slot - mid).abs() > 1.0 {
+                    r.face_left = mid < slot;
+                }
             }
         }
     }
@@ -913,27 +960,48 @@ impl CharacterOverlay {
         }
     }
 
-    /// Both ends of each rope in play, surface px (x0, y0, x1, y1), held at
-    /// hand height by the one at the back of each side.
-    pub(super) fn rope_ends(&self) -> Vec<[f32; 4]> {
+    /// The rope of a tug of war in play: both ends, surface px (x0, y0, x1,
+    /// y1), held at hand height by the one at the back of each side.
+    fn rope_of(&self, c: &Chat) -> Option<[f32; 4]> {
+        if c.stage != Stage::Tug || c.step != 1 {
+            return None;
+        }
         let n = self.extras.len() + 1;
         let hand = |i: usize| {
             let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
             ((r[0] + r[2]) * 0.5, r[1] + (r[3] - r[1]) * 0.62)
         };
-        self.chats
-            .iter()
-            .filter(|c| c.stage == Stage::Tug && c.step == 1)
-            .filter_map(|c| {
-                let ends = |team: &Vec<usize>| -> Vec<(f32, f32)> {
-                    team.iter().filter(|&&i| i < n && c.members.contains(&i)).map(|&i| hand(i)).collect()
-                };
-                let (left, right) = (ends(&c.teams.0), ends(&c.teams.1));
-                let a = left.iter().copied().min_by(|p, q| p.0.total_cmp(&q.0))?;
-                let b = right.iter().copied().max_by(|p, q| p.0.total_cmp(&q.0))?;
-                Some([a.0, a.1, b.0, b.1])
-            })
-            .collect()
+        let ends = |team: &Vec<usize>| -> Vec<(f32, f32)> {
+            team.iter().filter(|&&i| i < n && c.members.contains(&i)).map(|&i| hand(i)).collect()
+        };
+        let (left, right) = (ends(&c.teams.0), ends(&c.teams.1));
+        let a = left.iter().copied().min_by(|p, q| p.0.total_cmp(&q.0))?;
+        let b = right.iter().copied().max_by(|p, q| p.0.total_cmp(&q.0))?;
+        Some([a.0, a.1, b.0, b.1])
+    }
+
+    pub(super) fn rope_ends(&self) -> Vec<[f32; 4]> {
+        self.chats.iter().filter_map(|c| self.rope_of(c)).collect()
+    }
+
+    /// The cursor is on the middle third of the rope.
+    fn on_rope_middle(&self, c: &Chat, mouse: [f32; 2]) -> bool {
+        let Some([x0, y0, x1, y1]) = self.rope_of(c) else { return false };
+        let t = (mouse[0] - x0) / (x1 - x0).abs().max(1.0);
+        (0.3..=0.7).contains(&t) && (mouse[1] - (y0 + (y1 - y0) * t)).abs() < 34.0
+    }
+
+    /// A press that started on the rope takes hold of it.
+    fn rope_grab(&self, c: &Chat, mouse: [f32; 2]) -> Option<(f32, f32)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !crate::backend::pointer::BUTTON_DOWN.load(Relaxed) || crate::backend::pointer::DRAGGING.load(Relaxed) {
+            return None;
+        }
+        let (_, at, _) = self.press?;
+        let [x0, y0, x1, y1] = self.rope_of(c)?;
+        let t = ((at[0] - x0) / (x1 - x0).abs().max(1.0)).clamp(0.0, 1.0);
+        let on_rope = at[0] >= x0 - 20.0 && at[0] <= x1 + 20.0 && (at[1] - (y0 + (y1 - y0) * t)).abs() < 30.0;
+        on_rope.then_some((mouse[0], c.offset))
     }
 
     /// Tug of war: two sides facing each other, the whole line swaying until
@@ -956,7 +1024,18 @@ impl CharacterOverlay {
         for &(i, x) in &c.base.clone() {
             self.go(i, x, 0.2);
         }
+        // the only way into this game is the rope
+        for k in 0..c.members.len() {
+            let i = c.members[k];
+            let wk = self.walk_of(i);
+            wk.notify_jump = None;
+            if let Some(r) = wk.social.as_mut() {
+                r.no_touch = true;
+            }
+        }
         c.teams = (left, right);
+        c.tug_clicks = crate::backend::pointer::CLICKS.load(std::sync::atomic::Ordering::Relaxed);
+        c.cuts = 0;
         c.offset = 0.0;
         c.pull = 0.0;
         c.pull_target = 0.0;
@@ -968,7 +1047,7 @@ impl CharacterOverlay {
         c.stage = Stage::Tug;
     }
 
-    fn run_tug(&mut self, c: &mut Chat, dt: f32) {
+    fn run_tug(&mut self, c: &mut Chat, dt: f32, mouse: [f32; 2]) {
         c.wait -= dt;
         match c.step {
             0 => {
@@ -997,7 +1076,56 @@ impl CharacterOverlay {
                     c.pull_target = (force * tn().tug_pull).clamp(-tn().tug_speed, tn().tug_speed);
                 }
                 c.pull += (c.pull_target - c.pull) * (dt * 3.0).min(1.0);
-                c.offset += c.pull * dt;
+                // clicked to bits in the middle: it snaps and everybody goes flying
+                let clicks = crate::backend::pointer::CLICKS.load(std::sync::atomic::Ordering::Relaxed);
+                c.cut_timer -= dt;
+                if clicks != c.tug_clicks {
+                    c.tug_clicks = clicks;
+                    if self.on_rope_middle(c, mouse) {
+                        if c.cut_timer <= 0.0 {
+                            c.cuts = 0;
+                        }
+                        c.cuts += 1;
+                        c.cut_timer = 1.5;
+                        log::debug!("chat {}: rope clicked {} times", c.id, c.cuts);
+                    }
+                }
+                if c.cuts as f32 >= tn().tug_cut_clicks {
+                    log::debug!("chat {}: the rope snaps", c.id);
+                    for k in 0..c.members.len() {
+                        let i = c.members[k];
+                        let dir = if self.walk.rand() < 0.5 { -1.0 } else { 1.0 };
+                        let distance = tn().tug_fling_min + self.walk.rand() * tn().tug_fling_rand;
+                        let time = 0.7 + self.walk.rand() * 0.5;
+                        if let Some(r) = self.walk_of(i).social.as_mut() {
+                            r.lean = 0.0;
+                        }
+                        self.fling(i, dir, distance, time);
+                    }
+                    c.scores.clear();
+                    c.wait = 1.6;
+                    c.step = 2;
+                    return;
+                }
+                // cheating: the rope goes where the cursor drags it
+                if !crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                    c.tug_grab = None;
+                } else if c.tug_grab.is_none() {
+                    c.tug_grab = self.rope_grab(c, mouse);
+                    c.tug_held = 0.0;
+                }
+                if let Some((from, offset)) = c.tug_grab {
+                    // they fight it hard at first and tire the longer it goes on
+                    c.tug_held += dt;
+                    let resist = (1.0 - c.tug_held / tn().tug_resist_time.max(0.01)).clamp(0.0, 1.0);
+                    let want = offset + (mouse[0] - from) * tn().tug_cursor;
+                    let gap = want - c.offset;
+                    c.offset += gap * (dt * (1.0 + 11.0 * (1.0 - resist))).min(1.0);
+                    c.offset -= gap.signum() * resist * tn().tug_speed * 0.6 * dt;
+                    c.pull = 0.0;
+                } else {
+                    c.offset += c.pull * dt;
+                }
                 for k in 0..c.base.len() {
                     let (i, x) = c.base[k];
                     if c.members.contains(&i) {
@@ -1048,19 +1176,57 @@ impl CharacterOverlay {
     /// Whoever spent the least time being "it" wins.
     fn start_tag(&mut self, c: &mut Chat) {
         log::debug!("chat {}: tag", c.id);
-        let mid = c.members.iter().map(|&i| self.strip_px(i)).sum::<f32>() / c.members.len() as f32;
-        let width = self.strip_width();
-        let lo = (mid - tn().tag_arena).max(tn().edge_px.min(width * 0.5));
-        let hi = (mid + tn().tag_arena).min((width - tn().edge_px).max(width * 0.5));
+        // one big window is the playground: everyone goes there first
+        let (x, cw) = self.big_window();
+        let (lo, hi) = (x + 40.0, x + cw - 40.0);
+        log::debug!("chat {}: playing in the window at {x:.0}, {cw:.0} wide", c.id);
         c.spots = vec![lo, hi];
         c.it = c.members[(self.walk.rand() * c.members.len() as f32) as usize % c.members.len()];
+        // "it" stays put and waits, the others run there
+        for k in 0..c.members.len() {
+            let i = c.members[k];
+            if i == c.it {
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.moving = false;
+                    r.happy = false;
+                }
+            } else {
+                let spot = lo + self.walk.rand() * (hi - lo).max(0.0);
+                let speed = tn().tag_run * 1.2;
+                self.go_facing(i, spot, speed);
+            }
+        }
         c.scores = c.members.iter().map(|&i| (i, 0.0)).collect();
         c.offset = 0.0;
         c.chase = c.it;
-        c.wait = 1.0;
-        c.timer = tn().tag_time_min + self.walk.rand() * tn().tag_time_rand;
+        c.recent.clear();
+        c.step = 9;
+        // getting there has its own limit, the game's clock starts after
+        c.timer = 60.0;
         c.regroup = true;
         c.stage = Stage::Tag;
+    }
+
+    /// Where a race or a game is held: the widest window of the workspace,
+    /// on screen or not; of those about as wide, the nearest. (left edge,
+    /// width) on the strip, logical px.
+    pub(super) fn biggest_column(&self) -> (f32, f32) {
+        let w = self.view_w;
+        let view_px = self.view[0] * w * 0.5;
+        let middle = view_px + w * 0.5;
+        let cols = crate::backend::governor::niri_columns();
+        let widest = cols.iter().map(|c| c.1).fold(0.0, f32::max);
+        cols.into_iter()
+            .filter(|c| c.1 >= widest * 0.9)
+            .min_by(|a, b| (a.0 + a.1 * 0.5 - middle).abs().total_cmp(&(b.0 + b.1 * 0.5 - middle).abs()))
+            .unwrap_or((view_px, w))
+    }
+
+    /// `biggest_column`, at least half a screen long.
+    fn big_window(&self) -> (f32, f32) {
+        let (x, cw) = self.biggest_column();
+        let len = cw.max(self.view_w * 0.5);
+        (x + cw * 0.5 - len * 0.5, len)
     }
 
     /// Bursts and lulls: a speed multiplier that eases towards a new value
@@ -1079,6 +1245,47 @@ impl CharacterOverlay {
     }
 
     fn run_tag(&mut self, c: &mut Chat, dt: f32) {
+        let (lo, hi) = (c.spots[0], c.spots[1]);
+        // nobody is held to the window until they've reached it
+        for k in 0..c.members.len() {
+            let i = c.members[k];
+            let x = self.strip_px(i);
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.inside |= x >= lo && x <= hi;
+            }
+        }
+        if c.step == 9 {
+            let mut waiting = false;
+            for k in 0..c.members.len() {
+                let i = c.members[k];
+                if i == c.it {
+                    continue;
+                }
+                let wk = self.walk_of(i);
+                let (spot, wait) = (wk.rand(), 1.0 + wk.rand());
+                let Some(r) = wk.social.as_mut() else { continue };
+                if !r.inside {
+                    waiting = true;
+                    continue;
+                }
+                // there already: stroll about until the rest arrive
+                r.hop_cool -= dt;
+                if r.hop_cool <= 0.0 {
+                    r.hop_cool = wait;
+                    self.run_to(i, lo + spot * (hi - lo).max(0.0), tn().tag_run);
+                }
+            }
+            if !waiting {
+                c.step = 0;
+                c.wait = tn().tag_wait;
+                c.offset = 0.0;
+                c.timer = tn().tag_time_min + self.walk.rand() * tn().tag_time_rand;
+                log::debug!("chat {}: everyone's in the window, {} is it", c.id, c.it);
+            } else if c.timer <= 0.0 {
+                self.end_game(c);
+            }
+            return;
+        }
         if c.timer <= 0.0 {
             self.end_game(c);
             return;
@@ -1087,9 +1294,12 @@ impl CharacterOverlay {
             c.it = c.members[0];
         }
         c.wait -= dt;
-        let (lo, hi) = (c.spots[0], c.spots[1]);
         let it_x = self.strip_px(c.it);
         let size = self.row_size(c);
+        c.tag_free -= dt;
+        if c.tag_free <= 0.0 {
+            c.recent.clear();
+        }
         let mut nearest: Option<(usize, f32)> = None;
         for k in 0..c.members.len() {
             let i = c.members[k];
@@ -1101,7 +1311,8 @@ impl CharacterOverlay {
             }
             let x = self.strip_px(i);
             let d = x - it_x;
-            if !c.recent.contains(&i) && nearest.is_none_or(|n| d.abs() < n.1) {
+            let in_air = self.walk_ref(i).act == Act::Jump;
+            if !in_air && !c.recent.contains(&i) && nearest.is_none_or(|n| d.abs() < n.1) {
                 nearest = Some((i, d.abs()));
             }
             // runners stick to a decision for a moment, changing their mind every
@@ -1109,6 +1320,8 @@ impl CharacterOverlay {
             let pace = self.tag_pace(i, dt);
             let wk = self.walk_of(i);
             let wait = 0.5 + wk.rand() * 0.5;
+            let coin = wk.rand() < 0.5;
+            let on_ground = grounded(wk);
             let Some(r) = wk.social.as_mut() else { continue };
             r.speed = tn().tag_run * pace;
             r.hop_cool -= dt;
@@ -1117,41 +1330,82 @@ impl CharacterOverlay {
             }
             r.hop_cool = wait;
             // away from "it", and round the other way when cornered
-            let away = if d >= 0.0 { 1.0 } else { -1.0 };
+            // far from "it" there's nothing to run from: they mill about instead
+            // of the whole game streaming off to one end
+            let away = if d.abs() > 800.0 {
+                if coin { 1.0 } else { -1.0 }
+            } else if d >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
             let goal = if (away > 0.0 && hi - x < 90.0) || (away < 0.0 && x - lo < 90.0) { it_x - away * 500.0 } else { x + away * 500.0 };
             self.run_to(i, goal.clamp(lo, hi), tn().tag_run * pace);
+            // backed into the end with "it" right there: over its head
+            let cornered = (away > 0.0 && hi - x < 90.0) || (away < 0.0 && x - lo < 90.0);
+            if cornered && on_ground && d.abs() < tn().tag_leap_range && pace >= tn().tag_leap_pace {
+                log::debug!("chat {}: {i} leaps over {}", c.id, c.it);
+                let past = (it_x - away * (tn().tag_leap_range + 120.0)).clamp(lo, hi);
+                self.run_to(i, past, tn().tag_run * 2.2);
+                let height = tn().jump_height * 0.9;
+                let wk = self.walk_of(i);
+                wk.start_jump(height);
+                if let Some(r) = wk.social.as_mut() {
+                    r.leaping = true;
+                    r.hop_cool = 1.2;
+                }
+            }
         }
         let Some((n, d)) = nearest else { return };
         if c.wait > 0.0 {
-            // just got caught: counts to one before running
-            let x = it_x;
-            self.steer(c.it, x, 0.1);
+            // just got caught: stands still and counts before running
+            if let Some(r) = self.walk_of(c.it).social.as_mut() {
+                r.moving = false;
+            }
             return;
         }
         if d < size * 0.35 {
             log::debug!("chat {}: {n} is it", c.id);
             // no tagging straight back
+            c.recent.clear();
             c.recent.push(c.it);
-            let keep = c.members.len().saturating_sub(2).clamp(1, 2);
-            let extra = c.recent.len().saturating_sub(keep);
-            c.recent.drain(..extra);
+            c.tag_free = tn().tag_wait + 1.5;
             c.it = n;
-            c.wait = 1.0;
+            c.offset = 0.0;
+            c.tag_turn = 0.0;
+            c.wait = tn().tag_wait;
             let wk = self.walk_of(n);
             if grounded(wk) {
                 wk.start_bob(tn().jump_height * 0.2);
             }
             return;
         }
-        // same for "it": one target at a time
-        c.offset -= dt;
-        if c.offset <= 0.0 || c.chase == c.it || c.recent.contains(&c.chase) || !c.members.contains(&c.chase) {
+        // always after the nearest; a clear margin before switching, or two
+        // about as far away would have it turning back and forth
+        let current = (c.chase != c.it && !c.recent.contains(&c.chase) && c.members.contains(&c.chase))
+            .then(|| (self.strip_px(c.chase) - it_x).abs());
+        if current.is_none_or(|now| d + 40.0 < now) {
             c.chase = n;
-            c.offset = 0.7;
         }
-        let target = self.strip_px(c.chase);
+        // always running at its own pace, and slow to turn round: someone who
+        // jumps over it isn't followed until a moment later
+        let side = (self.strip_px(c.chase) - it_x).signum();
+        if c.offset == 0.0 {
+            c.offset = side;
+        }
+        if side == c.offset {
+            c.tag_turn = 0.0;
+        } else {
+            c.tag_turn += dt;
+            if c.tag_turn >= tn().tag_delay {
+                c.offset = side;
+                c.tag_turn = 0.0;
+            }
+        }
         let pace = self.tag_pace(c.it, dt);
-        self.run_to(c.it, target.clamp(lo, hi), tn().tag_it * pace);
+        let held = self.walk_ref(c.it).social.is_some_and(|s| s.inside);
+        let ahead = it_x + c.offset * 600.0;
+        self.run_to(c.it, if held { ahead.clamp(lo, hi) } else { ahead }, tn().tag_it * pace);
     }
 
     /// Someone around sees a game going on: they come and stand by to watch,
@@ -1501,13 +1755,33 @@ impl CharacterOverlay {
     /// The game's over: the best one hops about, if anyone scored at all.
     fn end_game(&mut self, c: &mut Chat) {
         for &i in &c.members.clone() {
+            // stop here: the game's last goals mean nothing any more, and who
+            // looks at whom is worked out from where everyone stands
+            let here = self.strip_px(i);
             if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.goal_px = here;
+                r.moving = false;
                 r.chasing = false;
                 r.happy = false;
+                r.no_touch = false;
                 r.flying = false;
                 r.stuck = false;
                 r.lean = 0.0;
             }
+        }
+        // tag has no winner: everybody's just happy it's over
+        if c.stage == Stage::Tag && c.step != 9 {
+            log::debug!("chat {}: tag over, everyone hops", c.id);
+            for &i in &c.members.clone() {
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.happy = true;
+                }
+            }
+            c.winner = None;
+            c.all_cheer = true;
+            c.timer = tn().cheer_time;
+            c.stage = Stage::Cheer;
+            return;
         }
         let best = c.scores.iter().filter(|s| s.1 > 0.0 && c.members.contains(&s.0)).max_by(|a, b| a.1.total_cmp(&b.1));
         c.winner = best.map(|s| s.0);
@@ -1528,6 +1802,12 @@ impl CharacterOverlay {
 
     /// A game's not over till it's been talked about.
     fn talk_it_over(&mut self, c: &mut Chat) {
+        // the cheering is over
+        for &i in &c.members.clone() {
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.happy = false;
+            }
+        }
         self.take_in_watchers(c);
         self.maybe_split(c);
         if std::mem::take(&mut c.regroup) {
@@ -1743,12 +2023,23 @@ impl CharacterOverlay {
             }
             Stage::Long => self.run_long(c, dt),
             Stage::Domino => self.run_domino(c, dt),
-            Stage::Tug => self.run_tug(c, dt),
+            Stage::Tug => self.run_tug(c, dt, mouse),
             Stage::Tag => self.run_tag(c, dt),
             Stage::Cheer => {
                 if c.timer <= 0.0 {
+                    c.all_cheer = false;
                     self.talk_it_over(c);
                     return true;
+                }
+                if c.all_cheer {
+                    for k in 0..c.members.len() {
+                        let wk = self.walk_of(c.members[k]);
+                        // not all in step
+                        if grounded(wk) && wk.rand() < dt * 5.0 {
+                            let height = tn().jump_height * (0.4 + wk.rand() * 0.5);
+                            wk.start_jump(height);
+                        }
+                    }
                 }
                 if let Some(w) = c.winner.filter(|w| c.members.contains(w)) {
                     let wk = self.walk_of(w);

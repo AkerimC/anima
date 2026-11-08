@@ -97,21 +97,16 @@ impl CharacterOverlay {
             if n < 2 || !(asked || self.walk.rand() < dt / tn().race_every.max(1.0)) {
                 return;
             }
-            let view_px = self.view[0] * w * 0.5;
-            let cols = crate::backend::governor::niri_columns();
-            // the widest window, one on screen if there is one
-            let seen: Vec<_> = cols.iter().copied().filter(|c| c.0 + c.1 > view_px && c.0 < view_px + w).collect();
-            let pool = if seen.is_empty() { &cols } else { &seen };
-            let (x, cw) = pool.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap_or((view_px, w));
-            let len = cw.max(w * 0.5);
-            let mid = x + cw * 0.5;
-            let (a, b) = (mid - len * 0.42, mid + len * 0.42);
+            // from one end of the strip to the other, whatever the windows
+            let width = self.strip_width();
+            let (a, b) = (tn().edge_px.min(width * 0.25), (width - tn().edge_px).max(width * 0.75));
+            let len = b - a;
             let (start_px, finish_px) = if self.walk.rand() < 0.5 { (a, b) } else { (b, a) };
             log::debug!("race: from {start_px:.0} to {finish_px:.0}");
             self.race = Some(Race {
                 start_px,
                 finish_px,
-                zone: (len * tn().race_zone).max(220.0),
+                zone: (len * tn().race_zone).clamp(220.0, 600.0),
                 phase: Phase::Gather,
                 next_join: 0.0,
                 countdown: tn().race_countdown,
@@ -252,6 +247,7 @@ impl CharacterOverlay {
                     })
                     .collect();
                 let settle = race.age > 1.0;
+                let mut hits = Vec::new();
                 for &(i, p, _) in &field {
                     let ahead = field.iter().filter(|o| o.1 > p).min_by(|a, b| a.1.total_cmp(&b.1)).copied();
                     let lead = field.iter().filter(|o| o.1 > p).count();
@@ -266,11 +262,13 @@ impl CharacterOverlay {
                     r.hop_cool -= dt;
                     let mut want = r.pace;
                     // right on someone's heels: hop over them, or ease off
-                    if let Some((_, q, their)) = ahead.filter(|a| settle && a.1 - p < width * 0.45) {
+                    if let Some((victim, q, their)) = ahead.filter(|a| settle && a.1 - p < width * 0.45) {
                         if r.hop_cool <= 0.0 {
                             r.hop_cool = 1.5;
                             // only the front runners fight for it by hopping over
-                            if lead < tn().race_leaders as usize && wk.rand() < tn().race_hop_chance && grounded(wk) {
+                            if wk.rand() < tn().race_hit_chance && grounded(wk) {
+                                hits.push(victim);
+                            } else if lead < tn().race_leaders as usize && wk.rand() < tn().race_hop_chance && grounded(wk) {
                                 wk.start_jump(tn().jump_height * 0.55);
                                 r.pace = r.pace.max(their + 0.06);
                                 r.speed = r.pace;
@@ -282,6 +280,23 @@ impl CharacterOverlay {
                     }
                     r.speed = (r.speed + (want - r.speed) * (dt * 3.0).min(1.0)).clamp(tn().race_pace * 0.75, tn().race_pace + tn().race_pace_range * 1.6);
                     wk.race = Some(r);
+                }
+                // whoever got hit goes tumbling back the way they came
+                for v in hits {
+                    let wk = self.walk_of(v);
+                    if !grounded(wk) {
+                        continue;
+                    }
+                    let distance = tn().race_hit_min + wk.rand() * tn().race_hit_rand;
+                    let time = 0.5 + wk.rand() * 0.3;
+                    log::debug!("race: {v} got hit");
+                    wk.vx = -dir * (distance * 2.0 / w.max(1.0)) / time;
+                    wk.vy = 20.0 * time * 0.7;
+                    wk.air = 0.1;
+                    wk.jump = 0.0;
+                    wk.held_prev = None;
+                    wk.act = Act::Fall;
+                    wk.tumble = -dir * (6.0 + wk.rand() * 8.0);
                 }
                 for i in 0..n {
                     if self.walk_ref(i).race.is_some_and(|r| r.leg == Leg::Done) && !race.order.contains(&i) {
@@ -317,7 +332,7 @@ impl CharacterOverlay {
                     race.phase = Phase::Cheer;
                     race.cheer = tn().race_cheer;
                 } else {
-                    over = race.age > 60.0;
+                    over = race.age > 180.0;
                 }
             }
             Phase::Cheer => {

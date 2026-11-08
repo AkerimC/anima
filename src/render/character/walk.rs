@@ -64,6 +64,8 @@ pub(super) struct WalkState {
     pub(super) energy: f32,
     // turned (radians) and sunk into the ground (half-heights)
     pub(super) rot: f32,
+    // spinning while knocked through the air (radians/s, 0 when not)
+    pub(super) tumble: f32,
     // turned about the feet instead of the middle
     pub(super) feet: bool,
     pub(super) sink: f32,
@@ -236,6 +238,7 @@ impl WalkState {
         let mut height = 0.0;
         if self.act == Act::Jump {
             self.race_hop(dt);
+            self.social_hop(dt);
             self.jump -= dt;
             let t = 1.0 - (self.jump / self.jump_dur).max(0.0);
             height = 4.0 * t * (1.0 - t);
