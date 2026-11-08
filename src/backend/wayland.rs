@@ -235,6 +235,8 @@ struct FrontOverlayCtx {
     character: Option<CharacterOverlay>,
     // character boxes drawn last frame (they must be repainted when they move)
     prev_rects: Vec<[f32; 4]>,
+    input_boxes: Vec<[i32; 4]>,
+    input_at: Instant,
     /// Window mode: the characters are drawn into one window per workspace,
     /// placed by the compositor backend; this surface is a 1x1 frame clock.
     windowed: bool,
@@ -486,6 +488,8 @@ impl App {
                     gl: None,
                     character: None,
                     prev_rects: Vec::new(),
+                    input_boxes: Vec::new(),
+                    input_at: Instant::now(),
                     windowed,
                     windows: WorkspaceWindows::default(),
                 });
@@ -961,16 +965,26 @@ impl App {
                         }
                         // only the characters take clicks, the rest passes through
                         if fo.windowed {
-                        } else if let Ok(region) = Region::new(compositor) {
+                        } else {
+                            // the compositor redoes its bookkeeping for every one of
+                            // these: only when it changed, 30 times a second at most
                             let sc = oc.scale.max(1) as f32;
-                            for r in ch.input_rects() {
-                                let (x, y) = ((r[0] / sc) as i32, (r[1] / sc) as i32);
-                                let (w, h) = (((r[2] - r[0]) / sc) as i32, ((r[3] - r[1]) / sc) as i32);
-                                if w > 0 && h > 0 {
-                                    region.add(x, y, w, h);
+                            let boxes: Vec<[i32; 4]> = ch
+                                .input_rects()
+                                .iter()
+                                .map(|r| [(r[0] / sc) as i32, (r[1] / sc) as i32, ((r[2] - r[0]) / sc) as i32, ((r[3] - r[1]) / sc) as i32])
+                                .filter(|b| b[2] > 0 && b[3] > 0)
+                                .collect();
+                            if boxes != fo.input_boxes && fo.input_at.elapsed() >= Duration::from_millis(33) {
+                                if let Ok(region) = Region::new(compositor) {
+                                    for b in &boxes {
+                                        region.add(b[0], b[1], b[2], b[3]);
+                                    }
+                                    fo.layer.wl_surface().set_input_region(Some(region.wl_region()));
+                                    fo.input_boxes = boxes;
+                                    fo.input_at = Instant::now();
                                 }
                             }
-                            fo.layer.wl_surface().set_input_region(Some(region.wl_region()));
                         }
                         // tell the compositor only the character boxes changed, not
                         // the whole screen, so it doesn't recomposite everything each

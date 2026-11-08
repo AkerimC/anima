@@ -140,7 +140,7 @@ impl CharacterOverlay {
                 self.extras.iter().map(|e| e.hit_rect.map(|v| v.round())).collect::<Vec<_>>()
             );
             // only on the ground: petting mid-jump or while carried breaks the motion
-            let grounded = |w: &WalkState| !matches!(w.act, Act::Jump | Act::Held | Act::Fall) && !w.social.is_some_and(|s| s.no_touch);
+            let grounded = |w: &WalkState| !matches!(w.act, Act::Jump | Act::Held | Act::Fall) && !w.social.is_some_and(|s| s.no_touch || s.no_pat);
             if let Some(e) = self.extras.iter_mut().rev().find(|e| hit(&e.hit_rect)) {
                 if grounded(&e.walk) {
                     e.walk.start_pat();
@@ -189,7 +189,9 @@ impl CharacterOverlay {
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
                 self.walk.vy -= tn().gravity * dt;
                 self.walk.air += self.walk.vy * dt;
-                self.walk.x += self.walk.vx * dt;
+                if !self.walk.tag_fall_run(dt) {
+                    self.walk.x += self.walk.vx * dt;
+                }
                 // bounce off the ends of the strip
                 if self.walk.x < left_room || self.walk.x > right_room {
                     self.walk.x = self.walk.x.clamp(left_room, right_room);
@@ -209,6 +211,10 @@ impl CharacterOverlay {
                     self.walk.tumble = 0.0;
                     if self.walk.social.is_some_and(|s| s.flying) {
                         self.walk.plant();
+                    } else if self.walk.social.is_some_and(|s| s.no_pat) {
+                        // straight back to running, no bounce
+                        self.walk.act = Act::Idle;
+                        self.walk.timer = 1.0;
                     } else {
                         self.walk.dropped = tn().drop_time;
                         // land with a little bounce

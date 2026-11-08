@@ -51,6 +51,8 @@ pub(super) struct Social {
     inside: bool,
     // on the rope: nothing but the rope itself can be touched
     pub(super) no_touch: bool,
+    // in a game that petting would break
+    pub(super) no_pat: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -296,6 +298,21 @@ impl WalkState {
         }
     }
 
+    /// Tag, dropped by hand: already running on the way down. True if it did.
+    pub(super) fn tag_fall_run(&mut self, dt: f32) -> bool {
+        let Some(r) = self.social.as_mut().filter(|r| r.no_pat) else { return false };
+        self.vx = 0.0;
+        if r.moving {
+            let d = r.goal - self.x;
+            let s = r.speed * dt;
+            if d.abs() > 1e-4 {
+                self.left = d < 0.0;
+            }
+            self.x = if d.abs() <= s { r.goal } else { self.x + d.signum() * s };
+        }
+        true
+    }
+
     /// Leaping over someone: keeps moving while in the air.
     pub(super) fn social_hop(&mut self, dt: f32) {
         let Some(r) = self.social.as_mut().filter(|r| r.leaping && r.moving) else { return };
@@ -384,6 +401,8 @@ impl CharacterOverlay {
     fn prune(&mut self, c: &mut Chat, n: usize) -> bool {
         let id = c.id;
         let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Cheer);
+        // tag: you can carry someone off and they're still in it when put down
+        let tag = c.stage == Stage::Tag;
         let mut left = Vec::new();
         c.members.retain(|&i| {
             let stays = i < n && {
@@ -391,7 +410,8 @@ impl CharacterOverlay {
                 // hanging off the cursor and dropping from it is the game
                 // (not when someone's picked it up: that's the button held down)
                 let carried = crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
-                let playing = game && (wk.act == Act::Fall || (wk.act == Act::Held && (wk.hang > 0.0 || !carried)));
+                let playing = (game && (wk.act == Act::Fall || (wk.act == Act::Held && (wk.hang > 0.0 || !carried))))
+                    || (tag && matches!(wk.act, Act::Held | Act::Fall));
                 wk.social.is_some_and(|s| s.chat == id) && !wk.circle && (playing || !matches!(wk.act, Act::Held | Act::Fall | Act::Pat | Act::Chase))
             };
             if !stays {
@@ -458,7 +478,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false });
     }
 
     /// Two standing close, on screen and free: maybe they notice each other.
@@ -1182,6 +1202,11 @@ impl CharacterOverlay {
         log::debug!("chat {}: playing in the window at {x:.0}, {cw:.0} wide", c.id);
         c.spots = vec![lo, hi];
         c.it = c.members[(self.walk.rand() * c.members.len() as f32) as usize % c.members.len()];
+        for k in 0..c.members.len() {
+            if let Some(r) = self.walk_of(c.members[k]).social.as_mut() {
+                r.no_pat = true;
+            }
+        }
         // "it" stays put and waits, the others run there
         for k in 0..c.members.len() {
             let i = c.members[k];
@@ -1300,7 +1325,10 @@ impl CharacterOverlay {
         if c.tag_free <= 0.0 {
             c.recent.clear();
         }
+        // nearest that can be tagged (on the ground), nearest to go after
+        // (also someone carried overhead: it runs along underneath)
         let mut nearest: Option<(usize, f32)> = None;
+        let mut pursue: Option<(usize, f32)> = None;
         for k in 0..c.members.len() {
             let i = c.members[k];
             if i == c.it {
@@ -1311,7 +1339,10 @@ impl CharacterOverlay {
             }
             let x = self.strip_px(i);
             let d = x - it_x;
-            let in_air = self.walk_ref(i).act == Act::Jump;
+            if !c.recent.contains(&i) && pursue.is_none_or(|n| d.abs() < n.1) {
+                pursue = Some((i, d.abs()));
+            }
+            let in_air = !grounded(self.walk_ref(i));
             if !in_air && !c.recent.contains(&i) && nearest.is_none_or(|n| d.abs() < n.1) {
                 nearest = Some((i, d.abs()));
             }
@@ -1356,7 +1387,7 @@ impl CharacterOverlay {
                 }
             }
         }
-        let Some((n, d)) = nearest else { return };
+        let Some((chase_n, chase_d)) = pursue else { return };
         if c.wait > 0.0 {
             // just got caught: stands still and counts before running
             if let Some(r) = self.walk_of(c.it).social.as_mut() {
@@ -1364,7 +1395,7 @@ impl CharacterOverlay {
             }
             return;
         }
-        if d < size * 0.35 {
+        if let Some((n, _)) = nearest.filter(|t| t.1 < size * 0.35) {
             log::debug!("chat {}: {n} is it", c.id);
             // no tagging straight back
             c.recent.clear();
@@ -1384,8 +1415,8 @@ impl CharacterOverlay {
         // about as far away would have it turning back and forth
         let current = (c.chase != c.it && !c.recent.contains(&c.chase) && c.members.contains(&c.chase))
             .then(|| (self.strip_px(c.chase) - it_x).abs());
-        if current.is_none_or(|now| d + 40.0 < now) {
-            c.chase = n;
+        if current.is_none_or(|now| chase_d + 40.0 < now) {
+            c.chase = chase_n;
         }
         // always running at its own pace, and slow to turn round: someone who
         // jumps over it isn't followed until a moment later
@@ -1764,6 +1795,7 @@ impl CharacterOverlay {
                 r.chasing = false;
                 r.happy = false;
                 r.no_touch = false;
+                r.no_pat = false;
                 r.flying = false;
                 r.stuck = false;
                 r.lean = 0.0;

@@ -133,6 +133,25 @@ fn niri_layouts_changed(line: &str) -> bool {
     true
 }
 
+// something changed: the refresh thread should take a look
+static NIRI_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// each window as last seen, without its title
+static NIRI_SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// True if this WindowOpenedOrChanged differs from last time only by title.
+fn niri_only_title(line: &str) -> bool {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
+    let w = &mut v["WindowOpenedOrChanged"]["window"];
+    let Some(id) = w["id"].as_u64() else { return false };
+    if let Some(o) = w.as_object_mut() {
+        o.remove("title");
+    }
+    let now = w.to_string();
+    NIRI_SEEN.lock().unwrap().insert(id, now.clone()).is_some_and(|old| old == now)
+}
+
 // last time something that can scroll the strip happened (niri event, swipe)
 static NIRI_ACTIVITY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 // after such an event keep asking this long, a new window may take a moment to start the scroll
@@ -543,7 +562,45 @@ pub(super) fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
         .ok();
 
     log::info!("listening to niri events at {}", sock.display());
-    let mut last_output = String::new();
+
+    // a burst of events is one look at niri, not a handful of requests each
+    let (sock_bg, tx_bg, bounds_bg) = (sock.to_path_buf(), tx.clone(), bounds.clone());
+    std::thread::Builder::new()
+        .name("anima-niri-refresh".into())
+        .spawn(move || {
+            let mut last_output = String::new();
+            loop {
+                if !NIRI_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(8));
+                    continue;
+                }
+                update_niri_strip(&sock_bg);
+                if let Some(o) = niri_focused_output(&sock_bg) {
+                    if let Some(name) = o.get("name").and_then(|n| n.as_str()).map(String::from) {
+                        if name != last_output {
+                            last_output = name.clone();
+                            if let Some(r) = niri_output_rect(&sock_bg) {
+                                *bounds_bg.lock().unwrap() = (r, name.clone());
+                            }
+                            if tx_bg.send(GovernorEvent::FocusedMonitor(name)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if let Some((fs, max, rect)) = query_niri_window(&sock_bg) {
+                    if tx_bg
+                        .send(GovernorEvent::WindowState { fullscreen: fs, maximized: max, active_rect: rect })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        })
+        .ok();
+
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
         // things that can scroll the strip (title changes etc. can't)
@@ -565,28 +622,11 @@ pub(super) fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
         if line.starts_with("{\"WindowLayoutsChanged\"") && niri_layouts_changed(&line) {
             continue;
         }
-        update_niri_strip(sock);
-        if let Some(name) = niri_focused_output(sock)
-            .and_then(|o| o.get("name").and_then(|n| n.as_str()).map(String::from))
-        {
-            if name != last_output {
-                last_output = name.clone();
-                if let Some(r) = niri_output_rect(sock) {
-                    *bounds.lock().unwrap() = (r, name.clone());
-                }
-                if tx.send(GovernorEvent::FocusedMonitor(name)).is_err() {
-                    return;
-                }
-            }
+        // a browser or terminal retitling itself changes nothing we care about
+        if line.starts_with("{\"WindowOpenedOrChanged\"") && niri_only_title(&line) {
+            continue;
         }
-        if let Some((fs, max, rect)) = query_niri_window(sock) {
-            if tx
-                .send(GovernorEvent::WindowState { fullscreen: fs, maximized: max, active_rect: rect })
-                .is_err()
-            {
-                return;
-            }
-        }
+        NIRI_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     poll_forever(tx);
 }
