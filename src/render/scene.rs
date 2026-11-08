@@ -2337,12 +2337,17 @@ impl Renderer for SceneRenderer {
 
             let cw = (aabb_size[0] * px_per_world).ceil().clamp(1.0, 4096.0) as i32;
             let ch = (aabb_size[1] * px_per_world).ceil().clamp(1.0, 4096.0) as i32;
-            let mut canvas = self.pool.take(gl, cw, ch)?;
+            let canvas = self.pool.take(gl, cw, ch)?;
             let tmp = self.pool.take(gl, cw, ch)?;
 
             unsafe {
                 canvas.bind(gl);
-                gl.disable(glow::BLEND);
+                // Draw into the transparent canvas with the object's own blend
+                // mode so overlapping mesh pieces (for example a puppet's eyelid
+                // ring over its body) composite here exactly as they would when
+                // drawn directly to the screen.  Drawing with blending disabled
+                // makes each piece overwrite the previous one and leaves holes.
+                apply_blend(gl, blend);
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
