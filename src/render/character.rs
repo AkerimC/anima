@@ -274,7 +274,7 @@ uniform vec4 u_clip;      // target clip space: xy scale, zw offset
 uniform float u_rot;      // turned about its centre (tumbling, planted)
 uniform float u_sink;     // pushed down into the ground
 uniform float u_aspect;   // output width / height
-uniform float u_pivot;    // 0: turns about its middle, 1: about its feet
+uniform vec2 u_pivot;     // the point it turns about, clip offset from its centre
 
 void main() {
     vec2 uv = a_pos * 0.5 + 0.5;
@@ -293,7 +293,7 @@ void main() {
     vec2 d = p * u_half_size;
     d.x *= u_aspect;
     float c = cos(u_rot), s = sin(u_rot);
-    vec2 piv = vec2(0.0, -u_half_size.y * u_pivot);
+    vec2 piv = vec2(u_pivot.x * u_aspect, u_pivot.y);
     d -= piv;
     d = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
     d += piv;
@@ -1231,7 +1231,7 @@ impl CharacterOverlay {
             .chain(self.extras.iter())
             .map(|a| {
                 let [x0, y0, x1, y1] = a.hit_rect;
-                let pad = if a.walk.rot.abs() > 0.01 { y1 - y0 } else { 0.0 };
+                let pad = if a.walk.rot.abs() > 0.01 { (y1 - y0) * 1.5 } else { 0.0 };
                 [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
             })
             // the rope spans the gap between the two sides
@@ -1734,7 +1734,12 @@ impl CharacterOverlay {
             self.program.set_f32(gl, "u_rot", self.walk.rot);
             self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
             self.program.set_f32(gl, "u_aspect", w / h);
-            self.program.set_f32(gl, "u_pivot", f32::from(u8::from(self.walk.feet)));
+            let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
+                (true, _, Some(g)) => g,
+                (_, true, _) => [0.0, -half_clip[1]],
+                _ => [0.0, 0.0],
+            };
+            self.program.set_vec2(gl, "u_pivot", pivot[0], pivot[1]);
             self.program
                 .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right)));
             self.program.set_i32(gl, "u_mode", mode);

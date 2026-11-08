@@ -64,6 +64,15 @@ pub(super) struct WalkState {
     pub(super) energy: f32,
     // turned (radians) and sunk into the ground (half-heights)
     pub(super) rot: f32,
+    // characters on the team
+    pub(super) team: f32,
+    // hanging on the cursor: swing angle, its speed, the cursor speed last frame
+    pub(super) swing: f32,
+    pub(super) swing_v: f32,
+    pub(super) swing_last: Option<[f32; 2]>,
+    pub(super) swing_vel: [f32; 2],
+    // turns about the grip (until upright again)
+    pub(super) grip: bool,
     // spinning while knocked through the air (radians/s, 0 when not)
     pub(super) tumble: f32,
     // turned about the feet instead of the middle
@@ -90,7 +99,9 @@ impl WalkState {
     pub(super) fn pick(&mut self, min: f32, max: f32, can_chase: bool) {
         let t = tn();
         // the four chances count relative to each other
-        let r = self.rand() * (t.walk_chance + t.idle_chance + t.jump_chance + t.chase_chance).max(0.001);
+        // the bigger the team, the fewer run after the cursor
+        let chase = t.chase_chance * 2.0 / self.team.max(2.0);
+        let r = self.rand() * (t.walk_chance + t.idle_chance + t.jump_chance + chase).max(0.001);
         if r < t.walk_chance {
             // short or long stroll in a random direction
             let d = self.rand();

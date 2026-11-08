@@ -53,6 +53,10 @@ pub(super) struct Social {
     pub(super) no_touch: bool,
     // in a game that petting would break
     pub(super) no_pat: bool,
+    // long jump: has had its go (or was thrown by hand instead)
+    jumped: bool,
+    // samba: looks where it's told while stepping somewhere else
+    face_lock: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -68,6 +72,7 @@ enum Stage {
     Domino,
     Tug,
     Tag,
+    Samba,
     Cheer,
     Part,
 }
@@ -80,6 +85,7 @@ enum Game {
     Domino,
     Tug,
     Tag,
+    Samba,
 }
 
 impl Chat {
@@ -229,7 +235,7 @@ impl WalkState {
             let s = r.speed * dt;
             if d.abs() > s {
                 self.x += d.signum() * s;
-                self.left = d < 0.0;
+                self.left = if r.face_lock { r.face_left } else { d < 0.0 };
                 self.target = r.goal;
                 self.act = Act::Walk;
                 return Some((self.x, true, 0.0));
@@ -269,6 +275,11 @@ impl WalkState {
     /// Spin in the air, stay as planted, otherwise get back upright.
     fn update_pose(&mut self, dt: f32) {
         use std::f32::consts::{PI, TAU};
+        if self.act == Act::Held {
+            self.rot = self.swing;
+            self.feet = false;
+            return;
+        }
         if self.tumble != 0.0 {
             self.rot += self.tumble * dt;
             self.feet = false;
@@ -293,6 +304,7 @@ impl WalkState {
                 self.sink -= self.sink * k;
                 if self.rot.abs() < 0.02 {
                     self.feet = false;
+                    self.grip = false;
                 }
             }
         }
@@ -300,7 +312,7 @@ impl WalkState {
 
     /// Tag, dropped by hand: already running on the way down. True if it did.
     pub(super) fn tag_fall_run(&mut self, dt: f32) -> bool {
-        let Some(r) = self.social.as_mut().filter(|r| r.no_pat) else { return false };
+        let Some(r) = self.social.as_mut().filter(|r| r.inside && !r.flying) else { return false };
         self.vx = 0.0;
         if r.moving {
             let d = r.goal - self.x;
@@ -318,7 +330,9 @@ impl WalkState {
         let Some(r) = self.social.as_mut().filter(|r| r.leaping && r.moving) else { return };
         let d = r.goal - self.x;
         let s = r.speed * dt;
-        if d.abs() > 1e-4 {
+        if r.face_lock {
+            self.left = r.face_left;
+        } else if d.abs() > 1e-4 {
             self.left = d < 0.0;
         }
         if d.abs() <= s {
@@ -354,6 +368,7 @@ impl CharacterOverlay {
             let wk = self.walk_of(i);
             wk.social_cool = (wk.social_cool - dt).max(0.0);
             wk.dropped = (wk.dropped - dt).max(0.0);
+            wk.team = n as f32;
             wk.crowd_rest = (wk.crowd_rest - dt).max(0.0);
             wk.update_pose(dt);
         }
@@ -377,12 +392,12 @@ impl CharacterOverlay {
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
             if self.race.is_none() && !music {
-                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Cheer)) {
+                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
                 for c in chats.iter_mut() {
                     let full = c.members.len() >= tn().max_group as usize;
-                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Part) && self.overlap_join(c, n, full) {
+                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Part) && self.overlap_join(c, n, full) {
                         continue;
                     }
                     if !full && matches!(c.stage, Stage::Talk | Stage::Stroll) {
@@ -402,7 +417,7 @@ impl CharacterOverlay {
         let id = c.id;
         let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Cheer);
         // tag: you can carry someone off and they're still in it when put down
-        let tag = c.stage == Stage::Tag;
+        let tag = matches!(c.stage, Stage::Tag | Stage::Long);
         let mut left = Vec::new();
         c.members.retain(|&i| {
             let stays = i < n && {
@@ -478,7 +493,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false });
     }
 
     /// Two standing close, on screen and free: maybe they notice each other.
@@ -623,6 +638,11 @@ impl CharacterOverlay {
     fn join(&mut self, c: &mut Chat, i: usize, n: usize) {
         c.quiet = 0.0;
         self.enlist(i, c.id);
+        if !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part) {
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.no_pat = true;
+            }
+        }
         c.members.push(i);
         self.face(i, c.members[0]);
         self.walk_of(i).start_bob(tn().jump_height * 0.2);
@@ -817,6 +837,7 @@ impl CharacterOverlay {
                 (Game::Domino, tn().party_min as usize),
                 (Game::Tug, tn().party_min as usize),
                 (Game::Tag, tn().party_min as usize),
+                (Game::Samba, tn().party_min as usize),
             ]
             .iter()
             .filter(|g| len >= g.1 && !c.played.contains(&g.0))
@@ -836,6 +857,13 @@ impl CharacterOverlay {
     }
 
     fn start_game(&mut self, c: &mut Chat, game: Game) {
+        for k in 0..c.members.len() {
+            let wk = self.walk_of(c.members[k]);
+            wk.notify_jump = None;
+            if let Some(r) = wk.social.as_mut() {
+                r.no_pat = true;
+            }
+        }
         match game {
             Game::Contest => self.start_contest(c),
             Game::Cursor => self.start_cursor_game(c),
@@ -843,6 +871,7 @@ impl CharacterOverlay {
             Game::Domino => self.start_domino(c),
             Game::Tug => self.start_tug(c),
             Game::Tag => self.start_tag(c),
+            Game::Samba => self.start_samba(c),
         }
     }
 
@@ -857,6 +886,7 @@ impl CharacterOverlay {
             "domino" => (Game::Domino, t.party_min),
             "tug" => (Game::Tug, t.party_min),
             "tag" => (Game::Tag, t.party_min),
+            "samba" => (Game::Samba, t.party_min),
             _ => return,
         };
         let need = need as usize;
@@ -1194,6 +1224,65 @@ impl CharacterOverlay {
 
     /// Tag: one is "it" and runs after the nearest; a touch passes it on.
     /// Whoever spent the least time being "it" wins.
+    /// Samba: in a row, hopping forward together a step at a time, looking
+    /// right, then left, on the beat.
+    fn start_samba(&mut self, c: &mut Chat) {
+        log::debug!("chat {}: samba", c.id);
+        self.arrange(c);
+        let mean = c.members.iter().map(|&i| self.goal_of(i)).sum::<f32>() / c.members.len() as f32;
+        c.offset = if mean < self.strip_width() * 0.5 { 1.0 } else { -1.0 };
+        c.turn = 1.0;
+        c.wait = 0.0;
+        c.step = 9;
+        c.timer = 60.0;
+        c.scores.clear();
+        c.stage = Stage::Samba;
+    }
+
+    fn run_samba(&mut self, c: &mut Chat, dt: f32) {
+        if c.step == 9 {
+            if self.all_arrived(c) {
+                c.step = 0;
+                c.timer = tn().samba_time;
+            } else if c.timer <= 0.0 {
+                self.end_game(c);
+            }
+            return;
+        }
+        if c.timer <= 0.0 {
+            self.end_game(c);
+            return;
+        }
+        c.wait -= dt;
+        if c.wait > 0.0 {
+            return;
+        }
+        c.wait = tn().samba_beat;
+        c.turn = -c.turn;
+        let width = self.strip_width();
+        let w = self.view_w.max(1.0);
+        for k in 0..c.members.len() {
+            let i = c.members[k];
+            let x = self.strip_px(i);
+            let goal = (x + c.offset * tn().samba_step).clamp(0.0, width);
+            let left = c.turn < 0.0;
+            let wk = self.walk_of(i);
+            if !grounded(wk) {
+                continue;
+            }
+            wk.start_bob(tn().jump_height * 0.12);
+            if let Some(r) = wk.social.as_mut() {
+                r.goal_px = goal;
+                r.speed = tn().samba_step * 2.0 / w / 0.32;
+                r.moving = true;
+                r.leaping = true;
+                r.face_lock = true;
+                r.face_left = left;
+                r.happy = true;
+            }
+        }
+    }
+
     fn start_tag(&mut self, c: &mut Chat) {
         log::debug!("chat {}: tag", c.id);
         // one big window is the playground: everyone goes there first
@@ -1607,6 +1696,7 @@ impl CharacterOverlay {
         wk.act = Act::Fall;
         if let Some(r) = wk.social.as_mut() {
             r.flying = true;
+            r.jumped = true;
             r.launch_px = from;
             r.happy = true;
             r.spin = spin;
@@ -1674,6 +1764,31 @@ impl CharacterOverlay {
             self.end_game(c);
             return;
         }
+        // thrown by hand before its turn: that was its jump
+        for k in 0..l.turns.len() {
+            let t = l.turns[k];
+            if !c.members.contains(&t.flyer) {
+                continue;
+            }
+            let line = l.line;
+            let wk = self.walk_of(t.flyer);
+            let spin = if wk.vx < 0.0 { -9.0 } else { 9.0 };
+            let thrown = wk.act == Act::Fall;
+            let Some(r) = wk.social.as_mut().filter(|r| thrown && !r.jumped && !r.flying && !r.stuck) else { continue };
+            r.flying = true;
+            r.jumped = true;
+            r.happy = true;
+            r.moving = false;
+            r.spin = spin;
+            r.launch_px = line;
+            log::debug!("chat {}: {} thrown by hand", c.id, t.flyer);
+            if let Some(th) = t.thrower.filter(|th| c.members.contains(th) && l.running.iter().any(|x| x.flyer == t.flyer)) {
+                let size = self.width_of(th);
+                self.go(th, l.line + l.dir * size * (1.9 + 0.85 * l.thrown), 0.3);
+                l.thrown += 1.0;
+            }
+            l.running.retain(|x| x.flyer != t.flyer);
+        }
         if !l.ready {
             l.ready = self.all_arrived(c);
             c.long = Some(l);
@@ -1687,7 +1802,7 @@ impl CharacterOverlay {
             let t = l.turns[l.next];
             l.next += 1;
             l.gap = tn().long_gap_min + self.walk.rand() * tn().long_gap_rand;
-            if !c.members.contains(&t.flyer) {
+            if !c.members.contains(&t.flyer) || self.walk_ref(t.flyer).social.is_some_and(|s| s.jumped) {
                 continue;
             }
             let thrower = t.thrower.filter(|th| c.members.contains(th));
@@ -1796,6 +1911,7 @@ impl CharacterOverlay {
                 r.happy = false;
                 r.no_touch = false;
                 r.no_pat = false;
+                r.face_lock = false;
                 r.flying = false;
                 r.stuck = false;
                 r.lean = 0.0;
@@ -2057,6 +2173,7 @@ impl CharacterOverlay {
             Stage::Domino => self.run_domino(c, dt),
             Stage::Tug => self.run_tug(c, dt, mouse),
             Stage::Tag => self.run_tag(c, dt),
+            Stage::Samba => self.run_samba(c, dt),
             Stage::Cheer => {
                 if c.timer <= 0.0 {
                     c.all_cheer = false;

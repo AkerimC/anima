@@ -6,6 +6,9 @@ use super::CharacterOverlay;
 use super::walk::{Act, WalkState};
 use crate::render::FrameInfo;
 
+/// Where a clinging character holds on, in half-heights above its centre.
+pub(super) const GRIP: f32 = 0.5;
+
 impl CharacterOverlay {
     /// Pointer and desktop events, handled by the main character for the
     /// whole team.
@@ -15,7 +18,7 @@ impl CharacterOverlay {
             let n = crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
             if n != self.notified {
                 self.notified = n;
-                let free = |w: &WalkState| !w.social.is_some_and(|s| s.no_touch);
+                let free = |w: &WalkState| w.race.is_none() && !w.social.is_some_and(|s| s.no_touch || s.no_pat);
                 if free(&self.walk) {
                     self.walk.notify_jump = Some(0.0);
                 }
@@ -90,6 +93,10 @@ impl CharacterOverlay {
                         }
                         a.walk.act = Act::Held;
                         a.walk.grab = Some(grab);
+                        a.walk.swing = 0.0;
+                        a.walk.swing_v = 0.0;
+                        a.walk.swing_last = None;
+                        a.walk.swing_vel = [0.0, 0.0];
                         a.walk.held_prev = None;
                         a.walk.vx = 0.0;
                         a.walk.vy = 0.0;
@@ -179,6 +186,25 @@ impl CharacterOverlay {
                     self.walk.vy += ((self.walk.air - pa) / dt - self.walk.vy) * k;
                 }
                 self.walk.held_prev = Some((self.walk.x, self.walk.air));
+                // held up, by hand or hanging on: a pendulum on the grip, swung
+                // round it by the cursor
+                {
+                    let m = info.mouse;
+                    let wk = &mut self.walk;
+                    if let Some(l) = wk.swing_last {
+                        let v = [(m[0] - l[0]) / dt, -(m[1] - l[1]) / dt];
+                        let k = (dt * 25.0).min(1.0);
+                        let smooth = [wk.swing_vel[0] + (v[0] - wk.swing_vel[0]) * k, wk.swing_vel[1] + (v[1] - wk.swing_vel[1]) * k];
+                        let a = [(smooth[0] - wk.swing_vel[0]) / dt, (smooth[1] - wk.swing_vel[1]) / dt];
+                        wk.swing_vel = smooth;
+                        let (s, c) = wk.swing.sin_cos();
+                        let push = -(a[0] * c + a[1] * s) / 120.0 * tn().cling_swing;
+                        wk.swing_v = (wk.swing_v + (push - 40.0 * s - 2.0 * wk.swing_v) * dt).clamp(-30.0, 30.0);
+                        wk.swing += wk.swing_v * dt;
+                    }
+                    wk.swing_last = Some(m);
+                    wk.grip = true;
+                }
             }
             Act::Held => {
                 self.walk.act = Act::Fall;
@@ -242,8 +268,12 @@ impl CharacterOverlay {
                 wk.catch_jump = false;
                 wk.act = Act::Held;
                 wk.hang = tn().cling_min + wk.rand() * tn().cling_rand;
-                // cursor holds the middle of the body
-                wk.grab = Some([0.0, 0.0]);
+                wk.swing = 0.0;
+                wk.swing_v = 0.0;
+                wk.swing_last = None;
+                wk.swing_vel = [0.0, 0.0];
+                // held by the upper body: that's the point it swings round
+                wk.grab = Some([0.0, (r[3] - r[1]) / info.height.max(1) as f32 * GRIP]);
                 wk.held_prev = None;
                 wk.vx = 0.0;
                 wk.vy = 0.0;

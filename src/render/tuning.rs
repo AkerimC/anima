@@ -40,7 +40,7 @@ tuning! {
         walk_chance: "Yürüme" = 0.30, 0.0, 1.0, 0.01, 2;
         idle_chance: "Durma" = 0.63, 0.0, 1.0, 0.01, 2;
         jump_chance: "Zıplama" = 0.05, 0.0, 1.0, 0.01, 2;
-        chase_chance: "İmleci kovalama" = 0.02, 0.0, 1.0, 0.01, 2;
+        chase_chance: "İmleci kovalama (kalabalıkta azalır)" = 0.01, 0.0, 1.0, 0.01, 2;
     }
     "Gezinme", "Durma ve yürüme" {
         idle_min: "En kısa durma (sn)" = 1.0, 0.0, 30.0, 0.5, 1;
@@ -81,6 +81,7 @@ tuning! {
     "Etkileşim", "İmlece tutunma" {
         cling_min: "En kısa tutunma (sn)" = 1.0, 0.1, 15.0, 0.1, 1;
         cling_rand: "Tutunmaya eklenen rastgele (sn)" = 1.0, 0.0, 15.0, 0.1, 1;
+        cling_swing: "Tutunurken savrulma" = 1.0, 0.0, 5.0, 0.1, 1;
         cling_radius: "Tutunma alanı (karakter boyuna göre)" = 0.4, 0.05, 1.5, 0.05, 2;
     }
     "Etkileşim", "Elle gruba bırakma" {
@@ -192,6 +193,11 @@ tuning! {
         domino_gap: "Devrilme aralığı (sn)" = 0.3, 0.05, 3.0, 0.05, 2;
         domino_survive: "Sondakinin kurtulma şansı" = 0.35, 0.0, 1.0, 0.05, 2;
         domino_rest: "Yerde kalma (sn)" = 1.8, 0.0, 15.0, 0.5, 1;
+    }
+    "Oyunlar", "Samba" {
+        samba_time: "Süre (sn)" = 12.0, 2.0, 120.0, 1.0, 0;
+        samba_beat: "Adım aralığı (sn)" = 0.45, 0.35, 2.0, 0.05, 2;
+        samba_step: "Adım boyu (piksel)" = 40.0, 0.0, 300.0, 5.0, 0;
     }
     "Oyunlar", "Halat çekme" {
         tug_win: "Kazanma mesafesi (piksel)" = 180.0, 20.0, 1500.0, 10.0, 0;
