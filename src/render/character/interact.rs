@@ -63,19 +63,15 @@ impl CharacterOverlay {
                 self.press = None;
             } else if self.press.is_none() {
                 let [mx, my] = info.mouse;
-                let hit = |a: &CharacterOverlay| {
-                    let r = a.hit_rect;
-                    mx >= r[0] && mx <= r[2] && my >= r[1] && my <= r[3] && !a.walk.social.is_some_and(|s| s.no_touch)
-                };
+                let hit = |a: &CharacterOverlay| a.on_body([mx, my]) && !a.walk.social.is_some_and(|s| s.no_touch);
                 let target = (1..=self.extras.len())
                     .rev()
                     .find(|&i| hit(&self.extras[i - 1]))
                     .or_else(|| hit(self).then_some(0));
                 // measure the grab point now: the cursor may be far away by pick-up time
                 let target = target.map(|i| {
-                    let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
-                    let (w, h) = (info.width as f32, info.height as f32);
-                    (i, [(mx - (r[0] + r[2]) * 0.5) * 2.0 / w, -(my - (r[1] + r[3]) * 0.5) * 2.0 / h])
+                    let a = if i == 0 { &*self } else { &self.extras[i - 1] };
+                    (i, a.body_clip([mx, my]))
                 });
                 self.press = Some((now, [mx, my], target));
             } else if let Some((t0, at, Some((i, grab)))) = self.press {
@@ -85,6 +81,10 @@ impl CharacterOverlay {
                 if now - t0 > tn().pick_delay || moved {
                     let a = if i == 0 { &mut *self } else { &mut self.extras[i - 1] };
                     if a.walk.act != Act::Held {
+                        // caught in flight: it has moved and turned since the press
+                        let flying = matches!(a.walk.act, Act::Fall | Act::Planted);
+                        a.walk.sink = 0.0;
+                        let grab = if flying { a.body_clip([mx, my]) } else { grab };
                         // caught mid-jump: keep it at the height it is drawn at
                         if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
                             let t = 1.0 - (a.walk.jump / a.walk.jump_dur).clamp(0.0, 1.0);
@@ -93,8 +93,15 @@ impl CharacterOverlay {
                         }
                         a.walk.act = Act::Held;
                         a.walk.grab = Some(grab);
-                        a.walk.swing = 0.0;
-                        a.walk.swing_v = 0.0;
+                        // carries on from the angle and spin it had
+                        let pi = std::f32::consts::PI;
+                        a.walk.swing = if flying { (a.walk.rot + pi).rem_euclid(2.0 * pi) - pi } else { 0.0 };
+                        a.walk.swing_v = if flying { a.walk.tumble.clamp(-30.0, 30.0) } else { 0.0 };
+                        a.walk.tumble = 0.0;
+                        a.walk.rolling = false;
+                        if flying {
+                            a.walk.grip = true;
+                        }
                         a.walk.swing_last = None;
                         a.walk.swing_vel = [0.0, 0.0];
                         a.walk.held_prev = None;
@@ -123,9 +130,8 @@ impl CharacterOverlay {
             if n != self.clicks {
                 self.clicks = n;
                 let [mx, my] = info.mouse;
-                let hit = |r: &[f32; 4]| mx >= r[0] && mx <= r[2] && my >= r[1] && my <= r[3];
                 let keep = |a: &mut CharacterOverlay| {
-                    if a.walk.act == Act::Pat && hit(&a.hit_rect) {
+                    if a.walk.act == Act::Pat && a.on_body([mx, my]) {
                         a.walk.timer = a.walk.timer.max(tn().pat_keep);
                         a.patted_again = true;
                     }
@@ -140,7 +146,6 @@ impl CharacterOverlay {
             && crate::backend::pointer::DOUBLE_CLICK.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             let [mx, my] = info.mouse;
-            let hit = |r: &[f32; 4]| mx >= r[0] && mx <= r[2] && my >= r[1] && my <= r[3];
             log::debug!(
                 "pat: mouse ({mx:.0},{my:.0}) main {:?} extras {:?}",
                 self.hit_rect.map(|v| v.round()),
@@ -148,14 +153,69 @@ impl CharacterOverlay {
             );
             // only on the ground: petting mid-jump or while carried breaks the motion
             let grounded = |w: &WalkState| !matches!(w.act, Act::Jump | Act::Held | Act::Fall) && !w.social.is_some_and(|s| s.no_touch || s.no_pat);
-            if let Some(e) = self.extras.iter_mut().rev().find(|e| hit(&e.hit_rect)) {
+            if let Some(e) = self.extras.iter_mut().rev().find(|e| e.on_body([mx, my])) {
                 if grounded(&e.walk) {
                     e.walk.start_pat();
                 }
-            } else if hit(&self.hit_rect) && grounded(&self.walk) {
+            } else if self.on_body([mx, my]) && grounded(&self.walk) {
                 self.walk.start_pat();
             }
         }
+    }
+
+    /// The point it turns about, px from its centre, y up.
+    fn pivot_px(&self) -> [f32; 2] {
+        match (self.walk.grip, self.walk.feet, self.walk.grab) {
+            (true, _, Some(g)) => [g[0] * self.surface[0] * 0.5, g[1] * self.surface[1] * 0.5],
+            (_, true, _) => [0.0, -(self.hit_rect[3] - self.hit_rect[1]) * 0.5],
+            _ => [0.0, 0.0],
+        }
+    }
+
+    /// A screen point as it sits on the upright sprite: px from its centre, y up.
+    fn body_offset(&self, m: [f32; 2]) -> [f32; 2] {
+        let r = self.hit_rect;
+        let p = [m[0] - (r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5 - m[1]];
+        let piv = self.pivot_px();
+        let (s, c) = self.walk.rot.sin_cos();
+        let d = [p[0] - piv[0], p[1] - piv[1]];
+        [c * d[0] + s * d[1] + piv[0], c * d[1] - s * d[0] + piv[1]]
+    }
+
+    /// `body_offset` in clip units, the form a grab point is kept in.
+    fn body_clip(&self, m: [f32; 2]) -> [f32; 2] {
+        let o = self.body_offset(m);
+        [o[0] * 2.0 / self.surface[0].max(1.0), o[1] * 2.0 / self.surface[1].max(1.0)]
+    }
+
+    /// The drawn part of the sprite on an upright box: x half width, top, bottom, px, y up.
+    fn body_extent(&self) -> [f32; 3] {
+        let (w, h) = (self.hit_rect[2] - self.hit_rect[0], self.hit_rect[3] - self.hit_rect[1]);
+        let [half, top, bottom] = self.opaque;
+        [half * w, (0.5 - top) * h, (0.5 - bottom) * h]
+    }
+
+    /// Is this screen point on the character, not the empty margin of its image?
+    pub(super) fn on_body(&self, m: [f32; 2]) -> bool {
+        let o = self.body_offset(m);
+        let [half, top, bottom] = self.body_extent();
+        o[0].abs() <= half && o[1] <= top && o[1] >= bottom
+    }
+
+    /// Screen box around the drawn body, however it's turned.
+    pub(super) fn body_box(&self) -> [f32; 4] {
+        let r = self.hit_rect;
+        let (cx, cy) = ((r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5);
+        let [half, top, bottom] = self.body_extent();
+        let piv = self.pivot_px();
+        let (s, c) = self.walk.rot.sin_cos();
+        let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        for (x, y) in [(-half, top), (half, top), (-half, bottom), (half, bottom)] {
+            let d = [x - piv[0], y - piv[1]];
+            let (px, py) = (cx + piv[0] + c * d[0] - s * d[1], cy - piv[1] - s * d[0] - c * d[1]);
+            b = [b[0].min(px), b[1].min(py), b[2].max(px), b[3].max(py)];
+        }
+        b
     }
 
     /// Held: follow the cursor; let go: fall back down (thrown).
@@ -209,6 +269,24 @@ impl CharacterOverlay {
             Act::Held => {
                 self.walk.act = Act::Fall;
                 self.walk.held_prev = None;
+                // let go mid-swing: keeps spinning the same way until it lands,
+                // now about its own middle, moved so nothing jumps on screen
+                self.walk.tumble = self.walk.swing_v;
+                if let (true, Some(g)) = (self.walk.grip, self.walk.grab) {
+                    let aspect = w / h;
+                    let (s, c) = self.walk.rot.sin_cos();
+                    let p = [g[0] * aspect, g[1]];
+                    self.walk.x += (p[0] - (c * p[0] - s * p[1])) / aspect;
+                    self.walk.air = (self.walk.air + (p[1] - (s * p[0] + c * p[1])) / half_clip[1]).max(0.0);
+                    self.walk.grip = false;
+                }
+                // going to come down from high up: spinning all the way
+                let g = tn().gravity;
+                let apex = self.walk.air + self.walk.vy.max(0.0).powi(2) / (2.0 * g);
+                if self.walk.tumble.abs() < 2.0 && apex >= tn().fall_high && !self.walk.social.is_some_and(|s| s.no_pat) {
+                    let dir = if self.walk.vx < 0.0 { 1.0 } else { -1.0 };
+                    self.walk.tumble = dir * (8.0 + self.walk.rand() * 6.0);
+                }
             }
             Act::Fall => {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
@@ -231,9 +309,18 @@ impl CharacterOverlay {
                 }
                 self.walk.target = self.walk.x;
                 if self.walk.air <= 0.0 {
+                    let hard = self.walk.vy <= -(2.0 * tn().gravity * tn().fall_high).sqrt();
                     self.walk.air = 0.0;
                     self.walk.vx = 0.0;
                     self.walk.vy = 0.0;
+                    // rolls on to upright rather than turning back
+                    if self.walk.tumble != 0.0 {
+                        let tau = std::f32::consts::TAU;
+                        let dir = self.walk.tumble.signum();
+                        let rot = (self.walk.rot + tau * 0.5).rem_euclid(tau) - tau * 0.5;
+                        self.walk.rot = if rot * dir > 0.6 { rot - dir * tau } else { rot };
+                        self.walk.rolling = true;
+                    }
                     self.walk.tumble = 0.0;
                     if self.walk.social.is_some_and(|s| s.flying) {
                         self.walk.plant();
@@ -243,8 +330,12 @@ impl CharacterOverlay {
                         self.walk.timer = 1.0;
                     } else {
                         self.walk.dropped = tn().drop_time;
-                        // land with a little bounce
-                        self.walk.start_jump(tn().jump_height * tn().land_hop);
+                        if hard {
+                            self.walk.stick_in();
+                        } else {
+                            // land with a little bounce
+                            self.walk.start_jump(tn().jump_height * tn().land_hop);
+                        }
                     }
                 }
             }

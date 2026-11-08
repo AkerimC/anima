@@ -16,6 +16,8 @@ pub(super) enum Act {
     Pat,
     Held,
     Fall,
+    // dropped from high up: stuck in the ground for a moment
+    Planted,
 }
 
 /// Random behaviour: walk (likely), idle, jump (less likely) and, rarely,
@@ -75,6 +77,10 @@ pub(super) struct WalkState {
     pub(super) grip: bool,
     // spinning while knocked through the air (radians/s, 0 when not)
     pub(super) tumble: f32,
+    // landed spinning: rolling on upright the way it was going
+    pub(super) rolling: bool,
+    // how it is stuck in the ground while planted
+    pub(super) plant_pose: (f32, f32),
     // turned about the feet instead of the middle
     pub(super) feet: bool,
     pub(super) sink: f32,
@@ -166,7 +172,7 @@ impl WalkState {
     /// Advance one frame. `mouse` is the cursor x relative to the anchor.
     /// Returns (offset, moving, jump height 0..1).
     pub(super) fn step(&mut self, dt: f32, min: f32, max: f32, mouse: Option<f32>, reach: f32) -> (f32, bool, f32) {
-        if matches!(self.act, Act::Held | Act::Fall) {
+        if matches!(self.act, Act::Held | Act::Fall | Act::Planted) {
             return (self.x, false, 0.0);
         }
         if let Some(t) = self.notify_jump.as_mut() {
@@ -237,7 +243,7 @@ impl WalkState {
                     moving = true;
                 }
             }
-            Act::Jump | Act::Held | Act::Fall => {}
+            Act::Jump | Act::Held | Act::Fall | Act::Planted => {}
             Act::Pat => {
                 self.timer -= dt;
                 if self.timer <= 0.0 {

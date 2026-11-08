@@ -304,17 +304,33 @@ impl WalkState {
         Some((self.x, false, 0.0))
     }
 
-    /// Landed from a long jump: stuck in the ground, flat out or head first.
-    pub(super) fn plant(&mut self) {
+    /// Flat out or head first: how far round, and how deep.
+    fn stuck_pose(&mut self) -> (f32, f32) {
         use std::f32::consts::{FRAC_PI_2, PI};
         let roll = self.rand();
-        let (rot, sink) = if roll < tn().long_head_first {
+        if roll < tn().long_head_first {
             (PI, 0.55)
         } else if roll < 0.7 {
             (FRAC_PI_2, 0.25)
         } else {
             (-FRAC_PI_2, 0.25)
-        };
+        }
+    }
+
+    /// Came down hard: stuck in the ground like a long jumper, then hops out.
+    pub(super) fn stick_in(&mut self) {
+        self.plant_pose = self.stuck_pose();
+        self.rolling = false;
+        self.grip = false;
+        self.feet = false;
+        self.act = Act::Planted;
+        self.timer = tn().plant_time;
+        self.target = self.x;
+    }
+
+    /// Landed from a long jump: stuck in the ground, flat out or head first.
+    pub(super) fn plant(&mut self) {
+        let (rot, sink) = self.stuck_pose();
         self.act = Act::Idle;
         self.timer = 1.0;
         self.target = self.x;
@@ -334,6 +350,18 @@ impl WalkState {
             self.act = Act::Fall;
             self.vx = 0.0;
             self.vy = 0.0;
+        }
+        if self.act == Act::Planted {
+            let (rot, sink) = self.plant_pose;
+            let k = (dt * 14.0).min(1.0);
+            self.rot += ((rot - self.rot + PI).rem_euclid(TAU) - PI) * k;
+            self.sink += (sink - self.sink) * k;
+            self.feet = false;
+            self.timer -= dt;
+            if self.timer <= 0.0 {
+                self.start_jump(tn().jump_height * tn().plant_hop);
+            }
+            return;
         }
         if self.act == Act::Held {
             self.rot = self.swing;
@@ -359,12 +387,15 @@ impl WalkState {
             _ => {
                 let k = (dt * 8.0).min(1.0);
                 let lean = self.social.map_or(0.0, |s| s.lean);
-                self.rot = (self.rot + PI).rem_euclid(TAU) - PI;
+                if !self.rolling {
+                    self.rot = (self.rot + PI).rem_euclid(TAU) - PI;
+                }
                 self.rot += (lean - self.rot) * k;
                 self.sink -= self.sink * k;
                 if self.rot.abs() < 0.02 {
                     self.feet = false;
                     self.grip = false;
+                    self.rolling = false;
                 }
             }
         }

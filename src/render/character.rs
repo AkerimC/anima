@@ -920,6 +920,10 @@ pub struct CharacterOverlay {
     extras: Vec<CharacterOverlay>,
     // drawn sprite box from the last frame, surface pixels (x0, y0, x1, y1)
     hit_rect: [f32; 4],
+    // surface size that box was measured on
+    surface: [f32; 2],
+    // drawn part of the sprite, image fractions: half width, top, bottom
+    opaque: [f32; 3],
     // left button press: when, and which actor (0 = main) was under it,
     // with where on it the press landed (clip offset from its centre)
     // and where the cursor was
@@ -1074,6 +1078,8 @@ impl CharacterOverlay {
             actor,
             extras: Vec::new(),
             hit_rect: [0.0; 4],
+            surface: [1.0; 2],
+            opaque: [0.5, 0.0, 1.0],
             press: None,
             race: None,
             chats: Vec::new(),
@@ -1194,6 +1200,16 @@ impl CharacterOverlay {
                     .to_rgba8()
             };
             let (w, h) = img.dimensions();
+            // both ways round, the sprite gets flipped when it walks
+            let (mut half, mut top, mut bottom) = (0.0f32, h, 0);
+            for (x, y, _) in img.enumerate_pixels().filter(|(_, _, p)| p[3] > 25) {
+                half = half.max((x as f32 + 0.5 - w as f32 * 0.5).abs());
+                top = top.min(y);
+                bottom = bottom.max(y + 1);
+            }
+            if bottom > top {
+                self.opaque = [half / w as f32, top as f32 / h as f32, bottom as f32 / h as f32];
+            }
             let tex = create_texture(gl, w, h, img.as_raw(), Filter::Linear, true)?;
             self.sprite_tex = Some((tex, w, h));
 
@@ -1241,7 +1257,7 @@ impl CharacterOverlay {
 
     /// Where the cursor belongs to us: the characters, and a rope in play.
     pub fn input_rects(&self) -> Vec<[f32; 4]> {
-        let mut v = self.hit_rects();
+        let mut v: Vec<[f32; 4]> = std::iter::once(self).chain(self.extras.iter()).map(|a| a.body_box()).collect();
         v.extend(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 16.0, x1, y0.max(y1) + 16.0]));
         v
     }
@@ -1580,7 +1596,7 @@ impl CharacterOverlay {
                 Act::Chase => Pose::Run,
                 Act::Pat => Pose::Pat,
                 Act::Held => Pose::Held,
-                Act::Fall => Pose::Fall,
+                Act::Fall | Act::Planted => Pose::Fall,
                 Act::Idle | Act::Jump => Pose::Idle,
             };
             // light around where the character was drawn last frame
@@ -1697,6 +1713,7 @@ impl CharacterOverlay {
                 self.catch_cling(info);
                 // sprite box for click hit-testing (surface pixels)
                 let lift_now = (jump * self.walk.jump_amp) * half_clip[1] + air;
+                self.surface = [w, h];
                 self.hit_rect = [
                     (center_clip[0] + walk_x - half_clip[0] + 1.0) * 0.5 * w,
                     (1.0 - (center_clip[1] + half_clip[1] + lift_now)) * 0.5 * h,

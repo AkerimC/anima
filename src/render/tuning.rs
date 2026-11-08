@@ -73,6 +73,9 @@ tuning! {
         gravity: "Yerçekimi" = 40.0, 5.0, 150.0, 1.0, 0;
         wall_bounce: "Kenardan sekme" = 0.6, 0.0, 1.0, 0.05, 2;
         top_bounce: "Tavandan sekme" = 0.5, 0.0, 1.0, 0.05, 2;
+        fall_high: "Dönerek düşüp saplanma yüksekliği" = 4.0, 0.5, 20.0, 0.5, 1;
+        plant_time: "Saplı kalma süresi (sn)" = 0.7, 0.1, 5.0, 0.1, 1;
+        plant_hop: "Kalkarken zıplama" = 0.6, 0.0, 2.0, 0.05, 2;
         land_hop: "İnişte seken zıplama" = 0.3, 0.0, 2.0, 0.05, 2;
     }
     "Etkileşim", "Sevme" {
