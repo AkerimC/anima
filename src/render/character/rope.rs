@@ -131,18 +131,25 @@ void main() {
 }
 "#;
 
-// tip down, y up: an orange body with a few grooves, a tuft of leaves on top
+// y up: 0 a carrot, 1 a wrapped box, 2 a balloon, 3 a boxing glove on a spring
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
 out vec4 fragColor;
+uniform int u_kind;
+uniform int u_flip;
 float blade(vec2 p, float x, float lean) {
     float t = clamp((p.y - 0.25) / 0.7, 0.0, 1.0);
     float d = abs(p.x - x - lean * t) - 0.17 * (1.0 - t);
     return (1.0 - smoothstep(-0.02, 0.03, d)) * step(0.25, p.y) * (1.0 - smoothstep(0.9, 0.95, p.y));
 }
-void main() {
-    vec2 p = v_pos;
+float disc(vec2 p, vec2 c, float r) {
+    return 1.0 - smoothstep(r - 0.03, r + 0.01, length(p - c));
+}
+float bar(vec2 p, vec2 lo, vec2 hi) {
+    return step(lo.x, p.x) * step(p.x, hi.x) * step(lo.y, p.y) * step(p.y, hi.y);
+}
+vec4 carrot(vec2 p) {
     float t = clamp((p.y + 1.0) / 1.45, 0.0, 1.0);
     float half_w = 0.1 + 0.62 * pow(t, 0.75);
     float d = abs(p.x) - half_w;
@@ -151,9 +158,39 @@ void main() {
     vec3 orange = mix(vec3(1.0, 0.55, 0.08), vec3(0.8, 0.3, 0.02), groove * 0.7);
     orange *= 1.0 - 0.35 * smoothstep(0.1, 1.0, p.x / max(half_w, 0.01));
     float leaf = max(blade(p, 0.0, 0.0), max(blade(p, -0.14, -0.35), blade(p, 0.14, 0.35)));
-    vec3 col = body > 0.0 ? orange : vec3(0.2, 0.68, 0.18);
-    float alpha = max(body, leaf);
-    fragColor = vec4(col * alpha, alpha);
+    return vec4(body > 0.0 ? orange : vec3(0.2, 0.68, 0.18), max(body, leaf));
+}
+vec4 box(vec2 p) {
+    float body = bar(p, vec2(-0.78, -1.0), vec2(0.78, 0.3));
+    float lid = bar(p, vec2(-0.92, 0.3), vec2(0.92, 0.56));
+    float ribbon = step(abs(p.x), 0.16);
+    float bow = max(disc(p, vec2(-0.27, 0.74), 0.22), disc(p, vec2(0.27, 0.74), 0.22));
+    float a = max(max(body, lid), bow);
+    vec3 col = mix(lid > 0.0 ? vec3(0.9, 0.2, 0.26) : vec3(0.72, 0.13, 0.2), vec3(1.0, 0.82, 0.25), max(ribbon, bow));
+    return vec4(col, a);
+}
+vec4 balloon(vec2 p) {
+    float d = length((p - vec2(0.0, 0.25)) / vec2(0.62, 0.72));
+    float body = 1.0 - smoothstep(0.96, 1.0, d);
+    float knot = bar(p, vec2(-0.07, -0.56), vec2(0.07, -0.44));
+    float string_ = step(abs(p.x - 0.06 * sin(p.y * 9.0)), 0.025) * step(p.y, -0.5);
+    float shine = disc(p, vec2(-0.22, 0.5), 0.13);
+    vec3 col = mix(vec3(0.95, 0.2, 0.4), vec3(1.0, 0.85, 0.9), shine);
+    if (body <= 0.0) col = string_ > 0.0 ? vec3(0.85) : vec3(0.75, 0.15, 0.3);
+    return vec4(col, max(max(body, knot), string_));
+}
+vec4 glove(vec2 p) {
+    float fist = max(disc(p, vec2(0.58, 0.0), 0.42), disc(p, vec2(0.36, 0.34), 0.18));
+    float cuff = bar(p, vec2(0.04, -0.34), vec2(0.2, 0.34));
+    float spring = step(p.x, 0.06) * step(abs(p.y - 0.28 * sin(p.x * 22.0)), 0.09);
+    vec3 col = cuff > 0.0 ? vec3(0.95) : (fist > 0.0 ? vec3(0.9, 0.12, 0.12) : vec3(0.75, 0.76, 0.8));
+    return vec4(col, max(max(fist, cuff), spring));
+}
+void main() {
+    vec2 p = v_pos;
+    if (u_flip == 1) p.x = -p.x;
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : carrot(p);
+    fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
 
@@ -184,8 +221,8 @@ impl CarrotGl {
 
 impl CharacterOverlay {
     pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
-        let rects = self.carrot_rects();
-        if rects.is_empty() {
+        let props = self.props();
+        if props.is_empty() {
             return;
         }
         if self.carrot_gl.is_none() {
@@ -199,7 +236,7 @@ impl CharacterOverlay {
         }
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         let Some(c) = self.carrot_gl.as_mut() else { return };
-        for rect in rects {
+        for (kind, rect, flip) in props {
             if !target.begin(gl, 0, rect) {
                 continue;
             }
@@ -207,6 +244,8 @@ impl CharacterOverlay {
             c.program.bind(gl);
             c.program.set_vec4(gl, "u_rect", [x0 / w * 2.0 - 1.0, 1.0 - y1 / h * 2.0, x1 / w * 2.0 - 1.0, 1.0 - y0 / h * 2.0]);
             c.program.set_vec4(gl, "u_clip", target.clip_xform());
+            c.program.set_i32(gl, "u_kind", kind);
+            c.program.set_i32(gl, "u_flip", i32::from(flip));
             unsafe {
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);

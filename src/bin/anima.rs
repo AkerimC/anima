@@ -145,7 +145,7 @@ enum Cmd {
     Reload,
     /// Make the walking characters race each other.
     Race,
-    /// Start a game now: contest, cursor, long, domino, tug, tag, samba, volley, carrot.
+    /// Start a game now: contest, cursor, long, domino, tug, tag, samba, volley, carrot, gift.
     Game {
         name: String,
     },

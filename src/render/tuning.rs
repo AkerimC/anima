@@ -159,6 +159,19 @@ tuning! {
         after_game_rand: "Sohbete eklenen rastgele (sn)" = 5.0, 0.0, 60.0, 1.0, 0;
         cheer_time: "Kazananın sevinmesi (sn)" = 3.0, 0.0, 30.0, 0.5, 1;
     }
+    "Oyunlar", "Hediye" {
+        gift_min: "En az karakter" = 2.0, 2.0, 2.0, 1.0, 0;
+        gift_chance: "İki kişilik sohbette hediye şansı" = 0.12, 0.0, 1.0, 0.01, 2;
+        gift_prank: "Yumruklu kutu şansı" = 0.35, 0.0, 1.0, 0.05, 2;
+        gift_balloon: "Balon şansı" = 0.2, 0.0, 1.0, 0.05, 2;
+        gift_punch_speed: "Yumruğun fırlatma hızı" = 1.4, 0.1, 6.0, 0.1, 1;
+        gift_punch_rand: "Eklenen rastgele hız" = 0.6, 0.0, 4.0, 0.1, 1;
+        gift_punch_up: "Yumruğun yukarı gücü" = 22.0, 2.0, 60.0, 1.0, 0;
+        gift_bounces: "Yerden sekme sayısı" = 3.0, 0.0, 10.0, 1.0, 0;
+        gift_bounce: "Sekme gücü" = 0.62, 0.1, 0.95, 0.01, 2;
+        gift_balloon_height: "Balonla yükselme" = 9.0, 1.0, 30.0, 0.5, 1;
+        gift_balloon_time: "Balonla uçma süresi (sn)" = 2.2, 0.3, 10.0, 0.1, 1;
+    }
     "Oyunlar", "Havuç kapmaca" {
         carrot_min: "En az oyuncu" = 3.0, 2.0, 12.0, 1.0, 0;
         carrot_time: "Havucu kapınca oyun süresi (sn)" = 15.0, 3.0, 120.0, 1.0, 0;
@@ -233,7 +246,13 @@ tuning! {
         volley_accel: "Hızlanma" = 4.0, 0.2, 10.0, 0.1, 1;
     }
     "Oyunlar", "Samba" {
-        samba_time: "Süre (sn)" = 12.0, 2.0, 120.0, 1.0, 0;
+        samba_min: "En az karakter" = 3.0, 2.0, 12.0, 1.0, 0;
+        samba_big: "Tam şans için kişi sayısı" = 7.0, 3.0, 30.0, 1.0, 0;
+        samba_weight_small: "Az kişiyle seçilme ağırlığı" = 0.12, 0.0, 3.0, 0.01, 2;
+        samba_weight_big: "Çok kişiyle seçilme ağırlığı" = 0.3, 0.0, 3.0, 0.01, 2;
+        samba_join: "Görenin katılma şansı" = 0.5, 0.0, 1.0, 0.05, 2;
+        samba_join_gap: "Katılımlar arası (sn)" = 4.0, 0.5, 60.0, 0.5, 1;
+        samba_time: "Süre (sn)" = 45.0, 2.0, 120.0, 1.0, 0;
         samba_beat: "Adım aralığı (sn)" = 0.45, 0.35, 2.0, 0.05, 2;
         samba_step: "Adım boyu (piksel)" = 40.0, 0.0, 300.0, 5.0, 0;
     }

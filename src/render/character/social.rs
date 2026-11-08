@@ -59,6 +59,8 @@ pub(super) struct Social {
     face_lock: bool,
     // volleyball: standing on the other half of the net
     perched: bool,
+    // knocked flying: times it comes back off the ground
+    pub(super) bounces: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -75,6 +77,7 @@ enum Stage {
     Tug,
     Tag,
     Carrot,
+    Gift,
     Samba,
     Volley,
     Cheer,
@@ -161,8 +164,28 @@ struct Carrot {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
+enum GiftKind {
+    Carrot,
+    Prank,
+    Balloon,
+}
+
+/// A present from one to the other.
+struct Gift {
+    giver: usize,
+    taker: usize,
+    kind: GiftKind,
+    // where the prank box was left, strip x and screen top, and how long
+    // since it went off
+    box_x: f32,
+    box_y: f32,
+    t: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Game {
     Carrot,
+    Gift,
     Contest,
     Cursor,
     Long,
@@ -176,7 +199,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None }
+        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
     }
 }
 
@@ -266,6 +289,9 @@ pub(super) struct Chat {
     // seconds talking, towards splitting into talkers and players
     mood: f32,
     carrot: Option<Carrot>,
+    // samba: still walking over to join the row
+    samba_new: Vec<usize>,
+    gift: Option<Gift>,
 }
 
 /// Chance per look that someone nearby joins a chat this big: a pair is
@@ -362,6 +388,7 @@ impl WalkState {
         self.act = Act::Idle;
         self.timer = 1.0;
         self.target = self.x;
+        self.rolling = false;
         if let Some(r) = self.social.as_mut() {
             r.flying = false;
             r.stuck = true;
@@ -510,7 +537,7 @@ impl CharacterOverlay {
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
             if self.race.is_none() {
-                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Cheer)) {
+                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Volley | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
                 for c in chats.iter_mut() {
@@ -521,6 +548,9 @@ impl CharacterOverlay {
                     if !full && matches!(c.stage, Stage::Talk | Stage::Stroll) {
                         self.try_join(c, n);
                     }
+                }
+                for c in chats.iter_mut().filter(|c| c.stage == Stage::Samba && c.step != 9) {
+                    self.try_samba_join(c, n);
                 }
                 let room = chats.len() < (n / (tn().chat_divisor as usize).max(1)).max(1);
                 chats.extend(self.find_pair(n, room));
@@ -535,7 +565,7 @@ impl CharacterOverlay {
         let id = c.id;
         let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Volley | Stage::Cheer);
         // tag: you can carry someone off and they're still in it when put down
-        let tag = matches!(c.stage, Stage::Tag | Stage::Carrot | Stage::Long);
+        let tag = matches!(c.stage, Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Long);
         let mut left = Vec::new();
         c.members.retain(|&i| {
             let stays = i < n && {
@@ -611,7 +641,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, bounces: 0 });
     }
 
     /// Two standing close, on screen and free: maybe they notice each other.
@@ -942,6 +972,9 @@ impl CharacterOverlay {
             && self.walk.rand() < tn().race_chance
         {
             self.call_race(c);
+        } else if size == 2 && self.race.is_none() && !c.played.contains(&Game::Gift) && self.walk.rand() < tn().gift_chance {
+            c.played.push(Game::Gift);
+            self.start_gift(c);
         }
     }
 
@@ -1026,12 +1059,21 @@ impl CharacterOverlay {
             (Game::Tug, tn().party_min as usize),
             (Game::Tag, tn().party_min as usize),
             (Game::Carrot, tn().carrot_min as usize),
-            (Game::Samba, tn().party_min as usize),
+            (Game::Samba, tn().samba_min as usize),
             (Game::Volley, tn().volley_min as usize),
         ]
         .iter()
         .filter(|g| len >= g.1 && !played.contains(&g.0))
-        .map(|g| (g.0, (1.0 + (len - g.1) as f32).powf(-tn().game_fit)))
+        .map(|g| {
+            // samba isn't for a handful: the more there are the likelier
+            let weight = if g.0 == Game::Samba {
+                let t = ((len - g.1) as f32 / (tn().samba_big - g.1 as f32).max(1.0)).clamp(0.0, 1.0);
+                tn().samba_weight_small + (tn().samba_weight_big - tn().samba_weight_small) * t
+            } else {
+                (1.0 + (len - g.1) as f32).powf(-tn().game_fit)
+            };
+            (g.0, weight)
+        })
         .collect();
         let mut roll = self.walk.rand() * pool.iter().map(|g| g.1).sum::<f32>();
         for &(game, weight) in &pool {
@@ -1070,14 +1112,19 @@ impl CharacterOverlay {
         }
         let keen = (0..len).filter(|_| self.walk.rand() < tn().mood_game).count();
         let count = keen.clamp(min, len - 2);
-        // the ones with the most energy are the ones who want to play
-        let mut row = c.members.clone();
-        row.sort_by(|&a, &b| self.walk_ref(b).energy.total_cmp(&self.walk_ref(a).energy));
-        let talkers = row.split_off(count);
-        let players = row;
-        let mean = players.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / count as f32;
+        // the livelier end of the row goes, nobody has to cross the others
+        let row = self.sorted_row(c);
+        let energy = |m: &[usize]| m.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / m.len() as f32;
+        let (first, rest) = row.split_at(count);
+        let (others, last) = row.split_at(len - count);
+        let (players, talkers) = if energy(first) >= energy(last) {
+            (first.to_vec(), rest.to_vec())
+        } else {
+            (last.to_vec(), others.to_vec())
+        };
+        let mean = energy(&players);
         log::debug!("chat {}: mood split? {count} would play, energy {mean:.2}", c.id);
-        if mean < tn().energy_game_need {
+        if mean < tn().energy_game_need * 0.7 {
             return false;
         }
         let Some(game) = self.choose_game(&c.played, count) else {
@@ -1098,8 +1145,13 @@ impl CharacterOverlay {
         c.members = talkers;
         c.talker = c.members[0];
         c.turn = 0.0;
+        // the ones staying stay where they are
         self.arrange(&other);
-        self.arrange(c);
+        for &i in &other.members {
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.happy = false;
+            }
+        }
         let size = self.row_size(c);
         let mean_of = |this: &Self, m: &[usize]| m.iter().map(|&i| this.goal_of(i)).sum::<f32>() / m.len() as f32;
         let away = if mean_of(self, &other.members) < mean_of(self, &c.members) { -1.0 } else { 1.0 };
@@ -1127,6 +1179,7 @@ impl CharacterOverlay {
             Game::Tug => self.start_tug(c),
             Game::Tag => self.start_tag(c),
             Game::Carrot => self.start_carrot(c),
+            Game::Gift => self.start_gift(c),
             Game::Samba => self.start_samba(c),
             Game::Volley => self.start_volley(c),
         }
@@ -1144,7 +1197,8 @@ impl CharacterOverlay {
             "tug" => (Game::Tug, t.party_min),
             "tag" => (Game::Tag, t.party_min),
             "carrot" => (Game::Carrot, t.carrot_min),
-            "samba" => (Game::Samba, t.party_min),
+            "gift" => (Game::Gift, t.gift_min),
+            "samba" => (Game::Samba, t.samba_min),
             "volley" => (Game::Volley, t.volley_min),
             _ => return,
         };
@@ -1158,7 +1212,7 @@ impl CharacterOverlay {
             .iter()
             .filter(|c| {
                 c.forced.is_some()
-                    || matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Cheer | Stage::RaceCall | Stage::RaceWait)
+                    || matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Volley | Stage::Cheer | Stage::RaceCall | Stage::RaceWait)
             })
             .flat_map(|c| c.members.iter().copied())
             .collect();
@@ -1172,7 +1226,7 @@ impl CharacterOverlay {
             log::debug!("game {name}: only {} free, needs {need}", free.len());
             return;
         }
-        let count = if game == Game::Volley { free.len() } else { need.max(FORCED_PLAYERS.min(free.len())) };
+        let count = if game == Game::Gift { 2 } else if game == Game::Volley { free.len() } else { need.max(FORCED_PLAYERS.min(free.len())) };
         let members: Vec<usize> = free.iter().take(count).map(|f| f.0).collect();
         self.chat_id = self.chat_id.wrapping_add(1);
         let id = self.chat_id;
@@ -1765,6 +1819,48 @@ impl CharacterOverlay {
 
     /// Samba: in a row, hopping forward together a step at a time, looking
     /// right, then left, on the beat.
+    /// Things drawn beside the characters: (kind, surface box, mirrored).
+    pub(super) fn props(&self) -> Vec<(i32, [f32; 4], bool)> {
+        let mut v: Vec<(i32, [f32; 4], bool)> = self.carrot_rects().into_iter().map(|r| (0, r, false)).collect();
+        for c in self.chats.iter().filter(|c| c.stage == Stage::Gift) {
+            let Some(g) = c.gift.as_ref() else { continue };
+            let rect = |i: usize| if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
+            let (giver, taker) = (rect(g.giver), rect(g.taker));
+            let height = (taker[3] - taker[1]).max(1.0);
+            let size = height * 0.36;
+            let middle = |r: [f32; 4]| (r[0] + r[2]) * 0.5;
+            let dir = if middle(taker) >= middle(giver) { 1.0 } else { -1.0 };
+            let hand = |r: [f32; 4], side: f32| {
+                let x = middle(r) + side * height * 0.3;
+                let top = r[1] + height * 0.55 - size * 0.5;
+                [x - size * 0.5, top, x + size * 0.5, top + size]
+            };
+            match (c.step, g.kind) {
+                (1, _) => v.push((1, hand(giver, dir), false)),
+                (2, _) => v.push((1, hand(taker, -dir), false)),
+                (3, GiftKind::Carrot) => v.push((0, hand(taker, -dir), false)),
+                (3, GiftKind::Balloon) => {
+                    let w = height * 0.32;
+                    let x = middle(taker);
+                    v.push((2, [x - w, taker[1] - height * 0.72, x + w, taker[1] + height * 0.08], false));
+                }
+                (3, GiftKind::Prank) => {
+                    let x = g.box_x - self.view[0] * self.view_w * 0.5;
+                    v.push((1, [x - size * 0.5, g.box_y, x + size * 0.5, g.box_y + size], false));
+                    // shoots out at once, then quivers on its spring
+                    let out = height * (0.75 + 0.06 * (g.t * 40.0).sin()) * (g.t / 0.08).min(1.0);
+                    let face = taker[1] + height * 0.3;
+                    let (a, b) = (x, x + dir * out);
+                    let half = height * 0.17;
+                    let top = g.box_y.min(face) + (face - g.box_y).abs() * 0.5 - half;
+                    v.push((3, [a.min(b), top, a.max(b), top + half * 2.0], dir < 0.0));
+                }
+                _ => {}
+            }
+        }
+        v
+    }
+
     /// The carrot on the screen, surface pixels.
     pub(super) fn carrot_rects(&self) -> Vec<[f32; 4]> {
         self.chats.iter().filter(|c| c.stage == Stage::Carrot && c.step != 9).filter_map(|c| self.carrot_rect(c)).collect()
@@ -2016,6 +2112,192 @@ impl CharacterOverlay {
         c.carrot = Some(v);
     }
 
+    /// Two of them: one hands the other a present and it goes well or it
+    /// doesn't.
+    fn start_gift(&mut self, c: &mut Chat) {
+        let giver = usize::from(self.walk.rand() < 0.5);
+        let (giver, taker) = (c.members[giver], c.members[1 - giver]);
+        let roll = self.walk.rand();
+        let kind = if roll < tn().gift_prank {
+            GiftKind::Prank
+        } else if roll < tn().gift_prank + tn().gift_balloon {
+            GiftKind::Balloon
+        } else {
+            GiftKind::Carrot
+        };
+        log::debug!("chat {}: {giver} gives {taker} a present: {kind:?}", c.id);
+        for k in 0..c.members.len() {
+            if let Some(r) = self.walk_of(c.members[k]).social.as_mut() {
+                r.no_pat = true;
+                r.happy = false;
+            }
+        }
+        c.gift = Some(Gift { giver, taker, kind, box_x: 0.0, box_y: 0.0, t: 0.0 });
+        c.scores.clear();
+        c.step = 0;
+        c.wait = 0.0;
+        c.timer = 40.0;
+        c.stage = Stage::Gift;
+    }
+
+    fn run_gift(&mut self, c: &mut Chat, dt: f32) {
+        let Some(mut g) = c.gift.take() else { return };
+        if c.timer <= 0.0 || !c.members.contains(&g.giver) || !c.members.contains(&g.taker) {
+            if let Some(r) = self.walk_of(g.taker).social.as_mut() {
+                r.perched = false;
+            }
+            self.end_game(c);
+            return;
+        }
+        c.wait -= dt;
+        g.t += dt;
+        let (giver, taker) = (g.giver, g.taker);
+        let dir = if self.strip_px(taker) >= self.strip_px(giver) { 1.0 } else { -1.0 };
+        let happy = |this: &mut Self, i: usize, on: bool| {
+            if let Some(r) = this.walk_of(i).social.as_mut() {
+                r.happy = on;
+            }
+        };
+        match c.step {
+            // held out towards the other, who looks
+            0 => {
+                if self.all_arrived(c) {
+                    self.face(giver, taker);
+                    self.face(taker, giver);
+                    happy(self, giver, true);
+                    let wk = self.walk_of(giver);
+                    wk.gesture = true;
+                    wk.start_bob(tn().jump_height * 0.2);
+                    c.wait = 1.0;
+                    c.step = 1;
+                }
+            }
+            // taken, and turned over in the hands
+            1 if c.wait <= 0.0 => {
+                self.walk_of(taker).gesture = true;
+                happy(self, taker, true);
+                c.wait = 0.8;
+                c.step = 2;
+            }
+            2 if c.wait <= 0.0 => {
+                c.step = 3;
+                g.t = 0.0;
+                match g.kind {
+                    GiftKind::Carrot => c.wait = 2.5,
+                    GiftKind::Balloon => {
+                        c.wait = tn().gift_balloon_time;
+                        let wk = self.walk_of(taker);
+                        if let Some(r) = wk.social.as_mut() {
+                            r.perched = true;
+                        }
+                        wk.air = 0.01;
+                    }
+                    GiftKind::Prank => {
+                        // where the box stays once the taker is gone
+                        let r = if taker == 0 { self.hit_rect } else { self.extras[taker - 1].hit_rect };
+                        let height = (r[3] - r[1]).max(1.0);
+                        g.box_x = self.strip_px(taker) - dir * height * 0.3;
+                        g.box_y = r[1] + height * 0.55 - height * 0.18;
+                        c.wait = 0.45;
+                        let speed = tn().gift_punch_speed + self.walk.rand() * tn().gift_punch_rand;
+                        let spin = dir * -(12.0 + self.walk.rand() * 6.0);
+                        let wk = self.walk_of(taker);
+                        wk.vx = dir * speed;
+                        wk.vy = tn().gift_punch_up;
+                        wk.air = wk.air.max(0.3);
+                        wk.jump = 0.0;
+                        wk.held_prev = None;
+                        wk.act = Act::Fall;
+                        wk.tumble = spin;
+                        if let Some(r) = wk.social.as_mut() {
+                            r.flying = true;
+                            r.stuck = false;
+                            r.moving = false;
+                            r.happy = false;
+                            r.spin = spin;
+                            r.bounces = tn().gift_bounces as u8;
+                        }
+                        log::debug!("chat {}: pow!", c.id);
+                    }
+                }
+            }
+            3 => match g.kind {
+                GiftKind::Carrot => {
+                    for i in [giver, taker] {
+                        let wk = self.walk_of(i);
+                        if grounded(wk) && wk.rand() < dt * 3.0 {
+                            let height = tn().jump_height * (0.4 + wk.rand() * 0.4);
+                            wk.start_jump(height);
+                        }
+                    }
+                    if c.wait <= 0.0 {
+                        self.end_game(c);
+                        return;
+                    }
+                }
+                GiftKind::Balloon => {
+                    let rise = tn().gift_balloon_height / tn().gift_balloon_time.max(0.1);
+                    let spin = if self.walk.rand() < 0.5 { 10.0 } else { -10.0 };
+                    let wk = self.walk_of(taker);
+                    wk.air += rise * dt;
+                    if c.wait <= 0.0 {
+                        log::debug!("chat {}: the balloon pops", c.id);
+                        wk.act = Act::Fall;
+                        wk.vx = 0.0;
+                        wk.vy = 0.0;
+                        wk.jump = 0.0;
+                        wk.held_prev = None;
+                        if let Some(r) = wk.social.as_mut() {
+                            r.perched = false;
+                            r.flying = true;
+                            r.spin = spin;
+                            r.happy = false;
+                        }
+                        c.step = 4;
+                    }
+                }
+                GiftKind::Prank => {
+                    if c.wait <= 0.0 {
+                        c.step = 4;
+                    }
+                }
+            },
+            // laughing until the other has come to a stop, then off after it
+            4 => {
+                if self.walk_ref(taker).social.is_some_and(|s| s.stuck) {
+                    log::debug!("chat {}: landed {:.0} px away", c.id, (self.strip_px(taker) - self.strip_px(giver)).abs());
+                    let size = self.width_of(taker);
+                    let spot = self.strip_px(taker) - dir * size * 0.7;
+                    self.go_facing(giver, spot, 0.65);
+                    c.step = 5;
+                }
+            }
+            // there: helps it up
+            5 => {
+                if self.arrived(giver) {
+                    self.face(giver, taker);
+                    let hop = tn().jump_height * 0.5;
+                    let wk = self.walk_of(taker);
+                    if let Some(r) = wk.social.as_mut() {
+                        r.stuck = false;
+                    }
+                    wk.start_jump(hop);
+                    let wk = self.walk_of(giver);
+                    wk.gesture = true;
+                    wk.start_bob(tn().jump_height * 0.2);
+                    c.wait = 1.0;
+                    c.step = 6;
+                }
+            }
+            6 if c.wait <= 0.0 => {
+                self.end_game(c);
+                return;
+            }
+            _ => {}
+        }
+        c.gift = Some(g);
+    }
+
     fn start_samba(&mut self, c: &mut Chat) {
         log::debug!("chat {}: samba", c.id);
         self.arrange(c);
@@ -2025,13 +2307,58 @@ impl CharacterOverlay {
         c.wait = 0.0;
         c.step = 9;
         c.timer = 60.0;
+        c.tag_free = tn().samba_join_gap;
+        c.samba_new.clear();
         c.scores.clear();
         c.stage = Stage::Samba;
+    }
+
+    /// Someone passing sees the dancing and joins the end of the row, one
+    /// at a time.
+    fn try_samba_join(&mut self, c: &mut Chat, n: usize) {
+        if c.tag_free > 0.0 || c.members.len() >= tn().max_group as usize || c.base.is_empty() {
+            return;
+        }
+        let spots: Vec<f32> = c.members.iter().map(|&i| self.strip_px(i)).collect();
+        let size = self.width_of(c.members[0]);
+        let nearest = (0..n)
+            .filter(|&i| {
+                let wk = self.walk_ref(i);
+                grounded(wk) && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_join_need && chat_cool(wk) <= 0.0
+            })
+            .map(|i| {
+                let x = self.strip_px(i);
+                (i, x, spots.iter().map(|p| (p - x).abs()).fold(f32::MAX, f32::min))
+            })
+            .filter(|f| f.2 < size * tn().see_range)
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        let Some((i, x, _)) = nearest else { return };
+        c.tag_free = tn().samba_join_gap * (0.7 + self.walk.rand() * 0.6);
+        if self.walk.rand() >= tn().samba_join {
+            return;
+        }
+        let gap = self.row_size(c) * 0.72;
+        let lo = c.base.iter().map(|b| b.1).fold(f32::MAX, f32::min);
+        let hi = c.base.iter().map(|b| b.1).fold(f32::MIN, f32::max);
+        let slot = if x - c.pull < (lo + hi) * 0.5 { lo - gap } else { hi + gap };
+        self.spend(i, tn().energy_join_cost);
+        self.enlist(i, c.id);
+        let wk = self.walk_of(i);
+        if let Some(r) = wk.social.as_mut() {
+            r.no_pat = true;
+        }
+        wk.start_bob(tn().jump_height * 0.2);
+        c.members.push(i);
+        c.base.push((i, slot));
+        c.samba_new.push(i);
+        log::debug!("chat {}: {i} joins the samba, now {}", c.id, c.members.len());
     }
 
     fn run_samba(&mut self, c: &mut Chat, dt: f32) {
         if c.step == 9 {
             if self.all_arrived(c) {
+                c.base = c.members.iter().map(|&i| (i, self.strip_px(i))).collect();
+                c.pull = 0.0;
                 c.step = 0;
                 c.timer = tn().samba_time;
             } else if c.timer <= 0.0 {
@@ -2043,18 +2370,53 @@ impl CharacterOverlay {
             self.end_game(c);
             return;
         }
+        c.tag_free -= dt;
+        // put down somewhere else: runs back to its place in the row
+        let width = self.strip_width();
+        let far = (tn().samba_step * 1.6).max(30.0);
+        let slot = |x: f32, marched: f32| (x + marched).clamp(0.0, width);
+        let mut away = Vec::new();
+        for &(i, x) in &c.base.clone() {
+            if !c.members.contains(&i) || !grounded(self.walk_ref(i)) {
+                continue;
+            }
+            let goal = slot(x, c.pull);
+            if (self.strip_px(i) - goal).abs() > far {
+                away.push(i);
+                let speed = if c.samba_new.contains(&i) { 0.24 } else { 0.5 };
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.goal_px = goal;
+                    r.speed = speed;
+                    r.moving = true;
+                    r.leaping = false;
+                    r.face_lock = false;
+                    r.happy = false;
+                }
+            } else {
+                c.samba_new.retain(|&m| m != i);
+            }
+        }
         c.wait -= dt;
         if c.wait > 0.0 {
             return;
         }
         c.wait = tn().samba_beat;
         c.turn = -c.turn;
-        let width = self.strip_width();
+        // at the end of the strip the whole row turns back
+        let edge = 120.0f32.min(width * 0.25);
+        let step = c.offset * tn().samba_step;
+        let lo = c.base.iter().map(|b| b.1).fold(f32::MAX, f32::min);
+        let hi = c.base.iter().map(|b| b.1).fold(f32::MIN, f32::max);
+        if lo + c.pull + step < edge || hi + c.pull + step > width - edge {
+            c.offset = -c.offset;
+        }
+        c.pull += c.offset * tn().samba_step;
         let w = self.view_w.max(1.0);
-        for k in 0..c.members.len() {
-            let i = c.members[k];
-            let x = self.strip_px(i);
-            let goal = (x + c.offset * tn().samba_step).clamp(0.0, width);
+        for &(i, x) in &c.base.clone() {
+            if !c.members.contains(&i) || away.contains(&i) {
+                continue;
+            }
+            let goal = slot(x, c.pull);
             let left = c.turn < 0.0;
             let wk = self.walk_of(i);
             if !grounded(wk) {
@@ -2943,6 +3305,7 @@ impl CharacterOverlay {
             Stage::Tug => self.run_tug(c, dt, mouse),
             Stage::Tag => self.run_tag(c, dt),
             Stage::Carrot => self.run_carrot(c, dt),
+            Stage::Gift => self.run_gift(c, dt),
             Stage::Samba => self.run_samba(c, dt),
             Stage::Volley => self.run_volley(c, dt),
             Stage::Cheer => {

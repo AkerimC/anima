@@ -309,6 +309,15 @@ impl CharacterOverlay {
                     self.walk.vy = -self.walk.vy.abs() * tn().top_bounce;
                 }
                 self.walk.target = self.walk.x;
+                // knocked flying: off the ground again a few times
+                if self.walk.air <= 0.0 {
+                    if let Some(s) = self.walk.social.as_mut().filter(|s| s.bounces > 0) {
+                        s.bounces -= 1;
+                        self.walk.air = 0.01;
+                        self.walk.vy = self.walk.vy.abs() * tn().gift_bounce;
+                        self.walk.vx *= 0.8;
+                    }
+                }
                 if self.walk.air <= 0.0 {
                     let hard = self.walk.vy <= -(2.0 * tn().gravity * tn().fall_high).sqrt();
                     self.walk.air = 0.0;
