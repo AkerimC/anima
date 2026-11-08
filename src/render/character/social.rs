@@ -611,6 +611,18 @@ impl CharacterOverlay {
         }
     }
 
+    /// `go`, and still looking that way after getting there (the others may
+    /// take longer).
+    fn go_facing(&mut self, i: usize, goal_px: f32, speed: f32) {
+        let here = self.strip_px(i);
+        self.go(i, goal_px, speed);
+        if let Some(r) = self.walk_of(i).social.as_mut() {
+            if (goal_px - here).abs() > 1.0 {
+                r.face_left = goal_px < here;
+            }
+        }
+    }
+
     fn arrived(&self, i: usize) -> bool {
         let wk = self.walk_ref(i);
         grounded(wk) && wk.social.is_some_and(|s| !s.moving)
@@ -711,7 +723,7 @@ impl CharacterOverlay {
             dist = dist.min(room(dir));
         }
         for (k, &i) in c.members.clone().iter().enumerate() {
-            self.go(i, spots[k] + dir * dist, 0.12);
+            self.go_facing(i, spots[k] + dir * dist, 0.12);
         }
         c.strolls += 1;
         c.stage = Stage::Stroll;
@@ -1540,7 +1552,7 @@ impl CharacterOverlay {
             } else {
                 (x - mean).signum()
             };
-            self.go(i, (x + away * dist).clamp(tn().edge_px.min(width * 0.5), (width - tn().edge_px).max(width * 0.5)), 0.12);
+            self.go_facing(i, (x + away * dist).clamp(tn().edge_px.min(width * 0.5), (width - tn().edge_px).max(width * 0.5)), 0.12);
         }
         c.stage = Stage::Part;
     }
