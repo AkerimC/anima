@@ -2,6 +2,7 @@
 //! hopping, running after the cursor or into a drawn circle.
 
 use super::race::Racer;
+use super::social::Social;
 
 /// What the character is doing right now.
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
@@ -53,6 +54,11 @@ pub(super) struct WalkState {
     // dropped at a random spot on the first frame
     pub(super) placed: bool,
     pub(super) race: Option<Racer>,
+    pub(super) social: Option<Social>,
+    // seconds before it's up for another chat
+    pub(super) social_cool: f32,
+    // play a gesture now (3D characters)
+    pub(super) gesture: bool,
     // animation time not yet given to the 3D model (skipped frames)
     pub(super) model_dt: f32,
 }
@@ -72,7 +78,7 @@ impl WalkState {
 
     pub(super) fn pick(&mut self, min: f32, max: f32, can_chase: bool) {
         let r = self.rand();
-        if r < 0.27 {
+        if r < 0.30 {
             // short or long stroll in a random direction
             let d = self.rand();
             let dist = if d < 0.4 {
@@ -89,7 +95,7 @@ impl WalkState {
             }
             self.target = (self.x + dir * dist).clamp(min, max);
             self.act = Act::Walk;
-        } else if r < 0.82 {
+        } else if r < 0.93 {
             self.act = Act::Idle;
             self.timer = 1.0 + self.rand() * 3.0;
         } else if r < 0.98 || !can_chase {
@@ -131,6 +137,9 @@ impl WalkState {
             }
         }
         if let Some(r) = self.race_step(dt) {
+            return r;
+        }
+        if let Some(r) = self.social_step(dt) {
             return r;
         }
         let mut moving = false;

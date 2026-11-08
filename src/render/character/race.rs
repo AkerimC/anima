@@ -69,16 +69,16 @@ pub(super) struct Race {
 }
 
 impl CharacterOverlay {
-    fn walk_ref(&self, i: usize) -> &WalkState {
+    pub(super) fn walk_ref(&self, i: usize) -> &WalkState {
         if i == 0 { &self.walk } else { &self.extras[i - 1].walk }
     }
 
-    fn walk_of(&mut self, i: usize) -> &mut WalkState {
+    pub(super) fn walk_of(&mut self, i: usize) -> &mut WalkState {
         if i == 0 { &mut self.walk } else { &mut self.extras[i - 1].walk }
     }
 
     /// Strip position of a character's centre, logical px.
-    fn strip_px(&self, i: usize) -> f32 {
+    pub(super) fn strip_px(&self, i: usize) -> f32 {
         let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
         (r[0] + r[2]) * 0.5 + self.view[0] * self.view_w * 0.5
     }
@@ -139,7 +139,8 @@ impl CharacterOverlay {
                     let free: Vec<(usize, f32)> =
                         (0..n).filter(|&i| self.walk_ref(i).race.is_none()).map(|i| (i, self.strip_px(i))).collect();
                     let pick = if joined.is_empty() {
-                        Some((self.walk.rand() * n as f32) as usize % n)
+                        let first = self.race_first.take().filter(|&i| i < n);
+                        Some(first.unwrap_or((self.walk.rand() * n as f32) as usize % n))
                     } else {
                         let d = |x: f32| joined.iter().map(|p| (p - x).abs()).fold(f32::MAX, f32::min);
                         free.iter().min_by(|a, b| d(a.1).total_cmp(&d(b.1))).map(|f| f.0)
@@ -150,6 +151,7 @@ impl CharacterOverlay {
                         let speed = 0.22 + wk.rand() * 0.08;
                         wk.race = Some(Racer { leg: Leg::ToStart, goal_px, goal: 0.0, speed, wait: 0.0, greeted: false, pace: 0.0, next_pace: 0.0, hop_cool: 0.0 });
                         wk.circle = false;
+                        wk.social = None;
                         // a little hop: "let's race!"
                         if grounded(wk) {
                             wk.start_jump(JUMP_AMP * 0.5);

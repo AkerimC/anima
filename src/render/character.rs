@@ -28,10 +28,12 @@ use crate::pkg::decode_tex;
 
 mod interact;
 mod race;
+mod social;
 mod uma;
 mod walk;
 
 use race::Race;
+use social::Chat;
 pub use race::RACE_NOW;
 use walk::{Act, PAT_DUR, WalkState};
 
@@ -907,6 +909,12 @@ pub struct CharacterOverlay {
     press: Option<(f32, [f32; 2], Option<(usize, [f32; 2])>)>,
     // a race between the walking characters (main character only)
     race: Option<Race>,
+    // pairs chatting, and when to look for the next (main character only)
+    chats: Vec<Chat>,
+    social_tick: f32,
+    chat_id: u32,
+    // who starts the race a big chat set off
+    race_first: Option<usize>,
     view_w: f32,
     // notifications seen so far
     notified: u32,
@@ -1047,6 +1055,10 @@ impl CharacterOverlay {
             hit_rect: [0.0; 4],
             press: None,
             race: None,
+            chats: Vec::new(),
+            social_tick: 0.0,
+            chat_id: 0,
+            race_first: None,
             view_w: 1.0,
             notified: crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed),
             clicks: 0,
@@ -1096,6 +1108,7 @@ impl CharacterOverlay {
             }
         }
         self.config.extra = extra.to_vec();
+        self.clear_chats();
     }
 
     pub fn reload_source(&mut self, gl: &glow::Context, _width: i32, _height: i32) -> Result<()> {
@@ -1106,6 +1119,8 @@ impl CharacterOverlay {
         self.model = None;
 
         if self.actor == 0 {
+            self.chats.clear();
+            self.walk.social = None;
             self.extras.clear();
             for src in &self.config.extra {
                 let mut cfg = self.config.clone();
@@ -1413,6 +1428,7 @@ impl CharacterOverlay {
             }
             if self.config.walk {
                 self.run_race(dt, w);
+                self.run_social(dt);
             }
         }
         let (tx, ty, pw, ph) = self.target_bounds(info.width, info.height, 1.0, active_window);
@@ -1592,7 +1608,15 @@ impl CharacterOverlay {
                 if let Some(r) = self.walk.race.as_mut() {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
+                if let Some(r) = self.walk.social.as_mut() {
+                    r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
+                }
                 let r = self.walk.step(dt, left_room, right_room, mouse, reach);
+                if std::mem::take(&mut self.walk.gesture) {
+                    if let Some(m) = self.model.as_mut() {
+                        m.gesture_now();
+                    }
+                }
                 // music: stay put instead of strolling or chasing, a gesture
                 // every eight beats
                 if self.vibe.on && self.walk.race.is_none() && matches!(self.walk.act, Act::Walk | Act::Chase) {
@@ -1674,8 +1698,10 @@ impl CharacterOverlay {
             self.program.set_vec4(gl, "u_mouth", mouth);
 
             gl.active_texture(glow::TEXTURE0);
-            let tex = match (self.walk.act, self.sprite_happy) {
-                (Act::Jump | Act::Pat | Act::Held | Act::Fall, Some(h)) => h,
+            let happy = matches!(self.walk.act, Act::Jump | Act::Pat | Act::Held | Act::Fall)
+                || self.walk.social.is_some_and(|s| s.happy);
+            let tex = match (happy, self.sprite_happy) {
+                (true, Some(h)) => h,
                 _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),
             };
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
