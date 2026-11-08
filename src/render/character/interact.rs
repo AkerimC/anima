@@ -84,6 +84,7 @@ impl CharacterOverlay {
                         // caught in flight: it has moved and turned since the press
                         let flying = matches!(a.walk.act, Act::Fall | Act::Planted);
                         a.walk.sink = 0.0;
+                        a.walk.race_down = false;
                         let grab = if flying { a.body_clip([mx, my]) } else { grab };
                         // caught mid-jump: keep it at the height it is drawn at
                         if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
@@ -330,7 +331,7 @@ impl CharacterOverlay {
                         self.walk.timer = 1.0;
                     } else {
                         self.walk.dropped = tn().drop_time;
-                        if hard {
+                        if hard || self.walk.race_down {
                             self.walk.stick_in();
                         } else {
                             // land with a little bounce

@@ -935,10 +935,14 @@ pub struct CharacterOverlay {
     social_tick: f32,
     chat_id: u32,
     rope: Option<rope::RopeGl>,
+    carrot_gl: Option<rope::CarrotGl>,
     // groups that split off this frame
     new_chats: Vec<Chat>,
     // who starts the race a big chat set off
-    race_first: Option<usize>,
+    // the group that decided to race together, in the order they set off
+    race_crew: Vec<usize>,
+    // seconds before another race can start by itself
+    race_quiet: f32,
     view_w: f32,
     // notifications seen so far
     notified: u32,
@@ -1086,8 +1090,10 @@ impl CharacterOverlay {
             social_tick: 0.0,
             chat_id: 0,
             rope: None,
+            carrot_gl: None,
             new_chats: Vec::new(),
-            race_first: None,
+            race_crew: Vec::new(),
+            race_quiet: 0.0,
             view_w: 1.0,
             notified: crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed),
             clicks: 0,
@@ -1251,6 +1257,7 @@ impl CharacterOverlay {
                 [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
             })
             // the rope spans the gap between the two sides
+            .chain(self.carrot_rect())
             .chain(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0]))
             .collect()
     }
@@ -1679,12 +1686,7 @@ impl CharacterOverlay {
                         m.gesture_now();
                     }
                 }
-                // music: stay put instead of strolling or chasing, a gesture
-                // every eight beats
-                if self.vibe.on && self.walk.race.is_none() && matches!(self.walk.act, Act::Walk | Act::Chase) {
-                    self.walk.act = Act::Idle;
-                    self.walk.target = self.walk.x;
-                }
+                // music: a gesture every eight beats
                 if self.vibe.on && self.vibe.beat_now && self.walk.act == Act::Idle {
                     if self.vibe.beats % 8 == 0 {
                         if let Some(m) = self.model.as_mut() {
@@ -1798,6 +1800,7 @@ impl CharacterOverlay {
         }
         if self.actor == 0 {
             self.draw_ropes(gl, info, target);
+            self.draw_carrot(gl, info, target);
         }
         Ok(())
     }

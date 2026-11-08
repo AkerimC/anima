@@ -79,6 +79,8 @@ pub(super) struct WalkState {
     pub(super) tumble: f32,
     // landed spinning: rolling on upright the way it was going
     pub(super) rolling: bool,
+    // knocked over in a race, until back on its feet
+    pub(super) race_down: bool,
     // how it is stuck in the ground while planted
     pub(super) plant_pose: (f32, f32),
     // turned about the feet instead of the middle

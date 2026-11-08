@@ -117,3 +117,100 @@ impl CharacterOverlay {
         }
     }
 }
+
+const CARROT_VS: &str = r#"#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_pos;
+out vec2 v_pos;
+uniform vec4 u_rect; // x0, y0, x1, y1 in clip space
+uniform vec4 u_clip;
+void main() {
+    v_pos = a_pos;
+    vec2 p = mix(u_rect.xy, u_rect.zw, a_pos * 0.5 + 0.5);
+    gl_Position = vec4(p * u_clip.xy + u_clip.zw, 0.0, 1.0);
+}
+"#;
+
+// tip down, y up: an orange body with a few grooves, a tuft of leaves on top
+const CARROT_FS: &str = r#"#version 300 es
+precision highp float;
+in vec2 v_pos;
+out vec4 fragColor;
+float blade(vec2 p, float x, float lean) {
+    float t = clamp((p.y - 0.25) / 0.7, 0.0, 1.0);
+    float d = abs(p.x - x - lean * t) - 0.17 * (1.0 - t);
+    return (1.0 - smoothstep(-0.02, 0.03, d)) * step(0.25, p.y) * (1.0 - smoothstep(0.9, 0.95, p.y));
+}
+void main() {
+    vec2 p = v_pos;
+    float t = clamp((p.y + 1.0) / 1.45, 0.0, 1.0);
+    float half_w = 0.1 + 0.62 * pow(t, 0.75);
+    float d = abs(p.x) - half_w;
+    float body = (1.0 - smoothstep(-0.04, 0.02, d)) * step(p.y, 0.45) * step(-1.0, p.y);
+    float groove = smoothstep(0.82, 1.0, sin(p.y * 15.0 + p.x * 1.6));
+    vec3 orange = mix(vec3(1.0, 0.55, 0.08), vec3(0.8, 0.3, 0.02), groove * 0.7);
+    orange *= 1.0 - 0.35 * smoothstep(0.1, 1.0, p.x / max(half_w, 0.01));
+    float leaf = max(blade(p, 0.0, 0.0), max(blade(p, -0.14, -0.35), blade(p, 0.14, 0.35)));
+    vec3 col = body > 0.0 ? orange : vec3(0.2, 0.68, 0.18);
+    float alpha = max(body, leaf);
+    fragColor = vec4(col * alpha, alpha);
+}
+"#;
+
+pub(super) struct CarrotGl {
+    program: Program,
+    vao: glow::VertexArray,
+    #[allow(dead_code)]
+    vbo: glow::Buffer,
+}
+
+impl CarrotGl {
+    fn new(gl: &glow::Context) -> Result<Self> {
+        let program = Program::new(gl, CARROT_VS, CARROT_FS)?;
+        let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        unsafe {
+            let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
+            let vbo = gl.create_buffer().map_err(|e| anyhow!(e))?;
+            gl.bind_vertex_array(Some(vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck_cast(&verts), glow::STATIC_DRAW);
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
+            gl.bind_vertex_array(None);
+            Ok(Self { program, vao, vbo })
+        }
+    }
+}
+
+impl CharacterOverlay {
+    pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
+        let Some(rect) = self.carrot_rect() else { return };
+        if self.carrot_gl.is_none() {
+            match CarrotGl::new(gl) {
+                Ok(c) => self.carrot_gl = Some(c),
+                Err(e) => {
+                    log::warn!("carrot: {e:#}");
+                    return;
+                }
+            }
+        }
+        let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
+        let Some(c) = self.carrot_gl.as_mut() else { return };
+        if !target.begin(gl, 0, rect) {
+            return;
+        }
+        let [x0, y0, x1, y1] = rect;
+        c.program.bind(gl);
+        c.program.set_vec4(gl, "u_rect", [x0 / w * 2.0 - 1.0, 1.0 - y1 / h * 2.0, x1 / w * 2.0 - 1.0, 1.0 - y0 / h * 2.0]);
+        c.program.set_vec4(gl, "u_clip", target.clip_xform());
+        unsafe {
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+            gl.bind_vertex_array(Some(c.vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_vertex_array(None);
+            gl.disable(glow::BLEND);
+        }
+        target.end(gl, 0);
+    }
+}

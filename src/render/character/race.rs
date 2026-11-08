@@ -14,6 +14,12 @@ pub(super) enum Leg {
     ToStart,
     // there, wandering about until everyone has come
     Mill,
+    // not racing: off to the finish line, and cheering there
+    Watch,
+    Watching,
+    // going round telling the others, and stopped to tell one
+    Invite,
+    Invited,
     // everyone's here: bunch up on the start line
     Line,
     Lined,
@@ -67,6 +73,13 @@ pub(super) struct Race {
     cheer: f32,
     // seconds in this phase, to give up on stuck ones
     age: f32,
+    // the one going round inviting the others, and its pause after each
+    herald: Option<usize>,
+    // said no when asked: they stay out of it
+    refused: Vec<usize>,
+    // who it has just asked, waiting for the answer
+    asking: Option<usize>,
+    invite_pause: f32,
 }
 
 impl CharacterOverlay {
@@ -84,6 +97,98 @@ impl CharacterOverlay {
         (r[0] + r[2]) * 0.5 + self.view[0] * self.view_w * 0.5
     }
 
+    /// In on it: a little hop, and off to the gathering spot.
+    fn recruit(&mut self, i: usize, lo: f32, hi: f32) {
+        let wk = self.walk_of(i);
+        let goal_px = lo + wk.rand() * (hi - lo);
+        let speed = tn().race_gather_speed + wk.rand() * tn().race_gather_rand;
+        wk.race = Some(Racer { leg: Leg::ToStart, goal_px, goal: 0.0, speed, wait: 0.0, greeted: false, pace: 0.0, next_pace: 0.0, hop_cool: 0.0 });
+        wk.circle = false;
+        wk.social = None;
+        if matches!(wk.act, Act::Idle | Act::Walk) {
+            wk.start_jump(tn().jump_height * 0.5);
+        }
+    }
+
+    /// One racer goes to each of the others in turn, hops and invites them,
+    /// and comes back when there's nobody left to tell.
+    fn run_herald(&mut self, race: &mut Race, dt: f32, lo: f32, hi: f32, n: usize) {
+        let free: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).race.is_none() && !race.refused.contains(&i)).collect();
+        if race.herald.is_some_and(|h| self.walk_ref(h).race.is_none()) {
+            race.herald = None;
+        }
+        if race.herald.is_none() {
+            // whoever is closest to someone not in on it yet
+            let near = |this: &Self, h: usize| free.iter().map(|&f| (this.strip_px(f) - this.strip_px(h)).abs()).fold(f32::MAX, f32::min);
+            race.herald = (0..n)
+                .filter(|&i| self.walk_ref(i).race.is_some_and(|r| !matches!(r.leg, Leg::Watch | Leg::Watching)))
+                .filter(|_| !free.is_empty())
+                .min_by(|&a, &b| near(self, a).total_cmp(&near(self, b)));
+            if let Some(h) = race.herald {
+                log::debug!("race: {h} goes round inviting {free:?}");
+            }
+        }
+        let Some(h) = race.herald else { return };
+        race.invite_pause -= dt;
+        if race.invite_pause > 0.0 {
+            return;
+        }
+        if let Some(t) = race.asking.take() {
+            if self.walk_ref(t).race.is_none() {
+                if n >= tn().race_refuse_min as usize && self.walk.rand() < tn().race_refuse {
+                    // no thanks: straight to the finish to watch
+                    log::debug!("race: {t} says no to {h}");
+                    race.refused.push(t);
+                    let goal_px = race.finish_px - (race.finish_px - race.start_px).signum() * (60.0 + self.walk.rand() * 240.0);
+                    let wk = self.walk_of(t);
+                    wk.race = Some(Racer { leg: Leg::Watch, goal_px, goal: 0.0, speed: tn().race_watch_speed, wait: 0.0, greeted: true, pace: 0.0, next_pace: 0.0, hop_cool: 0.0 });
+                    wk.circle = false;
+                    wk.social = None;
+                } else {
+                    log::debug!("race: {t} is in");
+                    self.recruit(t, lo, hi);
+                }
+            }
+            race.invite_pause = tn().race_invite_pause;
+            return;
+        }
+        let x = self.strip_px(h);
+        let Some(t) = free.iter().copied().min_by(|&a, &b| (self.strip_px(a) - x).abs().total_cmp(&(self.strip_px(b) - x).abs())) else {
+            // everyone knows: back to the others
+            log::debug!("race: {h} is done inviting");
+            let wk = self.walk_of(h);
+            let goal_px = lo + wk.rand() * (hi - lo);
+            if let Some(r) = wk.race.as_mut() {
+                r.leg = Leg::ToStart;
+                r.goal_px = goal_px;
+                r.speed = tn().race_herald_speed;
+            }
+            race.herald = None;
+            return;
+        };
+        let tx = self.strip_px(t);
+        let reach = self.width_of(h) * 0.8;
+        let on_ground = matches!(self.walk_ref(h).act, Act::Idle | Act::Walk);
+        if (tx - x).abs() <= reach && on_ground {
+            // asks, and waits for the answer
+            log::debug!("race: {h} asks {t}");
+            let hop = tn().jump_height * 0.7;
+            let wk = self.walk_of(h);
+            wk.gesture = true;
+            wk.left = tx < x;
+            if let Some(r) = wk.race.as_mut() {
+                r.leg = Leg::Invited;
+            }
+            wk.start_jump(hop);
+            race.asking = Some(t);
+            race.invite_pause = tn().race_ask_time;
+        } else if let Some(r) = self.walk_of(h).race.as_mut() {
+            r.leg = Leg::Invite;
+            r.goal_px = tx + (x - tx).signum() * reach * 0.7;
+            r.speed = tn().race_herald_speed;
+        }
+    }
+
     /// Very rarely one character wants to race; the mood spreads to the
     /// others one by one, they gather at one end of a big window and wander
     /// about there, and once all have come they bunch up and run to its
@@ -93,8 +198,9 @@ impl CharacterOverlay {
         let n = self.extras.len() + 1;
         let asked = RACE_NOW.swap(false, std::sync::atomic::Ordering::Relaxed);
         if self.race.is_none() {
-            // about once every two hours
-            if n < 2 || !(asked || self.walk.rand() < dt / tn().race_every.max(1.0)) {
+            // only ever by asking: a small group agrees on one in a chat
+            self.race_quiet = (self.race_quiet - dt).max(0.0);
+            if n < 2 || !asked {
                 return;
             }
             // from one end of the strip to the other, whatever the windows
@@ -114,6 +220,10 @@ impl CharacterOverlay {
                 order: Vec::new(),
                 cheer: 0.0,
                 age: 0.0,
+                herald: None,
+                refused: Vec::new(),
+                asking: None,
+                invite_pause: 0.0,
             });
         }
         let Some(mut race) = self.race.take() else { return };
@@ -128,32 +238,29 @@ impl CharacterOverlay {
 
         match race.phase {
             Phase::Gather => {
-                // the mood spreads: the one nearest to someone already in joins next
+                // the group that decided on it goes first, in a quick wave
                 race.next_join -= dt;
+                let mut crew = std::mem::take(&mut self.race_crew);
+                crew.retain(|&i| i < n && self.walk_ref(i).race.is_none());
                 if race.next_join <= 0.0 {
-                    let joined: Vec<f32> = (0..n).filter(|&i| self.walk_ref(i).race.is_some()).map(|i| self.strip_px(i)).collect();
-                    let free: Vec<(usize, f32)> =
-                        (0..n).filter(|&i| self.walk_ref(i).race.is_none()).map(|i| (i, self.strip_px(i))).collect();
-                    let pick = if joined.is_empty() {
-                        let first = self.race_first.take().filter(|&i| i < n);
-                        Some(first.unwrap_or((self.walk.rand() * n as f32) as usize % n))
+                    let started = (0..n).any(|i| self.walk_ref(i).race.is_some());
+                    let pick = if !crew.is_empty() {
+                        Some(crew.remove(0))
+                    } else if !started {
+                        Some((self.walk.rand() * n as f32) as usize % n)
                     } else {
-                        let d = |x: f32| joined.iter().map(|p| (p - x).abs()).fold(f32::MAX, f32::min);
-                        free.iter().min_by(|a, b| d(a.1).total_cmp(&d(b.1))).map(|f| f.0)
+                        None
                     };
                     if let Some(i) = pick {
-                        let wk = self.walk_of(i);
-                        let goal_px = lo + wk.rand() * (hi - lo);
-                        let speed = tn().race_gather_speed + wk.rand() * tn().race_gather_rand;
-                        wk.race = Some(Racer { leg: Leg::ToStart, goal_px, goal: 0.0, speed, wait: 0.0, greeted: false, pace: 0.0, next_pace: 0.0, hop_cool: 0.0 });
-                        wk.circle = false;
-                        wk.social = None;
-                        // a little hop: "let's race!"
-                        if grounded(wk) {
-                            wk.start_jump(tn().jump_height * 0.5);
-                        }
+                        self.recruit(i, lo, hi);
                     }
-                    race.next_join = tn().race_join_min + self.walk.rand() * tn().race_join_rand;
+                    race.next_join = tn().race_wave_min + self.walk.rand() * tn().race_wave_rand;
+                }
+                let waved = crew.is_empty();
+                self.race_crew = crew;
+                // then one of them goes round everybody else
+                if waved {
+                    self.run_herald(&mut race, dt, lo, hi, n);
                 }
                 for i in 0..n {
                     let x = self.strip_px(i);
@@ -184,9 +291,9 @@ impl CharacterOverlay {
                     })
                     .count();
                 // stragglers far along the strip don't hold it up forever
-                if here == n || (race.age > tn().race_wait && here >= 2) {
+                if here + race.refused.len() == n || (race.age > tn().race_wait && here >= 2 && race.herald.is_none()) {
+                    let (start, finish) = (race.start_px, race.finish_px);
                     for i in 0..n {
-                        let start = race.start_px;
                         let wk = self.walk_of(i);
                         match wk.race.as_mut() {
                             Some(r) if r.leg == Leg::Mill => {
@@ -194,9 +301,17 @@ impl CharacterOverlay {
                                 r.goal_px = start;
                                 r.speed = 0.2;
                             }
-                            _ => wk.race = None,
+                            Some(r) if matches!(r.leg, Leg::Watch | Leg::Watching) => {}
+                            // not in it: they go and cheer at the finish
+                            _ => {
+                                let goal_px = finish - dir * (60.0 + wk.rand() * 240.0);
+                                wk.race = Some(Racer { leg: Leg::Watch, goal_px, goal: 0.0, speed: tn().race_watch_speed, wait: 0.0, greeted: true, pace: 0.0, next_pace: 0.0, hop_cool: 0.0 });
+                                wk.circle = false;
+                                wk.social = None;
+                            }
                         }
                     }
+                    self.race_crew.clear();
                     race.phase = Phase::Line;
                     race.age = 0.0;
                 }
@@ -204,7 +319,7 @@ impl CharacterOverlay {
             Phase::Line => {
                 let lined = (0..n).all(|i| {
                     let wk = self.walk_ref(i);
-                    wk.race.is_none_or(|r| r.leg == Leg::Lined && grounded(wk))
+                    wk.race.is_none_or(|r| matches!(r.leg, Leg::Watch | Leg::Watching) || (r.leg == Leg::Lined && grounded(wk)))
                 });
                 if lined {
                     race.countdown -= dt;
@@ -212,7 +327,7 @@ impl CharacterOverlay {
                 if race.countdown <= 0.0 {
                     // off they go, all at once; starting paces spread evenly
                     // (shuffled) so the bunch pulls apart
-                    let mut runners: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).race.is_some()).collect();
+                    let mut runners: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).race.is_some_and(|r| !matches!(r.leg, Leg::Watch | Leg::Watching))).collect();
                     for k in (1..runners.len()).rev() {
                         let j = (self.walk.rand() * (k + 1) as f32) as usize % (k + 1);
                         runners.swap(k, j);
@@ -290,6 +405,7 @@ impl CharacterOverlay {
                     let distance = tn().race_hit_min + wk.rand() * tn().race_hit_rand;
                     let time = 0.5 + wk.rand() * 0.3;
                     log::debug!("race: {v} got hit");
+                    wk.race_down = true;
                     wk.vx = -dir * (distance * 2.0 / w.max(1.0)) / time;
                     wk.vy = 20.0 * time * 0.7;
                     wk.air = 0.1;
@@ -310,7 +426,7 @@ impl CharacterOverlay {
                         }
                     }
                 }
-                let all_done = (0..n).all(|i| self.walk_ref(i).race.is_none_or(|r| r.leg == Leg::Done));
+                let all_done = (0..n).all(|i| self.walk_ref(i).race.is_none_or(|r| matches!(r.leg, Leg::Done | Leg::Watch | Leg::Watching)));
                 if all_done && race.winner.is_some() {
                     // gather round: the winner in the middle, the rest on both
                     // sides in finishing order, half overlapping like a crowd
@@ -346,11 +462,24 @@ impl CharacterOverlay {
                 over = race.cheer <= 0.0;
             }
         }
+        // the crowd at the finish, facing the runners
+        for i in 0..n {
+            let wk = self.walk_of(i);
+            if wk.race.is_some_and(|r| r.leg == Leg::Watching) && grounded(wk) {
+                wk.left = dir > 0.0;
+                if wk.rand() < dt * tn().race_watch_cheer {
+                    let height = tn().jump_height * (0.3 + wk.rand() * 0.5);
+                    wk.start_jump(height);
+                }
+            }
+        }
         if over || race.age > 300.0 {
             log::debug!("race: over, winner {:?}", race.winner);
+            self.race_quiet = tn().race_cool;
             for i in 0..n {
                 let wk = self.walk_of(i);
                 let raced = wk.race.take().is_some();
+                wk.race_down = false;
                 if raced {
                     wk.crowd_rest = tn().crowd_rest_base + wk.rand() * tn().crowd_rest_rand;
                 }
@@ -373,7 +502,11 @@ impl WalkState {
             if r.leg == Leg::Lined && (r.goal - self.x).abs() > 0.02 {
                 r.leg = Leg::Line;
             }
-            let walking = matches!(r.leg, Leg::ToStart | Leg::Mill | Leg::Line | Leg::Run);
+            // knocked down: picked itself up, starts again from a jog
+            if std::mem::take(&mut self.race_down) {
+                r.speed = tn().race_pace * 0.75;
+            }
+            let walking = matches!(r.leg, Leg::ToStart | Leg::Mill | Leg::Watch | Leg::Invite | Leg::Line | Leg::Run);
             let d = r.goal - self.x;
             let s = r.speed * dt;
             if walking && d.abs() > s {
@@ -387,6 +520,8 @@ impl WalkState {
                 self.x = r.goal;
                 r.leg = match r.leg {
                     Leg::ToStart => Leg::Mill,
+                    Leg::Invite => Leg::Invite,
+                    Leg::Watch => Leg::Watching,
                     Leg::Line => Leg::Lined,
                     Leg::Run => Leg::Done,
                     l => l,
@@ -402,6 +537,10 @@ impl WalkState {
 
     /// Hopping over someone mid-race: keep going.
     pub(super) fn race_hop(&mut self, dt: f32) {
+        // getting up from a fall isn't running
+        if self.race_down {
+            return;
+        }
         if let Some(r) = self.race.as_mut().filter(|r| r.leg == Leg::Run) {
             let d = r.goal - self.x;
             let s = r.speed * dt;

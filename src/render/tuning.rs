@@ -159,6 +159,24 @@ tuning! {
         after_game_rand: "Sohbete eklenen rastgele (sn)" = 5.0, 0.0, 60.0, 1.0, 0;
         cheer_time: "Kazananın sevinmesi (sn)" = 3.0, 0.0, 30.0, 0.5, 1;
     }
+    "Oyunlar", "Havuç kapmaca" {
+        carrot_min: "En az oyuncu" = 3.0, 2.0, 12.0, 1.0, 0;
+        carrot_time: "Havucu kapınca oyun süresi (sn)" = 15.0, 3.0, 120.0, 1.0, 0;
+        carrot_rush: "Havuca koşma hızı" = 0.36, 0.05, 2.0, 0.01, 2;
+        carrot_run: "Havuçlunun normal hızı" = 0.4, 0.05, 2.0, 0.01, 2;
+        carrot_sprint: "Havuçlunun depar hızı" = 0.62, 0.05, 3.0, 0.01, 2;
+        carrot_burst: "Yorulmadan depar süresi (sn)" = 2.5, 0.2, 20.0, 0.1, 1;
+        carrot_tired: "Yorgun kalma süresi (sn)" = 4.0, 0.0, 30.0, 0.5, 1;
+        carrot_slow: "Yorgunken hız" = 0.16, 0.02, 2.0, 0.01, 2;
+        carrot_hop: "Havuçlunun zıplaması" = 0.9, 0.0, 3.0, 0.05, 2;
+        carrot_hop_chance: "Yakındakinin üstünden zıplama şansı" = 0.85, 0.0, 1.0, 0.05, 2;
+        carrot_chase: "Kovalayanların hızı" = 0.34, 0.02, 2.0, 0.01, 2;
+        carrot_lag: "Kovalayanların tepki gecikmesi (sn)" = 0.6, 0.0, 5.0, 0.05, 2;
+        carrot_smart_every: "Biri zekileşme aralığı (sn)" = 3.0, 0.5, 30.0, 0.5, 1;
+        carrot_smart_time: "Zeki kalma süresi (sn)" = 1.5, 0.1, 10.0, 0.1, 1;
+        carrot_smart_speed: "Zekiyken hız çarpanı" = 1.35, 1.0, 3.0, 0.05, 2;
+        carrot_grace: "Kapınca dokunulmazlık (sn)" = 1.0, 0.0, 5.0, 0.1, 1;
+    }
     "Oyunlar", "Oyunu izlemeye gelme" {
         see_range: "Fark etme mesafesi (karakter genişliği)" = 6.0, 0.5, 40.0, 0.5, 1;
         see_chance: "Fark etme şansı" = 0.15, 0.0, 1.0, 0.01, 2;
@@ -166,6 +184,10 @@ tuning! {
     }
     "Oyunlar", "Kalabalığın bölünmesi" {
         split_min: "Bölünebilen grup (kişi)" = 6.0, 2.0, 20.0, 1.0, 0;
+        mood_min: "Sohbet ve oyun diye ayrılan grup (kişi)" = 6.0, 4.0, 30.0, 1.0, 0;
+        mood_after: "Ayrılmadan önce sohbet (sn)" = 8.0, 0.0, 120.0, 1.0, 0;
+        mood_game: "Birinin oyun isteme şansı" = 0.3, 0.0, 1.0, 0.05, 2;
+        game_fit: "Kişi sayısına uyan oyunu seçme gücü" = 2.0, 0.0, 6.0, 0.5, 1;
         split_chance: "Oyun sonrası ikiye bölünme şansı" = 0.5, 0.0, 1.0, 0.05, 2;
     }
     "Oyunlar", "Zıplama oyunu" {
@@ -240,14 +262,22 @@ tuning! {
     }
 
     "Yarış", "Kendiliğinden başlama" {
-        race_every: "Ortalama aralık (sn)" = 7200.0, 60.0, 86400.0, 60.0, 0;
-        race_min: "Sohbetten tetikleme: en az kişi" = 5.0, 2.0, 20.0, 1.0, 0;
-        race_share: "Sohbetten tetikleme: ekibin oranı" = 0.7, 0.1, 1.0, 0.05, 2;
-        race_chance: "Sohbetten tetiklenme şansı" = 0.1, 0.0, 1.0, 0.05, 2;
+        race_call: "Duyurudan sonra konuşma (sn)" = 3.0, 0.5, 30.0, 0.5, 1;
+        race_invite_pause: "Davetten sonra bekleme (sn)" = 2.0, 0.0, 10.0, 0.1, 1;
+        race_herald_speed: "Davet edenin yürüme hızı" = 0.18, 0.05, 2.0, 0.05, 2;
+        race_wave_min: "Grubun yarışa geçme aralığı (sn)" = 0.2, 0.05, 5.0, 0.05, 2;
+        race_wave_rand: "Eklenen rastgele (sn)" = 0.3, 0.0, 5.0, 0.05, 2;
+        race_cool: "İki yarış arası en az (sn)" = 1800.0, 0.0, 86400.0, 60.0, 0;
+        race_group_min: "Karar verebilen grup: en az" = 3.0, 2.0, 12.0, 1.0, 0;
+        race_group_max: "Karar verebilen grup: en çok" = 4.0, 2.0, 30.0, 1.0, 0;
+        race_ask_time: "Cevabı bekleme (sn)" = 1.0, 0.1, 10.0, 0.1, 1;
+        race_refuse_min: "Reddetme için en az karakter" = 9.0, 2.0, 50.0, 1.0, 0;
+        race_refuse: "Daveti reddetme şansı" = 0.03, 0.0, 1.0, 0.01, 2;
+        race_watch_speed: "İzleyicilerin yürüme hızı" = 0.3, 0.05, 2.0, 0.05, 2;
+        race_watch_cheer: "İzleyicilerin zıplaması (saniyede)" = 2.0, 0.0, 10.0, 0.5, 1;
+        race_chance: "Küçük grubun yarışa karar verme şansı (sohbet başına)" = 0.02, 0.0, 1.0, 0.05, 2;
     }
     "Yarış", "Toplanma" {
-        race_join_min: "Yeni katılım aralığı (sn)" = 1.5, 0.1, 30.0, 0.5, 1;
-        race_join_rand: "Eklenen rastgele (sn)" = 2.5, 0.0, 30.0, 0.5, 1;
         race_gather_speed: "Toplanmaya yürüme hızı" = 0.22, 0.02, 2.0, 0.01, 2;
         race_gather_rand: "Eklenen rastgele hız" = 0.08, 0.0, 2.0, 0.01, 2;
         race_mill_speed: "Alanda dolaşma hızı" = 0.06, 0.01, 1.0, 0.01, 2;

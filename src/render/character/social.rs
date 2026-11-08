@@ -74,10 +74,15 @@ enum Stage {
     Domino,
     Tug,
     Tag,
+    Carrot,
     Samba,
     Volley,
     Cheer,
     Part,
+    // someone's said "let's race": the group talks it over, then sets off
+    RaceCall,
+    // setting off a few at a time; the rest stay and chat till their turn
+    RaceWait,
 }
 
 /// Volleyball: who does what, and the score.
@@ -129,8 +134,35 @@ impl Volley {
     }
 }
 
+/// Carrot grab: where it lies or who's got it, and how the runner is doing.
+struct Carrot {
+    x: f32,
+    lo: f32,
+    hi: f32,
+    holder: Option<usize>,
+    // the 15 seconds have started
+    started: bool,
+    // seconds sprinting so far, sprinting for how much longer, worn out for how long
+    burst: f32,
+    sprint: f32,
+    tired: f32,
+    // until it may sprint or hop again, and can't be caught
+    sprint_cool: f32,
+    hop_cool: f32,
+    grace: f32,
+    // the chaser who is thinking for a moment
+    smart: Option<usize>,
+    smart_left: f32,
+    smart_wait: f32,
+    dir: f32,
+    // its current speed, and seconds before it reconsiders its direction
+    speed: f32,
+    decide: f32,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Game {
+    Carrot,
     Contest,
     Cursor,
     Long,
@@ -144,7 +176,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None }
+        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None }
     }
 }
 
@@ -231,13 +263,9 @@ pub(super) struct Chat {
     // a game that ends with everyone hopping, no winner
     all_cheer: bool,
     volley: Option<Volley>,
-}
-
-/// How many in one chat set off a race: a minimum, and in a bigger team a
-/// share of it.
-fn race_at(team: usize) -> usize {
-    let t = tn();
-    ((team as f32 * t.race_share).ceil() as usize).max(t.race_min as usize)
+    // seconds talking, towards splitting into talkers and players
+    mood: f32,
+    carrot: Option<Carrot>,
 }
 
 /// Chance per look that someone nearby joins a chat this big: a pair is
@@ -435,7 +463,7 @@ impl WalkState {
     }
 
     /// A short quick bob, for talking and laughing.
-    fn start_bob(&mut self, amp: f32) {
+    pub(super) fn start_bob(&mut self, amp: f32) {
         self.start_jump(amp);
         self.jump_dur = 0.32;
         self.jump = 0.32;
@@ -463,14 +491,13 @@ impl CharacterOverlay {
             wk.crowd_rest = (wk.crowd_rest - dt).max(0.0);
             wk.update_pose(dt);
         }
-        let music = self.vibe.on;
         let mut chats = std::mem::take(&mut self.chats);
         let asked = GAME_NOW.lock().unwrap().take();
         if let Some(name) = asked {
             self.force_game(&mut chats, &name, n);
         }
         chats.retain_mut(|c| {
-            let keep = !music && self.prune(c, n) && self.advance(c, dt, mouse);
+            let keep = self.prune(c, n) && self.advance(c, dt, mouse);
             if !keep {
                 self.finish(c, n);
             }
@@ -482,13 +509,13 @@ impl CharacterOverlay {
         self.social_tick -= dt;
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
-            if self.race.is_none() && !music {
-                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Volley | Stage::Cheer)) {
+            if self.race.is_none() {
+                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
                 for c in chats.iter_mut() {
                     let full = c.members.len() >= tn().max_group as usize;
-                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Volley | Stage::Part) && self.overlap_join(c, n, full) {
+                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part) && self.overlap_join(c, n, full) {
                         continue;
                     }
                     if !full && matches!(c.stage, Stage::Talk | Stage::Stroll) {
@@ -508,7 +535,7 @@ impl CharacterOverlay {
         let id = c.id;
         let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Volley | Stage::Cheer);
         // tag: you can carry someone off and they're still in it when put down
-        let tag = matches!(c.stage, Stage::Tag | Stage::Long);
+        let tag = matches!(c.stage, Stage::Tag | Stage::Carrot | Stage::Long);
         let mut left = Vec::new();
         c.members.retain(|&i| {
             let stays = i < n && {
@@ -570,7 +597,7 @@ impl CharacterOverlay {
         }
     }
 
-    fn width_of(&self, i: usize) -> f32 {
+    pub(super) fn width_of(&self, i: usize) -> f32 {
         let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
         (r[2] - r[0]).max(1.0)
     }
@@ -690,7 +717,7 @@ impl CharacterOverlay {
             return;
         }
         self.spend(i, tn().energy_join_cost);
-        self.join(c, i, n);
+        self.join(c, i);
     }
 
     /// Someone standing inside a member of a chat: a chat right there is
@@ -715,10 +742,10 @@ impl CharacterOverlay {
         let Some((d, i, m)) = hit else { return false };
         // put right there by hand: no question about it
         if self.walk_ref(i).dropped > 0.0 {
-            self.join(c, i, n);
+            self.join(c, i);
         } else if !full && chat_cool(self.walk_ref(i)) <= tn().overlap_cool {
             if self.walk.rand() < tn().overlap_chance {
-                self.join(c, i, n);
+                self.join(c, i);
             }
         } else if self.walk.rand() < tn().step_chance {
             self.step_aside(i, m, d);
@@ -726,10 +753,10 @@ impl CharacterOverlay {
         true
     }
 
-    fn join(&mut self, c: &mut Chat, i: usize, n: usize) {
+    fn join(&mut self, c: &mut Chat, i: usize) {
         c.quiet = 0.0;
         self.enlist(i, c.id);
-        if !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part) {
+        if !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::RaceCall | Stage::RaceWait) {
             if let Some(r) = self.walk_of(i).social.as_mut() {
                 r.no_pat = true;
             }
@@ -760,11 +787,28 @@ impl CharacterOverlay {
                 }
             }
         }
-        if c.members.len() >= race_at(n) && self.walk.rand() < tn().race_chance {
-            self.race_first = Some(i);
-            super::RACE_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
-            log::debug!("chat {}: {} together, race!", c.id, c.members.len());
+    }
+
+    /// One of a small group suggests a race; the others agree.
+    fn call_race(&mut self, c: &mut Chat) {
+        let caller = c.members[(self.walk.rand() * c.members.len() as f32) as usize % c.members.len()];
+        log::debug!("chat {}: {} together, {caller} calls a race!", c.id, c.members.len());
+        c.it = caller;
+        c.talker = caller;
+        self.look_at_talker(c);
+        let hop = tn().jump_height * 0.7;
+        let wk = self.walk_of(caller);
+        wk.gesture = true;
+        if let Some(r) = wk.social.as_mut() {
+            r.happy = true;
         }
+        if grounded(wk) {
+            wk.start_jump(hop);
+        }
+        c.turn = 1.2;
+        c.bob = 0.0;
+        c.timer = tn().race_call;
+        c.stage = Stage::RaceCall;
     }
 
     /// `i` looks towards `other`.
@@ -882,6 +926,15 @@ impl CharacterOverlay {
         c.timer = length + Self::crowd_talk(c);
         c.turn = 0.0;
         c.bob = 0.0;
+        let size = c.members.len();
+        if self.race.is_none()
+            && self.race_quiet <= 0.0
+            && size >= tn().race_group_min as usize
+            && size <= tn().race_group_max as usize
+            && self.walk.rand() < tn().race_chance
+        {
+            self.call_race(c);
+        }
     }
 
     /// Taking turns to talk: the happy pose, a gesture, laughing, nodding.
@@ -952,39 +1005,101 @@ impl CharacterOverlay {
         wk.energy = (wk.energy - amount).max(0.0);
     }
 
+    /// A game for this many that they haven't played yet: the closer its
+    /// minimum is to their number, the likelier.
+    fn choose_game(&mut self, played: &[Game], len: usize) -> Option<Game> {
+        if !played.contains(&Game::Cursor) && self.walk.rand() < tn().cursor_game {
+            return Some(Game::Cursor);
+        }
+        let pool: Vec<(Game, f32)> = [
+            (Game::Contest, tn().game_min as usize),
+            (Game::Long, tn().long_min as usize),
+            (Game::Domino, tn().party_min as usize),
+            (Game::Tug, tn().party_min as usize),
+            (Game::Tag, tn().party_min as usize),
+            (Game::Carrot, tn().carrot_min as usize),
+            (Game::Samba, tn().party_min as usize),
+            (Game::Volley, tn().volley_min as usize),
+        ]
+        .iter()
+        .filter(|g| len >= g.1 && !played.contains(&g.0))
+        .map(|g| (g.0, (1.0 + (len - g.1) as f32).powf(-tn().game_fit)))
+        .collect();
+        let mut roll = self.walk.rand() * pool.iter().map(|g| g.1).sum::<f32>();
+        for &(game, weight) in &pool {
+            roll -= weight;
+            if roll <= 0.0 {
+                return Some(game);
+            }
+        }
+        pool.last().map(|g| g.0)
+    }
+
     /// Start a game this group hasn't played yet, if it has the energy.
     fn next_game(&mut self, c: &mut Chat) -> bool {
         let mean = c.members.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / c.members.len() as f32;
         if mean < tn().energy_game_need {
             return false;
         }
-        let len = c.members.len();
-        let game = if !c.played.contains(&Game::Cursor) && self.walk.rand() < tn().cursor_game {
-            Game::Cursor
-        } else {
-            let pool: Vec<Game> = [
-                (Game::Contest, tn().game_min as usize),
-                (Game::Long, tn().long_min as usize),
-                (Game::Domino, tn().party_min as usize),
-                (Game::Tug, tn().party_min as usize),
-                (Game::Tag, tn().party_min as usize),
-                (Game::Samba, tn().party_min as usize),
-                (Game::Volley, tn().volley_min as usize),
-            ]
-            .iter()
-            .filter(|g| len >= g.1 && !c.played.contains(&g.0))
-            .map(|g| g.0)
-            .collect();
-            if pool.is_empty() {
-                return false;
-            }
-            pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()]
+        let Some(game) = self.choose_game(&c.played, c.members.len()) else {
+            return false;
         };
         c.played.push(game);
         for &i in &c.members.clone() {
             self.spend(i, tn().energy_game_cost);
         }
         self.start_game(c, game);
+        true
+    }
+
+    /// A big group doesn't all want the same: a few go off to play, the
+    /// others stay and talk.
+    fn mood_split(&mut self, c: &mut Chat) -> bool {
+        let len = c.members.len();
+        let min = tn().game_min as usize;
+        if len < min + 2 {
+            return false;
+        }
+        let keen = (0..len).filter(|_| self.walk.rand() < tn().mood_game).count();
+        let count = keen.clamp(min, len - 2);
+        // the ones with the most energy are the ones who want to play
+        let mut row = c.members.clone();
+        row.sort_by(|&a, &b| self.walk_ref(b).energy.total_cmp(&self.walk_ref(a).energy));
+        let talkers = row.split_off(count);
+        let players = row;
+        let mean = players.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / count as f32;
+        log::debug!("chat {}: mood split? {count} would play, energy {mean:.2}", c.id);
+        if mean < tn().energy_game_need {
+            return false;
+        }
+        let Some(game) = self.choose_game(&c.played, count) else {
+            return false;
+        };
+        self.chat_id = self.chat_id.wrapping_add(1);
+        let id = self.chat_id;
+        let mut other = Chat::new(id, players, Stage::Approach, 0.0);
+        other.played = c.played.clone();
+        other.forced = Some(game);
+        log::debug!("chat {}: {:?} go off to play {game:?} as chat {id}, {talkers:?} keep talking", c.id, other.members);
+        for &i in &other.members.clone() {
+            self.spend(i, tn().energy_game_cost);
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.chat = id;
+            }
+        }
+        c.members = talkers;
+        c.talker = c.members[0];
+        c.turn = 0.0;
+        self.arrange(&other);
+        self.arrange(c);
+        let size = self.row_size(c);
+        let mean_of = |this: &Self, m: &[usize]| m.iter().map(|&i| this.goal_of(i)).sum::<f32>() / m.len() as f32;
+        let away = if mean_of(self, &other.members) < mean_of(self, &c.members) { -1.0 } else { 1.0 };
+        for i in other.members.clone() {
+            let x = self.goal_of(i);
+            self.steer(i, x + away * size * 1.5, 0.16);
+        }
+        self.new_chats.push(other);
         true
     }
 
@@ -1003,6 +1118,7 @@ impl CharacterOverlay {
             Game::Domino => self.start_domino(c),
             Game::Tug => self.start_tug(c),
             Game::Tag => self.start_tag(c),
+            Game::Carrot => self.start_carrot(c),
             Game::Samba => self.start_samba(c),
             Game::Volley => self.start_volley(c),
         }
@@ -1019,6 +1135,7 @@ impl CharacterOverlay {
             "domino" => (Game::Domino, t.party_min),
             "tug" => (Game::Tug, t.party_min),
             "tag" => (Game::Tag, t.party_min),
+            "carrot" => (Game::Carrot, t.carrot_min),
             "samba" => (Game::Samba, t.party_min),
             "volley" => (Game::Volley, t.volley_min),
             _ => return,
@@ -1626,6 +1743,254 @@ impl CharacterOverlay {
 
     /// Samba: in a row, hopping forward together a step at a time, looking
     /// right, then left, on the beat.
+    /// The carrot on the screen, surface pixels.
+    pub(super) fn carrot_rect(&self) -> Option<[f32; 4]> {
+        let c = self.chats.iter().find(|c| c.stage == Stage::Carrot && c.step != 9)?;
+        let v = c.carrot.as_ref()?;
+        let first = *c.members.first()?;
+        let rect = |i: usize| if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
+        let body = rect(first);
+        let size = (body[3] - body[1]).max(1.0) * 0.42;
+        let half = size * 0.42;
+        let (x, top) = match v.holder {
+            // in its hand, on the side it's running towards
+            Some(h) => {
+                let r = rect(h);
+                let reach = if h == 0 { self.opaque[0] } else { self.extras[h - 1].opaque[0] } * (r[2] - r[0]);
+                let side = if self.walk_ref(h).left { -1.0 } else { 1.0 };
+                ((r[0] + r[2]) * 0.5 + side * reach * 0.8, r[1] + (r[3] - r[1]) * 0.55 - size * 0.5)
+            }
+            None => (v.x - self.view[0] * self.view_w * 0.5, body[3] - size),
+        };
+        Some([x - half, top, x + half, top + size])
+    }
+
+    /// Carrot grab: everyone goes to the widest window, a carrot appears, and
+    /// whoever holds it when the time's up wins.
+    fn start_carrot(&mut self, c: &mut Chat) {
+        log::debug!("chat {}: carrot grab", c.id);
+        let (x, cw) = self.big_window();
+        let (lo, hi) = (x + 40.0, x + cw - 40.0);
+        // all over the window in no particular order: a slot each, somewhere
+        // in it (well inside, the very ends can be out of a character's reach)
+        let mut order = c.members.clone();
+        for k in (1..order.len()).rev() {
+            let j = (self.walk.rand() * (k + 1) as f32) as usize % (k + 1);
+            order.swap(k, j);
+        }
+        let slot = (hi - lo - 220.0).max(0.0) / order.len() as f32;
+        for (k, &i) in order.iter().enumerate() {
+            let spot = lo + 110.0 + (k as f32 + self.walk.rand()) * slot;
+            self.go_facing(i, spot, tn().tag_run * 1.2);
+        }
+        c.carrot = Some(Carrot { x: lo, lo, hi, holder: None, started: false, burst: 0.0, sprint: 0.0, tired: 0.0, sprint_cool: 0.0, hop_cool: 0.0, grace: 0.0, smart: None, smart_left: 0.0, smart_wait: tn().carrot_smart_every, dir: 1.0, speed: 0.0, decide: 0.0 });
+        c.scores.clear();
+        c.step = 9;
+        c.timer = 60.0;
+        c.regroup = true;
+        c.stage = Stage::Carrot;
+    }
+
+    fn run_carrot(&mut self, c: &mut Chat, dt: f32) {
+        let Some(mut v) = c.carrot.take() else { return };
+        if c.step == 9 {
+            for k in 0..c.members.len() {
+                let i = c.members[k];
+                let x = self.strip_px(i);
+                let inside = x >= v.lo && x <= v.hi;
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.inside |= inside;
+                }
+            }
+            if self.all_arrived(c) {
+                v.x = v.lo + 110.0 + self.walk.rand() * (v.hi - v.lo - 220.0).max(0.0);
+                log::debug!("chat {}: a carrot at {:.0}", c.id, v.x);
+                c.step = 0;
+                c.timer = 30.0;
+            } else if c.timer <= 0.0 {
+                self.end_game(c);
+                return;
+            }
+            c.carrot = Some(v);
+            return;
+        }
+        if c.members.is_empty() {
+            return;
+        }
+        let size = self.row_size(c);
+        if v.holder.is_some_and(|h| !c.members.contains(&h)) {
+            v.holder = None;
+        }
+        let Some(h) = v.holder else {
+            if c.timer <= 0.0 {
+                self.end_game(c);
+                return;
+            }
+            // nobody has it: a mad dash
+            let mut closest: Option<(usize, f32)> = None;
+            for k in 0..c.members.len() {
+                let i = c.members[k];
+                let pace = self.tag_pace(i, dt);
+                self.run_to(i, v.x, tn().carrot_rush * pace);
+                let d = (self.strip_px(i) - v.x).abs();
+                if grounded(self.walk_ref(i)) && closest.is_none_or(|n| d < n.1) {
+                    closest = Some((i, d));
+                }
+            }
+            if let Some((i, _)) = closest.filter(|n| n.1 < size * 0.4) {
+                log::debug!("chat {}: {i} got the carrot", c.id);
+                v.holder = Some(i);
+                v.grace = tn().carrot_grace;
+                v.burst = 0.0;
+                v.sprint = 0.0;
+                v.tired = 0.0;
+                if !v.started {
+                    v.started = true;
+                    c.timer = tn().carrot_time;
+                }
+                v.decide = 0.0;
+                v.speed = tn().carrot_run;
+            }
+            c.carrot = Some(v);
+            return;
+        };
+        if c.timer <= 0.0 {
+            log::debug!("chat {}: carrot time, {h} has it", c.id);
+            c.scores = vec![(h, 1.0)];
+            self.end_game(c);
+            return;
+        }
+        v.grace -= dt;
+        v.hop_cool -= dt;
+        v.sprint_cool -= dt;
+        v.tired = (v.tired - dt).max(0.0);
+        let hx = self.strip_px(h);
+        v.x = hx;
+        // who is nearest, and who could actually grab it
+        let mut nearest: Option<(usize, f32)> = None;
+        let mut catcher: Option<(usize, f32)> = None;
+        for &i in c.members.iter().filter(|&&i| i != h) {
+            let d = (self.strip_px(i) - hx).abs();
+            if nearest.is_none_or(|n| d < n.1) {
+                nearest = Some((i, d));
+            }
+            if grounded(self.walk_ref(i)) && catcher.is_none_or(|n| d < n.1) {
+                catcher = Some((i, d));
+            }
+        }
+        // grabbed: it's theirs now, a moment's head start
+        if let Some((n, _)) = catcher.filter(|t| v.grace <= 0.0 && t.1 < size * 0.3 && grounded(self.walk_ref(h))) {
+            log::debug!("chat {}: {n} takes the carrot from {h}", c.id);
+            v.holder = Some(n);
+            v.grace = tn().carrot_grace;
+            v.burst = 0.0;
+            v.sprint = 0.0;
+            v.tired = 0.0;
+            v.smart = None;
+            v.decide = 0.0;
+            v.speed = tn().carrot_run;
+            c.carrot = Some(v);
+            return;
+        }
+        let Some((near, near_d)) = nearest else {
+            c.carrot = Some(v);
+            return;
+        };
+        // picks a way to go and sticks to it for a moment; turning every
+        // frame is what makes a runner shake on the spot
+        let others: Vec<usize> = c.members.iter().copied().filter(|&i| i != h).collect();
+        let positions: Vec<f32> = others.iter().map(|&i| self.strip_px(i) - hx).collect();
+        let room = |d: f32| if d > 0.0 { v.hi - hx } else { hx - v.lo };
+        let clear = |d: f32| positions.iter().filter(|&&p| p * d > 0.0).map(|p| p.abs()).fold(f32::MAX, f32::min);
+        v.decide -= dt;
+        let at_wall = room(v.dir) < 70.0;
+        if at_wall {
+            v.dir = -v.dir;
+            v.decide = 0.8;
+        } else if v.decide <= 0.0 {
+            let score = |d: f32| room(d).min(clear(d));
+            v.dir = if score(1.0) >= score(-1.0) { 1.0 } else { -1.0 };
+            v.decide = 0.6 + self.walk.rand() * 0.6;
+        }
+        // sprinting too long wears it out for a good while
+        if v.sprint <= 0.0 && v.tired <= 0.0 && v.sprint_cool <= 0.0 && near_d < 320.0 {
+            v.sprint_cool = 1.2;
+            if self.walk.rand() < 0.6 {
+                v.sprint = 1.0 + self.walk.rand();
+            }
+        }
+        let mut wanted = if v.tired > 0.0 {
+            v.burst = 0.0;
+            v.sprint = 0.0;
+            tn().carrot_slow
+        } else if v.sprint > 0.0 {
+            v.sprint -= dt;
+            v.burst += dt;
+            if v.burst >= tn().carrot_burst {
+                log::debug!("chat {}: {h} is worn out", c.id);
+                v.tired = tn().carrot_tired;
+            }
+            tn().carrot_sprint
+        } else {
+            v.burst = (v.burst - dt * 0.25).max(0.0);
+            tn().carrot_run
+        };
+        // someone in the way, or turning back at a wall with them close: over
+        let blocked = clear(v.dir) < size * 1.1 || (at_wall && near_d < size * 1.5);
+        let leap = blocked && grounded(self.walk_ref(h)) && v.hop_cool <= 0.0 && v.tired <= 0.0 && self.walk.rand() < tn().carrot_hop_chance;
+        if blocked && v.hop_cool <= 0.0 {
+            v.hop_cool = 0.9;
+        }
+        if leap {
+            wanted = wanted.max(tn().carrot_run) * 1.3;
+        }
+        v.speed += (wanted - v.speed) * (dt * 8.0).min(1.0);
+        self.run_to(h, (hx + v.dir * 600.0).clamp(v.lo, v.hi), v.speed);
+        if leap {
+            let height = tn().jump_height * tn().carrot_hop;
+            let wk = self.walk_of(h);
+            wk.start_jump(height);
+            if let Some(r) = wk.social.as_mut() {
+                r.leaping = true;
+            }
+        }
+        // every so often one of them thinks and heads it off
+        v.smart_left -= dt;
+        v.smart_wait -= dt;
+        if v.smart_left <= 0.0 {
+            v.smart = None;
+        }
+        if v.smart_wait <= 0.0 {
+            v.smart = Some(if self.walk.rand() < 0.6 { near } else { others[(self.walk.rand() * others.len() as f32) as usize % others.len()] });
+            v.smart_left = tn().carrot_smart_time;
+            v.smart_wait = tn().carrot_smart_every * (0.7 + self.walk.rand() * 0.6);
+        }
+        // the others only notice where it went a moment later, and run on
+        // past that spot instead of stopping and bunching up on it
+        for &i in &others {
+            let pace = self.tag_pace(i, dt);
+            if v.smart == Some(i) {
+                let ahead = (hx + v.dir * 80.0).clamp(v.lo, v.hi);
+                self.run_to(i, ahead, tn().carrot_chase * tn().carrot_smart_speed);
+                continue;
+            }
+            let x = self.strip_px(i);
+            let wk = self.walk_of(i);
+            let wait = tn().carrot_lag * (0.5 + wk.rand());
+            let spread = (wk.rand() - 0.5) * 120.0;
+            let Some(r) = wk.social.as_mut() else { continue };
+            r.hop_cool -= dt;
+            if r.hop_cool > 0.0 {
+                r.speed = tn().carrot_chase * pace;
+                continue;
+            }
+            r.hop_cool = wait;
+            let goal = hx + (hx - x).signum() * 90.0 + spread;
+            self.run_to(i, goal.clamp(v.lo, v.hi), tn().carrot_chase * pace);
+        }
+        c.carrot = Some(v);
+    }
+
     fn start_samba(&mut self, c: &mut Chat) {
         log::debug!("chat {}: samba", c.id);
         self.arrange(c);
@@ -2357,8 +2722,14 @@ impl CharacterOverlay {
                 r.happy = false;
             }
         }
-        self.take_in_watchers(c);
-        self.maybe_split(c);
+        if c.stage == Stage::Samba {
+            // danced together: everyone stays, watchers too, and talks about it
+            c.members.append(&mut c.watchers);
+            c.regroup = true;
+        } else {
+            self.take_in_watchers(c);
+            self.maybe_split(c);
+        }
         if std::mem::take(&mut c.regroup) {
             self.arrange(c);
             c.stage = Stage::Approach;
@@ -2423,6 +2794,13 @@ impl CharacterOverlay {
             }
             Stage::Talk => {
                 c.quiet += dt;
+                c.mood += dt;
+                if c.members.len() >= tn().mood_min as usize && c.mood >= tn().mood_after && self.race.is_none() {
+                    c.mood = -60.0;
+                    if self.mood_split(c) {
+                        return true;
+                    }
+                }
                 let may_play = c.members.len() >= tn().game_min as usize
                     && c.quiet >= tn().game_after
                     && (c.games == 0 || (c.members.len() >= tn().crowd_games as usize && (c.games as f32) < tn().max_games));
@@ -2539,6 +2917,7 @@ impl CharacterOverlay {
             Stage::Domino => self.run_domino(c, dt),
             Stage::Tug => self.run_tug(c, dt, mouse),
             Stage::Tag => self.run_tag(c, dt),
+            Stage::Carrot => self.run_carrot(c, dt),
             Stage::Samba => self.run_samba(c, dt),
             Stage::Volley => self.run_volley(c, dt),
             Stage::Cheer => {
@@ -2581,6 +2960,27 @@ impl CharacterOverlay {
                 }
             }
             Stage::Part => return !self.all_arrived(c),
+            Stage::RaceCall => {
+                if c.timer <= 0.0 {
+                    // the caller first, then the others
+                    let mut crew = vec![c.it];
+                    crew.extend(c.members.iter().copied().filter(|&m| m != c.it));
+                    log::debug!("chat {}: off to race, {crew:?}", c.id);
+                    self.race_crew = crew;
+                    super::RACE_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
+                    c.timer = 30.0;
+                    c.stage = Stage::RaceWait;
+                    return true;
+                }
+                self.chatter(c, dt);
+            }
+            Stage::RaceWait => {
+                if c.timer <= 0.0 {
+                    self.part(c);
+                    return true;
+                }
+                self.chatter(c, dt);
+            }
         }
         true
     }
