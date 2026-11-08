@@ -57,6 +57,8 @@ pub(super) struct Social {
     jumped: bool,
     // samba: looks where it's told while stepping somewhere else
     face_lock: bool,
+    // volleyball: standing on the other half of the net
+    perched: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -73,8 +75,58 @@ enum Stage {
     Tug,
     Tag,
     Samba,
+    Volley,
     Cheer,
     Part,
+}
+
+/// Volleyball: who does what, and the score.
+struct Volley {
+    /// hit high enough to go over: the net can't stop it on the way up
+    lofted: bool,
+    teams: [Vec<usize>; 2],
+    homes: Vec<(usize, f32)>,
+    ball: usize,
+    net: Vec<usize>,
+    // this ball was misjudged: nobody gets it
+    fumbled: bool,
+    mid: f32,
+    lo: f32,
+    hi: f32,
+    score: [u32; 2],
+    server: usize,
+    // after a point: seconds until the next serve
+    rest: f32,
+    // who is running for the ball, where to, after what reaction, how fast
+    runner: Option<usize>,
+    to: f32,
+    react: f32,
+    run_speed: f32,
+    top_speed: f32,
+    rally: i32,
+}
+
+impl Volley {
+    /// Height of the top of the net, in `air` units.
+    fn net_top(&self) -> f32 {
+        (self.net.len() as f32 - 1.0) * 1.7 + 2.0
+    }
+
+    /// The part of the court a team may stand on.
+    fn half(&self, team: usize, gap: f32) -> (f32, f32) {
+        if team == 0 { (self.lo, self.mid - gap) } else { (self.mid + gap, self.hi) }
+    }
+
+    /// Shortest flight from `x` to `to` that passes over the net, or 0 if
+    /// it doesn't cross it.
+    fn clear_time(&self, x: f32, to: f32, air: f32) -> f32 {
+        let f = (self.mid - x) / (to - x);
+        if !(0.0..=1.0).contains(&f) {
+            return 0.0;
+        }
+        let need = (self.net_top() + 0.6 - air).max(0.0);
+        (2.0 * need / (tn().gravity * (f * (1.0 - f)).max(0.04))).sqrt()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -86,12 +138,13 @@ enum Game {
     Tug,
     Tag,
     Samba,
+    Volley,
 }
 
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false }
+        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None }
     }
 }
 
@@ -177,6 +230,7 @@ pub(super) struct Chat {
     cut_timer: f32,
     // a game that ends with everyone hopping, no winner
     all_cheer: bool,
+    volley: Option<Volley>,
 }
 
 /// How many in one chat set off a race: a minimum, and in a bigger team a
@@ -275,6 +329,12 @@ impl WalkState {
     /// Spin in the air, stay as planted, otherwise get back upright.
     fn update_pose(&mut self, dt: f32) {
         use std::f32::consts::{PI, TAU};
+        // nothing left to stand on: down it comes
+        if self.air > 0.0 && matches!(self.act, Act::Idle | Act::Walk) && !self.social.is_some_and(|s| s.perched) {
+            self.act = Act::Fall;
+            self.vx = 0.0;
+            self.vy = 0.0;
+        }
         if self.act == Act::Held {
             self.rot = self.swing;
             self.feet = false;
@@ -392,12 +452,12 @@ impl CharacterOverlay {
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
             if self.race.is_none() && !music {
-                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Cheer)) {
+                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Volley | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
                 for c in chats.iter_mut() {
                     let full = c.members.len() >= tn().max_group as usize;
-                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Part) && self.overlap_join(c, n, full) {
+                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Samba | Stage::Volley | Stage::Part) && self.overlap_join(c, n, full) {
                         continue;
                     }
                     if !full && matches!(c.stage, Stage::Talk | Stage::Stroll) {
@@ -415,7 +475,7 @@ impl CharacterOverlay {
     /// too few are left to go on.
     fn prune(&mut self, c: &mut Chat, n: usize) -> bool {
         let id = c.id;
-        let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Cheer);
+        let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Volley | Stage::Cheer);
         // tag: you can carry someone off and they're still in it when put down
         let tag = matches!(c.stage, Stage::Tag | Stage::Long);
         let mut left = Vec::new();
@@ -493,7 +553,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false });
     }
 
     /// Two standing close, on screen and free: maybe they notice each other.
@@ -793,6 +853,46 @@ impl CharacterOverlay {
         c.bob = 0.0;
     }
 
+    /// Taking turns to talk: the happy pose, a gesture, laughing, nodding.
+    fn chatter(&mut self, c: &mut Chat, dt: f32) {
+        c.turn -= dt;
+        if c.turn <= 0.0 {
+            // next one in the row who's in place (a newcomer may still be walking)
+            let at = c.members.iter().position(|&i| i == c.talker).map_or(0, |k| k + 1);
+            let count = c.members.len();
+            if let Some(next) = (0..count).map(|k| c.members[(at + k) % count]).find(|&i| self.arrived(i)) {
+                c.talker = next;
+            }
+            c.turn = 1.0 + self.walk.rand() * 1.6;
+            self.look_at_talker(c);
+            let roll = self.walk.rand();
+            let laugh = roll < 0.15;
+            for &i in &c.members {
+                let talking = i == c.talker;
+                let in_place = self.arrived(i);
+                let wk = self.walk_of(i);
+                if let Some(r) = wk.social.as_mut() {
+                    r.happy = talking || laugh;
+                }
+                if laugh && in_place {
+                    wk.start_bob(tn().jump_height * 0.15);
+                }
+            }
+            if !laugh && roll < 0.45 {
+                self.walk_of(c.talker).gesture = true;
+            }
+        }
+        // nodding along while talking
+        c.bob -= dt;
+        if c.bob <= 0.0 {
+            let amp = tn().jump_height * (0.05 + self.walk.rand() * 0.04);
+            c.bob = 0.5 + self.walk.rand() * 0.6;
+            if self.arrived(c.talker) {
+                self.walk_of(c.talker).start_bob(amp);
+            }
+        }
+    }
+
     /// Off for a walk together, keeping their places in the row.
     fn stroll(&mut self, c: &mut Chat) {
         log::debug!("chat {}: stroll", c.id);
@@ -838,6 +938,7 @@ impl CharacterOverlay {
                 (Game::Tug, tn().party_min as usize),
                 (Game::Tag, tn().party_min as usize),
                 (Game::Samba, tn().party_min as usize),
+                (Game::Volley, tn().volley_min as usize),
             ]
             .iter()
             .filter(|g| len >= g.1 && !c.played.contains(&g.0))
@@ -872,6 +973,7 @@ impl CharacterOverlay {
             Game::Tug => self.start_tug(c),
             Game::Tag => self.start_tag(c),
             Game::Samba => self.start_samba(c),
+            Game::Volley => self.start_volley(c),
         }
     }
 
@@ -887,6 +989,7 @@ impl CharacterOverlay {
             "tug" => (Game::Tug, t.party_min),
             "tag" => (Game::Tag, t.party_min),
             "samba" => (Game::Samba, t.party_min),
+            "volley" => (Game::Volley, t.volley_min),
             _ => return,
         };
         let need = need as usize;
@@ -906,7 +1009,8 @@ impl CharacterOverlay {
         if free.len() < need {
             return;
         }
-        let members: Vec<usize> = free.iter().take(need.max(FORCED_PLAYERS.min(n))).map(|f| f.0).collect();
+        let count = if game == Game::Volley { n } else { need.max(FORCED_PLAYERS.min(n)) };
+        let members: Vec<usize> = free.iter().take(count).map(|f| f.0).collect();
         self.chat_id = self.chat_id.wrapping_add(1);
         let id = self.chat_id;
         for &i in &members {
@@ -1224,6 +1328,271 @@ impl CharacterOverlay {
 
     /// Tag: one is "it" and runs after the nearest; a touch passes it on.
     /// Whoever spent the least time being "it" wins.
+    /// Volleyball in the widest window, an even number of characters: three
+    /// stand on each other as the net, one is the ball, the rest are two
+    /// equal teams.
+    fn start_volley(&mut self, c: &mut Chat) {
+        log::debug!("chat {}: volleyball", c.id);
+        let mut all = c.members.clone();
+        for k in (1..all.len()).rev() {
+            let j = (self.walk.rand() * (k + 1) as f32) as usize % (k + 1);
+            all.swap(k, j);
+        }
+        // a crowd gets a taller net; the teams must still come out equal
+        let tall = all.len() >= tn().volley_big as usize;
+        let high = if tall { 4 } else { 3 };
+        if (all.len() - high - 1) % 2 == 1 {
+            if let Some(i) = all.pop() {
+                self.leave(i, c.id);
+            }
+        }
+        c.members = all.clone();
+        let (x, cw) = self.big_window();
+        let (lo, hi, mid) = (x + 40.0, x + cw - 40.0, x + cw * 0.5);
+        let net: Vec<usize> = all[..high].to_vec();
+        let ball = all[high];
+        let mut teams = [Vec::new(), Vec::new()];
+        for (k, &i) in all[high + 1..].iter().enumerate() {
+            teams[k % 2].push(i);
+        }
+        let mut homes = Vec::new();
+        for (t, team) in teams.iter().enumerate() {
+            let (a, b) = if t == 0 { (lo, mid) } else { (mid, hi) };
+            for (k, &i) in team.iter().enumerate() {
+                homes.push((i, a + (b - a) * (k + 1) as f32 / (team.len() + 1) as f32));
+            }
+        }
+        let walk = tn().volley_gather;
+        for &(i, x) in &homes {
+            self.go(i, x, walk);
+        }
+        self.go(ball, x + cw * 0.35, walk);
+        for &i in &net {
+            self.go(i, mid, walk);
+        }
+        c.talker = all[0];
+        c.turn = 0.0;
+        c.bob = 0.0;
+        c.wait = 2.5;
+        for &i in &all {
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.no_touch = true;
+            }
+        }
+        c.volley = Some(Volley { lofted: false, teams, homes, ball, net, fumbled: false, mid, lo, hi, score: [0, 0], server: 0, rest: 0.0, runner: None, to: 0.0, react: 0.0, run_speed: 0.0, top_speed: 0.0, rally: 0 });
+        c.scores.clear();
+        c.step = 9;
+        c.timer = 60.0;
+        c.regroup = true;
+        c.stage = Stage::Volley;
+    }
+
+    /// A serve always clears the net.
+    fn serve_time(&self, v: &Volley, to: f32) -> f32 {
+        let x = self.strip_px(v.ball);
+        let air = self.walk_ref(v.ball).air;
+        v.clear_time(x, to, air).max(1.2)
+    }
+
+    /// Send the ball in an arc to `to`, landing in `time` seconds.
+    fn ball_to(&mut self, ball: usize, to: f32, time: f32) {
+        let x = self.strip_px(ball);
+        let w = self.view_w.max(1.0);
+        let wk = self.walk_of(ball);
+        wk.vx = (to - x) * 2.0 / w / time;
+        wk.vy = tn().gravity * time * 0.5;
+        wk.air = wk.air.max(0.3);
+        wk.jump = 0.0;
+        wk.held_prev = None;
+        wk.act = Act::Fall;
+        let spin = if to < x { 8.0 } else { -8.0 };
+        if let Some(r) = wk.social.as_mut() {
+            r.flying = true;
+            r.stuck = false;
+            r.moving = false;
+            r.spin = spin;
+            r.happy = true;
+        }
+    }
+
+    fn run_volley(&mut self, c: &mut Chat, dt: f32) {
+        let Some(mut v) = c.volley.take() else { return };
+        let intact = c.members.contains(&v.ball)
+            && v.net.iter().all(|i| c.members.contains(i))
+            && v.teams.iter().flatten().all(|i| c.members.contains(i));
+        if !intact || c.timer <= 0.0 {
+            self.end_game(c);
+            return;
+        }
+        if c.step == 9 {
+            // they walk over talking, and chat a little more once all are there
+            self.chatter(c, dt);
+            if self.all_arrived(c) {
+                c.wait -= dt;
+            }
+            if self.all_arrived(c) && c.wait <= 0.0 {
+                for k in 0..c.members.len() {
+                    if let Some(r) = self.walk_of(c.members[k]).social.as_mut() {
+                        r.happy = false;
+                    }
+                }
+                // up onto each other's shoulders, and the first serve
+                for k in 1..v.net.len() {
+                    let i = v.net[k];
+                    if let Some(r) = self.walk_of(i).social.as_mut() {
+                        r.perched = true;
+                    }
+                    self.walk_of(i).air = 0.01;
+                }
+                for k in 0..2 {
+                    for j in 0..v.teams[k].len() {
+                        self.face(v.teams[k][j], v.net[0]);
+                    }
+                }
+                log::debug!("chat {}: first serve", c.id);
+                let at = self.strip_px(v.teams[0][0]);
+                let time = self.serve_time(&v, at);
+                self.ball_to(v.ball, at, time);
+                c.step = 0;
+                c.timer = 150.0;
+            }
+            c.volley = Some(v);
+            return;
+        }
+        for k in 1..v.net.len() {
+            let top = self.walk_of(v.net[k]);
+            top.air += (k as f32 * 1.7 - top.air) * (dt * 6.0).min(1.0);
+        }
+        if v.rest > 0.0 {
+            v.rest -= dt;
+            if v.rest <= 0.0 {
+                let at = self.strip_px(v.teams[v.server][0]);
+                let time = self.serve_time(&v, at);
+                self.ball_to(v.ball, at, time);
+            }
+            c.volley = Some(v);
+            return;
+        }
+        let x = self.strip_px(v.ball);
+        let side = usize::from(x >= v.mid);
+        let (stuck, falling, air) = {
+            let wk = self.walk_ref(v.ball);
+            (wk.social.is_some_and(|s| s.stuck), wk.act == Act::Fall && wk.vy < 0.0, wk.air)
+        };
+        if stuck {
+            // down on one side: a point to the other
+            let scorer = 1 - side;
+            v.score[scorer] += 1;
+            v.server = scorer;
+            v.rest = 1.0;
+            v.rally = 0;
+            v.fumbled = false;
+            v.runner = None;
+            log::debug!("chat {}: volleyball {} - {}", c.id, v.score[0], v.score[1]);
+            if v.score[scorer] as f32 >= tn().volley_win {
+                c.scores = v.teams[scorer].iter().map(|&i| (i, 1.0)).collect();
+                self.end_game(c);
+                return;
+            }
+            for k in 0..v.teams[scorer].len() {
+                let hopper = self.walk_of(v.teams[scorer][k]);
+                if grounded(hopper) {
+                    hopper.start_jump(tn().jump_height * 0.5);
+                }
+            }
+            c.volley = Some(v);
+            return;
+        }
+        let w = self.view_w.max(1.0);
+        let net_half = self.width_of(v.net[0]) * 0.25;
+        let top = v.net_top();
+        let wk = self.walk_of(v.ball);
+        // off the sides of the window, wherever that takes it
+        if wk.act == Act::Fall && ((x < v.lo && wk.vx < 0.0) || (x > v.hi && wk.vx > 0.0)) {
+            wk.vx = -wk.vx * 0.8;
+        }
+        // into the net: it can't get through, and drops back on this side
+        if wk.act == Act::Fall && wk.air < top && (x - v.mid).abs() < net_half && (x < v.mid) == (wk.vx > 0.0) && !(v.lofted && wk.vy > 0.0) {
+            wk.vx = -wk.vx * 0.35;
+            v.fumbled = false;
+            log::debug!("chat {}: volley into the net", c.id);
+        }
+        let closest = |this: &Self, team: &[usize], at: f32| {
+            team.iter().copied().min_by(|a, b| (this.strip_px(*a) - at).abs().total_cmp(&(this.strip_px(*b) - at).abs()))
+        };
+        // where it will really come down, walls included; the chaser follows
+        // that as it changes, so a bounce or the net can still be played
+        let wk = self.walk_ref(v.ball);
+        if wk.act == Act::Fall {
+            let g = tn().gravity;
+            let t = (wk.vy + (wk.vy * wk.vy + 2.0 * g * (wk.air - 1.5).max(0.0)).sqrt()) / g;
+            let mut land = x + wk.vx * w * 0.5 * t;
+            if land > v.hi {
+                land = v.hi - (land - v.hi) * 0.8;
+            } else if land < v.lo {
+                land = v.lo + (v.lo - land) * 0.8;
+            }
+            let to_side = usize::from(land >= v.mid);
+            if !v.runner.is_some_and(|r| v.teams[to_side].contains(&r)) {
+                if let Some(&(old, home)) = v.runner.and_then(|r| v.homes.iter().find(|h| h.0 == r)) {
+                    self.run_to(old, home, 0.25);
+                }
+                v.runner = closest(self, &v.teams[to_side], land);
+                v.react = 0.12;
+                v.run_speed = 0.05;
+                // more players cover more ground: each is given less time to do it
+                v.top_speed = tn().volley_speed * (0.85 + self.walk.rand() * 0.3) / (v.teams[to_side].len() as f32).powf(0.25);
+            }
+            v.to = land;
+        }
+        if let Some(r) = v.runner {
+            v.react -= dt;
+            if v.react <= 0.0 {
+                v.run_speed = (v.run_speed + tn().volley_accel * dt).min(v.top_speed);
+                // nobody walks through the net
+                let (a, b) = v.half(usize::from(v.teams[1].contains(&r)), net_half * 2.0);
+                self.run_to(r, v.to.clamp(a, b), v.run_speed);
+            }
+        }
+        // the ball has to come down on someone's head
+        let player = closest(self, &v.teams[side], x);
+        if let Some(player) = player.filter(|&p| falling && air < 2.2 && air > 0.5 && (self.strip_px(p) - x).abs() < tn().volley_reach) {
+            // misjudged: the more of them and the longer it goes on, the likelier
+            let fumble = tn().volley_fumble + (v.teams[side].len() as f32 - 1.0) * 0.02 + v.rally as f32 * 0.01;
+            if v.fumbled || self.walk.rand() < fumble {
+                v.fumbled = true;
+                c.volley = Some(v);
+                return;
+            }
+            // any power and pace: a hard one flies long and comes off the side,
+            // a high one comes off the top
+            let dir = if side == 0 { 1.0 } else { -1.0 };
+            let (a, b) = if side == 0 { (v.mid + 100.0, v.hi - 60.0) } else { (v.lo + 60.0, v.mid - 100.0) };
+            let power = if self.walk.rand() < 0.3 { self.walk.rand() * 500.0 } else { 0.0 };
+            let to = a + self.walk.rand() * (b - a).max(0.0) + dir * power;
+            v.rally += 1;
+            let mut time = ((tn().volley_time_min + self.walk.rand() * tn().volley_time_rand) * 0.97f32.powi(v.rally)).max(0.5);
+            // most are hit high enough; the rest go wherever, the net included
+            v.lofted = self.walk.rand() >= tn().volley_net;
+            if v.lofted {
+                time = time.max(v.clear_time(x, to, air));
+            }
+            log::debug!("chat {}: volley hit by {player}", c.id);
+            self.ball_to(v.ball, to, time);
+            let hop = tn().jump_height * 0.5;
+            let wk = self.walk_of(player);
+            if grounded(wk) {
+                wk.start_jump(hop);
+            }
+            // whoever is nearest reacts next frame; the hitter drifts home
+            v.runner = None;
+            if let Some(&(_, home)) = v.homes.iter().find(|h| h.0 == player) {
+                self.run_to(player, home, 0.25);
+            }
+        }
+        c.volley = Some(v);
+    }
+
     /// Samba: in a row, hopping forward together a step at a time, looking
     /// right, then left, on the beat.
     fn start_samba(&mut self, c: &mut Chat) {
@@ -1912,6 +2281,7 @@ impl CharacterOverlay {
                 r.no_touch = false;
                 r.no_pat = false;
                 r.face_lock = false;
+                r.perched = false;
                 r.flying = false;
                 r.stuck = false;
                 r.lean = 0.0;
@@ -2043,42 +2413,7 @@ impl CharacterOverlay {
                     }
                     return true;
                 }
-                c.turn -= dt;
-                if c.turn <= 0.0 {
-                    // next one in the row who's in place (a newcomer may still be walking)
-                    let at = c.members.iter().position(|&i| i == c.talker).map_or(0, |k| k + 1);
-                    let count = c.members.len();
-                    if let Some(next) = (0..count).map(|k| c.members[(at + k) % count]).find(|&i| self.arrived(i)) {
-                        c.talker = next;
-                    }
-                    c.turn = 1.0 + self.walk.rand() * 1.6;
-                    self.look_at_talker(c);
-                    let roll = self.walk.rand();
-                    let laugh = roll < 0.15;
-                    for &i in &c.members {
-                        let talking = i == c.talker;
-                        let in_place = self.arrived(i);
-                        let wk = self.walk_of(i);
-                        if let Some(r) = wk.social.as_mut() {
-                            r.happy = talking || laugh;
-                        }
-                        if laugh && in_place {
-                            wk.start_bob(tn().jump_height * 0.15);
-                        }
-                    }
-                    if !laugh && roll < 0.45 {
-                        self.walk_of(c.talker).gesture = true;
-                    }
-                }
-                // nodding along while talking
-                c.bob -= dt;
-                if c.bob <= 0.0 {
-                    let amp = tn().jump_height * (0.05 + self.walk.rand() * 0.04);
-                    c.bob = 0.5 + self.walk.rand() * 0.6;
-                    if self.arrived(c.talker) {
-                        self.walk_of(c.talker).start_bob(amp);
-                    }
-                }
+                self.chatter(c, dt);
             }
             Stage::Stroll => {
                 if self.all_arrived(c) {
@@ -2174,6 +2509,7 @@ impl CharacterOverlay {
             Stage::Tug => self.run_tug(c, dt, mouse),
             Stage::Tag => self.run_tag(c, dt),
             Stage::Samba => self.run_samba(c, dt),
+            Stage::Volley => self.run_volley(c, dt),
             Stage::Cheer => {
                 if c.timer <= 0.0 {
                     c.all_cheer = false;

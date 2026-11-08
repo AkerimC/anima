@@ -422,7 +422,7 @@ fn force_buttons(ui: &Rc<Ui>) -> adw::PreferencesGroup {
         .column_spacing(6)
         .homogeneous(true)
         .build();
-    let games: [(&str, &'static str, &'static str); 7] = [
+    let games: [(&str, &'static str, &'static str); 8] = [
         ("Zıplama oyunu", "contest", "game_min"),
         ("İmleç oyunu", "cursor", "game_min"),
         ("İleri atlama", "long", "long_min"),
@@ -430,6 +430,7 @@ fn force_buttons(ui: &Rc<Ui>) -> adw::PreferencesGroup {
         ("Halat çekme", "tug", "party_min"),
         ("Ebelemece", "tag", "party_min"),
         ("Samba", "samba", "party_min"),
+        ("Voleybol", "volley", "volley_min"),
     ];
     for (label, name, min_key) in games {
         let b = gtk::Button::with_label(label);

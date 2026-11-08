@@ -194,6 +194,19 @@ tuning! {
         domino_survive: "Sondakinin kurtulma şansı" = 0.35, 0.0, 1.0, 0.05, 2;
         domino_rest: "Yerde kalma (sn)" = 1.8, 0.0, 15.0, 0.5, 1;
     }
+    "Oyunlar", "Voleybol" {
+        volley_min: "En az karakter (çift sayı)" = 6.0, 6.0, 12.0, 2.0, 0;
+        volley_reach: "Vuruş alanı (piksel)" = 55.0, 10.0, 300.0, 5.0, 0;
+        volley_big: "4 kişilik ağ için en az karakter" = 11.0, 7.0, 30.0, 1.0, 0;
+        volley_fumble: "Topu kaçırma şansı (kalabalıkta artar)" = 0.04, 0.0, 1.0, 0.01, 2;
+        volley_time_min: "Vuruşun en kısa havada kalışı (sn)" = 0.7, 0.3, 3.0, 0.05, 2;
+        volley_time_rand: "Eklenen rastgele (sn)" = 1.0, 0.0, 3.0, 0.05, 2;
+        volley_win: "Kazanmak için sayı" = 5.0, 1.0, 21.0, 1.0, 0;
+        volley_speed: "Oyuncuların en yüksek hızı" = 0.7, 0.1, 2.0, 0.05, 2;
+        volley_net: "Ağa takılabilen vuruş oranı" = 0.25, 0.0, 1.0, 0.01, 2;
+        volley_gather: "Toplanırken yürüme hızı" = 0.18, 0.05, 1.0, 0.01, 2;
+        volley_accel: "Hızlanma" = 4.0, 0.2, 10.0, 0.1, 1;
+    }
     "Oyunlar", "Samba" {
         samba_time: "Süre (sn)" = 12.0, 2.0, 120.0, 1.0, 0;
         samba_beat: "Adım aralığı (sn)" = 0.45, 0.35, 2.0, 0.05, 2;
