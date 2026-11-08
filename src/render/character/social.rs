@@ -778,8 +778,16 @@ impl CharacterOverlay {
                 c.scores.push((i, 0.0));
             }
             _ => {
-                // nobody waits for them: whatever's going on goes on
-                self.arrange(c);
+                // nobody waits for them and nobody shuffles along: the
+                // newcomer walks round to the end of the row, looking in
+                self.catch_up(c, i);
+                let mean = c.members.iter().filter(|&&m| m != i).map(|&m| self.strip_px(m)).sum::<f32>() / (c.members.len() - 1).max(1) as f32;
+                let left_of_row = self.strip_px(i) < mean;
+                let pace = 0.11 + self.walk.rand() * 0.05;
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.face_left = !left_of_row;
+                    r.speed = pace;
+                }
                 if c.stage == Stage::Contest {
                     c.queue.push(i);
                 } else if c.stage == Stage::Talk {
@@ -1326,6 +1334,11 @@ impl CharacterOverlay {
         for &(i, x) in &c.base.clone() {
             self.go(i, x, 0.2);
         }
+        // an odd one out has no side: walks calmly to the middle and watches
+        // (would otherwise carry on with whatever it was doing)
+        if row.len() % 2 == 1 {
+            self.go_facing(row[half], mid, 0.14);
+        }
         // the only way into this game is the rope
         for k in 0..c.members.len() {
             let i = c.members[k];
@@ -1357,6 +1370,8 @@ impl CharacterOverlay {
                     for (i, left) in c.teams.0.iter().map(|&i| (i, false)).chain(c.teams.1.iter().map(|&i| (i, true))).collect::<Vec<_>>() {
                         if let Some(r) = self.walk_of(i).social.as_mut() {
                             r.face_left = left;
+                            // dragged backwards by the rope, still facing it
+                            r.face_lock = true;
                         }
                     }
                     c.timer = tn().tug_time;
