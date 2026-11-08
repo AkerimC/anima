@@ -3263,6 +3263,18 @@ struct CompiledProgram {
 unsafe impl Send for CompiledProgram {}
 
 impl CompiledProgram {
+    /// Release the GL program, VAO and VBO.  Needs a current context, so it
+    /// cannot live in `Drop`.
+    fn destroy(&self, gl: &glow::Context) {
+        self.prog.destroy(gl);
+        unsafe {
+            gl.delete_vertex_array(self.vao);
+            gl.delete_buffer(self.vbo);
+        }
+    }
+}
+
+impl CompiledProgram {
     fn new(
         gl: &glow::Context,
         name: &str,
@@ -3459,6 +3471,20 @@ pub struct EffectInstance {
     fbos: Vec<(String, i32)>,
     named: HashMap<String, Canvas>,
     dims: (i32, i32),
+}
+
+impl EffectInstance {
+    /// Release every canvas and shader program owned by this effect chain.
+    pub fn destroy(self, gl: &glow::Context) {
+        for (_, canvas) in self.named {
+            canvas.destroy(gl);
+        }
+        for pass in self.passes {
+            if let Some(program) = pass.program {
+                program.destroy(gl);
+            }
+        }
+    }
 }
 
 pub struct EffectContext<'a> {

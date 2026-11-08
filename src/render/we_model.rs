@@ -95,14 +95,15 @@ impl ParsedMdl {
         if self.bones.is_empty() || self.anims.is_empty() {
             return self.vertices.clone();
         }
-        let nbones = self.bones.len();
+        // The assembled rest pose: the MDLS reference array when present, otherwise
+        // the first keyframe of the first clip (see `compute_base_pose`).
         let mut pose = self.base_pose.clone();
 
         if layers.is_empty() {
+            // Wallpaper Engine scenes normally list `animationlayers`; when they do
+            // not, treat the first clip as an implicit layer so puppets still move.
             if let Some(anim) = self.anims.first() {
-                for b in 0..nbones.min(anim.tracks.len()) {
-                    pose[b] = sample_track(&anim.tracks[b], anim.fps, anim.frame_count, anim.mode, time);
-                }
+                accumulate_anim(&mut pose, anim, time, 1.0);
             }
         } else {
             for layer in layers {
@@ -116,17 +117,7 @@ impl ParsedMdl {
                 let Some(anim) = anim else {
                     continue;
                 };
-                let t = time * layer.rate.max(0.0);
-                for b in 0..nbones.min(anim.tracks.len()) {
-                    let kf = sample_track(&anim.tracks[b], anim.fps, anim.frame_count, anim.mode, t);
-                    let base = self.base_pose[b];
-                    let w = layer.blend;
-                    pose[b].tx += w * (kf.tx - base.tx);
-                    pose[b].ty += w * (kf.ty - base.ty);
-                    pose[b].rz += w * (kf.rz - base.rz);
-                    pose[b].sx += w * (kf.sx - base.sx);
-                    pose[b].sy += w * (kf.sy - base.sy);
-                }
+                accumulate_anim(&mut pose, anim, time * layer.rate.max(0.0), layer.blend);
             }
         }
 
@@ -218,10 +209,10 @@ pub fn parse_mdl(bytes: &[u8]) -> Option<ParsedMdl> {
     }
     let material = {
         let start = bytes
-            .windows(9)
+            .windows(10)
             .position(|w| w == b"materials/")
             .map(|p| p)
-            .or_else(|| bytes.windows(8).position(|w| w == b"material/"))?;
+            .or_else(|| bytes.windows(9).position(|w| w == b"material/"))?;
         let end = bytes[start..].iter().position(|&b| b == 0)? + start;
         std::str::from_utf8(&bytes[start..end])
             .ok()
@@ -232,7 +223,7 @@ pub fn parse_mdl(bytes: &[u8]) -> Option<ParsedMdl> {
     // marker `00 <stride-variant> 00 80 01`, then a 32-bit vertex byte count.
     let search_from = material
         .as_ref()
-        .and_then(|_| bytes.windows(9).position(|w| w == b"materials/"))
+        .and_then(|_| bytes.windows(10).position(|w| w == b"materials/"))
         .unwrap_or(0);
     let marker = bytes[search_from..]
         .windows(5)
@@ -300,15 +291,15 @@ pub fn parse_mdl(bytes: &[u8]) -> Option<ParsedMdl> {
     }
 
     let search_after = indices_start + index_bytes;
-    let bones = parse_mdls(bytes, search_after).unwrap_or_default();
+    let (bones, reference_pose) = parse_mdls(bytes, search_after).unwrap_or_default();
     let anims = if !bones.is_empty() {
         parse_mdla(bytes, search_after, bones.len()).unwrap_or_default()
     } else {
         Vec::new()
     };
-    let base_pose = compute_base_pose(&bones, &anims);
+    let base_pose = compute_base_pose(&bones, reference_pose.as_deref(), &anims);
 
-    let vertices = if !bones.is_empty() && !anims.is_empty() {
+    let vertices = if !bones.is_empty() {
         skin_vertices(&raw_vertices, &bones, &base_pose)
     } else {
         raw_vertices
@@ -403,10 +394,10 @@ fn mat2d_inv(m: [f32; 6]) -> [f32; 6] {
     ]
 }
 
-fn parse_mdls(bytes: &[u8], from: usize) -> Option<Vec<MdlsBone>> {
+fn parse_mdls(bytes: &[u8], from: usize) -> Option<(Vec<MdlsBone>, Option<Vec<BonePose>>)> {
     let mdls_off = bytes.get(from..)?.windows(8).position(|w| w.starts_with(b"MDLS000"))? + from;
     let mut pos = mdls_off + 9;
-    let _end_size = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?);
+    let section_end = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
     let nbones = u32::from_le_bytes(bytes.get(pos + 4..pos + 8)?.try_into().ok()?) as usize;
     pos += 8;
     if nbones == 0 || nbones > 512 {
@@ -433,16 +424,7 @@ fn parse_mdls(bytes: &[u8], from: usize) -> Option<Vec<MdlsBone>> {
         let z2 = bytes.get(pos..)?.iter().position(|&b| b == 0)?;
         pos += z2 + 1;
 
-        let sx = m[0].hypot(m[1]).max(1e-5);
-        let sy = m[4].hypot(m[5]).max(1e-5);
-        let rz = m[1].atan2(m[0]);
-        let rest_local = BonePose {
-            tx: m[12],
-            ty: m[13],
-            rz,
-            sx,
-            sy,
-        };
+        let rest_local = pose_from_matrix(&m);
         let local_m = [m[0], m[1], m[4], m[5], m[12], m[13]];
         let w_m = if parent >= 0 && (parent as usize) < world.len() {
             mat2d_mul(world[parent as usize], local_m)
@@ -456,7 +438,73 @@ fn parse_mdls(bytes: &[u8], from: usize) -> Option<Vec<MdlsBone>> {
             inv_rest_world: mat2d_inv(w_m),
         });
     }
-    Some(bones)
+
+    // Some skeletons store a second matrix array after the bone records: the
+    // assembled reference pose.  It is the pose the artist intended the mesh to
+    // be seen in (the per-bone bind matrices are often an exploded texture-sheet
+    // layout).  Animation tracks are expressed relative to it.
+    let reference = parse_reference_pose(bytes, pos, section_end, mdls_off, nbones);
+    Some((bones, reference))
+}
+
+fn pose_from_matrix(m: &[f32; 16]) -> BonePose {
+    BonePose {
+        tx: m[12],
+        ty: m[13],
+        rz: m[1].atan2(m[0]),
+        sx: m[0].hypot(m[1]).max(1e-5),
+        sy: m[4].hypot(m[5]).max(1e-5),
+    }
+}
+
+fn parse_reference_pose(
+    bytes: &[u8],
+    from: usize,
+    section_end: usize,
+    section_start: usize,
+    nbones: usize,
+) -> Option<Vec<BonePose>> {
+    let end = section_end.min(bytes.len());
+    let array_len = nbones.checked_mul(64)?.checked_add(1)?;
+    if end < from || end - from < array_len {
+        return None;
+    }
+    let limit = end - array_len;
+    let mut start = from.max(section_start + 9);
+    while start <= limit {
+        if bytes[start] != 1 {
+            start += 1;
+            continue;
+        }
+        let mut poses = Vec::with_capacity(nbones);
+        let mut ok = true;
+        for i in 0..nbones {
+            let off = start + 1 + i * 64;
+            let Some(slice) = bytes.get(off..off + 64) else {
+                ok = false;
+                break;
+            };
+            let mut m = [0.0f32; 16];
+            for (k, value) in m.iter_mut().enumerate() {
+                *value = f32::from_le_bytes(slice[k * 4..k * 4 + 4].try_into().unwrap());
+            }
+            if !(0..16).all(|k| m[k].is_finite())
+                || (m[15] - 1.0).abs() > 1e-3
+                || m[3].abs() > 1e-3
+                || m[7].abs() > 1e-3
+                || m[11].abs() > 1e-3
+            {
+                ok = false;
+                break;
+            }
+            poses.push(pose_from_matrix(&m));
+        }
+        if ok {
+            return Some(poses);
+        }
+        start += 1;
+    }
+    None
 }
 
 fn parse_mdla(bytes: &[u8], from: usize, expected_bones: usize) -> Option<Vec<MdlaAnim>> {
@@ -479,7 +527,8 @@ fn parse_mdla(bytes: &[u8], from: usize, expected_bones: usize) -> Option<Vec<Md
                     let fps = f32::from_le_bytes(hdr[0..4].try_into().unwrap());
                     let fcount = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
                     let abones = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
-                    if abones == expected_bones
+                    if abones >= expected_bones
+                        && abones <= expected_bones + 64
                         && fps.is_finite()
                         && fps > 0.0
                         && fps <= 240.0
@@ -561,51 +610,48 @@ fn parse_mdla(bytes: &[u8], from: usize, expected_bones: usize) -> Option<Vec<Md
     Some(anims)
 }
 
-fn compute_base_pose(bones: &[MdlsBone], anims: &[MdlaAnim]) -> Vec<BonePose> {
+fn compute_base_pose(
+    bones: &[MdlsBone],
+    reference: Option<&[BonePose]>,
+    anims: &[MdlaAnim],
+) -> Vec<BonePose> {
+    let first_track = |b: usize| {
+        anims
+            .iter()
+            .find_map(|a| a.tracks.get(b).and_then(|t| t.first()).copied())
+    };
     let mut base: Vec<BonePose> = bones.iter().map(|b| b.rest_local).collect();
-    if anims.is_empty() {
-        return base;
-    }
-    // Use the median of frame 0 across animations (or frame 0 of the single animation)
-    // so that bones moved only at frame 0 of one blink track still get the neutral base pose.
+    // Prefer the skeleton's assembled reference pose.  When it is absent, the
+    // first keyframe of the first clip is the pose the scene starts from (the
+    // per-bone bind matrices can be an exploded modelling layout).
     for b in 0..bones.len() {
-        let mut txs: Vec<f32> = anims
-            .iter()
-            .filter_map(|a| a.tracks.get(b).and_then(|t| t.first()).map(|p| p.tx))
-            .collect();
-        let mut tys: Vec<f32> = anims
-            .iter()
-            .filter_map(|a| a.tracks.get(b).and_then(|t| t.first()).map(|p| p.ty))
-            .collect();
-        let mut rzs: Vec<f32> = anims
-            .iter()
-            .filter_map(|a| a.tracks.get(b).and_then(|t| t.first()).map(|p| p.rz))
-            .collect();
-        let mut sxs: Vec<f32> = anims
-            .iter()
-            .filter_map(|a| a.tracks.get(b).and_then(|t| t.first()).map(|p| p.sx))
-            .collect();
-        let mut sys: Vec<f32> = anims
-            .iter()
-            .filter_map(|a| a.tracks.get(b).and_then(|t| t.first()).map(|p| p.sy))
-            .collect();
-        if !txs.is_empty() {
-            txs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            tys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            rzs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            sxs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            sys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let mid = txs.len() / 2;
-            base[b] = BonePose {
-                tx: txs[mid],
-                ty: tys[mid],
-                rz: rzs[mid],
-                sx: sxs[mid],
-                sy: sys[mid],
-            };
+        if let Some(pose) = reference.and_then(|r| r.get(b)) {
+            base[b] = *pose;
+        } else if let Some(pose) = first_track(b) {
+            base[b] = pose;
         }
     }
     base
+}
+
+/// Adds one clip's motion, relative to its own first keyframe, on top of `pose`.
+///
+/// Wallpaper Engine clips are relative motion tracks: the neutral pose comes
+/// from the skeleton (reference array or clip frame 0), and each animation
+/// layer contributes `blend * (sample(t) - keyframe0)`.
+fn accumulate_anim(pose: &mut [BonePose], anim: &MdlaAnim, time: f32, blend: f32) {
+    for b in 0..pose.len().min(anim.tracks.len()) {
+        let track = &anim.tracks[b];
+        let Some(&first) = track.first() else {
+            continue;
+        };
+        let kf = sample_track(track, anim.fps, anim.frame_count, anim.mode, time);
+        pose[b].tx += blend * (kf.tx - first.tx);
+        pose[b].ty += blend * (kf.ty - first.ty);
+        pose[b].rz += blend * (kf.rz - first.rz);
+        pose[b].sx += blend * (kf.sx - first.sx);
+        pose[b].sy += blend * (kf.sy - first.sy);
+    }
 }
 
 fn sample_track(

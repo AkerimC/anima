@@ -1004,17 +1004,27 @@ impl SceneRenderer {
         path: &str,
     ) -> Option<(glow::Texture, u32, u32)> {
         let mut candidates = Vec::new();
-        let clean = path.trim().trim_start_matches('/');
-        candidates.push(clean.to_string());
-        let no_ext = clean
-            .strip_suffix(".tex")
-            .or_else(|| clean.strip_suffix(".png"))
-            .or_else(|| clean.strip_suffix(".jpg"))
-            .unwrap_or(clean);
-        candidates.push(format!("materials/{no_ext}.tex"));
-        candidates.push(format!("{no_ext}.tex"));
-        if !no_ext.starts_with("materials/") {
+        // Texture names may legitimately contain (and even end with) spaces —
+        // e.g. `materials/Miles & Gwen Parts 1 .tex`.  Try the raw name first,
+        // then the trimmed spelling for sources that pad names.
+        let raw = path.trim_start_matches('/');
+        let mut names = vec![raw.to_string()];
+        let trimmed = raw.trim();
+        if trimmed != raw {
+            names.push(trimmed.to_string());
+        }
+        for name in names {
+            candidates.push(name.clone());
+            let no_ext = name
+                .strip_suffix(".tex")
+                .or_else(|| name.strip_suffix(".png"))
+                .or_else(|| name.strip_suffix(".jpg"))
+                .unwrap_or(&name);
             candidates.push(format!("materials/{no_ext}.tex"));
+            candidates.push(format!("{no_ext}.tex"));
+            if !no_ext.starts_with("materials/") {
+                candidates.push(format!("materials/{no_ext}.tex"));
+            }
         }
         for candidate in candidates {
             if candidate.is_empty() {
@@ -2433,6 +2443,9 @@ impl Renderer for SceneRenderer {
         self.pool.clear(gl);
         self.textures.clear(gl);
         for obj in &mut self.objects {
+            for effect in std::mem::take(&mut obj.effects) {
+                effect.destroy(gl);
+            }
             match &mut obj.kind {
                 ObjectKind::Text(layer) => {
                     if let Some(tex) = layer.texture.take() {
