@@ -184,7 +184,10 @@ impl CarrotGl {
 
 impl CharacterOverlay {
     pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
-        let Some(rect) = self.carrot_rect() else { return };
+        let rects = self.carrot_rects();
+        if rects.is_empty() {
+            return;
+        }
         if self.carrot_gl.is_none() {
             match CarrotGl::new(gl) {
                 Ok(c) => self.carrot_gl = Some(c),
@@ -196,21 +199,23 @@ impl CharacterOverlay {
         }
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         let Some(c) = self.carrot_gl.as_mut() else { return };
-        if !target.begin(gl, 0, rect) {
-            return;
+        for rect in rects {
+            if !target.begin(gl, 0, rect) {
+                continue;
+            }
+            let [x0, y0, x1, y1] = rect;
+            c.program.bind(gl);
+            c.program.set_vec4(gl, "u_rect", [x0 / w * 2.0 - 1.0, 1.0 - y1 / h * 2.0, x1 / w * 2.0 - 1.0, 1.0 - y0 / h * 2.0]);
+            c.program.set_vec4(gl, "u_clip", target.clip_xform());
+            unsafe {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                gl.bind_vertex_array(Some(c.vao));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.bind_vertex_array(None);
+                gl.disable(glow::BLEND);
+            }
+            target.end(gl, 0);
         }
-        let [x0, y0, x1, y1] = rect;
-        c.program.bind(gl);
-        c.program.set_vec4(gl, "u_rect", [x0 / w * 2.0 - 1.0, 1.0 - y1 / h * 2.0, x1 / w * 2.0 - 1.0, 1.0 - y0 / h * 2.0]);
-        c.program.set_vec4(gl, "u_clip", target.clip_xform());
-        unsafe {
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-            gl.bind_vertex_array(Some(c.vao));
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-            gl.bind_vertex_array(None);
-            gl.disable(glow::BLEND);
-        }
-        target.end(gl, 0);
     }
 }

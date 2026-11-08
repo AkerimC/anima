@@ -1153,19 +1153,26 @@ impl CharacterOverlay {
             log::debug!("game {name}: can't start now ({n} characters, needs {need})");
             return;
         }
-        for c in chats.drain(..) {
-            self.finish(&c, n);
-        }
+        // whoever is already playing carries on; the game goes to the others
+        let playing: Vec<usize> = chats
+            .iter()
+            .filter(|c| {
+                c.forced.is_some()
+                    || matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Cheer | Stage::RaceCall | Stage::RaceWait)
+            })
+            .flat_map(|c| c.members.iter().copied())
+            .collect();
         let middle = self.view[0] * self.view_w * 0.5 + self.view_w * 0.5;
         let mut free: Vec<(usize, f32)> = (0..n)
-            .filter(|&i| !self.walk_ref(i).circle && grounded(self.walk_ref(i)))
+            .filter(|&i| !playing.contains(&i) && !self.walk_ref(i).circle && grounded(self.walk_ref(i)))
             .map(|i| (i, (self.strip_px(i) - middle).abs()))
             .collect();
         free.sort_by(|a, b| a.1.total_cmp(&b.1));
         if free.len() < need {
+            log::debug!("game {name}: only {} free, needs {need}", free.len());
             return;
         }
-        let count = if game == Game::Volley { n } else { need.max(FORCED_PLAYERS.min(n)) };
+        let count = if game == Game::Volley { free.len() } else { need.max(FORCED_PLAYERS.min(free.len())) };
         let members: Vec<usize> = free.iter().take(count).map(|f| f.0).collect();
         self.chat_id = self.chat_id.wrapping_add(1);
         let id = self.chat_id;
@@ -1759,8 +1766,11 @@ impl CharacterOverlay {
     /// Samba: in a row, hopping forward together a step at a time, looking
     /// right, then left, on the beat.
     /// The carrot on the screen, surface pixels.
-    pub(super) fn carrot_rect(&self) -> Option<[f32; 4]> {
-        let c = self.chats.iter().find(|c| c.stage == Stage::Carrot && c.step != 9)?;
+    pub(super) fn carrot_rects(&self) -> Vec<[f32; 4]> {
+        self.chats.iter().filter(|c| c.stage == Stage::Carrot && c.step != 9).filter_map(|c| self.carrot_rect(c)).collect()
+    }
+
+    fn carrot_rect(&self, c: &Chat) -> Option<[f32; 4]> {
         let v = c.carrot.as_ref()?;
         let first = *c.members.first()?;
         let rect = |i: usize| if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };

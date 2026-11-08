@@ -1260,7 +1260,7 @@ impl CharacterOverlay {
                 [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
             })
             // the rope spans the gap between the two sides
-            .chain(self.carrot_rect())
+            .chain(self.carrot_rects())
             .chain(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0]))
             .collect()
     }
