@@ -54,7 +54,7 @@ tuning! {
         fish_catch_keeps: "A good catch keeps it going (s)" = 60.0, 0.0, 600.0, 5.0, 0;
         fish_lost_cost: "A lost fish or junk costs (s)" = 15.0, 0.0, 300.0, 5.0, 0;
         fish_again: "Won't fish again for (s)" = 300.0, 0.0, 3600.0, 10.0, 0;
-        fish_throw_far: "Thrown further than this, gives up (widths)" = 6.0, 1.0, 40.0, 0.5, 1;
+        fish_throw_far: "Thrown this far outside the window, gives up (widths)" = 6.0, 1.0, 40.0, 0.5, 1;
         fish_wait_min: "Waiting for a bite, at least (s)" = 12.0, 0.5, 60.0, 0.5, 1;
         fish_wait_rand: "Random extra wait (s)" = 28.0, 0.0, 180.0, 0.5, 1;
     }

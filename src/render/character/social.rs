@@ -431,6 +431,20 @@ fn chat_cool(wk: &WalkState) -> f32 {
 /// How many play a game started by hand, if the team has that many.
 const FORCED_PLAYERS: usize = 6;
 
+/// The place nearest `x` in the window with nobody else's rod on it.
+fn free_fishing_spot(f: &Fishing, me: usize, x: f32, lo: f32, hi: f32, size: f32) -> f32 {
+    let (min, max) = (lo + size, hi - size);
+    let x = if min > max { (lo + hi) * 0.5 } else { x.clamp(min, max) };
+    let gap = size * 1.1;
+    let free = |p: f32| f.anglers.iter().all(|o| o.i == me || (o.at - p).abs() >= gap);
+    let tries = ((hi - lo) / gap).ceil() as i32;
+    (0..=tries)
+        .flat_map(|k| [k as f32, -(k as f32)])
+        .map(|k| x + k * gap)
+        .find(|&p| p >= min && p <= max && free(p))
+        .unwrap_or(x)
+}
+
 fn grounded(wk: &WalkState) -> bool {
     matches!(wk.act, Act::Idle | Act::Walk)
 }
@@ -2194,6 +2208,18 @@ impl CharacterOverlay {
         c
     }
 
+    /// The stretch of floor `i` is fishing on: its window, or the screen
+    /// around it when that window isn't known.
+    fn fishing_window(&self, i: usize, at: f32) -> (f32, f32) {
+        let active = self.spaces.active;
+        let here = active == 0 || self.walk_ref(i).ws == active;
+        let cols = if here { crate::backend::governor::niri_columns() } else { Vec::new() };
+        match cols.into_iter().find(|c| at >= c.0 && at <= c.0 + c.1) {
+            Some(c) => (c.0, c.0 + c.1),
+            None => (at - self.view_w * 0.5, at + self.view_w * 0.5),
+        }
+    }
+
     /// Now and then something comes up beside the anglers: they drop
     /// everything and run, and it sinks back after 2-3 seconds.
     fn run_beast(&mut self, f: &mut Fishing, first: usize, dt: f32) {
@@ -2380,11 +2406,15 @@ impl CharacterOverlay {
             // thrown a long way: that's the end of fishing for this one
             if a.thrown && grounded(self.walk_ref(a.i)) {
                 a.thrown = false;
-                if (self.strip_px(a.i) - a.at).abs() > self.width_of(a.i) * tn().fish_throw_far {
+                let (x, size) = (self.strip_px(a.i), self.width_of(a.i));
+                let (lo, hi) = self.fishing_window(a.i, a.at);
+                let far = size * tn().fish_throw_far;
+                if x < lo - far || x > hi + far {
                     bored_off.push(a.i);
                     f.anglers[k] = a;
                     continue;
                 }
+                a.at = free_fishing_spot(&f, a.i, x, lo, hi, size);
                 self.go(a.i, a.at, 0.16);
             }
             // blown off its spot: lands, laughs, walks back, casts again
