@@ -36,6 +36,14 @@ macro_rules! tuning {
 }
 
 tuning! {
+    "Gezinme", "Tam ekrana ziyaret" {
+        fs_first: "İlk ziyarete kadar (sn)" = 60.0, 1.0, 1800.0, 5.0, 0;
+        fs_every: "Ziyaret aralığı (sn)" = 240.0, 5.0, 3600.0, 5.0, 0;
+        fs_chance: "Ziyaret olma ihtimali" = 0.7, 0.0, 1.0, 0.05, 2;
+        fs_max: "En fazla ziyaretçi" = 3.0, 1.0, 12.0, 1.0, 0;
+        fs_stay_min: "En kısa kalma (sn)" = 25.0, 1.0, 600.0, 5.0, 0;
+        fs_stay_rand: "Kalmaya eklenen rastgele (sn)" = 35.0, 0.0, 600.0, 5.0, 0;
+    }
     "Gezinme", "Masaüstleri arası gezme" {
         ws_every: "Kişi başı taşınma aralığı (sn)" = 240.0, 10.0, 3600.0, 10.0, 0;
         ws_bored: "Kaç saniyede sıkılsın (sn)" = 300.0, 10.0, 3600.0, 10.0, 0;
@@ -215,7 +223,7 @@ tuning! {
         game_min: "En az oyuncu" = 3.0, 2.0, 12.0, 1.0, 0;
         crowd_games: "Üst üste oyun için en az kişi" = 4.0, 2.0, 12.0, 1.0, 0;
         max_games: "Grup başına en çok oyun" = 2.0, 1.0, 7.0, 1.0, 0;
-        party_min: "Domino, halat, ebelemece için en az" = 4.0, 2.0, 12.0, 1.0, 0;
+        party_min: "Domino, ebelemece için en az" = 4.0, 2.0, 12.0, 1.0, 0;
         after_game_min: "Oyundan sonra sohbet (sn)" = 6.0, 0.0, 60.0, 1.0, 0;
         after_game_rand: "Sohbete eklenen rastgele (sn)" = 5.0, 0.0, 60.0, 1.0, 0;
         cheer_time: "Kazananın sevinmesi (sn)" = 3.0, 0.0, 30.0, 0.5, 1;
@@ -318,6 +326,11 @@ tuning! {
         samba_step: "Adım boyu (piksel)" = 40.0, 0.0, 300.0, 5.0, 0;
     }
     "Oyunlar", "Halat çekme" {
+        tug_min: "Halat için en az" = 2.0, 2.0, 12.0, 1.0, 0;
+        tug_pair_chance: "İki kişilik sohbette oyun ihtimali katı" = 0.4, 0.0, 1.0, 0.05, 2;
+        tug_cheat_chance: "Gören birinin hile yapma ihtimali" = 0.15, 0.0, 1.0, 0.05, 2;
+        tug_cheat_range: "Hileciyi görme mesafesi (ekran)" = 0.6, 0.05, 3.0, 0.05, 2;
+        tug_cheat_speed: "Hilecinin koşma hızı" = 0.5, 0.05, 3.0, 0.05, 2;
         tug_win: "Kazanma mesafesi (piksel)" = 180.0, 20.0, 1500.0, 10.0, 0;
         tug_time: "En uzun süre (sn)" = 16.0, 3.0, 120.0, 1.0, 0;
         tug_pull: "Çekiş gücü" = 90.0, 5.0, 500.0, 5.0, 0;

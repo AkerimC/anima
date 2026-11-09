@@ -101,6 +101,10 @@ pub(super) struct WalkState {
     pub(super) ws: u64,
     pub(super) here_t: f32,
     pub(super) trip: Option<super::spaces::Trip>,
+    // fullscreen: out of sight, or come out for a visit and for how long
+    pub(super) backstage: bool,
+    pub(super) visiting: bool,
+    pub(super) visit_left: f32,
     // just arrived, hasn't met anyone yet
     pub(super) newcomer: bool,
     // let go of here (screen px): might land on another workspace

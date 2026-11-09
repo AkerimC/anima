@@ -21,6 +21,9 @@ pub const IDLE_AFTER_MS: u32 = 20_000;
 /// Processor load, thousandths.
 pub static CPU: AtomicU32 = AtomicU32::new(0);
 
+/// A fullscreen app that characters may visit has the screen.
+pub static FS_VISIT: AtomicBool = AtomicBool::new(false);
+
 /// Bumped when a new window opens / one closes.
 pub static OPENED: AtomicU32 = AtomicU32::new(0);
 pub static CLOSED: AtomicU32 = AtomicU32::new(0);

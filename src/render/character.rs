@@ -269,6 +269,9 @@ pub struct CharacterConfig {
     pub tuning: super::tuning::Tuning,
     /// Show 3D characters' weapons where their animations hold them.
     pub weapons: bool,
+    /// Fullscreen apps a few characters may come out over now and then
+    /// (part of the window's app_id). Keep games out: it can cost them frames.
+    pub fullscreen_apps: Vec<String>,
 }
 
 impl CharacterConfig {
@@ -305,6 +308,7 @@ impl Default for CharacterConfig {
             voice_volume: 0.6,
             tuning: Default::default(),
             weapons: false,
+            fullscreen_apps: ["firefox", "zen", "chromium", "chrome", "brave", "mpv", "vlc", "celluloid", "haruna"].map(String::from).to_vec(),
         }
     }
 }
@@ -1743,6 +1747,12 @@ impl CharacterOverlay {
             let (walk_x, moving, jump) = if self.config.walk {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
+                // visiting a fullscreen app: only the screen itself
+                let (left_room, right_room) = if self.walk.visiting {
+                    (left_room + view, 1.0 - (center_clip[0] + half_clip[0]) + view)
+                } else {
+                    (left_room, right_room)
+                };
                 if !self.walk.placed {
                     // everyone at once, anywhere along the strip
                     self.walk.placed = true;
@@ -1787,6 +1797,7 @@ impl CharacterOverlay {
                 if let Some(r) = self.walk.social.as_mut() {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
+                let mouse = if self.walk.visiting { None } else { mouse };
                 let r = self.walk.step(dt, left_room, right_room, mouse, reach);
                 if std::mem::take(&mut self.walk.gesture) {
                     if let Some(m) = self.model.as_mut() {

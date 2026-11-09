@@ -233,6 +233,13 @@ pub static STRIP: std::sync::Mutex<Option<Strip>> = std::sync::Mutex::new(None);
 
 /// Columns of tiled windows on the active niri workspace: (x on the strip, width), logical px.
 static OVERVIEW_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FOCUSED_APP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// app_id of the focused window, as last seen.
+pub fn focused_app() -> Option<String> {
+    FOCUSED_APP.lock().unwrap().clone()
+}
+
 static WORKSPACES: std::sync::Mutex<Option<Vec<Space>>> = std::sync::Mutex::new(None);
 static WINDOW_COUNTS: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
@@ -514,6 +521,7 @@ fn niri_focused_output(sock: &Path) -> Option<serde_json::Value> {
 
 pub(super) fn query_niri_window(sock: &Path) -> Option<(bool, bool, Option<WindowRect>)> {
     let win = niri_request(sock, "\"FocusedWindow\"")?.get("FocusedWindow").cloned()?;
+    *FOCUSED_APP.lock().unwrap() = win.get("app_id").and_then(|a| a.as_str()).map(String::from);
     if win.is_null() {
         return Some((false, false, None));
     }

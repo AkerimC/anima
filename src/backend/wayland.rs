@@ -135,6 +135,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         active_window: None,
         focused_monitor: std::env::var("ANIMA_MONITOR").ok(),
         any_fullscreen: false,
+        fs_visits: false,
         any_maximized: false,
         on_battery: false,
         battery_percent: None,
@@ -332,6 +333,8 @@ pub struct App {
 
     focused_monitor: Option<String>,
     any_fullscreen: bool,
+    /// Fullscreen, but an app the characters may visit.
+    fs_visits: bool,
     any_maximized: bool,
     on_battery: bool,
     battery_percent: Option<u8>,
@@ -601,7 +604,7 @@ impl App {
             }
         }
         fo.configured = true;
-        if !self.outputs[idx].paused && !self.any_fullscreen {
+        if !self.outputs[idx].paused && (!self.any_fullscreen || self.fs_visits) {
             self.outputs[idx].overlay_hidden = false;
         }
     }
@@ -1053,7 +1056,7 @@ impl App {
 
     fn desired_paused(&self, idx: usize) -> bool {
         let g = &self.config.general;
-        let global = (g.pause_on_fullscreen && self.any_fullscreen)
+        let global = (g.pause_on_fullscreen && self.any_fullscreen && !self.fs_visits)
             || (g.pause_on_maximized && self.any_maximized)
             || (g.pause_on_battery && self.on_battery)
             || (g.low_battery_pause > 0
@@ -1064,13 +1067,21 @@ impl App {
         self.outputs[idx].user_paused || global
     }
 
+    /// Is the focused app one the characters may come out over when fullscreen?
+    /// Only those listed: drawing over a game can cost it frames.
+    fn character_may_visit(&self) -> bool {
+        let c = &self.config.character;
+        let Some(app) = super::governor::focused_app().map(|a| a.to_lowercase()) else { return false };
+        c.enabled && c.walk && c.fullscreen_apps.iter().any(|f| !f.is_empty() && app.contains(&f.to_lowercase()))
+    }
+
     fn refresh_pause(&mut self) {
         for idx in 0..self.outputs.len() {
             let desired = self.desired_paused(idx);
             // Never leave a character overlay floating above fullscreen
             // content, even when the wallpaper itself is allowed to keep
             // running.
-            let hide_overlay = desired || self.any_fullscreen;
+            let hide_overlay = if self.fs_visits { self.outputs[idx].user_paused } else { desired || self.any_fullscreen };
             if self.outputs[idx].front_overlay.is_some() {
                 let was_hidden = self.outputs[idx].overlay_hidden;
                 if hide_overlay && !was_hidden {
@@ -1733,7 +1744,11 @@ impl App {
                 active_rect,
             } => {
                 self.active_window = active_rect;
-                if self.any_fullscreen != fullscreen || self.any_maximized != maximized {
+                let visits = fullscreen && self.character_may_visit();
+                let visits_changed = visits != self.fs_visits;
+                self.fs_visits = visits;
+                super::desktop::FS_VISIT.store(visits, std::sync::atomic::Ordering::Relaxed);
+                if self.any_fullscreen != fullscreen || self.any_maximized != maximized || visits_changed {
                     log::debug!("fullscreen = {fullscreen}, maximized = {maximized}");
                     self.any_fullscreen = fullscreen;
                     self.any_maximized = maximized;

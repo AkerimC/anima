@@ -3,6 +3,9 @@
 //! moving up or down to the next one. The more at home it feels, and the
 //! better it knows those around it, the more it wants to see who's elsewhere.
 
+use std::sync::atomic::Ordering::Relaxed;
+
+use crate::backend::desktop;
 use crate::backend::governor::{self, Space};
 use crate::render::FrameInfo;
 use crate::render::tuning::get as tn;
@@ -17,6 +20,8 @@ enum Leg {
     Sinking,
     Rising,
     Emerging,
+    // ends a fullscreen visit: down and out of sight
+    Vanishing,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +40,9 @@ pub(super) struct Spaces {
     tick: f32,
     // how much each workspace has been looked at lately, seconds
     used: Vec<(u64, f32)>,
+    // a fullscreen app is up: seconds to the next visit
+    pub(super) fs_on: bool,
+    fs_wait: f32,
 }
 
 impl WalkState {
@@ -43,6 +51,22 @@ impl WalkState {
         self.act = Act::Travel;
         self.target = self.x;
         self.here_t = 0.0;
+    }
+
+    /// Comes up out of the floor for a visit.
+    fn come_out(&mut self, stay: f32) {
+        self.backstage = false;
+        self.visiting = true;
+        self.visit_left = stay;
+        self.trip = Some(Trip { to: self.ws, leg: Leg::Emerging, t: 0.0 });
+        self.act = Act::Travel;
+        self.sink = BELOW;
+        self.target = self.x;
+    }
+
+    fn go_back(&mut self) {
+        self.trip = Some(Trip { to: self.ws, leg: Leg::Vanishing, t: 0.0 });
+        self.act = Act::Travel;
     }
 
     /// `top`: the height at which it's out of sight above the screen.
@@ -71,6 +95,18 @@ impl WalkState {
                     self.act = Act::Fall;
                     self.trip = None;
                     self.newcomer = true;
+                    return;
+                }
+            }
+            Leg::Vanishing => {
+                self.sink += speed * dt;
+                if self.sink >= BELOW {
+                    self.sink = 0.0;
+                    self.act = Act::Idle;
+                    self.timer = 1.0;
+                    self.trip = None;
+                    self.backstage = true;
+                    self.visiting = false;
                     return;
                 }
             }
@@ -164,7 +200,7 @@ impl CharacterOverlay {
             a.screen_mouse = info.mouse;
             if list.is_empty() {
                 a.zoom = None;
-                a.visible = true;
+                a.visible = !a.walk.backstage;
                 a.walk.ws = 0;
             }
         }
@@ -184,7 +220,7 @@ impl CharacterOverlay {
                 let zoom = SceneZoom::new(s.rect, size, scale);
                 let a = self.actor_mut(i);
                 a.zoom = zoom;
-                a.visible = on_screen;
+                a.visible = on_screen && !a.walk.backstage;
             }
         }
         self.spaces.list = list;
@@ -223,6 +259,7 @@ impl CharacterOverlay {
             let top = self.actor_ref(i).top_air;
             self.walk_of(i).trip_tick(dt, top);
         }
+        self.run_visits(dt, n);
         if self.spaces.list.is_empty() {
             return;
         }
@@ -234,9 +271,66 @@ impl CharacterOverlay {
             }
         }
         self.spaces.tick -= dt;
-        if self.spaces.tick <= 0.0 {
+        if self.spaces.tick <= 0.0 && !self.spaces.fs_on {
             self.spaces.tick = 1.0;
             self.roam(n);
+        }
+    }
+
+    /// A fullscreen app we may visit: nearly everyone is out of sight, and
+    /// now and then one to three come out and potter along the bottom.
+    fn run_visits(&mut self, dt: f32, n: usize) {
+        let on = desktop::FS_VISIT.load(Relaxed);
+        let here = self.spaces.active;
+        if on != self.spaces.fs_on {
+            self.spaces.fs_on = on;
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                wk.backstage = on && (here == 0 || wk.ws == here);
+                wk.visiting = false;
+                wk.visit_left = 0.0;
+            }
+            let roll = self.walk.rand();
+            self.spaces.fs_wait = tn().fs_first * (0.5 + roll);
+        }
+        if !on {
+            return;
+        }
+        for i in 0..n {
+            let wk = self.walk_of(i);
+            if wk.visiting {
+                wk.fret = false;
+                wk.newcomer = false;
+                wk.visit_left -= dt;
+                if wk.visit_left <= 0.0 && wk.at_leisure() {
+                    wk.go_back();
+                }
+            }
+        }
+        self.spaces.fs_wait -= dt;
+        if self.spaces.fs_wait > 0.0 {
+            return;
+        }
+        let (roll, spread) = (self.walk.rand(), self.walk.rand());
+        self.spaces.fs_wait = tn().fs_every * (0.6 + spread * 0.8);
+        if roll >= tn().fs_chance {
+            return;
+        }
+        let want = 1 + (self.walk.rand() * tn().fs_max) as usize;
+        let mut free: Vec<usize> = (0..n).filter(|&i| {
+            let wk = self.walk_ref(i);
+            wk.backstage && wk.at_leisure()
+        }).collect();
+        for _ in 0..want.min(free.len()) {
+            let k = ((self.walk.rand() * free.len() as f32) as usize).min(free.len() - 1);
+            let i = free.swap_remove(k);
+            let a = self.actor_mut(i);
+            let (r, screen) = (a.hit_rect, a.surface[0].max(1.0));
+            let middle = (r[0] + r[2]) * 0.5;
+            let spot = screen * (0.1 + a.walk.rand() * 0.8);
+            let stay = tn().fs_stay_min + a.walk.rand() * tn().fs_stay_rand;
+            a.walk.x += (spot - middle) * 2.0 / screen;
+            a.walk.come_out(stay);
         }
     }
 
@@ -341,6 +435,24 @@ mod tests {
 
     fn walker(ws: u64) -> WalkState {
         WalkState { act: Act::Idle, timer: 100.0, seed: 9, ws, ..Default::default() }
+    }
+
+    #[test]
+    fn a_visitor_comes_up_and_goes_back_down() {
+        let mut wk = walker(1);
+        wk.backstage = true;
+        wk.come_out(5.0);
+        assert!(!wk.backstage && wk.visiting);
+        for _ in 0..60 * 5 {
+            wk.trip_tick(DT, 12.0);
+        }
+        assert_eq!((wk.act, wk.sink), (Act::Idle, 0.0));
+        wk.go_back();
+        for _ in 0..60 * 5 {
+            wk.trip_tick(DT, 12.0);
+        }
+        assert!(wk.backstage && !wk.visiting && wk.trip.is_none());
+        assert_eq!(wk.ws, 1, "stays on its workspace");
     }
 
     #[test]

@@ -199,7 +199,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
+        Chat { cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
     }
 }
 
@@ -281,6 +281,12 @@ pub(super) struct Chat {
     tug_held: f32,
     // clicks seen so far, and those landing on the middle of the rope lately
     tug_clicks: u32,
+    // tug of war: seconds until someone watching decides to cheat (<0: nobody
+    // will), who, for which side (1 = right), and whether it has hold of the rope
+    cheat_t: f32,
+    cheater: Option<usize>,
+    cheat_side: f32,
+    cheat_on: bool,
     cuts: u32,
     cut_timer: f32,
     // a game that ends with everyone hopping, no winner
@@ -549,7 +555,7 @@ impl CharacterOverlay {
         self.social_tick -= dt;
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
-            if self.race.is_none() && self.social_age >= tn().warm_alone && !self.moods.fretting {
+            if self.race.is_none() && self.social_age >= tn().warm_alone && !self.moods.fretting && !self.spaces.fs_on {
                 for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Volley | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
@@ -1131,14 +1137,14 @@ impl CharacterOverlay {
     /// A game for this many that they haven't played yet: the closer its
     /// minimum is to their number, the likelier.
     fn choose_game(&mut self, played: &[Game], len: usize, rivalry: f32) -> Option<Game> {
-        if !played.contains(&Game::Cursor) && self.walk.rand() < tn().cursor_game {
+        if len >= tn().game_min as usize && !played.contains(&Game::Cursor) && self.walk.rand() < tn().cursor_game {
             return Some(Game::Cursor);
         }
         let pool: Vec<(Game, f32)> = [
             (Game::Contest, tn().game_min as usize),
             (Game::Long, tn().long_min as usize),
             (Game::Domino, tn().party_min as usize),
-            (Game::Tug, tn().party_min as usize),
+            (Game::Tug, tn().tug_min as usize),
             (Game::Tag, tn().party_min as usize),
             (Game::Carrot, tn().carrot_min as usize),
             (Game::Samba, tn().samba_min as usize),
@@ -1284,7 +1290,7 @@ impl CharacterOverlay {
             "cursor" => (Game::Cursor, t.game_min),
             "long" => (Game::Long, t.long_min),
             "domino" => (Game::Domino, t.party_min),
-            "tug" => (Game::Tug, t.party_min),
+            "tug" => (Game::Tug, t.tug_min),
             "tag" => (Game::Tag, t.party_min),
             "carrot" => (Game::Carrot, t.carrot_min),
             "gift" => (Game::Gift, t.gift_min),
@@ -1511,6 +1517,82 @@ impl CharacterOverlay {
         c.scores.clear();
         c.regroup = true;
         c.stage = Stage::Tug;
+        c.cheater = None;
+        c.cheat_on = false;
+        c.cheat_t = if self.walk.rand() < tn().tug_cheat_chance { 3.0 + self.walk.rand() * 5.0 } else { -1.0 };
+    }
+
+    /// Someone watching runs round to one end of the rope and hauls on it:
+    /// that side wins.
+    fn tug_cheat(&mut self, c: &mut Chat, dt: f32) {
+        if let Some(i) = c.cheater {
+            if !c.watchers.contains(&i) {
+                c.cheater = None;
+                return;
+            }
+            if self.arrived(i) {
+                c.watchers.retain(|&w| w != i);
+                c.cheater = None;
+                let right = c.cheat_side > 0.0;
+                let losers = if right { c.teams.0.clone() } else { c.teams.1.clone() };
+                let x = self.tug_end(c, right) - c.offset;
+                c.members.push(i);
+                c.base.push((i, x));
+                if right { c.teams.1.push(i) } else { c.teams.0.push(i) }
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.face_left = right;
+                    r.face_lock = true;
+                    r.no_touch = true;
+                }
+                for l in losers {
+                    self.add_bond(i, l, 0.0, tn().bond_game * 2.0);
+                }
+                c.cheat_on = true;
+                c.timer = c.timer.max(6.0);
+                log::debug!("chat {}: {i} cheats, hauling on the {} side", c.id, if right { "right" } else { "left" });
+            }
+            return;
+        }
+        if c.cheat_on || c.cheat_t < 0.0 {
+            return;
+        }
+        c.cheat_t -= dt;
+        if c.cheat_t > 0.0 {
+            return;
+        }
+        c.cheat_t = -1.0;
+        let n = self.extras.len() + 1;
+        let middle = c.base.iter().map(|b| b.1).sum::<f32>() / c.base.len().max(1) as f32 + c.offset;
+        let ws = self.walk_ref(c.members[0]).ws;
+        let range = self.view_w * tn().tug_cheat_range;
+        let seen = (0..n)
+            .filter(|&i| !c.members.contains(&i) && self.walk_ref(i).ws == ws && self.walk_ref(i).at_leisure() && self.on_screen(i))
+            .map(|i| (i, (self.strip_px(i) - middle).abs()))
+            .filter(|s| s.1 <= range)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((i, _)) = seen else { return };
+        // on its friends' side, or either if it knows neither better
+        let liking = |this: &Self, team: &[usize]| team.iter().map(|&m| this.bond(i, m).0).fold(0.0, f32::max);
+        let (l, r) = (liking(self, &c.teams.0), liking(self, &c.teams.1));
+        let roll = self.walk.rand();
+        c.cheat_side = if r > l || (r == l && roll < 0.5) { 1.0 } else { -1.0 };
+        let right = c.cheat_side > 0.0;
+        self.enlist(i, c.id);
+        c.watchers.push(i);
+        c.cheater = Some(i);
+        c.timer = c.timer.max(8.0);
+        let to = self.tug_end(c, right);
+        self.go(i, to, tn().tug_cheat_speed);
+        log::debug!("chat {}: {i} saw the tug and runs to cheat", c.id);
+    }
+
+    /// Just behind the last one pulling on that side.
+    fn tug_end(&self, c: &Chat, right: bool) -> f32 {
+        let team = if right { &c.teams.1 } else { &c.teams.0 };
+        let xs = team.iter().filter_map(|t| c.base.iter().find(|b| b.0 == *t).map(|b| b.1));
+        let gap = self.row_size(c) * 0.72;
+        let end = if right { xs.fold(f32::MIN, f32::max) + gap } else { xs.fold(f32::MAX, f32::min) - gap };
+        end + c.offset
     }
 
     fn run_tug(&mut self, c: &mut Chat, dt: f32, mouse: [f32; 2]) {
@@ -1542,6 +1624,10 @@ impl CharacterOverlay {
                         force += self.walk.rand();
                     }
                     c.pull_target = (force * tn().tug_pull).clamp(-tn().tug_speed, tn().tug_speed);
+                }
+                self.tug_cheat(c, dt);
+                if c.cheat_on {
+                    c.pull_target = c.cheat_side * tn().tug_speed;
                 }
                 c.pull += (c.pull_target - c.pull) * (dt * 3.0).min(1.0);
                 // clicked to bits in the middle: it snaps and everybody goes flying
@@ -2771,7 +2857,7 @@ impl CharacterOverlay {
     /// and join when it's over.
     fn try_watch(&mut self, c: &mut Chat, n: usize) {
         for &w in &c.watchers.clone() {
-            if self.arrived(w) {
+            if Some(w) != c.cheater && self.arrived(w) {
                 self.face(w, c.talker);
                 if self.walk.rand() < 0.12 {
                     self.walk_of(w).start_bob(tn().jump_height * 0.1);
@@ -3275,12 +3361,13 @@ impl CharacterOverlay {
                         return true;
                     }
                 }
-                let may_play = c.members.len() >= tn().game_min as usize
+                let pair_only = c.members.len() < tn().game_min as usize;
+                let may_play = c.members.len() >= (tn().game_min as usize).min(tn().tug_min as usize)
                     && c.quiet >= tn().game_after
                     && (c.games == 0 || (c.members.len() >= tn().crowd_games as usize && (c.games as f32) < tn().max_games));
                 if may_play {
                     // not every chat turns into a game; ask again a good while later
-                    if self.walk.rand() >= tn().game_chance {
+                    if self.walk.rand() >= tn().game_chance * if pair_only { tn().tug_pair_chance } else { 1.0 } {
                         c.quiet = -2.0 * tn().game_after;
                     } else if self.next_game(c) {
                         c.games += 1;
