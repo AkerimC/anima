@@ -694,7 +694,7 @@ pub(super) fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
             continue;
         }
         // things that can scroll the strip (title changes etc. can't)
-        if ["WindowFocusChanged", "WindowLayoutsChanged", "WorkspaceActivated", "WindowClosed", "WindowsChanged"]
+        if ["WindowFocusChanged", "WindowLayoutsChanged", "WorkspaceActivated", "WorkspaceActiveWindowChanged", "WindowClosed", "WindowsChanged"]
             .iter()
             .any(|k| line.starts_with(&format!("{{\"{k}\"")))
         {
