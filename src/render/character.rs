@@ -27,9 +27,12 @@ use super::image::ImageRenderer;
 use crate::pkg::decode_tex;
 
 mod interact;
+mod moods;
+mod pat;
 mod race;
 mod rope;
 mod social;
+mod spaces;
 mod uma;
 mod walk;
 
@@ -165,6 +168,53 @@ impl ActorTarget for SharedSurface {
     }
 
     fn end(&mut self, _: &glow::Context, _: usize) {}
+}
+
+/// The whole scene shrunk onto one rectangle of the screen: the workspace
+/// as niri's overview draws it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneZoom {
+    scale: f32,
+    ox: f32,
+    oy: f32,
+    size: [f32; 2],
+}
+
+impl SceneZoom {
+    /// `rect` in logical px, `size` the surface in physical px. None when
+    /// the workspace simply fills the screen.
+    pub fn new(rect: [f32; 4], size: [f32; 2], output_scale: f32) -> Option<Self> {
+        let scale = rect[2] * output_scale / size[0].max(1.0);
+        let (ox, oy) = (rect[0] * output_scale, rect[1] * output_scale);
+        let plain = (scale - 1.0).abs() < 1e-3 && ox.abs() < 0.5 && oy.abs() < 0.5;
+        (scale > 0.01 && !plain).then_some(Self { scale, ox, oy, size })
+    }
+
+    /// Smaller than the screen: the overview, not just a sliding workspace.
+    pub(crate) fn shrunk(&self) -> bool {
+        self.scale < 0.95
+    }
+
+    /// A point on the screen as the scene sees it.
+    pub fn to_scene(&self, p: [f32; 2]) -> [f32; 2] {
+        [(p[0] - self.ox) / self.scale, (p[1] - self.oy) / self.scale]
+    }
+
+    /// A box in the scene as it lands on the screen.
+    pub fn to_screen(&self, r: [f32; 4]) -> [f32; 4] {
+        [r[0] * self.scale + self.ox, r[1] * self.scale + self.oy, r[2] * self.scale + self.ox, r[3] * self.scale + self.oy]
+    }
+}
+
+impl SceneZoom {
+    fn clip_xform(&self) -> [f32; 4] {
+        [
+            self.scale,
+            self.scale,
+            2.0 * self.ox / self.size[0] + self.scale - 1.0,
+            1.0 - self.scale - 2.0 * self.oy / self.size[1],
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -932,6 +982,16 @@ pub struct CharacterOverlay {
     race: Option<Race>,
     // pairs chatting, and when to look for the next (main character only)
     chats: Vec<Chat>,
+    moods: moods::Moods,
+    spaces: spaces::Spaces,
+    // this character's workspace: its place on screen, its scroll
+    zoom: Option<SceneZoom>,
+    visible: bool,
+    own_view: [f32; 2],
+    // the cursor on the screen, before `zoom`
+    screen_mouse: [f32; 2],
+    // how high is out of sight above the screen
+    top_air: f32,
     social_tick: f32,
     chat_id: u32,
     rope: Option<rope::RopeGl>,
@@ -1089,6 +1149,13 @@ impl CharacterOverlay {
             press: None,
             race: None,
             chats: Vec::new(),
+            moods: Default::default(),
+            spaces: Default::default(),
+            zoom: None,
+            visible: true,
+            own_view: [0.0; 2],
+            screen_mouse: [0.0; 2],
+            top_air: 10.0,
             social_tick: 0.0,
             chat_id: 0,
             rope: None,
@@ -1255,24 +1322,43 @@ impl CharacterOverlay {
 
     /// Boxes that must be repainted: a turned character reaches past its box.
     pub fn damage_rects(&self) -> Vec<[f32; 4]> {
+        let shown = |r: [f32; 4], owner: usize| self.placed(owner).map(|z| z.map_or(r, |z| z.to_screen(r)));
         std::iter::once(self)
             .chain(self.extras.iter())
+            .filter(|a| a.visible)
             .map(|a| {
                 let [x0, y0, x1, y1] = a.hit_rect;
                 let pad = if a.walk.rot.abs() > 0.01 { (y1 - y0) * 1.5 } else { 0.0 };
-                [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
+                let r = [x0 - pad, y0 - pad, x1 + pad, y1 + pad];
+                a.zoom.map_or(r, |z| z.to_screen(r))
             })
+            .chain(self.props().into_iter().filter_map(|p| shown(p.1, p.3)))
             // the rope spans the gap between the two sides
-            .chain(self.props().into_iter().map(|p| p.1))
-            .chain(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0]))
+            .chain(self.ropes_owned().into_iter().filter_map(|([x0, y0, x1, y1], o)| shown([x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0], o)))
             .collect()
     }
 
     /// Where the cursor belongs to us: the characters, and a rope in play.
     pub fn input_rects(&self) -> Vec<[f32; 4]> {
-        let mut v: Vec<[f32; 4]> = std::iter::once(self).chain(self.extras.iter()).map(|a| a.body_box()).collect();
-        v.extend(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 16.0, x1, y0.max(y1) + 16.0]));
+        let mut v: Vec<[f32; 4]> = std::iter::once(self)
+            .chain(self.extras.iter())
+            .filter(|a| a.visible)
+            .map(|a| {
+                let r = a.body_box();
+                a.zoom.map_or(r, |z| z.to_screen(r))
+            })
+            .collect();
+        v.extend(self.ropes_owned().into_iter().filter_map(|([x0, y0, x1, y1], o)| {
+            let r = [x0, y0.min(y1) - 16.0, x1, y0.max(y1) + 16.0];
+            self.placed(o).map(|z| z.map_or(r, |z| z.to_screen(r)))
+        }));
         v
+    }
+
+    /// Where actor `i` is drawn; None if its workspace is out of sight.
+    fn placed(&self, i: usize) -> Option<Option<SceneZoom>> {
+        let a = if i == 0 { self } else { &self.extras[i - 1] };
+        a.visible.then_some(a.zoom)
     }
 
     pub fn uses_audio(&self) -> bool {
@@ -1475,6 +1561,19 @@ impl CharacterOverlay {
             return Ok(());
         }
 
+        let outer = info;
+        if self.actor == 0 {
+            self.sync_spaces(outer);
+        }
+        let seen;
+        let info = match self.zoom {
+            Some(z) => {
+                seen = FrameInfo { mouse: z.to_scene(outer.mouse), ..outer.clone() };
+                &seen
+            }
+            None => outer,
+        };
+
         if self.actor == 0 {
             self.handle_input(info);
         }
@@ -1499,6 +1598,7 @@ impl CharacterOverlay {
             for e in &mut self.extras {
                 e.view = view;
             }
+            self.share_views(view);
             if self.config.walk {
                 self.run_race(dt, w);
                 self.run_social(dt, info.mouse);
@@ -1610,7 +1710,7 @@ impl CharacterOverlay {
                 Act::Pat => Pose::Pat,
                 Act::Held => Pose::Held,
                 Act::Fall | Act::Planted => Pose::Fall,
-                Act::Idle | Act::Jump => Pose::Idle,
+                Act::Idle | Act::Jump | Act::Rest | Act::Travel => Pose::Idle,
             };
             // light around where the character was drawn last frame
             let [x0, y0, x1, y1] = self.hit_rect;
@@ -1638,7 +1738,8 @@ impl CharacterOverlay {
                 .set_vec2(gl, "u_half_size", half_clip[0], half_clip[1]);
             // walking: positions live on niri's scrolling strip (offset from
             // the anchor when the strip isn't scrolled); `view` converts to screen
-            let [view, extra] = self.view;
+            let [view, extra] = self.own_view;
+            self.top_air = (1.0 - center_clip[1]) / half_clip[1] + 1.2;
             let (walk_x, moving, jump) = if self.config.walk {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
@@ -1787,8 +1888,8 @@ impl CharacterOverlay {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             self.program.set_i32(gl, "u_tex", 0);
 
-            if target.begin(gl, self.actor, self.hit_rect) {
-                let [sx, sy, ox, oy] = target.clip_xform();
+            if self.visible && target.begin(gl, self.actor, self.hit_rect) {
+                let [sx, sy, ox, oy] = self.zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform());
                 self.program.set_vec4(gl, "u_clip", [sx, sy, ox, oy]);
                 gl.bind_vertex_array(Some(self.vao));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
@@ -1802,7 +1903,7 @@ impl CharacterOverlay {
         self.speak(info);
 
         for e in &mut self.extras {
-            e.render(gl, info, active_window, target)?;
+            e.render(gl, outer, active_window, target)?;
         }
         if self.actor == 0 {
             self.draw_ropes(gl, info, target);
@@ -1828,5 +1929,24 @@ fn create_quad(gl: &glow::Context) -> Result<(glow::VertexArray, glow::Buffer)> 
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
         gl.bind_vertex_array(None);
         Ok((vao, vbo))
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn scene_maps_onto_the_workspace() {
+        let z = SceneZoom::new([480.0, 135.0, 960.0, 540.0], [1920.0, 1080.0], 1.0).unwrap();
+        assert_eq!(z.to_screen([0.0, 0.0, 1920.0, 1080.0]), [480.0, 135.0, 1440.0, 675.0]);
+        assert_eq!(z.to_scene([480.0, 675.0]), [0.0, 1080.0]);
+        // the clip space corners land on the same place
+        let [sx, sy, ox, oy] = z.clip_xform();
+        let (left, right) = (-sx + ox, sx + ox);
+        let (bottom, top) = (-sy + oy, sy + oy);
+        let px = |c: f32, size: f32| (c + 1.0) * 0.5 * size;
+        assert_eq!((px(left, 1920.0), px(right, 1920.0)), (480.0, 1440.0));
+        assert_eq!((1080.0 - px(top, 1080.0), 1080.0 - px(bottom, 1080.0)), (135.0, 675.0));
     }
 }

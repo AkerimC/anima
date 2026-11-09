@@ -15,7 +15,7 @@ pub static GAME_NOW: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(No
 /// like a race's.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Social {
-    chat: u32,
+    pub(super) chat: u32,
     pub(super) goal_px: f32,
     pub(super) goal: f32,
     speed: f32,
@@ -406,6 +406,14 @@ impl WalkState {
             self.vx = 0.0;
             self.vy = 0.0;
         }
+        if self.act == Act::Rest {
+            self.rest_pose(dt);
+            return;
+        }
+        if self.act == Act::Travel {
+            self.feet = false;
+            return;
+        }
         if self.act == Act::Planted {
             let (rot, sink) = self.plant_pose;
             let k = (dt * 14.0).min(1.0);
@@ -519,6 +527,10 @@ impl CharacterOverlay {
             wk.crowd_rest = (wk.crowd_rest - dt).max(0.0);
             wk.update_pose(dt);
         }
+        self.run_pat_crowd(dt, n);
+        self.run_moods(dt, n);
+        self.run_spaces(dt, n);
+        self.grow_bonds(dt);
         let mut chats = std::mem::take(&mut self.chats);
         let asked = GAME_NOW.lock().unwrap().take();
         if let Some(name) = asked {
@@ -537,7 +549,7 @@ impl CharacterOverlay {
         self.social_tick -= dt;
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
-            if self.race.is_none() && self.social_age >= tn().warm_alone {
+            if self.race.is_none() && self.social_age >= tn().warm_alone && !self.moods.fretting {
                 for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Volley | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
@@ -558,6 +570,31 @@ impl CharacterOverlay {
             }
         }
         self.chats = chats;
+    }
+
+    fn each_pair(members: &[usize]) -> Vec<(usize, usize)> {
+        members.iter().enumerate().flat_map(|(k, &a)| members[k + 1..].iter().map(move |&b| (a, b))).collect()
+    }
+
+    /// Time spent talking makes friends, a second at a time.
+    fn grow_bonds(&mut self, dt: f32) {
+        self.moods.bonds.tick(dt);
+        self.moods.bond_tick -= dt;
+        if self.moods.bond_tick > 0.0 {
+            return;
+        }
+        self.moods.bond_tick = 1.0;
+        let talking: Vec<(usize, usize)> = self.chats.iter().filter(|c| matches!(c.stage, Stage::Talk | Stage::Stroll)).flat_map(|c| Self::each_pair(&c.members)).collect();
+        let step = 1.0 / (tn().bond_minutes * 60.0).max(1.0);
+        for (a, b) in talking {
+            self.add_bond(a, b, step, 0.0);
+        }
+    }
+
+    /// Average rivalry in a group.
+    fn rivalry(&self, members: &[usize]) -> f32 {
+        let pairs = Self::each_pair(members);
+        pairs.iter().map(|&(a, b)| self.bond(a, b).1).sum::<f32>() / pairs.len().max(1) as f32
     }
 
     /// Biggest a group may get: small ones only while they're settling in.
@@ -582,7 +619,7 @@ impl CharacterOverlay {
                 let carried = crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
                 let playing = (game && (wk.act == Act::Fall || (wk.act == Act::Held && (wk.hang > 0.0 || !carried))))
                     || (tag && matches!(wk.act, Act::Held | Act::Fall));
-                wk.social.is_some_and(|s| s.chat == id) && !wk.circle && (playing || !matches!(wk.act, Act::Held | Act::Fall | Act::Pat | Act::Chase))
+                wk.social.is_some_and(|s| s.chat == id) && !wk.circle && (playing || !matches!(wk.act, Act::Held | Act::Fall | Act::Chase))
             };
             if !stays {
                 left.push(i);
@@ -596,7 +633,7 @@ impl CharacterOverlay {
         c.watchers.retain(|&i| {
             let stays = i < n && {
                 let wk = self.walk_ref(i);
-                wk.social.is_some_and(|s| s.chat == id) && !wk.circle && !matches!(wk.act, Act::Held | Act::Fall | Act::Pat | Act::Chase)
+                wk.social.is_some_and(|s| s.chat == id) && !wk.circle && !matches!(wk.act, Act::Held | Act::Fall | Act::Chase)
             };
             if !stays {
                 gone.push(i);
@@ -658,7 +695,7 @@ impl CharacterOverlay {
         let free: Vec<(usize, f32, f32, f32)> = (0..n)
             .filter(|&i| {
                 let wk = self.walk_ref(i);
-                wk.act == Act::Idle && wk.social.is_none() && wk.race.is_none() && !wk.circle && self.on_screen(i)
+                wk.act == Act::Idle && wk.crowd.is_none() && wk.social.is_none() && wk.race.is_none() && !wk.circle && self.on_screen(i)
             })
             .map(|i| (i, self.strip_px(i), self.width_of(i), chat_cool(self.walk_ref(i))))
             .collect();
@@ -667,17 +704,24 @@ impl CharacterOverlay {
         let mut crowded: Option<(f32, usize, usize)> = None;
         for (k, p) in free.iter().enumerate() {
             for q in &free[k + 1..] {
+                if self.walk_ref(p.0).ws != self.walk_ref(q.0).ws {
+                    continue;
+                }
                 let d = (p.1 - q.1).abs();
                 let size = (p.2 + q.2) * 0.5;
+                // old friends notice each other from further off, rivals less
+                let (friend, rival) = self.bond(p.0, q.0);
+                let pull = 1.0 + friend * tn().bond_pull;
+                let rank = d / pull * (1.0 + rival * 0.5);
                 let slot = if d < size * tn().overlap {
                     if p.3 <= tn().overlap_cool && q.3 <= tn().overlap_cool { &mut overlap } else { &mut crowded }
-                } else if d < size * tn().near_range && p.3 <= 0.0 && q.3 <= 0.0 {
+                } else if d < size * tn().near_range * pull && p.3 <= 0.0 && q.3 <= 0.0 {
                     &mut near
                 } else {
                     continue;
                 };
-                if slot.is_none_or(|s| d < s.0) {
-                    *slot = Some((d, p.0, q.0));
+                if slot.is_none_or(|s| rank < s.0) {
+                    *slot = Some((rank, p.0, q.0));
                 }
             }
         }
@@ -703,8 +747,37 @@ impl CharacterOverlay {
         self.enlist(b, id);
         let timer = 1.2 + self.walk.rand() * 0.8;
         self.face(a, b);
+        // friends are pleased to see each other
+        if self.bond(a, b).0 >= tn().bond_friend {
+            for i in [a, b] {
+                let wk = self.walk_of(i);
+                wk.notify_jump = Some(0.1 + wk.rand() * 0.3);
+            }
+        }
         log::debug!("chat {id}: {a} and {b}{}", if pair.0 < self.width_of(a) * tn().overlap { " (were inside each other)" } else { "" });
         Some(Chat::new(id, vec![a, b], Stage::Notice, timer))
+    }
+
+    /// Someone new on the workspace: whoever knows it least goes to say hello.
+    pub(super) fn greet_newcomer(&mut self, i: usize, n: usize) {
+        if self.social_age < tn().warm_alone || self.moods.fretting {
+            return;
+        }
+        let (ws, x) = (self.walk_ref(i).ws, self.strip_px(i));
+        let view = self.view_w.max(1.0);
+        let host = (0..n)
+            .filter(|&j| j != i && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure())
+            .map(|j| (j, self.bond(i, j).0 * 2.0 + (self.strip_px(j) - x).abs() / view))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((host, _)) = host else { return };
+        self.chat_id = self.chat_id.wrapping_add(1);
+        let id = self.chat_id;
+        self.enlist(host, id);
+        self.enlist(i, id);
+        self.face(host, i);
+        log::debug!("chat {id}: {host} comes to meet newcomer {i}");
+        let timer = 1.2 + self.walk.rand() * 0.8;
+        self.new_chats.push(Chat::new(id, vec![host, i], Stage::Notice, timer));
     }
 
     /// Standing inside someone with nothing to say: one shuffles over.
@@ -736,20 +809,21 @@ impl CharacterOverlay {
     fn try_join(&mut self, c: &mut Chat, n: usize) {
         let spots: Vec<f32> = c.members.iter().map(|&i| self.strip_px(i)).collect();
         let size = self.width_of(c.members[0]);
-        let free: Vec<(usize, f32)> = (0..n)
+        let free: Vec<(usize, f32, f32)> = (0..n)
             .filter(|&i| {
                 let wk = self.walk_ref(i);
-                grounded(wk) && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_join_need && chat_cool(wk) <= 0.0 && self.on_screen(i)
+                wk.ws == self.walk_ref(c.members[0]).ws && grounded(wk) && wk.crowd.is_none() && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_join_need && chat_cool(wk) <= 0.0 && self.on_screen(i)
             })
             .map(|i| {
                 let x = self.strip_px(i);
-                (i, spots.iter().map(|p| (p - x).abs()).fold(f32::MAX, f32::min))
+                let friend = c.members.iter().map(|&m| self.bond(i, m).0).fold(0.0, f32::max);
+                (i, spots.iter().map(|p| (p - x).abs()).fold(f32::MAX, f32::min), friend)
             })
-            .filter(|f| f.1 < size * join_range(c.members.len()))
+            .filter(|f| f.1 < size * join_range(c.members.len()) * (1.0 + f.2 * tn().bond_pull))
             .collect();
-        let Some(&(i, _)) = free.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else { return };
+        let Some(&(i, _, friend)) = free.iter().min_by(|a, b| (a.1 / (1.0 + a.2 * tn().bond_pull)).total_cmp(&(b.1 / (1.0 + b.2 * tn().bond_pull)))) else { return };
         let moving = c.stage == Stage::Stroll || self.walk_ref(i).act == Act::Walk;
-        let chance = join_chance(c.members.len()) * if moving { tn().walk_join } else { 1.0 };
+        let chance = join_chance(c.members.len()) * if moving { tn().walk_join } else { 1.0 } * (1.0 + friend);
         if self.walk.rand() >= chance {
             return;
         }
@@ -764,7 +838,7 @@ impl CharacterOverlay {
         let mut hit: Option<(f32, usize, usize)> = None;
         for i in 0..n {
             let wk = self.walk_ref(i);
-            if wk.act != Act::Idle || wk.social.is_some() || wk.race.is_some() || wk.circle || !self.on_screen(i) {
+            if wk.act != Act::Idle || wk.ws != self.walk_ref(c.members[0]).ws || wk.social.is_some() || wk.race.is_some() || wk.circle || !self.on_screen(i) {
                 continue;
             }
             let x = self.strip_px(i);
@@ -1056,7 +1130,7 @@ impl CharacterOverlay {
 
     /// A game for this many that they haven't played yet: the closer its
     /// minimum is to their number, the likelier.
-    fn choose_game(&mut self, played: &[Game], len: usize) -> Option<Game> {
+    fn choose_game(&mut self, played: &[Game], len: usize, rivalry: f32) -> Option<Game> {
         if !played.contains(&Game::Cursor) && self.walk.rand() < tn().cursor_game {
             return Some(Game::Cursor);
         }
@@ -1080,7 +1154,9 @@ impl CharacterOverlay {
             } else {
                 (1.0 + (len - g.1) as f32).powf(-tn().game_fit)
             };
-            (g.0, weight)
+            // rivals would rather settle it
+            let settles = matches!(g.0, Game::Contest | Game::Tug | Game::Volley | Game::Carrot);
+            (g.0, if settles { weight * (1.0 + rivalry * tn().bond_rival) } else { weight })
         })
         .collect();
         let mut roll = self.walk.rand() * pool.iter().map(|g| g.1).sum::<f32>();
@@ -1099,12 +1175,17 @@ impl CharacterOverlay {
         if mean < tn().energy_game_need || self.social_age < tn().warm_small {
             return false;
         }
-        let Some(game) = self.choose_game(&c.played, c.members.len()) else {
+        let rivalry = self.rivalry(&c.members);
+        let Some(game) = self.choose_game(&c.played, c.members.len(), rivalry) else {
             return false;
         };
+        for (a, b) in Self::each_pair(&c.members) {
+            self.add_bond(a, b, 0.0, tn().bond_game);
+        }
         c.played.push(game);
         for &i in &c.members.clone() {
             self.spend(i, tn().energy_game_cost);
+            self.walk_of(i).played += 1.0;
         }
         self.start_game(c, game);
         true
@@ -1135,7 +1216,7 @@ impl CharacterOverlay {
         if mean < tn().energy_game_need * 0.7 {
             return false;
         }
-        let Some(game) = self.choose_game(&c.played, count) else {
+        let Some(game) = self.choose_game(&c.played, count, 0.0) else {
             return false;
         };
         self.chat_id = self.chat_id.wrapping_add(1);
@@ -1146,6 +1227,7 @@ impl CharacterOverlay {
         log::debug!("chat {}: {:?} go off to play {game:?} as chat {id}, {talkers:?} keep talking", c.id, other.members);
         for &i in &other.members.clone() {
             self.spend(i, tn().energy_game_cost);
+            self.walk_of(i).played += 1.0;
             if let Some(r) = self.walk_of(i).social.as_mut() {
                 r.chat = id;
             }
@@ -1226,7 +1308,7 @@ impl CharacterOverlay {
             .collect();
         let middle = self.view[0] * self.view_w * 0.5 + self.view_w * 0.5;
         let mut free: Vec<(usize, f32)> = (0..n)
-            .filter(|&i| !playing.contains(&i) && !self.walk_ref(i).circle && grounded(self.walk_ref(i)))
+            .filter(|&i| !playing.contains(&i) && (self.spaces.active == 0 || self.walk_ref(i).ws == self.spaces.active) && !self.walk_ref(i).circle && grounded(self.walk_ref(i)))
             .map(|i| (i, (self.strip_px(i) - middle).abs()))
             .collect();
         free.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -1359,8 +1441,8 @@ impl CharacterOverlay {
         Some([a.0, a.1, b.0, b.1])
     }
 
-    pub(super) fn rope_ends(&self) -> Vec<[f32; 4]> {
-        self.chats.iter().filter_map(|c| self.rope_of(c)).collect()
+    pub(super) fn ropes_owned(&self) -> Vec<([f32; 4], usize)> {
+        self.chats.iter().filter_map(|c| Some((self.rope_of(c)?, *c.members.first()?))).collect()
     }
 
     /// The cursor is on the middle third of the rope.
@@ -1828,8 +1910,8 @@ impl CharacterOverlay {
     /// Samba: in a row, hopping forward together a step at a time, looking
     /// right, then left, on the beat.
     /// Things drawn beside the characters: (kind, surface box, mirrored).
-    pub(super) fn props(&self) -> Vec<(i32, [f32; 4], bool)> {
-        let mut v: Vec<(i32, [f32; 4], bool)> = self.carrot_rects().into_iter().map(|r| (0, r, false)).collect();
+    pub(super) fn props(&self) -> Vec<(i32, [f32; 4], bool, usize)> {
+        let mut v: Vec<(i32, [f32; 4], bool, usize)> = self.chats.iter().filter(|c| c.stage == Stage::Carrot && c.step != 9).filter_map(|c| Some((0, self.carrot_rect(c)?, false, *c.members.first()?))).collect();
         for c in self.chats.iter().filter(|c| c.stage == Stage::Gift) {
             let Some(g) = c.gift.as_ref() else { continue };
             let rect = |i: usize| if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
@@ -1844,36 +1926,33 @@ impl CharacterOverlay {
                 [x - size * 0.5, top, x + size * 0.5, top + size]
             };
             match (c.step, g.kind) {
-                (1, _) => v.push((1, hand(giver, dir), false)),
-                (2, _) => v.push((1, hand(taker, -dir), false)),
-                (3, GiftKind::Carrot) => v.push((0, hand(taker, -dir), false)),
+                (1, _) => v.push((1, hand(giver, dir), false, g.giver)),
+                (2, _) => v.push((1, hand(taker, -dir), false, g.giver)),
+                (3, GiftKind::Carrot) => v.push((0, hand(taker, -dir), false, g.giver)),
                 (3, GiftKind::Balloon) => {
                     let w = height * 0.32;
                     let x = middle(taker);
-                    v.push((2, [x - w, taker[1] - height * 0.72, x + w, taker[1] + height * 0.08], false));
+                    v.push((2, [x - w, taker[1] - height * 0.72, x + w, taker[1] + height * 0.08], false, g.giver));
                 }
                 (3, GiftKind::Prank) => {
                     let x = g.box_x - self.view[0] * self.view_w * 0.5;
-                    v.push((1, [x - size * 0.5, g.box_y, x + size * 0.5, g.box_y + size], false));
+                    v.push((1, [x - size * 0.5, g.box_y, x + size * 0.5, g.box_y + size], false, g.giver));
                     // shoots out at once, then quivers on its spring
                     let out = height * (0.75 + 0.06 * (g.t * 40.0).sin()) * (g.t / 0.08).min(1.0);
                     let face = taker[1] + height * 0.3;
                     let (a, b) = (x, x + dir * out);
                     let half = height * 0.17;
                     let top = g.box_y.min(face) + (face - g.box_y).abs() * 0.5 - half;
-                    v.push((3, [a.min(b), top, a.max(b), top + half * 2.0], dir < 0.0));
+                    v.push((3, [a.min(b), top, a.max(b), top + half * 2.0], dir < 0.0, g.giver));
                 }
                 _ => {}
             }
         }
+        self.mood_props(&mut v);
         v
     }
 
     /// The carrot on the screen, surface pixels.
-    pub(super) fn carrot_rects(&self) -> Vec<[f32; 4]> {
-        self.chats.iter().filter(|c| c.stage == Stage::Carrot && c.step != 9).filter_map(|c| self.carrot_rect(c)).collect()
-    }
-
     fn carrot_rect(&self, c: &Chat) -> Option<[f32; 4]> {
         let v = c.carrot.as_ref()?;
         let first = *c.members.first()?;
@@ -2332,7 +2411,7 @@ impl CharacterOverlay {
         let nearest = (0..n)
             .filter(|&i| {
                 let wk = self.walk_ref(i);
-                grounded(wk) && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_join_need && chat_cool(wk) <= 0.0
+                wk.ws == self.walk_ref(c.members[0]).ws && grounded(wk) && wk.crowd.is_none() && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_join_need && chat_cool(wk) <= 0.0
             })
             .map(|i| {
                 let x = self.strip_px(i);
@@ -2708,7 +2787,7 @@ impl CharacterOverlay {
         let free: Vec<(usize, f32)> = (0..n)
             .filter(|&i| {
                 let wk = self.walk_ref(i);
-                grounded(wk) && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_watch_need && chat_cool(wk) <= tn().overlap_cool && self.on_screen(i)
+                wk.ws == self.walk_ref(c.members[0]).ws && grounded(wk) && wk.crowd.is_none() && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_watch_need && chat_cool(wk) <= tn().overlap_cool && self.on_screen(i)
             })
             .map(|i| {
                 let x = self.strip_px(i);

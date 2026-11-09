@@ -2,6 +2,7 @@
 //! two ends of the line.
 
 use super::{ActorTarget, CharacterOverlay};
+use super::SceneZoom;
 use crate::render::FrameInfo;
 use crate::render::gl::{Program, bytemuck_cast};
 use anyhow::{Result, anyhow};
@@ -75,7 +76,7 @@ impl RopeGl {
 
 impl CharacterOverlay {
     pub(super) fn draw_ropes(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
-        let ropes = self.rope_ends();
+        let ropes: Vec<([f32; 4], Option<SceneZoom>)> = self.ropes_owned().into_iter().filter_map(|(r, o)| self.placed(o).map(|z| (r, z))).collect();
         if ropes.is_empty() {
             return;
         }
@@ -91,7 +92,7 @@ impl CharacterOverlay {
         let time = self.start.elapsed().as_secs_f32();
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         let Some(r) = self.rope.as_mut() else { return };
-        for [x0, y0, x1, y1] in ropes {
+        for ([x0, y0, x1, y1], zoom) in ropes {
             if !target.begin(gl, 0, [x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0]) {
                 continue;
             }
@@ -104,7 +105,7 @@ impl CharacterOverlay {
             r.program.set_f32(gl, "u_sag", (12.0 + (time * 9.0).sin() * 3.0) / h * 2.0);
             r.program.set_f32(gl, "u_half", 5.0 / h * 2.0);
             r.program.set_f32(gl, "u_twists", (x1 - x0).abs() / 9.0);
-            r.program.set_vec4(gl, "u_clip", target.clip_xform());
+            r.program.set_vec4(gl, "u_clip", zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform()));
             unsafe {
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
@@ -131,7 +132,8 @@ void main() {
 }
 "#;
 
-// y up: 0 a carrot, 1 a wrapped box, 2 a balloon, 3 a boxing glove on a spring
+// y up: 0 a carrot, 1 a wrapped box, 2 a balloon, 3 a boxing glove on a spring,
+// 4 a sleeping Z, 5 a drop of sweat
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
@@ -186,10 +188,23 @@ vec4 glove(vec2 p) {
     vec3 col = cuff > 0.0 ? vec3(0.95) : (fist > 0.0 ? vec3(0.9, 0.12, 0.12) : vec3(0.75, 0.76, 0.8));
     return vec4(col, max(max(fist, cuff), spring));
 }
+vec4 zee(vec2 p) {
+    float top = bar(p, vec2(-0.8, 0.5), vec2(0.8, 0.85));
+    float bottom = bar(p, vec2(-0.8, -0.85), vec2(0.8, -0.5));
+    float slash = step(abs(p.x - p.y * 1.2), 0.3) * step(abs(p.y), 0.55);
+    return vec4(0.75, 0.85, 1.0, max(max(top, bottom), slash));
+}
+vec4 sweat(vec2 p) {
+    float round_part = disc(p, vec2(0.0, -0.3), 0.55);
+    float half_w = 0.5 * (1.0 - (p.y + 0.1) / 0.9);
+    float tip = step(abs(p.x), half_w) * step(-0.1, p.y) * step(p.y, 0.8);
+    float shine = disc(p, vec2(-0.16, -0.38), 0.14);
+    return vec4(mix(vec3(0.45, 0.78, 1.0), vec3(1.0), shine), max(round_part, tip));
+}
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
@@ -221,7 +236,7 @@ impl CarrotGl {
 
 impl CharacterOverlay {
     pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
-        let props = self.props();
+        let props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, z))).collect();
         if props.is_empty() {
             return;
         }
@@ -236,14 +251,14 @@ impl CharacterOverlay {
         }
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         let Some(c) = self.carrot_gl.as_mut() else { return };
-        for (kind, rect, flip) in props {
+        for (kind, rect, flip, zoom) in props {
             if !target.begin(gl, 0, rect) {
                 continue;
             }
             let [x0, y0, x1, y1] = rect;
             c.program.bind(gl);
             c.program.set_vec4(gl, "u_rect", [x0 / w * 2.0 - 1.0, 1.0 - y1 / h * 2.0, x1 / w * 2.0 - 1.0, 1.0 - y0 / h * 2.0]);
-            c.program.set_vec4(gl, "u_clip", target.clip_xform());
+            c.program.set_vec4(gl, "u_clip", zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform()));
             c.program.set_i32(gl, "u_kind", kind);
             c.program.set_i32(gl, "u_flip", i32::from(flip));
             unsafe {

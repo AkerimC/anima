@@ -36,6 +36,53 @@ macro_rules! tuning {
 }
 
 tuning! {
+    "Gezinme", "Masaüstleri arası gezme" {
+        ws_every: "Kişi başı taşınma aralığı (sn)" = 240.0, 10.0, 3600.0, 10.0, 0;
+        ws_bored: "Kaç saniyede sıkılsın (sn)" = 300.0, 10.0, 3600.0, 10.0, 0;
+        ws_familiar: "Tanıdıklardan sıkılma" = 1.0, 0.0, 10.0, 0.5, 1;
+        ws_floor: "Her masaüstünün en az payı" = 0.15, 0.0, 0.5, 0.05, 2;
+        ws_use_weight: "Kullanım mı pencere sayısı mı (1 = kullanım)" = 0.5, 0.0, 1.0, 0.05, 2;
+        ws_use_half: "Kullanımın yarıya düşme süresi (sn)" = 900.0, 30.0, 14400.0, 30.0, 0;
+        ws_balance: "Kalabalıktan ayrılma isteği" = 1.0, 0.0, 10.0, 0.5, 1;
+        ws_max: "Aynı anda yolda olan" = 2.0, 1.0, 12.0, 1.0, 0;
+        ws_speed: "Yolculuk hızı" = 2.5, 0.2, 20.0, 0.1, 1;
+    }
+    "Gezinme", "Uyku" {
+        sleep_after: "Kaç saniye dokunulmayınca (sn)" = 300.0, 25.0, 3600.0, 15.0, 0;
+        sleep_spread: "Teker teker uyuma süresi (sn)" = 15.0, 0.0, 120.0, 1.0, 0;
+        sleep_sink: "Yatarken yere gömülme" = 0.55, 0.0, 1.0, 0.05, 2;
+        nap_games: "Şekerleme için oynanan oyun" = 3.0, 1.0, 20.0, 1.0, 0;
+        nap_energy: "Şekerleme için kalan sosyal pil" = 0.25, 0.0, 1.0, 0.05, 2;
+        nap_wait: "Yorgunken uyuya kalma (sn)" = 10.0, 0.5, 120.0, 0.5, 1;
+        nap_min: "En kısa şekerleme (sn)" = 40.0, 5.0, 600.0, 5.0, 0;
+        nap_rand: "Şekerlemeye eklenen rastgele (sn)" = 40.0, 0.0, 600.0, 5.0, 0;
+        wake_jump: "Sıçrayarak uyanma ihtimali" = 0.3, 0.0, 1.0, 0.05, 2;
+        wake_min: "Yavaş uyananın en kısa süresi (sn)" = 0.3, 0.0, 10.0, 0.1, 1;
+        wake_rand: "Uyanmaya eklenen rastgele (sn)" = 1.5, 0.0, 10.0, 0.1, 1;
+    }
+    "Gezinme", "Pencerelere tepki" {
+        win_curious: "Yeni pencereye bakmaya gelen" = 3.0, 0.0, 12.0, 1.0, 0;
+        win_linger: "Bakma süresi (sn)" = 5.0, 0.0, 30.0, 0.5, 1;
+        win_crowded: "Kaç sütundan sonra bunalsınlar" = 8.0, 1.0, 40.0, 1.0, 0;
+        sit_every: "Bunalınca kişi başı oturma aralığı (sn)" = 120.0, 5.0, 1200.0, 5.0, 0;
+        sit_min: "En kısa oturma (sn)" = 8.0, 1.0, 120.0, 1.0, 0;
+        sit_rand: "Oturmaya eklenen rastgele (sn)" = 12.0, 0.0, 120.0, 1.0, 0;
+        sit_sink: "Otururken yere inme" = 0.2, 0.0, 1.0, 0.05, 2;
+    }
+    "Gezinme", "İşlemci telaşı" {
+        cpu_hot: "Başlama yükü" = 0.75, 0.1, 1.0, 0.05, 2;
+        cpu_calm: "Sakinleşme yükü" = 0.55, 0.0, 1.0, 0.05, 2;
+        cpu_for: "Kaç saniye sürerse (sn)" = 4.0, 0.0, 60.0, 1.0, 0;
+        cpu_share: "Telaşlananların oranı" = 1.0, 0.0, 1.0, 0.05, 2;
+        cpu_run: "Telaşta hız katı" = 4.0, 1.0, 6.0, 0.1, 1;
+    }
+    "Sohbet", "Arkadaşlık ve rekabet" {
+        bond_minutes: "Bir arkadaşlık puanı için sohbet (dk)" = 5.0, 0.5, 120.0, 0.5, 1;
+        bond_pull: "Arkadaşları arama gücü" = 2.0, 0.0, 10.0, 0.5, 1;
+        bond_friend: "Selamlaşma için arkadaşlık" = 0.5, 0.0, 3.0, 0.1, 1;
+        bond_game: "Oyun başına rekabet puanı" = 0.25, 0.0, 3.0, 0.05, 2;
+        bond_rival: "Rakiplerin oyun isteği" = 1.5, 0.0, 10.0, 0.5, 1;
+    }
     "Gezinme", "Ne yapacağına karar verme (oranlar birbirine göre)" {
         walk_chance: "Yürüme" = 0.30, 0.0, 1.0, 0.01, 2;
         idle_chance: "Durma" = 0.63, 0.0, 1.0, 0.01, 2;
@@ -80,6 +127,15 @@ tuning! {
     }
     "Etkileşim", "Sevme" {
         pat_keep: "Her tıklamada uzama (sn)" = 0.6, 0.1, 5.0, 0.1, 1;
+        pat_fan: "Sevilirken yana açılma (karakter genişliği)" = 0.5, 0.2, 2.0, 0.05, 2;
+        pat_gather: "Yakındakileri çağırma mesafesi (ekran)" = 0.45, 0.0, 2.0, 0.05, 2;
+        pat_gather_chance: "Yakındakilerin gelme ihtimali" = 0.35, 0.0, 1.0, 0.05, 2;
+        pat_mate_chance: "Sohbettekilerin gelme ihtimali" = 0.5, 0.0, 1.0, 0.05, 2;
+        pat_side_max: "Her yanda en fazla bekleyen" = 3.0, 1.0, 8.0, 1.0, 0;
+        pat_walk_max: "Sıraya gelmek için en uzun yol" = 0.35, 0.05, 2.0, 0.05, 2;
+        pat_crowd_speed: "Sıraya toplanma hızı" = 0.2, 0.05, 2.0, 0.05, 2;
+        pat_linger: "Sevme bitince bekleme (sn)" = 2.5, 0.0, 15.0, 0.5, 1;
+        pat_hop: "Sıra beklerken zıplama (saniyede)" = 0.8, 0.0, 5.0, 0.1, 1;
     }
     "Etkileşim", "İmlece tutunma" {
         cling_min: "En kısa tutunma (sn)" = 1.0, 0.1, 15.0, 0.1, 1;

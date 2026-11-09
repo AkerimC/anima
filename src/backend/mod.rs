@@ -1,3 +1,4 @@
+pub mod desktop;
 pub mod charwin;
 pub mod compositor;
 pub mod envlight;

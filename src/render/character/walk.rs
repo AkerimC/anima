@@ -18,6 +18,10 @@ pub(super) enum Act {
     Fall,
     // dropped from high up: stuck in the ground for a moment
     Planted,
+    // asleep or sitting down (see `rest`)
+    Rest,
+    // on its way to another workspace
+    Travel,
 }
 
 /// Random behaviour: walk (likely), idle, jump (less likely) and, rarely,
@@ -92,6 +96,25 @@ pub(super) struct WalkState {
     pub(super) dropped: f32,
     // how far a jump must go to reach the cursor (half-heights), last frame
     pub(super) reach: f32,
+    pub(super) rest: Option<super::moods::Rest>,
+    // which workspace it's on (0: not known), how long it's been there
+    pub(super) ws: u64,
+    pub(super) here_t: f32,
+    pub(super) trip: Option<super::spaces::Trip>,
+    // just arrived, hasn't met anyone yet
+    pub(super) newcomer: bool,
+    // let go of here (screen px): might land on another workspace
+    pub(super) dropped_at: Option<[f32; 2]>,
+    // jumped down on purpose: lands on its feet
+    pub(super) leaped: bool,
+    // games played lately, wears off slowly
+    pub(super) played: f32,
+    // seconds until it dozes off
+    pub(super) sleep_wait: Option<f32>,
+    // the processor is flat out and it's in a state about it
+    pub(super) fret: bool,
+    // waiting for its turn to be petted
+    pub(super) crowd: Option<super::pat::PatCrowd>,
     // animation time not yet given to the 3D model (skipped frames)
     pub(super) model_dt: f32,
 }
@@ -106,6 +129,16 @@ impl WalkState {
 
     pub(super) fn pick(&mut self, min: f32, max: f32, can_chase: bool) {
         let t = tn();
+        // in a panic: off to somewhere else at once, no standing about
+        if self.fret {
+            let mut to = min + self.rand() * (max - min);
+            if (to - self.x).abs() < 0.25 {
+                to = if self.x < (min + max) * 0.5 { self.x + 0.5 } else { self.x - 0.5 };
+            }
+            self.target = to.clamp(min, max);
+            self.act = Act::Walk;
+            return;
+        }
         // the four chances count relative to each other
         // the bigger the team, the fewer run after the cursor
         let chase = t.chase_chance * 2.0 / self.team.max(2.0);
@@ -174,8 +207,11 @@ impl WalkState {
     /// Advance one frame. `mouse` is the cursor x relative to the anchor.
     /// Returns (offset, moving, jump height 0..1).
     pub(super) fn step(&mut self, dt: f32, min: f32, max: f32, mouse: Option<f32>, reach: f32) -> (f32, bool, f32) {
-        if matches!(self.act, Act::Held | Act::Fall | Act::Planted) {
+        if matches!(self.act, Act::Held | Act::Fall | Act::Planted | Act::Rest | Act::Travel) {
             return (self.x, false, 0.0);
+        }
+        if self.fret {
+            self.notify_jump = None;
         }
         if let Some(t) = self.notify_jump.as_mut() {
             *t -= dt;
@@ -185,6 +221,9 @@ impl WalkState {
                     self.start_jump(tn().jump_height);
                 }
             }
+        }
+        if let Some(r) = self.crowd_step(dt, min, max) {
+            return r;
         }
         if let Some(r) = self.race_step(dt) {
             return r;
@@ -204,6 +243,9 @@ impl WalkState {
         match self.act {
             Act::Idle => {
                 self.timer -= dt;
+                if self.fret {
+                    self.timer = 0.0;
+                }
                 if self.timer <= 0.0 {
                     self.pick(min, max, mouse.is_some());
                 }
@@ -217,7 +259,13 @@ impl WalkState {
                         None => self.timer = 0.0,
                     }
                 }
-                let speed = if chase { tn().chase_speed } else { tn().walk_speed };
+                let speed = if chase {
+                    tn().chase_speed
+                } else if self.fret {
+                    tn().walk_speed * tn().cpu_run
+                } else {
+                    tn().walk_speed
+                };
                 let d = self.target - self.x;
                 // close enough counts as caught, or a cursor circling fast
                 // keeps flipping the target left and right
@@ -245,7 +293,7 @@ impl WalkState {
                     moving = true;
                 }
             }
-            Act::Jump | Act::Held | Act::Fall | Act::Planted => {}
+            Act::Jump | Act::Held | Act::Fall | Act::Planted | Act::Rest | Act::Travel => {}
             Act::Pat => {
                 self.timer -= dt;
                 if self.timer <= 0.0 {

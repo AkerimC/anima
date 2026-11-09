@@ -94,7 +94,8 @@ impl CharacterOverlay {
     /// Strip position of a character's centre, logical px.
     pub(super) fn strip_px(&self, i: usize) -> f32 {
         let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
-        (r[0] + r[2]) * 0.5 + self.view[0] * self.view_w * 0.5
+        let view = if i == 0 { self.own_view } else { self.extras[i - 1].own_view };
+        (r[0] + r[2]) * 0.5 + view[0] * self.view_w * 0.5
     }
 
     /// In on it: a little hop, and off to the gathering spot.
@@ -113,7 +114,8 @@ impl CharacterOverlay {
     /// One racer goes to each of the others in turn, hops and invites them,
     /// and comes back when there's nobody left to tell.
     fn run_herald(&mut self, race: &mut Race, dt: f32, lo: f32, hi: f32, n: usize) {
-        let free: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).race.is_none() && !race.refused.contains(&i)).collect();
+        let race_ws = (0..n).find_map(|i| self.walk_ref(i).race.map(|_| self.walk_ref(i).ws)).unwrap_or(self.spaces.active);
+        let free: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).ws == race_ws && self.walk_ref(i).rest.is_none() && self.walk_ref(i).race.is_none() && !race.refused.contains(&i)).collect();
         if race.herald.is_some_and(|h| self.walk_ref(h).race.is_none()) {
             race.herald = None;
         }

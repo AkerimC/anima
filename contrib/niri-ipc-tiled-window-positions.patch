@@ -1,22 +1,26 @@
 diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
-index 0aa3cb4..2e18d23 100644
+index 0aa3cb4..4250f6e 100644
 --- a/niri-ipc/src/lib.rs
 +++ b/niri-ipc/src/lib.rs
-@@ -119,6 +119,8 @@ pub enum Request {
+@@ -119,6 +119,10 @@ pub enum Request {
      OverviewState,
      /// Request information about screencasts.
      Casts,
 +    /// Request the pointer position.
 +    CursorPosition,
++    /// Request where the workspaces of the focused output are drawn right now.
++    WorkspacesGeometry,
  }
  
  /// Reply from niri to client.
-@@ -165,6 +167,20 @@ pub enum Response {
+@@ -165,6 +169,42 @@ pub enum Response {
      OverviewState(Overview),
      /// Information about screencasts.
      Casts(Vec<Cast>),
 +    /// Pointer position.
 +    CursorPosition(Option<CursorPosition>),
++    /// Where the workspaces are drawn, top to bottom.
++    WorkspacesGeometry(Vec<WorkspaceGeometry>),
 +}
 +
 +/// Pointer position.
@@ -29,14 +33,34 @@ index 0aa3cb4..2e18d23 100644
 +    pub x: f64,
 +    /// Position within that output, in logical pixels.
 +    pub y: f64,
++}
++
++/// Where a workspace is drawn this frame, also during switches and the overview.
++#[derive(Serialize, Deserialize, Debug, Clone)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++pub struct WorkspaceGeometry {
++    /// Workspace id.
++    pub id: u64,
++    /// Whether this is the active workspace of the output.
++    pub active: bool,
++    /// Whether any window is on it.
++    pub has_windows: bool,
++    /// Position within the output, in logical pixels.
++    pub x: f64,
++    /// Position within the output, in logical pixels.
++    pub y: f64,
++    /// Size in logical pixels.
++    pub width: f64,
++    /// Size in logical pixels.
++    pub height: f64,
  }
  
  /// Overview information.
 diff --git a/src/ipc/server.rs b/src/ipc/server.rs
-index db71da6..8d337c3 100644
+index db71da6..3e143f8 100644
 --- a/src/ipc/server.rs
 +++ b/src/ipc/server.rs
-@@ -455,6 +455,23 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+@@ -455,6 +455,46 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
              let casts = state.casts.casts.values().cloned().collect();
              Response::Casts(casts)
          }
@@ -57,10 +81,33 @@ index db71da6..8d337c3 100644
 +            let cursor = result.map_err(|_| String::from("error getting cursor position"))?;
 +            Response::CursorPosition(cursor)
 +        }
++        Request::WorkspacesGeometry => {
++            let (tx, rx) = async_channel::bounded(1);
++            ctx.event_loop.insert_idle(move |state| {
++                let list = state.niri.layout.active_monitor_ref().map(|m| m.workspaces_ipc_geometry());
++                let reply: Vec<_> = list
++                    .unwrap_or_default()
++                    .into_iter()
++                    .map(|(id, active, has_windows, g)| niri_ipc::WorkspaceGeometry {
++                        id,
++                        active,
++                        has_windows,
++                        x: g.loc.x,
++                        y: g.loc.y,
++                        width: g.size.w,
++                        height: g.size.h,
++                    })
++                    .collect();
++                let _ = tx.send_blocking(reply);
++            });
++            let result = rx.recv().await;
++            let list = result.map_err(|_| String::from("error getting workspace geometry"))?;
++            Response::WorkspacesGeometry(list)
++        }
      };
  
      Ok(response)
-@@ -699,6 +716,10 @@ impl State {
+@@ -699,6 +739,10 @@ impl State {
          let layout = &self.niri.layout;
  
          let mut batch_change_layouts: Vec<(u64, WindowLayout)> = Vec::new();
@@ -71,7 +118,7 @@ index db71da6..8d337c3 100644
  
          // Check for window changes.
          let mut seen = HashSet::new();
-@@ -732,7 +753,16 @@ impl State {
+@@ -732,7 +776,16 @@ impl State {
              }
  
              if ipc_win.layout != window_layout {
@@ -89,7 +136,7 @@ index db71da6..8d337c3 100644
              }
  
              if mapped.is_focused() && !ipc_win.is_focused {
-@@ -786,6 +816,12 @@ impl State {
+@@ -786,6 +839,12 @@ impl State {
              state.apply(event.clone());
              server.send_event(event);
          }
@@ -102,6 +149,26 @@ index db71da6..8d337c3 100644
      }
  
      pub fn ipc_refresh_overview(&mut self) {
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index 53c0606..d318cc0 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -1396,6 +1396,15 @@ impl<W: LayoutElement> Monitor<W> {
+         self.overview_progress.as_ref().map(|p| p.value())
+     }
+ 
++    /// Each workspace as it's drawn this frame: id, active, has windows, where.
++    pub fn workspaces_ipc_geometry(&self) -> Vec<(u64, bool, bool, Rectangle<f64, Logical>)> {
++        let active = self.active_workspace_idx;
++        zip(self.workspaces.iter(), self.workspaces_render_geo())
++            .enumerate()
++            .map(|(idx, (ws, geo))| (ws.id().get(), idx == active, ws.has_windows(), geo))
++            .collect()
++    }
++
+     pub fn workspace_render_idx(&self) -> f64 {
+         // If workspace switch and overview progress are matching animations, then compute a
+         // correction term to make the movement appear monotonic.
 diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
 index 007bcaf..3b3c412 100644
 --- a/src/layout/scrolling.rs
