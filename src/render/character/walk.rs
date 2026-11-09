@@ -100,6 +100,8 @@ pub(super) struct WalkState {
     // which workspace it's on (0: not known), how long it's been there
     pub(super) ws: u64,
     pub(super) here_t: f32,
+    // its workspace before the lock screen gathered everyone
+    pub(super) lock_home: Option<u64>,
     pub(super) trip: Option<super::spaces::Trip>,
     // fullscreen: out of sight, or come out for a visit and for how long
     pub(super) backstage: bool,
@@ -117,6 +119,19 @@ pub(super) struct WalkState {
     pub(super) sleep_wait: Option<f32>,
     // the processor is flat out and it's in a state about it
     pub(super) fret: bool,
+    // laughing it off after a tumble (seconds), and whether that just began
+    pub(super) giggle: f32,
+    pub(super) giggle_new: bool,
+    // until it waves at a friend again
+    pub(super) greet_cool: f32,
+    // seconds with nothing to do and nobody around
+    pub(super) bored: f32,
+    // just gave up fishing: not again for a while
+    pub(super) fish_cool: f32,
+    // visiting a fullscreen app: gets a rod out once it's up
+    pub(super) fish_on_arrival: bool,
+    // petted while busy: a happy moment that doesn't stop what it's doing
+    pub(super) petted: f32,
     // waiting for its turn to be petted
     pub(super) crowd: Option<super::pat::PatCrowd>,
     // animation time not yet given to the 3D model (skipped frames)
@@ -126,6 +141,32 @@ pub(super) struct WalkState {
 pub(super) const PAT_DUR: f32 = 1.4;
 
 impl WalkState {
+    /// Up or on its way to somewhere else, not on the ground strolling.
+    pub(super) fn climb_like(&self) -> bool {
+        self.trip.is_some() || self.rest.is_some()
+    }
+
+    /// Laughs for a moment: stays put, happy face, little hops.
+    pub(super) fn laugh(&mut self, secs: f32) {
+        if secs > self.giggle {
+            self.giggle = secs;
+            self.giggle_new = true;
+        }
+    }
+
+    /// One frame of laughing, on the ground.
+    pub(super) fn giggle_step(&mut self, dt: f32) -> (f32, bool, f32) {
+        self.giggle -= dt;
+        self.act = Act::Idle;
+        self.timer = 0.5;
+        self.target = self.x;
+        if self.rand() < dt * 3.5 {
+            let h = tn().jump_height * (0.2 + self.rand() * 0.2);
+            self.start_jump(h);
+        }
+        (self.x, false, 0.0)
+    }
+
     pub(super) fn rand(&mut self) -> f32 {
         self.seed = self.seed.wrapping_mul(1664525).wrapping_add(1013904223);
         (self.seed >> 8) as f32 / (1u32 << 24) as f32
@@ -226,6 +267,9 @@ impl WalkState {
                 }
             }
         }
+        if self.giggle > 0.0 && self.social.is_none() && self.race.is_none() && matches!(self.act, Act::Idle | Act::Walk) {
+            return self.giggle_step(dt);
+        }
         if let Some(r) = self.crowd_step(dt, min, max) {
             return r;
         }
@@ -246,6 +290,10 @@ impl WalkState {
         }
         match self.act {
             Act::Idle => {
+                // looks about now and then
+                if self.rand() < dt * tn().look_around {
+                    self.left = !self.left;
+                }
                 self.timer -= dt;
                 if self.fret {
                     self.timer = 0.0;

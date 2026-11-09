@@ -4,6 +4,7 @@
 mod config;
 mod daemon;
 mod pages;
+mod roster;
 mod team;
 
 use adw::prelude::*;
@@ -14,6 +15,10 @@ const APP_ID: &str = "dev.anima.Anima";
 fn main() -> glib::ExitCode {
     // plain lists and sliders: drawing them on the CPU saves ~80 MB and leaves
     // the GPU to the compositor. GSK_RENDERER from outside still wins.
+    // a forced GTK theme (GTK_THEME=Breeze-Dark) has none of libadwaita's
+    // styles: rows lose their spacing and look broken. This window uses its own.
+    // SAFETY: before any thread exists
+    unsafe { std::env::remove_var("GTK_THEME") };
     if std::env::var_os("GSK_RENDERER").is_none() {
         // SAFETY: before any thread exists
         unsafe { std::env::set_var("GSK_RENDERER", "cairo") };

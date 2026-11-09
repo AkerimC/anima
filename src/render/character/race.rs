@@ -227,6 +227,7 @@ impl CharacterOverlay {
                 asking: None,
                 invite_pause: 0.0,
             });
+            self.call_to_race(n);
         }
         let Some(mut race) = self.race.take() else { return };
         race.age += dt;
@@ -478,9 +479,13 @@ impl CharacterOverlay {
         if over || race.age > 300.0 {
             log::debug!("race: over, winner {:?}", race.winner);
             self.race_quiet = tn().race_cool;
+            let mut ran = Vec::new();
             for i in 0..n {
                 let wk = self.walk_of(i);
                 let raced = wk.race.take().is_some();
+                if raced {
+                    ran.push(i);
+                }
                 wk.race_down = false;
                 if raced {
                     wk.crowd_rest = tn().crowd_rest_base + wk.rand() * tn().crowd_rest_rand;
@@ -489,6 +494,7 @@ impl CharacterOverlay {
                     wk.start_jump(tn().jump_height * 0.4);
                 }
             }
+            self.start_concert(&race.order, &ran, race.finish_px, n);
             return;
         }
         self.race = Some(race);

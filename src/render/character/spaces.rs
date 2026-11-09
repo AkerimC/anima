@@ -42,11 +42,15 @@ pub(super) struct Spaces {
     used: Vec<(u64, f32)>,
     // a fullscreen app is up: seconds to the next visit
     pub(super) fs_on: bool,
+    // where each character was (by name): workspace index, kept between runs
+    places: Option<std::collections::HashMap<String, usize>>,
+    places_save: f32,
+    locked: bool,
     fs_wait: f32,
 }
 
 impl WalkState {
-    fn set_off(&mut self, to: u64, down: bool) {
+    pub(super) fn set_off(&mut self, to: u64, down: bool) {
         self.trip = Some(Trip { to, leg: if down { Leg::Sinking } else { Leg::Rising }, t: 0.0 });
         self.act = Act::Travel;
         self.target = self.x;
@@ -194,19 +198,49 @@ impl CharacterOverlay {
         let size = [info.width.max(1) as f32, info.height.max(1) as f32];
         let scale = info.scale.max(1.0);
         self.spaces.active = list.iter().find(|s| s.active).map_or(0, |s| s.id);
+        let locked = super::locked();
+        if locked != self.spaces.locked {
+            self.spaces.locked = locked;
+            let here = self.spaces.active;
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                if locked {
+                    // all on the one screen, back home afterwards
+                    wk.lock_home = Some(wk.ws);
+                    if here != 0 {
+                        wk.ws = here;
+                    }
+                    wk.backstage = false;
+                    wk.visiting = false;
+                    if wk.act == Act::Travel {
+                        wk.trip = None;
+                        wk.sink = 0.0;
+                        wk.air = 0.0;
+                        wk.act = Act::Idle;
+                    }
+                } else if let Some(home) = wk.lock_home.take() {
+                    wk.ws = home;
+                }
+            }
+        }
         let hosts: Vec<u64> = list.iter().filter(|s| s.active || s.has_windows).map(|s| s.id).collect();
         for i in 0..n {
             let a = self.actor_mut(i);
             a.screen_mouse = info.mouse;
-            if list.is_empty() {
+            if list.is_empty() || locked {
                 a.zoom = None;
                 a.visible = !a.walk.backstage;
                 a.walk.ws = 0;
             }
         }
-        if !list.is_empty() {
+        if !list.is_empty() && !locked {
             for i in 0..n {
                 if !list.iter().any(|s| s.id == self.walk_ref(i).ws) {
+                    // back where it was last time, or with its team
+                    if let Some(ws) = self.home_for(i, &list, n) {
+                        self.walk_of(i).ws = ws;
+                        continue;
+                    }
                     // whichever workspace is shortest of its share
                     let seats = self.seats(&hosts, n);
                     let lacking = |h: u64, want: usize| want as i64 - (0..n).filter(|&j| self.walk_ref(j).ws == h).count() as i64;
@@ -226,6 +260,42 @@ impl CharacterOverlay {
         self.spaces.list = list;
     }
 
+    /// Where `i` belongs when it first shows up: its place from last time.
+    fn home_for(&mut self, i: usize, list: &[Space], n: usize) -> Option<u64> {
+        if self.spaces.places.is_none() {
+            let saved = std::fs::read_to_string(places_path()).ok().and_then(|t| serde_json::from_str(&t).ok());
+            self.spaces.places = Some(saved.unwrap_or_default());
+        }
+        let name = self.character_name(i);
+        if let Some(&k) = self.spaces.places.as_ref().and_then(|p| p.get(&name)) {
+            return list.get(k.min(list.len().saturating_sub(1))).map(|s| s.id);
+        }
+        let _ = n;
+        None
+    }
+
+    /// Writes who is on which workspace now and then.
+    fn keep_places(&mut self, dt: f32, n: usize) {
+        self.spaces.places_save -= dt;
+        if self.spaces.places_save > 0.0 || super::locked() {
+            return;
+        }
+        self.spaces.places_save = 20.0;
+        let mut map = self.spaces.places.clone().unwrap_or_default();
+        for i in 0..n {
+            let ws = self.walk_ref(i).ws;
+            if let Some(k) = self.spaces.list.iter().position(|s| s.id == ws) {
+                map.insert(self.character_name(i), k);
+            }
+        }
+        if self.spaces.places.as_ref() != Some(&map) {
+            if let Ok(text) = serde_json::to_string(&map) {
+                let _ = crate::util::atomic_write(&places_path(), text.as_bytes());
+            }
+            self.spaces.places = Some(map);
+        }
+    }
+
     /// Fair number of characters for each of `hosts`.
     fn seats(&self, hosts: &[u64], n: usize) -> Vec<usize> {
         let stats: Vec<(f32, f32)> = hosts
@@ -239,17 +309,21 @@ impl CharacterOverlay {
     }
 
     /// The strip's scroll position, as each character's workspace had it.
-    pub(super) fn share_views(&mut self, view: [f32; 2]) {
+    pub(super) fn share_views(&mut self, view: [f32; 2], strip_ws: Option<u64>) {
         let active = self.spaces.active;
-        if let Some(v) = self.spaces.views.iter_mut().find(|v| v.0 == active) {
+        // during a switch the strip and the workspace list change at different
+        // moments: file the view under the workspace it was really read from
+        let from = if active == 0 { 0 } else { strip_ws.unwrap_or(active) };
+        if let Some(v) = self.spaces.views.iter_mut().find(|v| v.0 == from) {
             v.1 = view;
         } else {
-            self.spaces.views.push((active, view));
+            self.spaces.views.push((from, view));
         }
         let n = self.extras.len() + 1;
         for i in 0..n {
             let ws = self.walk_ref(i).ws;
-            let own = if ws == active { view } else { self.spaces.views.iter().find(|v| v.0 == ws).map_or([0.0, 0.0], |v| v.1) };
+            let fallback = if ws == active { view } else { [0.0, 0.0] };
+            let own = self.spaces.views.iter().find(|v| v.0 == ws).map_or(fallback, |v| v.1);
             self.actor_mut(i).own_view = own;
         }
     }
@@ -264,6 +338,7 @@ impl CharacterOverlay {
             return;
         }
         self.drop_between_spaces(n);
+        self.keep_places(dt, n);
         for i in 0..n {
             if self.walk_ref(i).newcomer && self.walk_ref(i).at_leisure() {
                 self.walk_of(i).newcomer = false;
@@ -271,7 +346,7 @@ impl CharacterOverlay {
             }
         }
         self.spaces.tick -= dt;
-        if self.spaces.tick <= 0.0 && !self.spaces.fs_on {
+        if self.spaces.tick <= 0.0 && !self.spaces.fs_on && !super::locked() {
             self.spaces.tick = 1.0;
             self.roam(n);
         }
@@ -280,7 +355,7 @@ impl CharacterOverlay {
     /// A fullscreen app we may visit: nearly everyone is out of sight, and
     /// now and then one to three come out and potter along the bottom.
     fn run_visits(&mut self, dt: f32, n: usize) {
-        let on = desktop::FS_VISIT.load(Relaxed);
+        let on = desktop::FS_VISIT.load(Relaxed) && !super::locked();
         let here = self.spaces.active;
         if on != self.spaces.fs_on {
             self.spaces.fs_on = on;
@@ -331,6 +406,27 @@ impl CharacterOverlay {
             let stay = tn().fs_stay_min + a.walk.rand() * tn().fs_stay_rand;
             a.walk.x += (spot - middle) * 2.0 / screen;
             a.walk.come_out(stay);
+            // now and then a visitor sits down and fishes for a while
+            if a.walk.rand() < tn().fs_fish {
+                a.walk.fish_on_arrival = true;
+            }
+        }
+    }
+
+    /// A race on the workspace in view: some from the others come over.
+    pub(super) fn call_to_race(&mut self, n: usize) {
+        let here = self.spaces.active;
+        let order: Vec<u64> = self.spaces.list.iter().map(|s| s.id).collect();
+        let Some(at) = order.iter().position(|&w| w == here) else { return };
+        for i in 0..n {
+            let ws = self.walk_ref(i).ws;
+            if ws == here || !self.walk_ref(i).at_leisure() || self.walk_of(i).rand() >= tn().race_travel {
+                continue;
+            }
+            if let Some(from) = order.iter().position(|&w| w == ws) {
+                log::debug!("race: {i} comes over from workspace {ws}");
+                self.walk_of(i).set_off(here, at > from);
+            }
         }
     }
 
@@ -391,10 +487,12 @@ impl CharacterOverlay {
             let Some(pos) = hosts.iter().position(|&h| h == ws) else { continue };
             let mates: Vec<usize> = (0..n).filter(|&j| j != i && self.walk_ref(j).ws == ws).collect();
             let known = mates.iter().map(|&j| self.bond(i, j).0).sum::<f32>() / mates.len().max(1) as f32;
+            // with its team or close friends here it's happy to stay
+            let stay = if mates.iter().any(|&j| self.close(i, j)) { 0.4 } else { 1.0 };
             // crowded for how little it's used: time to go; thin already: stay
             let spare = surplus(self, pos);
             let balance = if spare > 0.0 { 1.0 + spare * tn().ws_balance } else { 0.25 };
-            let urge = (1.0 + here / tn().ws_bored.max(1.0)) * (1.0 + known * tn().ws_familiar) * balance;
+            let urge = (1.0 + here / tn().ws_bored.max(1.0)) * (1.0 + known * tn().ws_familiar) * balance * stay;
             let roll = self.walk_of(i).rand();
             if roll >= urge / tn().ws_every.max(1.0) {
                 continue;
@@ -422,6 +520,14 @@ impl CharacterOverlay {
                 log::debug!("workspaces: {i} goes from {ws} to {}", hosts[to]);
                 self.walk_of(i).set_off(hosts[to], to > pos);
                 moving += 1;
+                // close friends and teammates come along
+                for j in 0..n {
+                    if self.close(i, j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure() && self.walk_of(j).rand() < tn().close_follow {
+                        log::debug!("workspaces: {j} goes along with {i}");
+                        self.walk_of(j).set_off(hosts[to], to > pos);
+                        moving += 1;
+                    }
+                }
             }
         }
     }
@@ -519,4 +625,8 @@ mod tests {
         assert!(wk.trip.is_none());
         assert_eq!(wk.ws, 1);
     }
+}
+
+fn places_path() -> std::path::PathBuf {
+    crate::util::data_dir().join("places.json")
 }

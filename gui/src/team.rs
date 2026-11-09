@@ -10,14 +10,21 @@ use std::path::{Path, PathBuf};
 pub struct Member {
     pub path: String,
     pub on: bool,
+    /// no longer used (hand-made teams), kept so old files still load
+    #[serde(default)]
+    pub crew: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Team {
     #[serde(default)]
     pub team: Vec<Member>,
+    /// saved line-ups, by name
     #[serde(default)]
     pub groups: BTreeMap<String, Vec<Member>>,
+    /// no longer used, kept so old files still load
+    #[serde(default)]
+    pub crews: Vec<String>,
 }
 
 fn file() -> PathBuf {
@@ -34,12 +41,12 @@ impl Team {
         let mut team = Vec::new();
         let source = config::text(&doc, "character", "source", "");
         if !source.is_empty() {
-            team.push(Member { path: source, on: true });
+            team.push(Member { path: source, on: true, crew: String::new() });
         }
         if let Some(extra) = doc.get("character").and_then(|c| c.get("extra")).and_then(|e| e.as_array()) {
-            team.extend(extra.iter().filter_map(|v| v.as_str()).map(|p| Member { path: p.to_string(), on: true }));
+            team.extend(extra.iter().filter_map(|v| v.as_str()).map(|p| Member { path: p.to_string(), on: true, crew: String::new() }));
         }
-        Team { team, groups: BTreeMap::new() }
+        Team { team, groups: BTreeMap::new(), crews: Vec::new() }
     }
 
     pub fn save(&self) {

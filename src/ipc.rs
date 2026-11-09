@@ -74,6 +74,12 @@ pub enum Request {
     Reload,
     /// Walking characters gather and race each other.
     Race,
+    /// What each walking character is doing, and its friendships.
+    CharacterInfo,
+    /// The lock screen is up (on) or gone (off).
+    LockScreen {
+        on: bool,
+    },
     /// Start a game among the characters right now.
     Game {
         name: String,

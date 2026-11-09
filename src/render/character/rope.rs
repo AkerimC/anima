@@ -133,7 +133,10 @@ void main() {
 "#;
 
 // y up: 0 a carrot, 1 a wrapped box, 2 a balloon, 3 a boxing glove on a spring,
-// 4 a sleeping Z, 5 a drop of sweat
+// 4 a sleeping Z, 5 a drop of sweat, 6 a crumb of carrot, 7 the arrow over "it",
+// 8 a blindfold, 9 a bush, 10 a barrel, 11 a crate, 12 a music note,
+// 13 a fishing rod, 14 a line and float, 15 a star, 16 a rubber duck, 17 an old boot, 18 a tin can,
+// 20 confetti, 21 a beast out of the ground
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
@@ -201,10 +204,124 @@ vec4 sweat(vec2 p) {
     float shine = disc(p, vec2(-0.16, -0.38), 0.14);
     return vec4(mix(vec3(0.45, 0.78, 1.0), vec3(1.0), shine), max(round_part, tip));
 }
+vec4 crumb(vec2 p) {
+    float a = atan(p.y, p.x);
+    float d = length(p * vec2(1.0, 1.25)) - (0.72 + 0.14 * sin(a * 5.0 + 1.3));
+    vec3 col = mix(vec3(1.0, 0.6, 0.12), vec3(0.85, 0.35, 0.05), smoothstep(-0.4, 0.6, p.x - p.y));
+    return vec4(col, 1.0 - smoothstep(-0.06, 0.04, d));
+}
+vec4 marker(vec2 p) {
+    // a fat arrow pointing down, white rim round red
+    float outer = step(p.y, 0.75) * step(-0.95 + abs(p.x) * 1.7, p.y) * step(abs(p.x), 0.95);
+    float inner = step(p.y, 0.6) * step(-0.75 + abs(p.x) * 1.7, p.y) * step(abs(p.x), 0.8);
+    vec3 red = mix(vec3(0.85, 0.12, 0.2), vec3(1.0, 0.4, 0.45), smoothstep(-0.6, 0.6, p.y));
+    return vec4(inner > 0.0 ? red : vec3(1.0), outer);
+}
+vec4 blindfold(vec2 p) {
+    float strip = step(abs(p.y), 0.55) * step(abs(p.x), 0.78);
+    float knot = disc(p, vec2(0.84, 0.0), 0.28);
+    float tail = step(abs(p.y + 0.35 + (p.x - 0.84) * 0.6), 0.16) * step(0.84, p.x);
+    vec3 col = mix(vec3(0.7, 0.04, 0.12), vec3(0.98, 0.22, 0.28), smoothstep(-0.5, 0.5, p.y));
+    return vec4(col, max(max(strip, knot), tail));
+}
+vec4 bush(vec2 p) {
+    float a = max(max(disc(p, vec2(-0.45, -0.3), 0.52), disc(p, vec2(0.45, -0.3), 0.52)), max(disc(p, vec2(0.0, 0.15), 0.62), bar(p, vec2(-0.92, -1.0), vec2(0.92, -0.35))));
+    float spot = disc(p, vec2(-0.2, 0.35), 0.16) + disc(p, vec2(0.4, -0.1), 0.12);
+    vec3 col = mix(vec3(0.12, 0.4, 0.16), vec3(0.35, 0.72, 0.3), smoothstep(-0.9, 0.7, p.y));
+    col = mix(col, vec3(0.5, 0.85, 0.4), min(spot, 1.0) * 0.6);
+    return vec4(col, a);
+}
+vec4 barrel(vec2 p) {
+    float w = 0.66 + 0.14 * (1.0 - p.y * p.y);
+    float body = step(abs(p.x), w) * step(abs(p.y), 0.96);
+    float hoop = step(abs(abs(p.y) - 0.55), 0.07);
+    vec3 col = mix(vec3(0.42, 0.24, 0.11), vec3(0.68, 0.45, 0.24), smoothstep(-w, 0.3, -abs(p.x - 0.15)));
+    col = mix(col, vec3(0.32, 0.32, 0.35), hoop);
+    return vec4(col, body);
+}
+vec4 crate_box(vec2 p) {
+    float body = bar(p, vec2(-0.92, -0.96), vec2(0.92, 0.86));
+    float inner = bar(p, vec2(-0.74, -0.78), vec2(0.74, 0.68));
+    float cross_ = step(abs(p.x - p.y * 0.97), 0.13) * inner;
+    vec3 col = mix(vec3(0.58, 0.4, 0.22), vec3(0.78, 0.58, 0.34), smoothstep(-1.0, 0.9, p.y));
+    col = mix(col, vec3(0.48, 0.32, 0.17), max(1.0 - inner, cross_));
+    return vec4(col, body);
+}
+vec4 note(vec2 p) {
+    float head = disc(p, vec2(-0.28, -0.5), 0.34);
+    float stem = bar(p, vec2(-0.02, -0.5), vec2(0.12, 0.78));
+    float flag = bar(p, vec2(-0.02, 0.52), vec2(0.5, 0.78));
+    return vec4(vec3(1.0, 0.86, 0.35), max(max(head, stem), flag));
+}
+vec4 rod(vec2 p) {
+    // bottom left (the hand) to top right (the tip)
+    float t = clamp((p.x + 1.0) * 0.5, 0.0, 1.0);
+    float y = -1.0 + 2.0 * t;
+    float a = step(abs(p.y - y), 0.09 * (1.2 - t));
+    vec3 col = mix(vec3(0.35, 0.22, 0.12), vec3(0.75, 0.6, 0.35), t);
+    return vec4(col, a);
+}
+vec4 line_float(vec2 p) {
+    float line = step(abs(p.x), 0.07) * step(-0.7, p.y);
+    float top = disc(p, vec2(0.0, -0.78), 0.32) * step(-0.78, p.y);
+    float bottom = disc(p, vec2(0.0, -0.78), 0.32) * step(p.y, -0.78);
+    vec3 col = top > 0.0 ? vec3(0.95, 0.2, 0.2) : bottom > 0.0 ? vec3(1.0) : vec3(0.9);
+    return vec4(col, max(line * 0.8, max(top, bottom)));
+}
+vec4 star(vec2 p) {
+    float a = atan(p.y, p.x);
+    float r = 0.55 + 0.35 * cos(a * 5.0 + 1.57);
+    float body = 1.0 - smoothstep(r - 0.04, r + 0.02, length(p));
+    return vec4(mix(vec3(1.0, 0.78, 0.15), vec3(1.0, 0.95, 0.6), smoothstep(0.4, -0.2, length(p))), body);
+}
+vec4 duck(vec2 p) {
+    float body = 1.0 - smoothstep(0.92, 0.98, length((p - vec2(0.0, -0.35)) / vec2(0.8, 0.5)));
+    float head = disc(p, vec2(0.35, 0.3), 0.32);
+    float beak = bar(p, vec2(0.62, 0.2), vec2(0.9, 0.32));
+    float eye = disc(p, vec2(0.42, 0.38), 0.06);
+    vec3 col = beak > 0.0 ? vec3(1.0, 0.5, 0.1) : eye > 0.0 ? vec3(0.1) : vec3(1.0, 0.85, 0.2);
+    return vec4(col, max(max(body, head), beak));
+}
+vec4 boot(vec2 p) {
+    float leg = bar(p, vec2(-0.5, -0.4), vec2(0.05, 0.9));
+    float foot = bar(p, vec2(-0.5, -0.9), vec2(0.85, -0.4)) * (1.0 - step(0.0, (p.x - 0.55) + (p.y + 0.4) * 0.7));
+    float sole = bar(p, vec2(-0.55, -0.95), vec2(0.8, -0.8));
+    vec3 col = sole > 0.0 ? vec3(0.2, 0.15, 0.1) : vec3(0.45, 0.32, 0.2);
+    return vec4(col, max(max(leg, foot), sole));
+}
+vec4 can(vec2 p) {
+    float body = bar(p, vec2(-0.5, -0.85), vec2(0.5, 0.75));
+    float label = bar(p, vec2(-0.5, -0.4), vec2(0.5, 0.35));
+    vec3 col = label > 0.0 ? vec3(0.3, 0.55, 0.85) : vec3(0.72, 0.74, 0.78);
+    col *= 0.75 + 0.25 * smoothstep(0.5, -0.3, abs(p.x + 0.15));
+    return vec4(col, body);
+}
+vec4 beast(vec2 p) {
+    float body = 1.0 - smoothstep(0.86, 0.92, length((p - vec2(0.0, -0.25)) / vec2(0.62, 0.8)));
+    float arm = max(bar(p, vec2(-0.92, -0.45), vec2(-0.55, 0.05)), bar(p, vec2(0.55, -0.45), vec2(0.92, 0.05)));
+    float horn = max(disc(p, vec2(-0.3, 0.62), 0.13), disc(p, vec2(0.3, 0.62), 0.13));
+    float eyes = max(disc(p, vec2(-0.24, 0.12), 0.15), disc(p, vec2(0.24, 0.12), 0.15));
+    float pupils = max(disc(p, vec2(-0.2, 0.1), 0.06), disc(p, vec2(0.2, 0.1), 0.06));
+    float mouth = bar(p, vec2(-0.3, -0.34), vec2(0.3, -0.2));
+    float tooth = mouth * step(0.5, fract((p.x + 0.3) * 8.0)) * step(-0.27, p.y);
+    vec3 col = vec3(0.25, 0.55, 0.42);
+    if (horn > 0.0 && body <= 0.0) col = vec3(0.85, 0.8, 0.6);
+    if (mouth > 0.0) col = tooth > 0.0 ? vec3(0.95) : vec3(0.2, 0.03, 0.06);
+    if (eyes > 0.0) col = pupils > 0.0 ? vec3(0.8, 0.05, 0.05) : vec3(1.0, 0.95, 0.6);
+    return vec4(col, max(max(body, arm), horn));
+}
+vec4 confetti(vec2 p) {
+    vec2 cell = floor((p + 1.0) * 4.0);
+    vec2 f = fract((p + 1.0) * 4.0) - 0.5;
+    float h = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+    float on = step(0.55, h) * step(abs(f.x), 0.22) * step(abs(f.y), 0.12) * step(length(p), 1.0);
+    vec3 col = h > 0.85 ? vec3(1.0, 0.4, 0.6) : h > 0.75 ? vec3(0.4, 0.8, 1.0) : h > 0.65 ? vec3(1.0, 0.85, 0.3) : vec3(0.5, 0.95, 0.5);
+    return vec4(col, on);
+}
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;

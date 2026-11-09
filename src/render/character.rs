@@ -39,6 +39,14 @@ mod walk;
 use race::Race;
 use social::Chat;
 pub use race::RACE_NOW;
+
+/// The lock screen shows the characters: everyone gathers on one screen and
+/// is drawn offscreen for it (backend/wayland.rs).
+pub static LOCK_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn locked() -> bool {
+    LOCK_SCREEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub use social::GAME_NOW;
 use walk::{Act, PAT_DUR, WalkState};
 
@@ -272,6 +280,9 @@ pub struct CharacterConfig {
     /// Fullscreen apps a few characters may come out over now and then
     /// (part of the window's app_id). Keep games out: it can cost them frames.
     pub fullscreen_apps: Vec<String>,
+    /// Characters (folder names) whose happy picture is drawn turned the
+    /// other way: it's mirrored to match the calm one.
+    pub happy_flip: Vec<String>,
 }
 
 impl CharacterConfig {
@@ -308,6 +319,7 @@ impl Default for CharacterConfig {
             voice_volume: 0.6,
             tuning: Default::default(),
             weapons: false,
+            happy_flip: Vec::new(),
             fullscreen_apps: ["firefox", "zen", "chromium", "chrome", "brave", "mpv", "vlc", "celluloid", "haruna"].map(String::from).to_vec(),
         }
     }
@@ -1040,6 +1052,13 @@ pub struct CharacterOverlay {
     last_act: Act,
     // placed at a random spot along the strip yet
     spawned: bool,
+    // the focused window (output pixels), where a bored one goes to fish
+    active: Option<WindowRect>,
+    // this frame's sprite, drawn once everyone is updated, frontmost last
+    pending: Option<glow::Texture>,
+    // where it stands among those level with it; reshuffled when it sets off
+    layer: f32,
+    layer_act: Act,
 }
 
 /// Music on the desktop: the characters stop talking and wandering and move
@@ -1187,6 +1206,10 @@ impl CharacterOverlay {
             thrown_hard: false,
             last_act: Act::Idle,
             spawned: false,
+            pending: None,
+            active: None,
+            layer: actor as f32 * 0.37 % 1.0,
+            layer_act: Act::Idle,
             walk: WalkState {
                 seed: (std::process::id() + actor as u32 * 7919).wrapping_mul(2654435761),
                 ..Default::default()
@@ -1198,6 +1221,8 @@ impl CharacterOverlay {
 
     /// Swap the extra characters without touching the ones that stay.
     pub fn update_extras(&mut self, gl: &glow::Context, extra: &[String], width: i32, height: i32) {
+        // only new ones at the end: everyone keeps their place, chats and games go on
+        let appended = extra.len() >= self.config.extra.len() && extra[..self.config.extra.len()] == self.config.extra[..];
         let mut old = std::mem::take(&mut self.extras);
         for src in extra {
             let n = self.extras.len() + 1;
@@ -1217,7 +1242,9 @@ impl CharacterOverlay {
             }
         }
         self.config.extra = extra.to_vec();
-        self.clear_chats();
+        if !appended {
+            self.clear_chats();
+        }
     }
 
     pub fn reload_source(&mut self, gl: &glow::Context, _width: i32, _height: i32) -> Result<()> {
@@ -1306,7 +1333,11 @@ impl CharacterOverlay {
             if let Some(hp) = happy.filter(|p| p.is_file()) {
                 if let Ok(img) = image::ImageReader::open(&hp).and_then(|r| r.with_guessed_format()) {
                     if let Ok(img) = img.decode() {
-                        let img = img.to_rgba8();
+                        let mut img = img.to_rgba8();
+                        let folder = hp.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if self.config.happy_flip.contains(&folder) {
+                            img = image::imageops::flip_horizontal(&img);
+                        }
                         let (hw, hh) = img.dimensions();
                         self.sprite_happy =
                             create_texture(gl, hw, hh, img.as_raw(), Filter::Linear, true).ok();
@@ -1363,6 +1394,99 @@ impl CharacterOverlay {
     fn placed(&self, i: usize) -> Option<Option<SceneZoom>> {
         let a = if i == 0 { self } else { &self.extras[i - 1] };
         a.visible.then_some(a.zoom)
+    }
+
+    /// Every character's state and friendships, for the settings window.
+    pub fn status(&mut self) -> serde_json::Value {
+        self.social_report()
+    }
+
+    fn actor_at(&self, i: usize) -> &CharacterOverlay {
+        if i == 0 { self } else { &self.extras[i - 1] }
+    }
+
+    /// Back to front: on the ground by how low it stands, then whoever set
+    /// off last; anyone jumping or flying over them; the one in your hand on top.
+    fn draw_key(&self) -> (u8, f32, f32) {
+        let level = match self.walk.act {
+            Act::Held => 3,
+            Act::Jump | Act::Fall => 2,
+            _ => 1,
+        };
+        (level, self.hit_rect[3].round(), self.layer)
+    }
+
+    /// The frontmost character for which `hit` holds.
+    pub(super) fn topmost(&self, hit: impl Fn(&CharacterOverlay) -> bool) -> Option<usize> {
+        (0..self.extras.len() + 1)
+            .filter(|&i| hit(self.actor_at(i)))
+            .max_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    fn draw_pending(&mut self, gl: &glow::Context, target: &mut dyn ActorTarget) {
+        let Some(tex) = self.pending.take() else { return };
+        unsafe {
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+            self.program.bind(gl);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            self.program.set_i32(gl, "u_tex", 0);
+            if target.begin(gl, self.actor, self.hit_rect) {
+                let clip = self.zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform());
+                self.program.set_vec4(gl, "u_clip", clip);
+                gl.bind_vertex_array(Some(self.vao));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.bind_vertex_array(None);
+                target.end(gl, self.actor);
+            }
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.disable(glow::BLEND);
+        }
+    }
+
+    /// Another character takes the first place in the team (the one that
+    /// was there is leaving): it keeps where it is and what it's doing.
+    pub fn promote(&mut self, source: &str) -> bool {
+        let Some(k) = self.extras.iter().position(|e| e.config.source == source) else { return false };
+        let o = &mut self.extras[k];
+        std::mem::swap(&mut self.config.source, &mut o.config.source);
+        std::mem::swap(&mut self.config.source_happy, &mut o.config.source_happy);
+        std::mem::swap(&mut self.sprite_renderer, &mut o.sprite_renderer);
+        std::mem::swap(&mut self.sprite_tex, &mut o.sprite_tex);
+        std::mem::swap(&mut self.sprite_happy, &mut o.sprite_happy);
+        std::mem::swap(&mut self.faces_right, &mut o.faces_right);
+        std::mem::swap(&mut self.model, &mut o.model);
+        std::mem::swap(&mut self.hit_rect, &mut o.hit_rect);
+        std::mem::swap(&mut self.opaque, &mut o.opaque);
+        std::mem::swap(&mut self.zoom, &mut o.zoom);
+        std::mem::swap(&mut self.visible, &mut o.visible);
+        std::mem::swap(&mut self.own_view, &mut o.own_view);
+        std::mem::swap(&mut self.smooth_look, &mut o.smooth_look);
+        std::mem::swap(&mut self.smooth_bounce, &mut o.smooth_bounce);
+        std::mem::swap(&mut self.smooth_pos, &mut o.smooth_pos);
+        std::mem::swap(&mut self.walk, &mut o.walk);
+        std::mem::swap(&mut self.voice, &mut o.voice);
+        std::mem::swap(&mut self.greeted, &mut o.greeted);
+        std::mem::swap(&mut self.screen_speed, &mut o.screen_speed);
+        std::mem::swap(&mut self.last_x, &mut o.last_x);
+        std::mem::swap(&mut self.patted_again, &mut o.patted_again);
+        std::mem::swap(&mut self.vibe, &mut o.vibe);
+        std::mem::swap(&mut self.spot, &mut o.spot);
+        std::mem::swap(&mut self.thrown_hard, &mut o.thrown_hard);
+        std::mem::swap(&mut self.last_act, &mut o.last_act);
+        std::mem::swap(&mut self.spawned, &mut o.spawned);
+        std::mem::swap(&mut self.layer, &mut o.layer);
+        std::mem::swap(&mut self.layer_act, &mut o.layer_act);
+        // chats and a race remember who's who by place: start those afresh
+        self.clear_chats();
+        if self.race.take().is_some() {
+            self.walk.race = None;
+            for e in &mut self.extras {
+                e.walk.race = None;
+            }
+        }
+        true
     }
 
     pub fn uses_audio(&self) -> bool {
@@ -1579,6 +1703,7 @@ impl CharacterOverlay {
         };
 
         if self.actor == 0 {
+            self.active = active_window;
             self.handle_input(info);
         }
 
@@ -1591,6 +1716,7 @@ impl CharacterOverlay {
             let strip = crate::backend::compositor::current().strip();
             // logical px -> clip units (assumes output scale 1)
             let to_clip = 2.0 / w;
+            let strip = if locked() { None } else { strip };
             let target = strip.map_or([0.0, 0.0], |st| {
                 [st.view_x * to_clip, ((st.width - w) * to_clip).max(0.0)]
             });
@@ -1602,7 +1728,7 @@ impl CharacterOverlay {
             for e in &mut self.extras {
                 e.view = view;
             }
-            self.share_views(view);
+            self.share_views(view, strip.map(|st| st.ws));
             if self.config.walk {
                 self.run_race(dt, w);
                 self.run_social(dt, info.mouse);
@@ -1629,8 +1755,9 @@ impl CharacterOverlay {
         let half_clip = [pw / w, ph / h];
 
         let target_look = if self.config.look_at_mouse {
-            let dx = ((info.mouse[0] - cx_px) / (w * 0.45)).clamp(-1.0, 1.0);
-            let dy = (((h - info.mouse[1]) - cy_px) / (h * 0.45)).clamp(-1.0, 1.0);
+            let seen = self.scene_mouse();
+            let dx = ((seen[0] - cx_px) / (w * 0.45)).clamp(-1.0, 1.0);
+            let dy = (((h - seen[1]) - cy_px) / (h * 0.45)).clamp(-1.0, 1.0);
             [dx, dy]
         } else {
             [0.0, 0.0]
@@ -1753,6 +1880,11 @@ impl CharacterOverlay {
                 } else {
                     (left_room, right_room)
                 };
+                // gathered on the lock screen: everyone somewhere on it
+                if locked() && !(left_room..=right_room).contains(&self.walk.x) && matches!(self.walk.act, Act::Idle | Act::Walk) {
+                    self.walk.x = left_room + self.walk.rand() * (right_room - left_room).max(0.0);
+                    self.walk.target = self.walk.x;
+                }
                 if !self.walk.placed {
                     // everyone at once, anywhere along the strip
                     self.walk.placed = true;
@@ -1774,8 +1906,12 @@ impl CharacterOverlay {
                     .circle_target
                     .filter(|_| self.walk.circle || self.walk.act == Act::Chase)
                     .map(|c| [c[0], c[1]]);
-                let aim = circle.unwrap_or(info.mouse);
-                let mouse = (self.config.look_at_mouse && aim != [0.0, 0.0])
+                // the overview shrinks each workspace: aim where this scene has the cursor
+                let circle = circle.map(|c| self.zoom.map_or(c, |z| z.to_scene(c)));
+                let aim = circle.unwrap_or_else(|| self.scene_mouse());
+                // and only a cursor over this workspace can be chased
+                let over = (0.0..=w).contains(&aim[0]) && (0.0..=h).contains(&aim[1]);
+                let mouse = (self.config.look_at_mouse && aim != [0.0, 0.0] && over)
                     .then(|| (aim[0] / w) * 2.0 - 1.0 - center_clip[0] + view);
                 let aim_y = 1.0 - (aim[1] / h) * 2.0;
                 // jump height (half-heights): head to the cursor, or body into the circle
@@ -1843,9 +1979,11 @@ impl CharacterOverlay {
                 self.pat_leaves(info);
             }
             // sprites have no rig: idle sway + hop, quicker hops while walking
-            let (sway, hop, squash) = if mode == 0 && self.walk.act == Act::Pat {
+            let petted = self.walk.petted > 0.0 && self.walk.act != Act::Pat;
+            let (sway, hop, squash) = if mode == 0 && (self.walk.act == Act::Pat || petted) {
                 // pat pat: quick downward squashes, no sway
-                let p = (self.walk.timer / PAT_DUR * std::f32::consts::PI * 5.0).sin().abs();
+                let t = if petted { self.walk.petted } else { self.walk.timer };
+                let p = (t / PAT_DUR * std::f32::consts::PI * 5.0).sin().abs();
                 (0.0, 0.0, p * 5.0)
             } else if mode == 0 && self.model.is_some() {
                 // the rig animates itself: only lift for jumps and drags,
@@ -1891,6 +2029,8 @@ impl CharacterOverlay {
 
             gl.active_texture(glow::TEXTURE0);
             let happy = matches!(self.walk.act, Act::Jump | Act::Pat | Act::Held | Act::Fall)
+                || self.walk.giggle > 0.0
+                || self.walk.petted > 0.0
                 || self.walk.social.is_some_and(|s| s.happy);
             let tex = match (happy, self.sprite_happy) {
                 (true, Some(h)) => h,
@@ -1899,16 +2039,16 @@ impl CharacterOverlay {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             self.program.set_i32(gl, "u_tex", 0);
 
-            if self.visible && target.begin(gl, self.actor, self.hit_rect) {
-                let [sx, sy, ox, oy] = self.zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform());
-                self.program.set_vec4(gl, "u_clip", [sx, sy, ox, oy]);
-                gl.bind_vertex_array(Some(self.vao));
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-                gl.bind_vertex_array(None);
-                target.end(gl, self.actor);
-            }
+            // drawn after everyone has moved, so the order can be by depth
+            self.pending = self.visible.then_some(tex);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.disable(glow::BLEND);
+        }
+        if self.walk.act != self.layer_act {
+            if self.walk.act == Act::Walk {
+                self.layer = self.walk.rand();
+            }
+            self.layer_act = self.walk.act;
         }
 
         self.speak(info);
@@ -1917,6 +2057,16 @@ impl CharacterOverlay {
             e.render(gl, outer, active_window, target)?;
         }
         if self.actor == 0 {
+            let n = self.extras.len() + 1;
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal));
+            for i in order {
+                if i == 0 {
+                    self.draw_pending(gl, target);
+                } else {
+                    self.extras[i - 1].draw_pending(gl, target);
+                }
+            }
             self.draw_ropes(gl, info, target);
             self.draw_carrot(gl, info, target);
         }

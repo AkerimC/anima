@@ -64,10 +64,7 @@ impl CharacterOverlay {
             } else if self.press.is_none() {
                 let [mx, my] = info.mouse;
                 let hit = |a: &CharacterOverlay| a.touching() && !a.walk.social.is_some_and(|s| s.no_touch);
-                let target = (1..=self.extras.len())
-                    .rev()
-                    .find(|&i| hit(&self.extras[i - 1]))
-                    .or_else(|| hit(self).then_some(0));
+                let target = self.topmost(hit);
                 // measure the grab point now: the cursor may be far away by pick-up time
                 let target = target.map(|i| {
                     let a = if i == 0 { &*self } else { &self.extras[i - 1] };
@@ -131,6 +128,9 @@ impl CharacterOverlay {
             if n != self.clicks {
                 self.clicks = n;
                 let keep = |a: &mut CharacterOverlay| {
+                    if a.walk.petted > 0.0 && a.touching() {
+                        a.walk.petted = tn().pat_distract;
+                    }
                     if a.walk.act == Act::Pat && a.touching() {
                         a.walk.timer = a.walk.timer.max(tn().pat_keep);
                         a.patted_again = true;
@@ -153,10 +153,15 @@ impl CharacterOverlay {
             );
             // only on the ground: petting mid-jump or while carried breaks the motion
             let grounded = |w: &WalkState| !matches!(w.act, Act::Jump | Act::Held | Act::Fall) && !w.social.is_some_and(|s| s.no_touch || s.no_pat);
-            let hit = self.extras.iter().rposition(|e| e.touching()).map(|i| i + 1).or_else(|| self.touching().then_some(0));
-            if let Some(i) = hit.filter(|&i| grounded(self.walk_ref(i))) {
-                self.walk_of(i).start_pat();
-                self.gather_for_pat(i);
+            let hit = self.topmost(|a| a.touching());
+            if let Some(i) = hit.filter(|&i| !self.dancing(i)) {
+                if grounded(self.walk_ref(i)) && self.walk_ref(i).race.is_none() {
+                    self.walk_of(i).start_pat();
+                    self.gather_for_pat(i);
+                } else if !matches!(self.walk_ref(i).act, Act::Held) {
+                    // busy in a game or a race: a happy moment, and it carries on
+                    self.walk_of(i).petted = tn().pat_distract;
+                }
             }
         }
     }
@@ -352,8 +357,12 @@ impl CharacterOverlay {
                         if (hard && !leaped) || self.walk.race_down {
                             self.walk.stick_in();
                         } else {
-                            // land with a little bounce
+                            // land with a little bounce, sometimes a giggle
                             self.walk.start_jump(tn().jump_height * tn().land_hop);
+                            if self.walk.social.is_none() && self.walk.rand() < 0.5 {
+                                let secs = tn().laugh_time * 0.5;
+                                self.walk.laugh(secs);
+                            }
                         }
                     }
                 }

@@ -70,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "anima",
  "gtk4",
+ "image",
  "libadwaita",
  "serde",
  "serde_json",
