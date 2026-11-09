@@ -112,7 +112,7 @@ systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR \
 anima set [PATH|ID] [-m MONITOR]   set a wallpaper (file, folder, name, Workshop ID)
 anima next / prev                  playlist / directory navigation
 anima pause / resume / toggle      freeze all or one output (-m)
-anima volume [0..1|0..100] [--mute true|false]  video audio
+anima volume [0..1|0..100] [--mute true|false]  video and scene audio
 anima prop [key] [value]           list / get / set user properties
 anima playlist --interval N --shuffle true
 anima char [preset|file|off] [--corner ...] [--placement ...]
@@ -132,9 +132,9 @@ fps, pause state, audio levels and lyric state.
 ```toml
 [general]
 fps = 60                    # animated wallpaper frame rate
-mute = true
-volume = 0.0
-automute = true             # mute video when another app plays audio
+mute = true                 # mute video and scene audio
+volume = 0.0                # video and scene audio volume
+automute = true             # mute wallpaper audio when another app plays audio
 audio_capture = true        # desktop spectrum/beat analysis
 pause_on_fullscreen = true
 pause_on_maximized = false
@@ -185,8 +185,9 @@ Runtime changes via the CLI are persisted back to this file.
   Wallpaper Engine `scene.pkg` archives are supported: model/material
   resolution, texture decoding (RGBA, DXT1/3/5, LZ4), the full layered scene
   graph (element order is draw order), parallax, blend modes, text/clock/date
-  layers, skeletal puppet meshes (`MDLV`/`MDLS`/`MDLA` animation layers) and
-  per-layer effect stacks.
+  layers, skeletal puppet meshes (`MDLV`/`MDLS`/`MDLA` animation layers),
+  per-layer effect stacks, and bundled `sound` layers (played through libmpv,
+  following the global mute/volume settings).
 
   Puppet meshes use the skeleton's assembled reference pose (the extra MDLS
   matrix array) or, when absent, the first keyframe of the first clip as the
@@ -217,13 +218,14 @@ These are deliberate, documented gaps rather than bugs:
 3. **Wayland only.** X11 and Windows/macOS are out of scope.
 4. **Fullscreen detection uses Hyprland's IPC socket.** On other compositors
    the wallpaper still renders, but pause-on-fullscreen is a no-op.
-5. **Wallpaper Engine compatibility is partial.** Common 2D scene, video and
-   effect-heavy wallpapers work. Not yet implemented: scene render-target
-   composition (`_rt_imageLayerComposite_*` / `copybackground` instanced solid
-   layers such as day-night composites — these are skipped instead of being
-   drawn as white rectangles), 3D/perspective meshes, Wallpaper Engine's native
-   particle systems beyond the generic emitter model, and `application`
-   wallpapers. Custom effect math may still differ visually from the original.
+5. **Wallpaper Engine compatibility is partial.** 2D scene, video, and
+   effect-heavy wallpapers work — including skeletal puppet (`.mdl`) animations,
+   bounded `composelayer` / `projectlayer` / `copybackground` render-target
+   composition (`_rt_imageLayerComposite_*`), keyframe / time-of-day /
+   audio-reactive shader constant scripts, and WE particle presets with
+   spritesheet textures and `instanceoverride` parameters. Not yet implemented:
+   arbitrary 3D/perspective scenes, full SceneScript VM execution beyond
+   standard clock/date/time-of-day/audio patterns, and `application` wallpapers.
 
 6. **Audio analysis is PulseAudio/PipeWire only** (loaded dynamically; the
    daemon still runs without it).

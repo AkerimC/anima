@@ -97,6 +97,8 @@ struct CachedTexture {
     tex: glow::Texture,
     w: u32,
     h: u32,
+    spritesheet: Option<crate::pkg::SpritesheetMeta>,
+    is_r8: bool,
 }
 
 pub struct TextureCache {
@@ -125,14 +127,28 @@ impl TextureCache {
         pkg: &PackageFs,
         path: &str,
     ) -> Option<(glow::Texture, u32, u32)> {
+        self.get_spritesheet(gl, pkg, path)
+            .map(|(tex, w, h, _, _)| (tex, w, h))
+    }
+
+    pub fn get_spritesheet(
+        &mut self,
+        gl: &glow::Context,
+        pkg: &PackageFs,
+        path: &str,
+    ) -> Option<(glow::Texture, u32, u32, Option<crate::pkg::SpritesheetMeta>, bool)> {
         let key = normalize(path);
         if let Some(cached) = self.map.get(&key) {
-            return cached.as_ref().map(|t| (t.tex, t.w, t.h));
+            return cached
+                .as_ref()
+                .map(|t| (t.tex, t.w, t.h, t.spritesheet, t.is_r8));
         }
 
         let loaded = match pkg.load_rgba(&key) {
             Ok(decoded) => {
                 let (w, h) = (decoded.image.width(), decoded.image.height());
+                let spritesheet = decoded.spritesheet;
+                let is_r8 = decoded.is_r8;
                 let filter = if decoded.no_interpolation {
                     Filter::Nearest
                 } else {
@@ -148,7 +164,13 @@ impl TextureCache {
                     decoded.clamp_uvs,
                 )
                 .ok()
-                .map(|tex| CachedTexture { tex, w, h })
+                .map(|tex| CachedTexture {
+                    tex,
+                    w,
+                    h,
+                    spritesheet,
+                    is_r8,
+                })
             }
             Err(err) => {
                 if let Some((w, h, pixels)) = builtin_texture(&key) {
@@ -158,7 +180,13 @@ impl TextureCache {
                     );
                     create_texture_ex(gl, w, h, &pixels, Filter::Linear, !clamp, clamp)
                         .ok()
-                        .map(|tex| CachedTexture { tex, w, h })
+                        .map(|tex| CachedTexture {
+                            tex,
+                            w,
+                            h,
+                            spritesheet: None,
+                            is_r8: false,
+                        })
                 } else {
                     log::debug!("effect texture {key}: {err}");
                     // Unknown `util/*` helpers are almost always masks; white is
@@ -167,7 +195,13 @@ impl TextureCache {
                         builtin_texture("util/white").and_then(|(w, h, px)| {
                             create_texture_ex(gl, w, h, &px, Filter::Linear, false, true)
                                 .ok()
-                                .map(|tex| CachedTexture { tex, w, h })
+                                .map(|tex| CachedTexture {
+                                    tex,
+                                    w,
+                                    h,
+                                    spritesheet: None,
+                                    is_r8: false,
+                                })
                         })
                     } else {
                         None
@@ -180,7 +214,7 @@ impl TextureCache {
         self.map
             .get(&key)
             .and_then(|v| v.as_ref())
-            .map(|t| (t.tex, t.w, t.h))
+            .map(|t| (t.tex, t.w, t.h, t.spritesheet, t.is_r8))
     }
 }
 
@@ -381,6 +415,17 @@ vec2 we_max(float a, vec2 b) { return max(vec2(a), b); }
 vec3 we_max(float a, vec3 b) { return max(vec3(a), b); }
 vec4 we_max(float a, vec4 b) { return max(vec4(a), b); }
 #define max(a, b) we_max(a, b)
+
+// HLSL's smoothstep with equal edges behaves like a step (saturate(inf));
+// GLSL leaves it undefined, which breaks audio `bounds` like "0.6 0.6".
+float we_smoothstep(float a, float b, float x) { return a == b ? step(a, x) : smoothstep(a, b, x); }
+vec2 we_smoothstep(float a, float b, vec2 x) { return a == b ? step(vec2(a), x) : smoothstep(a, b, x); }
+vec3 we_smoothstep(float a, float b, vec3 x) { return a == b ? step(vec3(a), x) : smoothstep(a, b, x); }
+vec4 we_smoothstep(float a, float b, vec4 x) { return a == b ? step(vec4(a), x) : smoothstep(a, b, x); }
+vec2 we_smoothstep(vec2 a, vec2 b, vec2 x) { return mix(step(a, x), smoothstep(a, b, x), vec2(notEqual(a, b))); }
+vec3 we_smoothstep(vec3 a, vec3 b, vec3 x) { return mix(step(a, x), smoothstep(a, b, x), vec3(notEqual(a, b))); }
+vec4 we_smoothstep(vec4 a, vec4 b, vec4 x) { return mix(step(a, x), smoothstep(a, b, x), vec4(notEqual(a, b))); }
+#define smoothstep(a, b, x) we_smoothstep(a, b, x)
 
 vec4 mmul(vec4 v, mat4 m) { return m * v; }
 vec4 mmul(mat4 m, vec4 v) { return m * v; }
@@ -3246,6 +3291,7 @@ struct UniformSpec {
     name: String,
     kind: UniformKind,
     material: Option<String>,
+    alt_materials: Vec<String>,
     label: Option<String>,
     default: Option<Value>,
     default_tex: Option<String>,
@@ -3299,15 +3345,21 @@ impl CompiledProgram {
                 return Err(err);
             }
         };
-        let exp_frag = expand_includes(frag_src, 0);
-        let exp_vert = expand_includes(vert_src, 0);
+        let exp_frag = filter_active_lines(&expand_includes(frag_src, 0), combos);
+        let exp_vert = filter_active_lines(&expand_includes(vert_src, 0), combos);
         let uniforms = parse_uniforms(&exp_frag);
         let uniforms_v = parse_uniforms(&exp_vert);
         let mut all = uniforms;
         for u in uniforms_v {
             if let Some(existing) = all.iter_mut().find(|x| x.name == u.name) {
                 if existing.material.is_none() {
-                    existing.material = u.material;
+                    existing.material = u.material.clone();
+                } else if let Some(m) = u.material {
+                    if existing.material.as_deref() != Some(m.as_str())
+                        && !existing.alt_materials.contains(&m)
+                    {
+                        existing.alt_materials.push(m);
+                    }
                 }
                 if existing.label.is_none() {
                     existing.label = u.label;
@@ -3355,6 +3407,116 @@ impl CompiledProgram {
             Ok(Self { prog, uniforms: all, vao, vbo, blending })
         }
     }
+}
+
+/// Evaluate simple `#if` / `#elif` / `#else` / `#endif` combo blocks so
+/// uniform metadata from inactive shader branches (such as `#if MODE == 1` in
+/// `foliagesway.vert` when `MODE == 0`) does not shadow active declarations.
+fn filter_active_lines(src: &str, combos: &[(String, i32)]) -> String {
+    let lookup = |name: &str| -> i32 {
+        combos
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| *v)
+            .unwrap_or(0)
+    };
+    fn eval_atom(expr: &str, lookup: &dyn Fn(&str) -> i32) -> i32 {
+        let e = expr.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        if let Some(rest) = e.strip_prefix('!') {
+            return if eval_atom(rest, lookup) == 0 { 1 } else { 0 };
+        }
+        if let Some((a, b)) = e.split_once("==") {
+            let va = a.trim().parse::<i32>().unwrap_or_else(|_| lookup(a.trim()));
+            let vb = b.trim().parse::<i32>().unwrap_or_else(|_| lookup(b.trim()));
+            return i32::from(va == vb);
+        }
+        if let Some((a, b)) = e.split_once("!=") {
+            let va = a.trim().parse::<i32>().unwrap_or_else(|_| lookup(a.trim()));
+            let vb = b.trim().parse::<i32>().unwrap_or_else(|_| lookup(b.trim()));
+            return i32::from(va != vb);
+        }
+        if let Some((a, b)) = e.split_once(">=") {
+            let va = a.trim().parse::<i32>().unwrap_or_else(|_| lookup(a.trim()));
+            let vb = b.trim().parse::<i32>().unwrap_or_else(|_| lookup(b.trim()));
+            return i32::from(va >= vb);
+        }
+        if let Some((a, b)) = e.split_once("<=") {
+            let va = a.trim().parse::<i32>().unwrap_or_else(|_| lookup(a.trim()));
+            let vb = b.trim().parse::<i32>().unwrap_or_else(|_| lookup(b.trim()));
+            return i32::from(va <= vb);
+        }
+        if let Some((a, b)) = e.split_once('>') {
+            let va = a.trim().parse::<i32>().unwrap_or_else(|_| lookup(a.trim()));
+            let vb = b.trim().parse::<i32>().unwrap_or_else(|_| lookup(b.trim()));
+            return i32::from(va > vb);
+        }
+        if let Some((a, b)) = e.split_once('<') {
+            let va = a.trim().parse::<i32>().unwrap_or_else(|_| lookup(a.trim()));
+            let vb = b.trim().parse::<i32>().unwrap_or_else(|_| lookup(b.trim()));
+            return i32::from(va < vb);
+        }
+        e.parse::<i32>().unwrap_or_else(|_| lookup(e))
+    }
+    fn eval_cond(expr: &str, lookup: &dyn Fn(&str) -> i32) -> bool {
+        let clean = expr.split("//").next().unwrap_or(expr).trim();
+        clean.split("||").any(|or_part| {
+            or_part
+                .split("&&")
+                .all(|and_part| eval_atom(and_part, lookup) != 0)
+        })
+    }
+
+    // Stack of (parent_active, branch_active, matched_any_branch)
+    let mut stack: Vec<(bool, bool, bool)> = Vec::new();
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let t = line.trim_start();
+        let parent_active = stack.last().map(|&(_, a, _)| a).unwrap_or(true);
+        if let Some(rest) = t.strip_prefix("#ifdef ") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let cond = parent_active && lookup(name) != 0;
+            stack.push((parent_active, cond, cond));
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("#ifndef ") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let cond = parent_active && lookup(name) == 0;
+            stack.push((parent_active, cond, cond));
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("#if ") {
+            let cond = parent_active && eval_cond(rest, &lookup);
+            stack.push((parent_active, cond, cond));
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("#elif ") {
+            if let Some((p_act, b_act, seen)) = stack.last_mut() {
+                if *p_act && !*seen && eval_cond(rest, &lookup) {
+                    *b_act = true;
+                    *seen = true;
+                } else {
+                    *b_act = false;
+                }
+            }
+            continue;
+        }
+        if t.starts_with("#else") {
+            if let Some((p_act, b_act, seen)) = stack.last_mut() {
+                *b_act = *p_act && !*seen;
+                *seen = true;
+            }
+            continue;
+        }
+        if t.starts_with("#endif") {
+            stack.pop();
+            continue;
+        }
+        if parent_active {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn parse_uniforms(src: &str) -> Vec<UniformSpec> {
@@ -3421,6 +3583,7 @@ fn parse_uniforms(src: &str) -> Vec<UniformSpec> {
             name,
             kind,
             material,
+            alt_materials: Vec::new(),
             label,
             default,
             default_tex,
@@ -3485,14 +3648,39 @@ impl EffectInstance {
             }
         }
     }
+
+    /// Whether any pass in this effect reads audio spectrum uniforms, enables
+    /// `AUDIOPROCESSING`, or binds an audio-reactive property script.
+    pub fn uses_audio(&self) -> bool {
+        self.passes.iter().any(|p| {
+            p.combos
+                .iter()
+                .any(|(k, v)| k == "AUDIOPROCESSING" && *v > 0)
+                || p.program.as_ref().is_some_and(|prog| {
+                    prog.uniforms
+                        .iter()
+                        .any(|u| u.name.starts_with("g_AudioSpectrum"))
+                })
+                || p.constants.values().any(|v| {
+                    v.get("script")
+                        .and_then(|s| s.as_str())
+                        .is_some_and(|s| s.contains("registerAudioBuffers"))
+                })
+        })
+    }
 }
 
 pub struct EffectContext<'a> {
     pub time: f32,
+    pub frametime: f32,
+    pub daytime: f32,
     pub mouse: [f32; 2],
     pub audio: [f32; 4],
     pub spectrum: &'a [f32; 64],
     pub projection_inverse: [f32; 16],
+    pub composites: &'a HashMap<i64, Canvas>,
+    pub self_id: Option<i64>,
+    pub dependencies: &'a [i64],
 }
 
 fn read_text(pkg: &PackageFs, path: &str) -> Option<String> {
@@ -3502,53 +3690,13 @@ fn read_text(pkg: &PackageFs, path: &str) -> Option<String> {
     we_asset(path)
 }
 
-fn read_bytes(pkg: &PackageFs, path: &str) -> Option<Vec<u8>> {
-    if let Ok(b) = pkg.read(path) {
-        return Some(b);
-    }
-    let p = we_asset_path(path)?;
-    std::fs::read(p).ok()
-}
-
 fn we_asset(path: &str) -> Option<String> {
     let p = we_asset_path(path)?;
     std::fs::read_to_string(p).ok()
 }
 
 fn we_asset_path(path: &str) -> Option<PathBuf> {
-    if let Some(p) = crate::pkg::resolve_we_asset(path) {
-        return Some(p);
-    }
-    let home = std::env::var_os("HOME")?;
-    for rel in [
-        ".local/share/Steam/steamapps/common/wallpaper_engine/assets",
-        ".steam/steam/steamapps/common/wallpaper_engine/assets",
-    ] {
-        let root = PathBuf::from(&home).join(rel);
-        if !root.is_dir() {
-            continue;
-        }
-        let clean = path.trim_start_matches('/');
-        let direct = root.join(clean);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        if let Some(rest) = clean.strip_prefix("materials/effects/") {
-            let name = rest.split('/').next()?;
-            let p = root.join("effects").join(name).join("materials/effects").join(rest);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        if let Some(rest) = clean.strip_prefix("shaders/effects/") {
-            let name = rest.split('/').next()?;
-            let p = root.join("effects").join(name).join("shaders/effects").join(rest);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
+    crate::pkg::resolve_we_asset(path)
 }
 
 fn read_json(pkg: &PackageFs, path: &str) -> Option<Value> {
@@ -3638,19 +3786,9 @@ impl EffectInstance {
                     }
                 }
             }
-            if let Some(c) = scene_pass
-                .and_then(|p| p.get("combos"))
-                .and_then(|c| c.as_object())
-            {
-                for (k, v) in c {
-                    if let Some(n) = v.as_i64() {
-                        combos = merge_combos(&combos, &[(k.clone(), n as i32)]);
-                    }
-                }
-            }
 
             // A texture bound to a slot whose uniform declares a `MASK`/other
-            // combo normally enables that combo.
+            // combo enables that combo unless the scene pass explicitly overrides it.
             let mut textures: Vec<Option<String>> = mat_pass
                 .get("textures")
                 .and_then(|t| t.as_array())
@@ -3686,6 +3824,19 @@ impl EffectInstance {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // Merge explicit `scene_pass.combos` AFTER texture-combo inference
+            // so authored combo values (such as `"MASK": 0`) are never clobbered.
+            if let Some(c) = scene_pass
+                .and_then(|p| p.get("combos"))
+                .and_then(|c| c.as_object())
+            {
+                for (k, v) in c {
+                    if let Some(n) = v.as_i64() {
+                        combos = merge_combos(&combos, &[(k.clone(), n as i32)]);
                     }
                 }
             }
@@ -3806,17 +3957,6 @@ impl EffectInstance {
         Ok(())
     }
 
-    fn target_canvas<'a>(
-        &'a mut self,
-        name: Option<&str>,
-        output: &'a Canvas,
-    ) -> &'a Canvas {
-        match name {
-            Some(n) if n != "previous" => self.named.get(n).unwrap_or(output),
-            _ => output,
-        }
-    }
-
     pub fn apply(
         &mut self,
         gl: &glow::Context,
@@ -3900,7 +4040,27 @@ impl EffectInstance {
                         .map(|c| (c.tex, c.w as u32, c.h as u32)),
                     None => {
                         if let Some(path) = pass.textures.get(slot).and_then(|t| t.as_deref()) {
-                            cache.get(gl, pkg, path)
+                            if let Some(rest) = path.strip_prefix("_rt_imageLayerComposite_") {
+                                let id_str = rest.split('_').next().unwrap_or("");
+                                let parsed_id = id_str.parse::<i64>().ok();
+                                let from_comp = parsed_id
+                                    .and_then(|id| ctx.composites.get(&id))
+                                    .or_else(|| {
+                                        ctx.dependencies
+                                            .get(slot)
+                                            .and_then(|id| ctx.composites.get(id))
+                                    })
+                                    .map(|c| (c.tex, c.w as u32, c.h as u32));
+                                if from_comp.is_some() {
+                                    from_comp
+                                } else if parsed_id.is_some() && parsed_id == ctx.self_id {
+                                    Some((input.tex, input.w as u32, input.h as u32))
+                                } else {
+                                    Some(prev_source)
+                                }
+                            } else {
+                                cache.get(gl, pkg, path)
+                            }
                         } else if let Some(def_tex) = program
                             .uniforms
                             .iter()
@@ -3948,8 +4108,43 @@ impl EffectInstance {
                     continue;
                 }
 
+                if let Some(rest) = spec
+                    .name
+                    .strip_prefix("g_Texture")
+                    .and_then(|s| s.strip_suffix("Resolution"))
+                {
+                    if let Ok(slot) = rest.parse::<usize>() {
+                        let (w, h) = textures
+                            .get(&slot)
+                            .map(|(_, w, h)| (*w as f32, *h as f32))
+                            .unwrap_or((tw.max(1) as f32, th.max(1) as f32));
+                        program.prog.set_vec4(gl, &loc_name, [w, h, w, h]);
+                        continue;
+                    }
+                }
+
                 if spec.name == "g_Time" {
                     program.prog.set_f32(gl, &loc_name, ctx.time);
+                    continue;
+                }
+                if spec.name == "g_Frametime" {
+                    program.prog.set_f32(gl, &loc_name, ctx.frametime);
+                    continue;
+                }
+                if spec.name == "g_Daytime" {
+                    program.prog.set_f32(gl, &loc_name, ctx.daytime);
+                    continue;
+                }
+                if spec.name == "g_ViewUp" || spec.name == "g_OrientationUp" {
+                    if matches!(spec.kind, UniformKind::Vec2) {
+                        program.prog.set_vec2(gl, &loc_name, 0.0, 1.0);
+                    } else {
+                        program.prog.set_vec3(gl, &loc_name, 0.0, 1.0, 0.0);
+                    }
+                    continue;
+                }
+                if spec.name == "g_TextureReductionScale" {
+                    program.prog.set_f32(gl, &loc_name, 1.0);
                     continue;
                 }
                 if spec.name == "g_PointerPosition" {
@@ -3962,6 +4157,12 @@ impl EffectInstance {
                     program
                         .prog
                         .set_vec2(gl, &loc_name, ctx.mouse[0], ctx.mouse[1]);
+                    continue;
+                }
+                if spec.name == "g_ParallaxPosition" {
+                    program
+                        .prog
+                        .set_vec2(gl, &loc_name, ctx.mouse[0], 1.0 - ctx.mouse[1]);
                     continue;
                 }
                 if spec.name == "g_TexelSize" {
@@ -4003,29 +4204,50 @@ impl EffectInstance {
                     continue;
                 }
                 if spec.name.starts_with("g_AudioSpectrum") {
+                    let n = match spec.kind {
+                        UniformKind::FloatArray(len) => len.clamp(1, 64),
+                        _ => 64,
+                    };
                     let mut values = [0.0f32; 64];
-                    for (i, v) in values.iter_mut().enumerate() {
-                        *v = ctx.spectrum.get(i).copied().unwrap_or(0.0);
-                    }
-                    if let UniformKind::FloatArray(n) = spec.kind {
-                        let count = n.min(64);
-                        set_f32_array(gl, &mut program.prog, &loc_name, &values[..count]);
+                    if n == 16 {
+                        for (i, out) in values.iter_mut().take(16).enumerate() {
+                            let base = i * 4;
+                            *out = (ctx.spectrum[base]
+                                + ctx.spectrum[base + 1]
+                                + ctx.spectrum[base + 2]
+                                + ctx.spectrum[base + 3])
+                                * 0.25;
+                        }
+                    } else if n == 32 {
+                        for (i, out) in values.iter_mut().take(32).enumerate() {
+                            let base = i * 2;
+                            *out = (ctx.spectrum[base] + ctx.spectrum[base + 1]) * 0.5;
+                        }
                     } else {
-                        set_f32_array(gl, &mut program.prog, &loc_name, &values);
+                        for (i, v) in values.iter_mut().enumerate() {
+                            *v = ctx.spectrum.get(i).copied().unwrap_or(0.0);
+                        }
                     }
+                    set_f32_array(gl, &mut program.prog, &loc_name, &values[..n]);
                     continue;
                 }
 
+                let lookup_mat = |m: &str| -> Option<Value> {
+                    let ml = m.to_ascii_lowercase();
+                    pass.constants
+                        .get(&ml)
+                        .or_else(|| pass.constants.get(&format!("ui_editor_properties_{ml}")))
+                        .cloned()
+                };
                 let value = spec
                     .material
-                    .as_ref()
-                    .and_then(|m| {
-                        let ml = m.to_ascii_lowercase();
-                        pass.constants.get(&ml).or_else(|| {
-                            pass.constants.get(&format!("ui_editor_properties_{ml}"))
-                        })
+                    .as_deref()
+                    .and_then(lookup_mat)
+                    .or_else(|| {
+                        spec.alt_materials
+                            .iter()
+                            .find_map(|m| lookup_mat(m.as_str()))
                     })
-                    .cloned()
                     .or_else(|| {
                         spec.label
                             .as_ref()
@@ -4042,8 +4264,9 @@ impl EffectInstance {
                         pass.constants.get(&short).cloned()
                     })
                     .or_else(|| spec.default.clone());
-                if let Some(value) = value {
-                    set_uniform_value(gl, &mut program.prog, spec, &value);
+                if let Some(raw_value) = value {
+                    let resolved = eval_dynamic_constant(&raw_value, ctx);
+                    set_uniform_value(gl, &mut program.prog, spec, &resolved);
                 }
             }
 
@@ -4065,6 +4288,145 @@ impl EffectInstance {
         }
         Ok(())
     }
+}
+
+/// Evaluate Wallpaper Engine dynamic shader constant objects:
+/// - keyframe timeline animations (`"animation": { "c0": [...], "options": ... }`),
+/// - `engine.timeOfDay` smoothStep blend scripts (`START_HOUR` / `END_HOUR`),
+/// - `engine.registerAudioBuffers` audio-frequency response scripts.
+fn eval_dynamic_constant(val: &Value, ctx: &EffectContext) -> Value {
+    let Some(obj) = val.as_object() else {
+        return val.clone();
+    };
+    if let Some(anim) = obj.get("animation").and_then(|a| a.as_object()) {
+        let opts = anim.get("options").and_then(|o| o.as_object());
+        let fps = opts
+            .and_then(|o| o.get("fps"))
+            .and_then(json_f32)
+            .unwrap_or(30.0)
+            .max(1.0);
+        let length = opts
+            .and_then(|o| o.get("length"))
+            .and_then(json_f32)
+            .unwrap_or(60.0)
+            .max(1.0);
+        let mode = opts
+            .and_then(|o| o.get("mode"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("loop");
+        let raw_f = ctx.time * fps;
+        let frame = match mode {
+            "mirror" => {
+                let period = (length * 2.0).max(1.0);
+                let m = raw_f.rem_euclid(period);
+                if m > length { period - m } else { m }
+            }
+            "single" => raw_f.clamp(0.0, length),
+            _ => raw_f.rem_euclid(length),
+        };
+        let eval_curve = |key: &str| -> Option<f32> {
+            let frames = anim.get(key)?.as_array()?;
+            if frames.is_empty() {
+                return None;
+            }
+            let mut pts: Vec<(f32, f32)> = frames
+                .iter()
+                .filter_map(|k| {
+                    let f = k.get("frame").and_then(json_f32)?;
+                    let v = k.get("value").and_then(json_f32)?;
+                    Some((f, v))
+                })
+                .collect();
+            if pts.is_empty() {
+                return None;
+            }
+            pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if frame <= pts[0].0 {
+                return Some(pts[0].1);
+            }
+            for w in pts.windows(2) {
+                let (f0, v0) = w[0];
+                let (f1, v1) = w[1];
+                if frame <= f1 {
+                    let span = (f1 - f0).max(1e-5);
+                    let t = ((frame - f0) / span).clamp(0.0, 1.0);
+                    let s = t * t * (3.0 - 2.0 * t);
+                    return Some(v0 + (v1 - v0) * s);
+                }
+            }
+            pts.last().map(|&(_, v)| v)
+        };
+        if let Some(c0) = eval_curve("c0") {
+            if let (Some(c1), Some(c2)) = (eval_curve("c1"), eval_curve("c2")) {
+                return Value::String(format!("{c0} {c1} {c2}"));
+            }
+            if let Some(n) = serde_json::Number::from_f64(c0 as f64) {
+                return Value::Number(n);
+            }
+        }
+    }
+    if let Some(script) = obj.get("script").and_then(|s| s.as_str()) {
+        if script.contains("engine.timeOfDay") && script.contains("START_HOUR") {
+            let parse_const = |name: &str| -> Option<f32> {
+                let idx = script.find(name)?;
+                let rest = &script[idx + name.len()..];
+                let eq = rest.find('=')?;
+                let after = rest[eq + 1..].trim_start();
+                let end = after
+                    .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+                    .unwrap_or(after.len());
+                after[..end].parse::<f32>().ok()
+            };
+            if let (Some(start_h), Some(end_h)) =
+                (parse_const("START_HOUR"), parse_const("END_HOUR"))
+            {
+                let blend_dur = parse_const("BLEND_DURATION").unwrap_or(0.05).max(0.001);
+                let tod = ctx.daytime.clamp(0.0, 1.0);
+                let smooth = |e0: f32, e1: f32, x: f32| -> f32 {
+                    if (e1 - e0).abs() < 1e-6 {
+                        return if x >= e1 { 1.0 } else { 0.0 };
+                    }
+                    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                };
+                let v = smooth((start_h - blend_dur) / 24.0, start_h / 24.0, tod)
+                    * smooth(end_h / 24.0, (end_h - blend_dur) / 24.0, tod);
+                if let Some(n) = serde_json::Number::from_f64(v as f64) {
+                    return Value::Number(n);
+                }
+            }
+        }
+        if script.contains("registerAudioBuffers") && script.contains("scriptProperties.frequency")
+        {
+            let base = obj.get("value").and_then(json_f32).unwrap_or(0.15);
+            let props = obj.get("scriptproperties").and_then(|p| p.as_object());
+            let freq = props
+                .and_then(|p| p.get("frequency"))
+                .and_then(json_f32)
+                .unwrap_or(0.0)
+                .clamp(0.0, 15.0) as usize;
+            let min_val = props
+                .and_then(|p| p.get("minvalue"))
+                .and_then(json_f32)
+                .unwrap_or(0.8);
+            let max_val = props
+                .and_then(|p| p.get("maxvalue"))
+                .and_then(json_f32)
+                .unwrap_or(1.2);
+            let idx = freq * 4;
+            let level = ((ctx.spectrum[idx]
+                + ctx.spectrum[idx + 1]
+                + ctx.spectrum[idx + 2]
+                + ctx.spectrum[idx + 3])
+                * 0.25)
+                .clamp(0.0, 1.0);
+            let v = base * (level * (max_val - min_val) + min_val);
+            if let Some(n) = serde_json::Number::from_f64(v as f64) {
+                return Value::Number(n);
+            }
+        }
+    }
+    val.clone()
 }
 
 fn set_uniform_value(
@@ -4351,7 +4713,3 @@ void main() {
     gl_Position = vec4(a_pos, 0.0, 1.0);
 }
 "#;
-
-pub fn read_binary(pkg: &PackageFs, path: &str) -> Option<Vec<u8>> {
-    read_bytes(pkg, path)
-}

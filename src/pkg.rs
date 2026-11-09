@@ -124,14 +124,28 @@ impl PackageFs {
     /// Load an image or `.tex` texture by relative path (or material path).
     pub fn load_rgba(&self, rel: &str) -> Result<DecodedTex> {
         let key = normalize_key(rel);
-        let candidates = [
+        // Texture names may end in a space before the extension
+        // (`materials/Miles & Gwen Parts 1 .tex`).  `normalize_key` trims the
+        // whole path, so try the untrimmed stem first.
+        let raw = rel
+            .replace('\\', "/")
+            .trim_start()
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+        let mut candidates = Vec::new();
+        if raw != key {
+            candidates.push(format!("{raw}.tex"));
+            candidates.push(format!("materials/{raw}.tex"));
+        }
+        candidates.extend([
             key.clone(),
             format!("materials/{key}"),
             format!("materials/{key}.tex"),
             format!("{key}.tex"),
             format!("materials/{key}.png"),
             format!("{key}.png"),
-        ];
+        ]);
 
         for cand in &candidates {
             if let Ok(bytes) = self.read(cand) {
@@ -147,6 +161,7 @@ impl PackageFs {
                     spritesheet: None,
                     clamp_uvs: false,
                     no_interpolation: false,
+                    is_r8: false,
                 });
             }
         }
@@ -199,6 +214,7 @@ fn normalize_key(path: &str) -> String {
 }
 
 pub fn resolve_we_asset(rel: &str) -> Option<PathBuf> {
+    let rel = rel.trim_start_matches('/');
     let home = std::env::var_os("HOME")?;
     let home = Path::new(&home);
     let roots = [
@@ -214,25 +230,40 @@ pub fn resolve_we_asset(rel: &str) -> Option<PathBuf> {
             return Some(direct);
         }
         // Check presets/*/<rel> and effects/*/<rel> when Wallpaper Engine groups
-        // built-in preset/effect assets into subdirectories.
-        if rel.starts_with("particles/presets/") || rel.starts_with("materials/presets/") {
+        // built-in preset/effect assets into subdirectories.  Always scan real
+        // effect/preset directories across all entries before falling back to
+        // `preview/` subdirectories, which often hold older stripped shaders.
+        if rel.starts_with("particles/") || rel.starts_with("materials/presets/") {
             if let Ok(entries) = fs::read_dir(base.join("presets")) {
-                for entry in entries.flatten() {
-                    let cand = entry.path().join(rel);
+                let dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                for dir in &dirs {
+                    let cand = dir.join(rel);
                     if cand.is_file() {
                         return Some(cand);
                     }
                 }
+                for dir in &dirs {
+                    let cand_prev = dir.join("preview").join(rel);
+                    if cand_prev.is_file() {
+                        return Some(cand_prev);
+                    }
+                }
             }
         }
-        if rel.starts_with("materials/effects/") || rel.starts_with("shaders/effects/") {
+        if rel.starts_with("materials/effects/")
+            || rel.starts_with("shaders/effects/")
+            || rel.starts_with("effects/")
+        {
             if let Ok(entries) = fs::read_dir(base.join("effects")) {
-                for entry in entries.flatten() {
-                    let cand = entry.path().join(rel);
+                let dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                for dir in &dirs {
+                    let cand = dir.join(rel);
                     if cand.is_file() {
                         return Some(cand);
                     }
-                    let cand_prev = entry.path().join("preview").join(rel);
+                }
+                for dir in &dirs {
+                    let cand_prev = dir.join("preview").join(rel);
                     if cand_prev.is_file() {
                         return Some(cand_prev);
                     }
@@ -290,7 +321,7 @@ pub fn parse_pkg_bytes(data: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
     Ok(map)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SpritesheetMeta {
     pub cols: u32,
     pub rows: u32,
@@ -304,6 +335,7 @@ pub struct DecodedTex {
     pub spritesheet: Option<SpritesheetMeta>,
     pub clamp_uvs: bool,
     pub no_interpolation: bool,
+    pub is_r8: bool,
 }
 
 /// Decode a Wallpaper Engine `.tex` binary buffer into an `RgbaImage`.
@@ -370,6 +402,21 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
         raw_slice.to_vec()
     };
 
+    // Video textures (`flags & 32`) carry a raw MP4 stream.  Decode it into a
+    // spritesheet atlas so image layers can play it back like an animated
+    // texture.
+    if payload.len() >= 12 && &payload[4..8] == b"ftyp" {
+        let (image, spritesheet) = decode_mp4_atlas(&payload, img_width, img_height)
+            .context("decoding embedded MP4 in .tex")?;
+        return Ok(DecodedTex {
+            image,
+            spritesheet,
+            clamp_uvs: true,
+            no_interpolation,
+            is_r8: false,
+        });
+    }
+
     // Check if payload is actually an embedded standard image (PNG / JPEG / WebP / GIF).
     if is_embedded_image(&payload) {
         let decoded = image::load_from_memory(&payload)
@@ -382,6 +429,7 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
             spritesheet,
             clamp_uvs,
             no_interpolation,
+            is_r8: false,
         });
     }
 
@@ -412,6 +460,7 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
         spritesheet,
         clamp_uvs,
         no_interpolation,
+        is_r8: format == 9,
     })
 }
 
@@ -451,6 +500,142 @@ fn parse_texs_spritesheet(data: &[u8], img_w: u32, img_h: u32) -> Option<Sprites
         frames,
         duration: (frame_time * frames as f32).max(0.01),
     })
+}
+
+/// Decode an MP4 payload with `ffmpeg` into a grid atlas of frames.
+///
+/// The atlas is capped at roughly 24 Mpx (≈96 MiB RGBA) and 8192 px per side,
+/// so long or 4K clips are downscaled; short WE video textures (transition
+/// clips, glitch overlays) fit comfortably.
+fn decode_mp4_atlas(
+    mp4: &[u8],
+    hint_w: u32,
+    hint_h: u32,
+) -> Result<(RgbaImage, Option<SpritesheetMeta>)> {
+    use std::process::Command;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "anima-tex-{}-{:x}.mp4",
+        std::process::id(),
+        mp4.len() ^ (mp4.as_ptr() as usize)
+    ));
+    fs::write(&tmp, mp4)?;
+    let result = (|| -> Result<(RgbaImage, Option<SpritesheetMeta>)> {
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=width,height,nb_read_packets,r_frame_rate",
+                "-of",
+                "default=noprint_wrappers=1",
+            ])
+            .arg(&tmp)
+            .output()
+            .context("running ffprobe (is ffmpeg installed?)")?;
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let mut src_w = hint_w;
+        let mut src_h = hint_h;
+        let mut frames = 0u32;
+        let mut fps = 30.0f32;
+        for line in text.lines() {
+            let (k, v) = match line.split_once('=') {
+                Some(kv) => kv,
+                None => continue,
+            };
+            let v = v.trim();
+            match k.trim() {
+                "width" => src_w = v.parse().unwrap_or(src_w),
+                "height" => src_h = v.parse().unwrap_or(src_h),
+                "nb_read_packets" => frames = v.parse().unwrap_or(0),
+                "r_frame_rate" => {
+                    if let Some((n, d)) = v.split_once('/') {
+                        let n: f32 = n.parse().unwrap_or(30.0);
+                        let d: f32 = d.parse().unwrap_or(1.0);
+                        if d > 0.0 && n > 0.0 {
+                            fps = n / d;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if src_w == 0 || src_h == 0 {
+            bail!("could not determine video size");
+        }
+        let duration = if frames > 0 { frames as f32 / fps } else { 1.0 };
+        // Limit the number of frames we keep; resample longer clips.
+        const MAX_FRAMES: u32 = 64;
+        let (keep, out_fps) = if frames == 0 {
+            (MAX_FRAMES, fps)
+        } else if frames > MAX_FRAMES {
+            (MAX_FRAMES, MAX_FRAMES as f32 / duration.max(0.01))
+        } else {
+            (frames, fps)
+        };
+        const MAX_PIXELS: f32 = 24.0 * 1024.0 * 1024.0;
+        const MAX_SIDE: f32 = 8192.0;
+        let aspect = src_w as f32 / src_h as f32;
+        let per_frame = (MAX_PIXELS / keep as f32).min((src_w * src_h) as f32);
+        let mut fh = (per_frame / aspect).sqrt().floor().max(1.0);
+        let mut fw = (fh * aspect).floor().max(1.0);
+        let mut cols = ((keep as f32 * fh / fw).sqrt().ceil() as u32).clamp(1, keep);
+        let mut rows = (keep + cols - 1) / cols;
+        let over = ((cols as f32 * fw) / MAX_SIDE).max((rows as f32 * fh) / MAX_SIDE);
+        if over > 1.0 {
+            fw = (fw / over).floor().max(1.0);
+            fh = (fh / over).floor().max(1.0);
+        }
+        // Even dimensions keep ffmpeg's scaler happy.
+        let fw = ((fw as u32) & !1).max(2);
+        let fh = ((fh as u32) & !1).max(2);
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&tmp)
+            .args([
+                "-vf",
+                &format!("fps={out_fps},scale={fw}:{fh}:flags=bicubic"),
+                "-frames:v",
+                &keep.to_string(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-",
+            ])
+            .output()
+            .context("running ffmpeg (is ffmpeg installed?)")?;
+        let frame_bytes = (fw * fh * 4) as usize;
+        let decoded = (out.stdout.len() / frame_bytes) as u32;
+        if decoded == 0 {
+            bail!("ffmpeg produced no frames");
+        }
+        cols = ((decoded as f32 * fh as f32 / fw as f32).sqrt().ceil() as u32).clamp(1, decoded);
+        rows = (decoded + cols - 1) / cols;
+        let mut atlas = RgbaImage::new(cols * fw, rows * fh);
+        for i in 0..decoded {
+            let frame = &out.stdout[i as usize * frame_bytes..(i as usize + 1) * frame_bytes];
+            let ox = (i % cols) * fw;
+            let oy = (i / cols) * fh;
+            for y in 0..fh {
+                let src = &frame[(y * fw * 4) as usize..((y + 1) * fw * 4) as usize];
+                let dst_start = (((oy + y) * cols * fw + ox) * 4) as usize;
+                atlas.as_mut()[dst_start..dst_start + src.len()].copy_from_slice(src);
+            }
+        }
+        let meta = (decoded > 1).then(|| SpritesheetMeta {
+            cols,
+            rows,
+            frames: decoded,
+            duration: (decoded as f32 / out_fps).max(0.01),
+        });
+        Ok((atlas, meta))
+    })();
+    let _ = fs::remove_file(&tmp);
+    result
 }
 
 fn crop_if_needed(img: RgbaImage, img_w: u32, img_h: u32, _flags: u32) -> RgbaImage {
@@ -564,7 +749,7 @@ fn decode_rg88(data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     for i in 0..pixels {
         let r = data[i * 2];
         let g = data[i * 2 + 1];
-        out.extend_from_slice(&[r, g, g, g]);
+        out.extend_from_slice(&[r, r, r, g]);
     }
     Ok(out)
 }
@@ -576,7 +761,7 @@ fn decode_r8(data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(pixels * 4);
     for &v in &data[..pixels] {
-        out.extend_from_slice(&[v, v, v, 255]);
+        out.extend_from_slice(&[v, v, v, v]);
     }
     Ok(out)
 }

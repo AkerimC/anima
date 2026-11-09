@@ -661,6 +661,11 @@ impl App {
         match built {
             Ok(mut renderer) => {
                 renderer.set_paused(oc.paused);
+                if matches!(oc.wallpaper.as_ref().map(|w| &w.kind), Some(WallpaperKind::Scene)) {
+                    let muted = config.mute_for(&name);
+                    let _ = renderer.set_property("mute", if muted { "true" } else { "false" });
+                    renderer.set_volume(config.volume_for(&name));
+                }
                 if let Some(mcfg) = config.monitor(&name) {
                     for (k, v) in &mcfg.properties {
                         let _ = renderer.set_property(k, v);
