@@ -77,6 +77,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
     if let Some(fps) = opts.fps {
         config.general.fps = fps.clamp(1, 360);
     }
+    compositor::configure(&config.general.compositor);
 
     let conn = Connection::connect_to_env()
         .context("connecting to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
@@ -1383,6 +1384,7 @@ impl App {
                     format!("{} monitor(s)", monitors.len()),
                     serde_json::json!({
                         "version": crate::VERSION,
+                        "compositor": compositor::current().name(),
                         "uptime_secs": self.started.elapsed().as_secs(),
                         "focused_monitor": self.focused_monitor,
                         "fullscreen": self.any_fullscreen,

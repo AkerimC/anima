@@ -43,6 +43,13 @@ pub trait Compositor: Send + Sync {
         None
     }
 
+    /// Tiled window columns on the active workspace, as `(x on the strip,
+    /// width)` in logical pixels. Used to pick a wide window for games and
+    /// races. Empty: no per-window layout, the whole screen is used.
+    fn columns(&self) -> Vec<(f32, f32)> {
+        Vec::new()
+    }
+
     /// Ask the compositor where the cursor is: None if it can't be asked,
     /// Some(None) if it doesn't know right now.
     fn cursor(&self) -> Option<Option<(f32, f32)>> {
@@ -77,17 +84,56 @@ pub trait Compositor: Send + Sync {
     fn place_workspace_window(&self, _slot: usize) {}
 }
 
+/// The backend requested by the user, set once before the first `current()`.
+static PREFERENCE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Pick the compositor backend before the first [`current()`] call.
+///
+/// `auto` (the default) detects niri, then Hyprland, then falls back to
+/// generic polling. `niri`, `hyprland` and `generic` force one backend; if a
+/// forced backend is not running, detection falls back to `auto` with a
+/// warning so the daemon still starts. `ANIMA_COMPOSITOR` overrides the
+/// configured value, which is useful in a systemd unit.
+pub fn configure(preference: &str) {
+    let pref = std::env::var("ANIMA_COMPOSITOR").unwrap_or_else(|_| preference.to_string());
+    let pref = pref.trim().to_ascii_lowercase();
+    let _ = PREFERENCE.set(if pref.is_empty() || pref == "auto" { None } else { Some(pref) });
+}
+
+fn detect() -> Box<dyn Compositor> {
+    if let Some(n) = super::niri::Niri::detect() {
+        Box::new(n)
+    } else if let Some(h) = super::hyprland::Hyprland::detect() {
+        Box::new(h)
+    } else {
+        Box::new(Fallback)
+    }
+}
+
 /// The compositor animad runs on, detected once.
 pub fn current() -> &'static dyn Compositor {
     static CURRENT: OnceLock<Box<dyn Compositor>> = OnceLock::new();
     CURRENT
         .get_or_init(|| {
-            let c: Box<dyn Compositor> = if let Some(n) = super::niri::Niri::detect() {
-                Box::new(n)
-            } else if let Some(h) = super::hyprland::Hyprland::detect() {
-                Box::new(h)
-            } else {
-                Box::new(Fallback)
+            let c: Box<dyn Compositor> = match PREFERENCE.get().and_then(|p| p.as_deref()) {
+                Some("generic") => Box::new(Fallback),
+                Some(want) => {
+                    let picked: Option<Box<dyn Compositor>> = match want {
+                        "niri" => super::niri::Niri::detect().map(|c| Box::new(c) as Box<dyn Compositor>),
+                        "hyprland" => {
+                            super::hyprland::Hyprland::detect().map(|c| Box::new(c) as Box<dyn Compositor>)
+                        }
+                        other => {
+                            log::warn!("compositor: unknown backend {other:?} in config, detecting");
+                            None
+                        }
+                    };
+                    picked.unwrap_or_else(|| {
+                        log::warn!("compositor: {want} requested but not detected, detecting instead");
+                        detect()
+                    })
+                }
+                None => detect(),
             };
             log::info!("compositor: {}", c.name());
             c

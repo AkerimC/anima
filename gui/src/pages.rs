@@ -514,15 +514,15 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
         });
         group.add(&row);
     };
-    let choice = |group: &adw::PreferencesGroup, key: &'static str, title: &str, def: &str, values: &'static [(&'static str, &'static str)]| {
+    let choice = |group: &adw::PreferencesGroup, section: &'static str, key: &'static str, title: &str, def: &str, values: &'static [(&'static str, &'static str)]| {
         let labels: Vec<&str> = values.iter().map(|v| v.1).collect();
-        let current = config::text(&doc, "character", key, def);
+        let current = config::text(&doc, section, key, def);
         let row = adw::ComboRow::builder().title(title).model(&gtk::StringList::new(&labels)).build();
         row.set_selected(values.iter().position(|v| v.0 == current).unwrap_or(0) as u32);
         let u = ui.clone();
         row.connect_selected_notify(move |r| {
             if let Some(v) = values.get(r.selected() as usize) {
-                config::set("character", key, v.0);
+                config::set(section, key, v.0);
                 u.restart_soon();
             }
         });
@@ -532,13 +532,13 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
     let look = adw::PreferencesGroup::builder().title("Görünüm").build();
     spin(&look, "character", "opacity", "Saydamlık", 1.0, 0.05, 1.0, 0.05, 2);
     switch(&look, "character", "flip_x", "Yatay aynala", false);
-    choice(&look, "placement", "Yerleşim", "screen-front", &[
+    choice(&look, "character", "placement", "Yerleşim", "screen-front", &[
         ("screen-front", "Ekranın önünde"),
         ("wallpaper", "Duvar kağıdında"),
         ("window-inside", "Pencerenin içinde"),
         ("window-outside", "Pencerenin dışında"),
     ]);
-    choice(&look, "corner", "Köşe", "bottom-right", &[
+    choice(&look, "character", "corner", "Köşe", "bottom-right", &[
         ("bottom-right", "Sağ alt"),
         ("bottom-left", "Sol alt"),
         ("top-right", "Sağ üst"),
@@ -564,10 +564,26 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
     switch(&sound, "general", "audio_capture", "Masaüstü sesini dinle", true);
     page.add(&sound);
 
+    let comp = adw::PreferencesGroup::builder().title("Kompozitör").build();
+    choice(&comp, "general", "compositor", "Arka uç", "auto", &[
+        ("auto", "Otomatik algıla"),
+        ("hyprland", "Hyprland"),
+        ("niri", "niri"),
+        ("generic", "Genel (IPC yok)"),
+    ]);
+    let comp_note = gtk::Label::builder()
+        .label("Değişiklik, animad yeniden başlatılınca uygulanır.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    comp_note.add_css_class("dim-label");
+    comp.add(&comp_note);
+    page.add(&comp);
+
     let models = adw::PreferencesGroup::builder().title("3D karakterler").build();
     switch(&models, "character", "screen_light", "Ekran renkleriyle aydınlat", true);
     switch(&models, "character", "weapons", "Silahları göster", false);
-    switch(&models, "character", "windows", "Çalışma alanı başına pencere (Hyprland)", true);
+    switch(&models, "character", "windows", "Çalışma alanı başına pencere (Hyprland eklentisi)", true);
     page.add(&models);
 
     let perf = adw::PreferencesGroup::builder().title("Performans").build();

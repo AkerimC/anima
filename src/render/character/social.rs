@@ -2488,7 +2488,7 @@ impl CharacterOverlay {
         let w = self.view_w;
         let view_px = self.view[0] * w * 0.5;
         let middle = view_px + w * 0.5;
-        let cols = crate::backend::governor::niri_columns();
+        let cols = crate::backend::compositor::current().columns();
         let widest = cols.iter().map(|c| c.1).fold(0.0, f32::max);
         cols.into_iter()
             .filter(|c| c.1 >= widest * 0.9)
