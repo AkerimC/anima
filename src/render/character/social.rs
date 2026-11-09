@@ -509,6 +509,7 @@ impl CharacterOverlay {
     }
 
     pub(super) fn run_social(&mut self, dt: f32, mouse: [f32; 2]) {
+        self.social_age += dt;
         let n = self.extras.len() + 1;
         for i in 0..n {
             let wk = self.walk_of(i);
@@ -536,12 +537,12 @@ impl CharacterOverlay {
         self.social_tick -= dt;
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
-            if self.race.is_none() {
+            if self.race.is_none() && self.social_age >= tn().warm_alone {
                 for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Volley | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
                 for c in chats.iter_mut() {
-                    let full = c.members.len() >= tn().max_group as usize;
+                    let full = c.members.len() >= self.group_cap();
                     if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part) && self.overlap_join(c, n, full) {
                         continue;
                     }
@@ -557,6 +558,12 @@ impl CharacterOverlay {
             }
         }
         self.chats = chats;
+    }
+
+    /// Biggest a group may get: small ones only while they're settling in.
+    fn group_cap(&self) -> usize {
+        let cap = tn().max_group as usize;
+        if self.social_age < tn().warm_small { cap.min(3) } else { cap }
     }
 
     /// Drop members who were picked up, called away and so on; false when
@@ -966,13 +973,14 @@ impl CharacterOverlay {
         c.bob = 0.0;
         let size = c.members.len();
         if self.race.is_none()
+            && self.social_age >= tn().warm_race
             && self.race_quiet <= 0.0
             && size >= tn().race_group_min as usize
             && size <= tn().race_group_max as usize
             && self.walk.rand() < tn().race_chance
         {
             self.call_race(c);
-        } else if size == 2 && self.race.is_none() && !c.played.contains(&Game::Gift) && self.walk.rand() < tn().gift_chance {
+        } else if size == 2 && self.race.is_none() && self.social_age >= tn().warm_small && !c.played.contains(&Game::Gift) && self.walk.rand() < tn().gift_chance {
             c.played.push(Game::Gift);
             self.start_gift(c);
         }
@@ -1088,7 +1096,7 @@ impl CharacterOverlay {
     /// Start a game this group hasn't played yet, if it has the energy.
     fn next_game(&mut self, c: &mut Chat) -> bool {
         let mean = c.members.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / c.members.len() as f32;
-        if mean < tn().energy_game_need {
+        if mean < tn().energy_game_need || self.social_age < tn().warm_small {
             return false;
         }
         let Some(game) = self.choose_game(&c.played, c.members.len()) else {
@@ -3182,7 +3190,7 @@ impl CharacterOverlay {
             Stage::Talk => {
                 c.quiet += dt;
                 c.mood += dt;
-                if c.members.len() >= tn().mood_min as usize && c.mood >= tn().mood_after && self.race.is_none() {
+                if c.members.len() >= tn().mood_min as usize && c.mood >= tn().mood_after && self.race.is_none() && self.social_age >= tn().warm_small {
                     c.mood = -60.0;
                     if self.mood_split(c) {
                         return true;

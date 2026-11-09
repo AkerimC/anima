@@ -943,6 +943,8 @@ pub struct CharacterOverlay {
     race_crew: Vec<usize>,
     // seconds before another race can start by itself
     race_quiet: f32,
+    // seconds since the characters appeared
+    social_age: f32,
     view_w: f32,
     // notifications seen so far
     notified: u32,
@@ -1094,6 +1096,7 @@ impl CharacterOverlay {
             new_chats: Vec::new(),
             race_crew: Vec::new(),
             race_quiet: 0.0,
+            social_age: 0.0,
             view_w: 1.0,
             notified: crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed),
             clicks: 0,

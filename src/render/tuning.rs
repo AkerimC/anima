@@ -92,6 +92,11 @@ tuning! {
         drop_range: "Katılma mesafesi (karakter genişliği)" = 1.0, 0.0, 5.0, 0.1, 1;
     }
 
+    "Sohbet", "Açılışta alışma" {
+        warm_alone: "Sadece gezinme (sn)" = 180.0, 0.0, 3600.0, 10.0, 0;
+        warm_small: "Küçük sohbetler, oyun yok (sn'ye kadar)" = 300.0, 0.0, 3600.0, 10.0, 0;
+        warm_race: "Yarış olmadan (sn'ye kadar)" = 600.0, 0.0, 7200.0, 10.0, 0;
+    }
     "Sohbet", "Sohbetin başlaması" {
         look_every: "Yoklama aralığı (sn)" = 0.4, 0.1, 5.0, 0.1, 1;
         near_chance: "Yakın duranların konuşma şansı" = 0.03, 0.0, 1.0, 0.01, 2;
