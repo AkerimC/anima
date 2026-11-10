@@ -127,3 +127,26 @@ pub(super) fn find_eyes(img: &image::RgbaImage) -> Option<([f32; 4], [f32; 4], [
     let sum = skin.iter().fold([0.0; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
     Some((l, r, [sum[0] / n / 255.0, sum[1] / n / 255.0, sum[2] / n / 255.0]))
 }
+
+/// Where a chibi's eyes usually are, when they can't be found: a little
+/// below the middle of the head, either side of the centre.
+pub(super) fn guess_eyes(img: &image::RgbaImage) -> Option<([f32; 4], [f32; 4], [f32; 3])> {
+    let (w, h) = img.dimensions();
+    let (mut top, mut bot, mut left, mut right) = (h, 0, w, 0);
+    for (x, y, p) in img.enumerate_pixels() {
+        if p[3] > 40 {
+            top = top.min(y);
+            bot = bot.max(y);
+            left = left.min(x);
+            right = right.max(x);
+        }
+    }
+    if bot <= top || right <= left {
+        return None;
+    }
+    let (hh, ww) = ((bot - top) as f32, (right - left) as f32);
+    let (cx, cy) = ((left + right) as f32 * 0.5, top as f32 + hh * 0.43);
+    let (ew, eh) = (ww * 0.13, hh * 0.05);
+    let b = |x: f32| [(x - ew * 0.5) / w as f32, (cy - eh * 0.5) / h as f32, (x + ew * 0.5) / w as f32, (cy + eh * 0.5) / h as f32];
+    Some((b(cx - ww * 0.12), b(cx + ww * 0.12), [1.0, 0.9, 0.85]))
+}
