@@ -620,7 +620,7 @@ impl WalkState {
                 self.start_jump(tn().jump_height * tn().plant_hop);
                 // back on its feet: laughs it off (not mid-race)
                 if self.race.is_none() {
-                    let secs = tn().laugh_time * (0.7 + self.rand() * 0.6);
+                    let secs = tn().land_laugh * (0.7 + self.rand() * 0.6);
                     self.laugh(secs);
                 }
             }
@@ -1219,21 +1219,29 @@ impl CharacterOverlay {
             k += 1;
             let side = if k % 2 == 0 { 1.0 } else { -1.0 };
             let slot = (x + side * ((k + 1) / 2) as f32 * gap).clamp(0.0, width);
-            let near = (self.strip_px(i) - slot).abs() < gap * 0.4;
+            let here = self.strip_px(i);
+            let near = (here - slot).abs() < gap * 0.4;
+            // carried right away: they stop and watch rather than chase it across the screen
+            let far = (here - x).abs() > self.view_w * tn().carry_follow;
             let wk = self.walk_of(i);
             if !grounded(wk) || wk.social.is_some_and(|s| s.grabbed) {
                 continue;
             }
-            // one hop after another; standing under it they just bounce
-            let amp = tn().jump_height * if near { 0.2 } else { 0.35 };
-            wk.start_bob(amp);
             if let Some(r) = wk.social.as_mut() {
-                r.goal_px = slot;
-                r.speed = tn().carry_chase;
-                r.moving = !near;
-                r.leaping = true;
                 r.face_lock = false;
-                r.happy = true;
+                r.leaping = false;
+                if far || near {
+                    r.moving = false;
+                    r.face_left = x < here;
+                } else {
+                    r.goal_px = slot;
+                    r.speed = tn().carry_chase;
+                    r.moving = true;
+                }
+            }
+            // now and then a little hop, not one after another
+            if wk.rand() < 0.02 {
+                wk.start_bob(tn().jump_height * 0.12);
             }
         }
     }

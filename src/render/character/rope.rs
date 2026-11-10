@@ -136,8 +136,7 @@ void main() {
 // 4 a sleeping Z, 5 a drop of sweat, 6 a crumb of carrot, 7 the arrow over "it",
 // 8 a blindfold, 9 a bush, 10 a barrel, 11 a crate, 12 a music note,
 // 13 a fishing rod, 14 a line and float, 15 a star, 16 a rubber duck, 17 an old boot, 18 a tin can,
-// 20 confetti, 21 a beast out of the ground, 22 an umbrella, 23 a snowflake,
-// 24 a blanket (flipped: head end on the right), 25 a pillow
+// 20 confetti, 21 a beast out of the ground, 22 an umbrella, 23 a snowflake
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
@@ -345,40 +344,6 @@ vec4 umbrella(vec2 p) {
     col = mix(col, vec3(0.32, 0.22, 0.16), stick);
     return vec4(col, max(dome, stick));
 }
-vec4 blanket(vec2 p) {
-    // a soft mound over someone lying down: flat underneath, rounded on top,
-    // turned down at the head end, with polka dots and a big bow
-    float ar = (u_rect.z - u_rect.x) / max(u_rect.w - u_rect.y, 0.001) * 1.78;
-    float top = -0.95 + 1.8 * pow(max(0.0, 1.0 - pow(abs(p.x) / 0.98, 2.2)), 0.6);
-    float a = (1.0 - smoothstep(top - 0.04, top, p.y)) * step(-0.98, p.y) * step(abs(p.x), 0.98);
-    vec3 col = vec3(0.98, 0.72, 0.82);
-    vec2 g = vec2(p.x * ar, p.y) * 2.6;
-    vec2 cell = fract(g + vec2(0.5 * step(0.5, fract(g.y * 0.5)), 0.0)) - 0.5;
-    col = mix(col, vec3(1.0, 0.95, 0.97), (1.0 - smoothstep(0.13, 0.19, length(cell))) * 0.9);
-    // the turned-down edge at the head end
-    float fold = step(p.x, -0.62);
-    col = mix(col, vec3(1.0, 0.9, 0.94), fold);
-    col = mix(col, vec3(0.88, 0.55, 0.68), (1.0 - smoothstep(0.0, 0.03, abs(p.x + 0.62))) * 0.8);
-    // a little shading along the top
-    col = mix(col, vec3(0.86, 0.5, 0.64), smoothstep(top - 0.25, top, p.y) * 0.35);
-    // the bow, on the fold
-    vec2 b;
-    b = (p - vec2(-0.74, -0.95 + 1.8 * pow(max(0.0, 1.0 - pow(0.74 / 0.98, 2.2)), 0.6) - 0.1)) * vec2(ar, 1.0) / 0.55;
-    float loops = (1.0 - smoothstep(0.95, 1.05, length(vec2(abs(b.x) - 0.5, b.y * 1.3) / vec2(0.48, 0.42)))) * step(0.08, abs(b.x));
-    float knot = 1.0 - smoothstep(0.16, 0.22, length(b));
-    float tails = step(abs(abs(b.x) - 0.22 - (-b.y) * 0.25), 0.1) * step(-0.85, b.y) * step(b.y, -0.05);
-    float bow = max(max(loops, knot), tails);
-    col = mix(col, mix(vec3(0.93, 0.36, 0.53), vec3(0.76, 0.24, 0.42), knot), bow);
-    return vec4(col, max(a, bow));
-}
-vec4 pillow(vec2 p) {
-    // plump, a little pinched at the corners
-    float d = sdBox(p, vec2(0.78, 0.5), 0.42);
-    float a = 1.0 - smoothstep(-0.02, 0.03, d);
-    vec3 col = mix(vec3(0.82, 0.88, 1.0), vec3(0.97, 0.98, 1.0), clamp(p.y * 0.6 + 0.5, 0.0, 1.0));
-    col = mix(col, vec3(0.7, 0.76, 0.92), smoothstep(-0.18, 0.0, d) * 0.5);
-    return vec4(col, a);
-}
 vec4 snowflake(vec2 p) {
     float a = atan(p.y, p.x);
     float r = length(p);
@@ -397,7 +362,7 @@ vec4 confetti(vec2 p) {
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? blanket(p) : u_kind == 25 ? pillow(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
@@ -428,9 +393,8 @@ impl CarrotGl {
 }
 
 impl CharacterOverlay {
-    /// `behind`: only what lies under the characters (a pillow), else the rest.
-    pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget, behind: bool) {
-        let props: Vec<_> = self.props().into_iter().filter(|p| (p.0 == 25) == behind).filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, z))).collect();
+    pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
+        let props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, z))).collect();
         if props.is_empty() {
             return;
         }

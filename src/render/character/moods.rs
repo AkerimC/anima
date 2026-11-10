@@ -305,7 +305,8 @@ impl CharacterOverlay {
                     continue;
                 }
                 let wk = self.walk_ref(j);
-                let along = wk.at_leisure() || (chat.is_some() && wk.social.map(|s| s.chat) == chat);
+                // only those it's with: a passer-by doesn't laugh along
+                let along = chat.is_some() && wk.social.map(|s| s.chat) == chat;
                 if !along || self.bond(i, j).0 < tn().meet_friend || wk.giggle > 0.0 {
                     continue;
                 }
@@ -487,9 +488,11 @@ impl CharacterOverlay {
         self.moods.weather = w;
         if w.night && !was.night {
             // who's sleepy tonight
+            let now = super::weather::BEDTIME.load(Relaxed);
+            let (share, spread) = if now { (1.0, 4.0) } else { (tn().night_sleep, tn().night_spread) };
             for i in 0..n {
                 let wk = self.walk_of(i);
-                wk.night_wait = if wk.rand() < tn().night_sleep { Some(wk.rand() * tn().night_spread) } else { None };
+                wk.night_wait = if wk.rand() < share { Some(wk.rand() * spread) } else { None };
             }
         }
         if !w.night && was.night {
@@ -540,33 +543,6 @@ impl CharacterOverlay {
     }
 
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
-        // in bed: a pillow under the head and a blanket up to the chin
-        let actors = std::iter::once((&self.walk, self.hit_rect, self.visible, self.opaque)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible, e.opaque)));
-        for (k, (wk, r, seen, o)) in actors.enumerate() {
-            let h = r[3] - r[1];
-            let lying = wk.act == Act::Rest && wk.rest.is_some_and(|x| x.kind == RestKind::Sleep) && wk.rot.abs() > 1.2;
-            if h <= 0.0 || !seen || !lying {
-                continue;
-            }
-            // turned a quarter round: the head is to the left when turned anticlockwise
-            let head_left = wk.rot > 0.0;
-            let cx = (r[0] + r[2]) * 0.5;
-            let floor = r[1] + h * o[2];
-            let long = h * (o[2] - o[1]);
-            let thick = (r[2] - r[0]) * o[0] * 2.0;
-            let dir = if head_left { -1.0 } else { 1.0 };
-            let head = cx + dir * long * 0.5;
-            // the pillow, under the head
-            let (pw, ph) = (long * 0.46, thick * 0.5);
-            let px = head - dir * long * 0.2;
-            v.push((25, [px - pw * 0.5, floor - ph, px + pw * 0.5, floor + ph * 0.06], false, k));
-            // the blanket from the shoulders to past the feet, low over the body
-            // a chibi's head is nearly half of it: the blanket stops at the neck
-            let from = head - dir * long * 0.48;
-            let to = cx - dir * long * 0.55;
-            let (x0, x1) = (from.min(to), from.max(to));
-            v.push((24, [x0, floor - thick * 0.55, x1, floor + thick * 0.04], !head_left, k));
-        }
         // keepsakes: lying beside whoever's resting
         let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
         for (k, (wk, r, seen)) in actors.enumerate() {

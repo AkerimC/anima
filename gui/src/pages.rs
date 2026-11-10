@@ -196,10 +196,52 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
     race.add_css_class("suggested-action");
     race.connect_clicked(|_| daemon::race());
     flow.insert(&race, -1);
+    // trying things out: weather, bedtime, training
+    let tries = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(3)
+        .min_children_per_line(2)
+        .row_spacing(10)
+        .column_spacing(10)
+        .homogeneous(true)
+        .build();
+    let actions: [(&str, &str, &'static str, &'static str); 7] = [
+        ("Train", "applications-science-symbolic", "game", "train"),
+        ("Rain", "weather-showers-symbolic", "weather", "rain"),
+        ("Snow", "weather-snow-symbolic", "weather", "snow"),
+        ("Night", "weather-clear-night-symbolic", "weather", "night"),
+        ("Bedtime now", "night-light-symbolic", "weather", "bedtime"),
+        ("Clear sky", "weather-clear-symbolic", "weather", "clear"),
+        ("Real weather", "find-location-symbolic", "weather", "auto"),
+    ];
+    for (label, icon, cmd, arg) in actions {
+        let inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).margin_top(10).margin_bottom(10).build();
+        inner.append(&gtk::Image::builder().icon_name(icon).pixel_size(28).build());
+        inner.append(&gtk::Label::new(Some(label)));
+        let b = gtk::Button::builder().child(&inner).build();
+        b.add_css_class("tile");
+        let u = ui.clone();
+        b.connect_clicked(move |_| {
+            if !daemon::running() {
+                u.say("Anima is off");
+                return;
+            }
+            if cmd == "game" {
+                daemon::game(arg);
+            } else {
+                daemon::weather(arg);
+            }
+            u.say(&format!("{label}"));
+        });
+        tries.insert(&b, -1);
+    }
     let page = adw::PreferencesPage::new();
     let group = adw::PreferencesGroup::builder().title("Play now").description("Starts straight away with the characters nearest the screen, whatever their energy").build();
     group.add(&flow);
     page.add(&group);
+    let try_group = adw::PreferencesGroup::builder().title("Try it out").description("Weather stays as set until you pick Real weather. Bedtime sends everyone to bed at once.").build();
+    try_group.add(&tries);
+    page.add(&try_group);
     page.upcast()
 }
 

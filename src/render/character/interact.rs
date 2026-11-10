@@ -374,7 +374,7 @@ impl CharacterOverlay {
                             // land with a little bounce, sometimes a giggle
                             self.walk.start_jump(tn().jump_height * tn().land_hop);
                             if self.walk.social.is_none() && self.walk.rand() < 0.5 {
-                                let secs = tn().laugh_time * 0.5;
+                                let secs = tn().land_laugh * 0.5;
                                 self.walk.laugh(secs);
                             }
                         }

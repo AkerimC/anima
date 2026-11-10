@@ -80,6 +80,7 @@ tuning! {
         blind_sneak: "Sneaking to another hiding place (per s)" = 0.06, 0.0, 1.0, 0.01, 2;
     }
     "Roaming", "Liveliness" {
+        land_laugh: "Laughing after being thrown (s)" = 0.5, 0.0, 5.0, 0.1, 1;
         laugh_time: "Laughing it off after a tumble (s)" = 1.6, 0.0, 10.0, 0.1, 1;
         laugh_spread: "Friends nearby laugh along" = 0.6, 0.0, 1.0, 0.05, 2;
         look_around: "Looking around while standing (per s)" = 0.12, 0.0, 2.0, 0.01, 2;
@@ -304,7 +305,8 @@ tuning! {
         energy_game_cost: "Cost of a game" = 0.5, 0.0, 1.0, 0.05, 2;
     }
     "Games", "Starting games" {
-        carry_chase: "Chat mates hop after a carried one (speed)" = 0.9, 0.1, 3.0, 0.05, 2;
+        carry_chase: "Chat mates walk after a carried one (speed)" = 0.25, 0.1, 3.0, 0.05, 2;
+        carry_follow: "They follow it this far (screens)" = 0.35, 0.0, 2.0, 0.05, 2;
         throw_far: "Thrown this far from a game, out of it (widths)" = 6.0, 1.0, 40.0, 0.5, 1;
         game_after: "Start if nobody joins (s)" = 7.0, 0.5, 120.0, 0.5, 1;
         game_chance: "Chat turns into a game" = 0.35, 0.0, 1.0, 0.05, 2;

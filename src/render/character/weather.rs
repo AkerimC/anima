@@ -17,11 +17,15 @@ pub struct Weather {
 static NOW: Mutex<Weather> = Mutex::new(Weather { rain: false, snow: false, night: false });
 static FORCED: Mutex<Option<Weather>> = Mutex::new(None);
 // sunrise and sunset, minutes after midnight
+/// Asked for by hand: everyone goes to bed at once.
+pub(super) static BEDTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SUN: Mutex<(u32, u32)> = Mutex::new((7 * 60, 19 * 60));
 
-/// "rain", "snow", "night", "clear" or "auto".
+/// "rain", "snow", "night", "bedtime", "clear" or "auto".
 pub fn force(name: &str) -> bool {
+    BEDTIME.store(name == "bedtime", std::sync::atomic::Ordering::Relaxed);
     let w = match name {
+        "bedtime" => Some(Weather { night: true, ..Default::default() }),
         "rain" => Some(Weather { rain: true, ..Default::default() }),
         "snow" => Some(Weather { snow: true, ..Default::default() }),
         "night" => Some(Weather { night: true, ..Default::default() }),

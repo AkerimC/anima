@@ -1469,7 +1469,7 @@ impl App {
                 if crate::render::character::weather::force(&name) {
                     Response::ok(format!("weather: {name}"))
                 } else {
-                    Response::err("weather: rain, snow, night, clear or auto")
+                    Response::err("weather: rain, snow, night, bedtime, clear or auto")
                 }
             }
             Request::Quit => {

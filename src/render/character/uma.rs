@@ -103,3 +103,23 @@ pub(super) fn mask_eyes(img: &image::RgbaImage) -> Option<([f32; 4], [f32; 4], [
     let b = |x: f32| [(x - ew * 0.5) / w as f32, (eye_y - eh * 0.5) / h as f32, (x + ew * 0.5) / w as f32, (eye_y + eh * 0.5) / h as f32];
     Some((b(cx - hw * 0.19), b(cx + hw * 0.19), [1.0, 0.9, 0.85]))
 }
+
+/// Sleep mask spots set by hand in the settings (`eyes.json`: sprite path ->
+/// [x, y] in texture units), read again whenever the file changes.
+pub(super) fn eye_fix(source: &str) -> Option<[f32; 2]> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant, SystemTime};
+    type Fixes = (Option<Instant>, Option<SystemTime>, std::collections::HashMap<String, [f32; 2]>);
+    static FIXES: std::sync::LazyLock<Mutex<Fixes>> = std::sync::LazyLock::new(|| Mutex::new((None, None, std::collections::HashMap::new())));
+    let mut f = FIXES.lock().unwrap();
+    if f.0.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+        f.0 = Some(Instant::now());
+        let path = crate::util::data_dir().join("eyes.json");
+        let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if stamp != f.1 {
+            f.1 = stamp;
+            f.2 = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        }
+    }
+    f.2.get(source).copied()
+}

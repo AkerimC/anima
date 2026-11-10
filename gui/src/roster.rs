@@ -198,6 +198,10 @@ fn choices(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, path: &str) -> gtk::Wid
     let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
     friends.connect_clicked(move |_| p.set_child(Some(&friends_view(&rr, &p, i, &n))));
     list.append(&friends);
+    let mask = menu_button("Sleep mask", "night-light-symbolic");
+    let (rr, p, n, pth) = (r.clone(), pop.clone(), name.clone(), path.to_string());
+    mask.connect_clicked(move |_| p.set_child(Some(&mask_view(&rr, &p, i, &n, &pth))));
+    list.append(&mask);
     list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let remove = menu_button("Remove from line-up", "user-trash-symbolic");
     let (rr, p) = (r.clone(), pop.clone());
@@ -225,6 +229,84 @@ fn back_header(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, title: 
     t.add_css_class("heading");
     head.append(&t);
     head
+}
+
+fn eye_fixes_path() -> std::path::PathBuf {
+    anima::util::data_dir().join("eyes.json")
+}
+
+fn eye_fixes() -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(eye_fixes_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn save_eye_fixes(m: &serde_json::Map<String, serde_json::Value>) {
+    if let Ok(text) = serde_json::to_string_pretty(m) {
+        let _ = anima::util::atomic_write(&eye_fixes_path(), text.as_bytes());
+    }
+}
+
+/// Click on the character's eyes: its sleep mask goes there from now on.
+fn mask_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str) -> gtk::Widget {
+    let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(260).build();
+    b.append(&back_header(r, pop, i, name, "Sleep mask"));
+    let hint = gtk::Label::builder().label("Click between its eyes. The mask moves there at once.").wrap(true).xalign(0.0).build();
+    hint.add_css_class("dim-label");
+    b.append(&hint);
+    let pic = gtk::Picture::for_filename(path);
+    pic.set_content_fit(gtk::ContentFit::Contain);
+    pic.set_size_request(240, 300);
+    // the chosen spot, drawn over the picture
+    let mark = gtk::DrawingArea::builder().can_target(false).build();
+    let spot: Rc<std::cell::Cell<Option<(f64, f64)>>> = Rc::new(std::cell::Cell::new(
+        eye_fixes().get(path).and_then(|v| Some((v[0].as_f64()?, v[1].as_f64()?))),
+    ));
+    let (iw, ih) = image::image_dimensions(path).map(|(w, h)| (w as f64, h as f64)).unwrap_or((1.0, 1.0));
+    // where the picture is drawn inside the widget
+    let fit = move |w: f64, h: f64| {
+        let a = iw / ih;
+        if w / h > a { (h * a, h, (w - h * a) * 0.5, 0.0) } else { (w, w / a, 0.0, (h - w / a) * 0.5) }
+    };
+    let s = spot.clone();
+    mark.set_draw_func(move |_, cr, w, h| {
+        let Some((x, y)) = s.get() else { return };
+        let (dw, dh, ox, oy) = fit(w as f64, h as f64);
+        let (cx, cy) = (ox + x * dw, oy + y * dh);
+        cr.set_source_rgba(0.98, 0.6, 0.75, 0.85);
+        cr.rectangle(cx - dw * 0.22, cy - dh * 0.025, dw * 0.44, dh * 0.05);
+        let _ = cr.fill();
+    });
+    let over = gtk::Overlay::builder().child(&pic).build();
+    over.add_overlay(&mark);
+    let click = gtk::GestureClick::new();
+    let (s, m, key, u) = (spot.clone(), mark.clone(), path.to_string(), r.ui.clone());
+    click.connect_pressed(move |g, _, x, y| {
+        let Some(w) = g.widget() else { return };
+        let (dw, dh, ox, oy) = fit(w.width() as f64, w.height() as f64);
+        let (fx, fy) = ((x - ox) / dw, (y - oy) / dh);
+        if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fy) {
+            return;
+        }
+        s.set(Some((fx, fy)));
+        m.queue_draw();
+        let mut all = eye_fixes();
+        all.insert(key.clone(), serde_json::json!([fx, fy]));
+        save_eye_fixes(&all);
+        u.say("Sleep mask moved");
+    });
+    over.add_controller(click);
+    b.append(&over);
+    let reset = gtk::Button::with_label("Back to automatic");
+    let (s, m, key, u) = (spot.clone(), mark.clone(), path.to_string(), r.ui.clone());
+    reset.connect_clicked(move |_| {
+        s.set(None);
+        m.queue_draw();
+        let mut all = eye_fixes();
+        all.remove(&key);
+        save_eye_fixes(&all);
+        u.say("Sleep mask found automatically again");
+    });
+    b.append(&reset);
+    b.upcast()
 }
 
 /// Everything anima knows about the characters, or None if it isn't running.

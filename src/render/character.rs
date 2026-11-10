@@ -975,8 +975,8 @@ void main() {
             vec2 mid = (a + b) * 0.5;
             float along = dot(P - mid, dir);
             float across = dot(P - mid, nrm);
-            float half_len = length(b - a) * 0.5 + ew * 0.6;
-            float half_h = eh * 0.95;
+            float half_len = length(b - a) * 0.5 + ew * 0.95;
+            float half_h = eh * 1.4;
             // the mask itself: a soft rounded band
             vec2 m = vec2(max(abs(along) - half_len + half_h, 0.0), across);
             float mask = 1.0 - smoothstep(half_h - 0.003, half_h + 0.002, length(m));
@@ -998,8 +998,8 @@ void main() {
             }
             col = mix(col, vec3(0.86, 0.5, 0.64), smoothstep(half_h * 0.75, half_h, length(m)) * 0.6);
             // the bow, at the outer corner of one eye
-            vec2 bow = b + dir * (ew * 0.8) - nrm * (half_h * 0.95);
-            vec2 r = vec2(dot(P - bow, dir), dot(P - bow, nrm)) / (eh * 1.25);
+            vec2 bow = b + dir * (ew * 1.05) - nrm * (half_h * 0.9);
+            vec2 r = vec2(dot(P - bow, dir), dot(P - bow, nrm)) / (eh * 2.0);
             float loops = 1.0 - smoothstep(0.95, 1.05, length(vec2(abs(r.x) - 0.55, r.y * 1.5) / vec2(0.5, 0.42)));
             loops *= step(0.08, abs(r.x));
             float knot = 1.0 - smoothstep(0.17, 0.23, length(r));
@@ -2194,7 +2194,16 @@ impl CharacterOverlay {
             self.lids += (goal - self.lids) * (dt * 3.0).min(1.0);
             let lids = if self.lids < 0.02 { 0.0 } else { self.lids };
             self.program.set_f32(gl, "u_sleep", lids);
-            if let Some((l, r, _)) = self.eyes {
+            // put right by hand in the settings: the mask centred on that spot
+            let fixed = self.eyes.map(|(l, r, s)| match uma::eye_fix(&self.config.source) {
+                Some([x, y]) => {
+                    let (mx, my) = ((l[0] + r[2]) * 0.5, (l[1] + l[3] + r[1] + r[3]) * 0.25);
+                    let (dx, dy) = (x - mx, y - my);
+                    ([l[0] + dx, l[1] + dy, l[2] + dx, l[3] + dy], [r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy], s)
+                }
+                None => (l, r, s),
+            });
+            if let Some((l, r, _)) = fixed {
                 let aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
                 self.program.set_f32(gl, "u_tex_aspect", aspect);
                 self.program.set_vec4(gl, "u_eye_l", l);
@@ -2224,8 +2233,6 @@ impl CharacterOverlay {
             let n = self.extras.len() + 1;
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal));
-            // what lies under them (pillows) first
-            self.draw_carrot(gl, info, target, true);
             for i in order {
                 if i == 0 {
                     self.draw_pending(gl, target);
@@ -2234,7 +2241,7 @@ impl CharacterOverlay {
                 }
             }
             self.draw_ropes(gl, info, target);
-            self.draw_carrot(gl, info, target, false);
+            self.draw_carrot(gl, info, target);
         }
         Ok(())
     }
