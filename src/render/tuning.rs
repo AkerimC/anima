@@ -132,6 +132,7 @@ tuning! {
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
     }
     "Roaming", "Weather" {
+        carry_keepsake: "Carries its favourite keepsake on its back (share of the time)" = 0.4, 0.0, 1.0, 0.05, 2;
         weather_show: "Weather shown: 0 off, 1 around them, 2 whole screen" = 1.0, 0.0, 2.0, 1.0, 0;
         drop_swing: "Swung this hard, the umbrella flies off" = 5.0, 0.5, 30.0, 0.5, 1;
         snow_settle: "Snow piles up on heads over (s)" = 45.0, 1.0, 600.0, 5.0, 0;

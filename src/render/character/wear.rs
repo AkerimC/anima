@@ -34,6 +34,8 @@ pub enum Anchor {
     Neck,
     Back,
     Hand,
+    // the middle of the chest, where it holds things close
+    Chest,
 }
 
 impl Anchor {
@@ -188,6 +190,7 @@ impl CharacterOverlay {
             Anchor::Neck => a.neck,
             Anchor::Back => a.back,
             Anchor::Hand => hand,
+            Anchor::Chest => [(a.hands[0][0] + a.hands[1][0]) * 0.5, a.neck[1] + (a.feet[1] - a.neck[1]) * 0.2],
         };
         // texture units -> sprite space, mirrored as the sprite is
         let sx = |u: f32| (if flip { 1.0 - u } else { u }) * 2.0 - 1.0;
@@ -212,6 +215,15 @@ impl CharacterOverlay {
                     continue;
                 }
                 out.push(Worn { kind: it.kind, rect: place(it.anchor, it.size, it.pivot, it.offset), flip, behind: it.behind, image: it.image.clone() });
+            }
+        }
+        // its favourite keepsake: hugged to its chest in its sleep, now and
+        // then carried on its back
+        if let Some(kind) = wk.keepsake {
+            if asleep {
+                out.push(Worn { kind, rect: place(Anchor::Chest, [0.46, 0.4], [0.5, 0.5], [0.0, 0.0]), flip, behind: false, image: None });
+            } else if wk.carry && wk.act != Act::Rest {
+                out.push(Worn { kind, rect: place(Anchor::Back, [0.5, 0.44], [0.5, 0.5], [0.0, -0.05]), flip, behind: true, image: None });
             }
         }
         let weather = super::weather::now();

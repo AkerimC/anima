@@ -545,15 +545,20 @@ impl CharacterOverlay {
                     wk.night_wait = Some(t - dt);
                 }
             }
-            // in bed or sitting about: its favourite thing beside it
-            if wk.act == Act::Rest {
-                if wk.keepsake.is_none() {
-                    let name = self.character_name(i);
-                    let fav = self.moods.keepsakes.favourite(&name);
-                    self.walk_of(i).keepsake = Some(fav.unwrap_or(-1));
-                }
-            } else if wk.keepsake.is_some() {
-                wk.keepsake = None;
+            // its favourite keepsake, looked up now and then; some days it
+            // carries it about on its back
+            wk.fav_t -= dt;
+            if wk.fav_t <= 0.0 {
+                wk.fav_t = 20.0;
+                let name = self.character_name(i);
+                let fav = self.moods.keepsakes.favourite(&name);
+                self.walk_of(i).keepsake = fav;
+            }
+            let wk = self.walk_of(i);
+            wk.carry_t -= dt;
+            if wk.carry_t <= 0.0 {
+                wk.carry_t = 60.0 + wk.rand() * 120.0;
+                wk.carry = wk.keepsake.is_some() && wk.rand() < tn().carry_keepsake;
             }
             // swung about hard in the rain: the umbrella flies out of its hand
             let wk = self.walk_ref(i);
@@ -668,19 +673,6 @@ impl CharacterOverlay {
     }
 
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
-        // keepsakes: lying beside whoever's resting
-        let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
-        for (k, (wk, r, seen)) in actors.enumerate() {
-            let Some(kind) = wk.keepsake.filter(|&k| k >= 0) else { continue };
-            let h = r[3] - r[1];
-            if h <= 0.0 || !seen {
-                continue;
-            }
-            let size = h * 0.3;
-            let side = if wk.left { 1.0 } else { -1.0 };
-            let x = (r[0] + r[2]) * 0.5 + side * h * 0.42;
-            v.push((kind, [x - size * 0.5, r[3] - size, x + size * 0.5, r[3]], false, k));
-        }
         // rain: an umbrella over everyone not busy in a game; snow: flakes about them
         let w = self.moods.weather;
         if (w.rain || w.snow) && (0.5..1.5).contains(&tn().weather_show) {

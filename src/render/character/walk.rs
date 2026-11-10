@@ -135,8 +135,11 @@ pub(super) struct WalkState {
     pub(super) in_game: bool,
     // trained a while ago: not again for a bit
     pub(super) train_cool: f32,
-    // its favourite keepsake while resting (-1: has none)
+    // its favourite keepsake, when to look again, whether it carries it about now, till when
     pub(super) keepsake: Option<i32>,
+    pub(super) fav_t: f32,
+    pub(super) carry: bool,
+    pub(super) carry_t: f32,
     // night: seconds until it goes to bed, and whether it's in bed for the night
     pub(super) night_wait: Option<f32>,
     pub(super) night_sleep: bool,
