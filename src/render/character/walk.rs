@@ -135,6 +135,8 @@ pub(super) struct WalkState {
     // whether one is open over it (it then floats down slowly)
     pub(super) brolly: u8,
     pub(super) parasol: bool,
+    // this jump started under an open umbrella
+    pub(super) floaty: bool,
     // already knocked about in this tumble
     pub(super) jolted: bool,
     // playing a game right now (not just chatting), kept up by the main character
@@ -275,6 +277,19 @@ impl WalkState {
         self.jump = 0.0;
     }
 
+    /// Height of a jump `t` of the way through it (0..1, peak 1). Under an
+    /// open umbrella it goes up quickly and drifts down slowly.
+    pub(super) fn arc(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let u = if self.floaty {
+            let peak = tn().parasol_peak;
+            if t < peak { t / peak * 0.5 } else { 0.5 + (t - peak) / (1.0 - peak).max(0.01) * 0.5 }
+        } else {
+            t
+        };
+        4.0 * u * (1.0 - u)
+    }
+
     pub(super) fn start_jump(&mut self, amp: f32) {
         self.catch_jump = false;
         self.act = Act::Jump;
@@ -282,6 +297,7 @@ impl WalkState {
         // higher jumps hang in the air a bit longer, and longer still under an
         // open umbrella (carrot grab, tag, any game in the rain)
         let hang = if self.parasol { tn().parasol_hang } else { 1.0 };
+        self.floaty = self.parasol;
         self.jump_dur = tn().jump_time * (amp / tn().jump_height).sqrt().max(1.0) * hang;
         self.jump = self.jump_dur;
     }
@@ -397,7 +413,7 @@ impl WalkState {
             self.social_hop(dt);
             self.jump -= dt;
             let t = 1.0 - (self.jump / self.jump_dur).max(0.0);
-            height = 4.0 * t * (1.0 - t);
+            height = self.arc(t);
             if self.jump <= 0.0 {
                 self.act = Act::Idle;
                 self.timer = 0.5 + self.rand();

@@ -92,7 +92,7 @@ impl CharacterOverlay {
                         // caught mid-jump: keep it at the height it is drawn at
                         if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
                             let t = 1.0 - (a.walk.jump / a.walk.jump_dur).clamp(0.0, 1.0);
-                            a.walk.air += 4.0 * t * (1.0 - t) * a.walk.jump_amp;
+                            a.walk.air += a.walk.arc(t) * a.walk.jump_amp;
                             a.walk.jump = 0.0;
                         }
                         a.walk.act = Act::Held;
@@ -402,7 +402,7 @@ impl CharacterOverlay {
             if (mx - hx).powi(2) + (my - hy).powi(2) <= near * near {
                 let wk = &mut self.walk;
                 let t = 1.0 - (wk.jump / wk.jump_dur.max(0.001)).clamp(0.0, 1.0);
-                wk.air += 4.0 * t * (1.0 - t) * wk.jump_amp;
+                wk.air += wk.arc(t) * wk.jump_amp;
                 wk.jump = 0.0;
                 wk.catch_jump = false;
                 wk.act = Act::Held;

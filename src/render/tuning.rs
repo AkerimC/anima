@@ -136,8 +136,9 @@ tuning! {
         weather_show: "Weather shown: 0 off, 1 around them, 2 whole screen" = 1.0, 0.0, 2.0, 1.0, 0;
         jolt_drop: "A tumble knocks the umbrella out of the hand" = 0.7, 0.0, 1.0, 0.05, 2;
         parasol_drag: "Open umbrella on the back slows games (speed share)" = 0.85, 0.3, 1.0, 0.05, 2;
-        parasol_hang: "Jumps under an open umbrella last (times)" = 1.5, 1.0, 4.0, 0.1, 1;
-        parasol_fall: "Gravity under an open umbrella (share)" = 0.3, 0.05, 1.0, 0.05, 2;
+        parasol_hang: "Jumps under an open umbrella last (times)" = 1.8, 1.0, 4.0, 0.1, 1;
+        parasol_peak: "Under an umbrella, the top of a jump comes at (share of it)" = 0.3, 0.1, 0.5, 0.05, 2;
+        parasol_fall: "Gravity under an open umbrella (share)" = 0.22, 0.05, 1.0, 0.05, 2;
         parasol_speed: "Fastest fall under an open umbrella" = 2.0, 0.2, 20.0, 0.1, 1;
         drop_swing: "Swung this hard, the umbrella flies off" = 5.0, 0.5, 30.0, 0.5, 1;
         snow_settle: "Snow piles up on heads over (s)" = 45.0, 1.0, 600.0, 5.0, 0;
