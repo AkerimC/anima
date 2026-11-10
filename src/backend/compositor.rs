@@ -50,6 +50,13 @@ pub trait Compositor: Send + Sync {
         Vec::new()
     }
 
+    /// Where window `id` sits on the strip: `(left edge, width)` in logical
+    /// pixels. Used to glance at a window that just opened; None means the
+    /// character guesses a spot on screen.
+    fn window_x(&self, _id: u64) -> Option<(f32, f32)> {
+        None
+    }
+
     /// Ask the compositor where the cursor is: None if it can't be asked,
     /// Some(None) if it doesn't know right now.
     fn cursor(&self) -> Option<Option<(f32, f32)>> {

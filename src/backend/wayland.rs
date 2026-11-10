@@ -136,6 +136,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         active_window: None,
         focused_monitor: std::env::var("ANIMA_MONITOR").ok(),
         any_fullscreen: false,
+        fs_visits: false,
         any_maximized: false,
         on_battery: false,
         battery_percent: None,
@@ -143,6 +144,9 @@ pub fn run(opts: RunOptions) -> Result<()> {
         last_playlist_advance: Instant::now(),
         playlist_idx: 0,
         exit: false,
+        lock_last: Instant::now(),
+        lock_frames: 0,
+        lock_heard: Instant::now(),
         socket,
         started: Instant::now(),
     };
@@ -250,6 +254,8 @@ struct FrontOverlayCtx {
     /// placed by the compositor backend; this surface is a 1x1 frame clock.
     windowed: bool,
     windows: WorkspaceWindows,
+    /// Offscreen target for the lock screen frames: fbo, texture, size.
+    lock_fbo: Option<(glow::Framebuffer, glow::Texture, (i32, i32))>,
 }
 
 struct OutputCtx {
@@ -341,6 +347,8 @@ pub struct App {
 
     focused_monitor: Option<String>,
     any_fullscreen: bool,
+    /// Fullscreen, but an app the characters may visit.
+    fs_visits: bool,
     any_maximized: bool,
     on_battery: bool,
     battery_percent: Option<u8>,
@@ -349,6 +357,10 @@ pub struct App {
     playlist_idx: usize,
 
     exit: bool,
+    /// Lock screen: last frame drawn for it, frames so far, last word from it.
+    lock_last: Instant,
+    lock_frames: u64,
+    lock_heard: Instant,
     socket: PathBuf,
     started: Instant,
 }
@@ -501,6 +513,7 @@ impl App {
                     input_at: Instant::now(),
                     windowed,
                     windows: WorkspaceWindows::default(),
+                    lock_fbo: None,
                 });
             } else {
                 let (w, h) = (self.outputs[idx].width, self.outputs[idx].height);
@@ -610,7 +623,7 @@ impl App {
             }
         }
         fo.configured = true;
-        if !self.outputs[idx].paused && !self.any_fullscreen {
+        if !self.outputs[idx].paused && (!self.any_fullscreen || self.fs_visits) {
             self.outputs[idx].overlay_hidden = false;
         }
     }
@@ -814,6 +827,75 @@ impl App {
             })
     }
 
+    /// Back to the screen: the usual frames take over again.
+    fn lock_off(&mut self) {
+        log::info!("lock screen: gone");
+        for idx in 0..self.outputs.len() {
+            self.outputs[idx].animating = true;
+            self.schedule_render(idx);
+        }
+    }
+
+    /// One frame of the characters for the lock screen: drawn offscreen and
+    /// the bottom of it written to $XDG_RUNTIME_DIR/anima-lock/frame.png.
+    fn render_lock_frame(&mut self) {
+        let now = Instant::now();
+        let delta = now.duration_since(self.lock_last).as_secs_f64().min(0.1);
+        self.lock_last = now;
+        self.lock_frames += 1;
+        let frame = self.lock_frames;
+        let Some(oc) = self.outputs.iter_mut().find(|o| o.front_overlay.as_ref().is_some_and(|f| f.character.is_some())) else { return };
+        let (w, h, scale, start) = (oc.width, oc.height, oc.scale, oc.start);
+        let Some(fo) = oc.front_overlay.as_mut() else { return };
+        let (Some(gl), Some(ctx), Some(surf), Some(ch)) = (fo.gl.as_ref(), fo.gl_context.as_ref(), fo.gl_surface.as_ref(), fo.character.as_mut()) else { return };
+        if w <= 0 || h <= 0 || ctx.make_current(surf).is_err() {
+            return;
+        }
+        unsafe {
+            if fo.lock_fbo.as_ref().is_none_or(|f| f.2 != (w, h)) {
+                if let Some((fbo, tex, _)) = fo.lock_fbo.take() {
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(tex);
+                }
+                let (Ok(tex), Ok(fbo)) = (gl.create_texture(), gl.create_framebuffer()) else { return };
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, w, h);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+                fo.lock_fbo = Some((fbo, tex, (w, h)));
+            }
+            let Some((fbo, _, _)) = fo.lock_fbo else { return };
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.viewport(0, 0, w, h);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        let info = FrameInfo {
+            width: w,
+            height: h,
+            time: now.duration_since(start).as_secs_f64(),
+            delta,
+            frame,
+            paused: false,
+            audio: [0.0; 4],
+            spectrum: [0.0; 64],
+            beat: 0.0,
+            mouth: [0.0; 4],
+            mouse: [-10000.0, -10000.0],
+            scale: scale as f32,
+        };
+        let _ = ch.render(gl, &info, None, &mut SharedSurface);
+        // the characters live along the bottom
+        let band = ((h as f32 * LOCK_BAND) as i32).clamp(1, h);
+        let mut pixels = vec![0u8; (w * band * 4) as usize];
+        unsafe {
+            gl.read_pixels(0, 0, w, band, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut pixels)));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        lock_write(pixels, w as u32, band as u32);
+    }
+
     fn schedule_render(&mut self, idx: usize) {
         if let Some(oc) = self.outputs.get_mut(idx) {
             if oc.paused || !oc.configured || oc.renderer.is_none() {
@@ -955,7 +1037,7 @@ impl App {
 
         // Also render the transparent front overlay surface if active!
         if let Some(fo) = oc.front_overlay.as_mut() {
-            if fo.configured && !oc.overlay_hidden {
+            if fo.configured && !oc.overlay_hidden && !crate::render::character::LOCK_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
                 if let (Some(fo_gl), Some(fo_ctx), Some(fo_surf), Some(ch)) = (
                     fo.gl.as_ref(),
                     fo.gl_context.as_ref(),
@@ -1067,7 +1149,7 @@ impl App {
 
     fn desired_paused(&self, idx: usize) -> bool {
         let g = &self.config.general;
-        let global = (g.pause_on_fullscreen && self.any_fullscreen)
+        let global = (g.pause_on_fullscreen && self.any_fullscreen && !self.fs_visits)
             || (g.pause_on_maximized && self.any_maximized)
             || (g.pause_on_battery && self.on_battery)
             || (g.low_battery_pause > 0
@@ -1078,13 +1160,21 @@ impl App {
         self.outputs[idx].user_paused || global
     }
 
+    /// Is the focused app one the characters may come out over when fullscreen?
+    /// Only those listed: drawing over a game can cost it frames.
+    fn character_may_visit(&self) -> bool {
+        let c = &self.config.character;
+        let Some(app) = super::governor::focused_app().map(|a| a.to_lowercase()) else { return false };
+        c.enabled && c.walk && c.fullscreen_apps.iter().any(|f| !f.is_empty() && app.contains(&f.to_lowercase()))
+    }
+
     fn refresh_pause(&mut self) {
         for idx in 0..self.outputs.len() {
             let desired = self.desired_paused(idx);
             // Never leave a character overlay floating above fullscreen
             // content, even when the wallpaper itself is allowed to keep
             // running.
-            let hide_overlay = desired || self.any_fullscreen;
+            let hide_overlay = if self.fs_visits { self.outputs[idx].user_paused } else { desired || self.any_fullscreen };
             if self.outputs[idx].front_overlay.is_some() {
                 let was_hidden = self.outputs[idx].overlay_hidden;
                 if hide_overlay && !was_hidden {
@@ -1125,10 +1215,12 @@ impl App {
             if let Some(ch) = v.get_mut("character").and_then(|c| c.as_object_mut()) {
                 ch.remove("extra");
                 ch.remove("tuning");
+                ch.remove("source");
+                ch.remove("source_happy");
             }
             v
         };
-        (self.config.character.extra != new.character.extra || self.config.character.tuning != new.character.tuning)
+        (self.config.character.extra != new.character.extra || self.config.character.source != new.character.source || self.config.character.tuning != new.character.tuning)
             && strip(&self.config) == strip(new)
     }
 
@@ -1241,6 +1333,9 @@ impl App {
     fn next_timeout(&self) -> Duration {
         let now = Instant::now();
         let mut timeout = Duration::from_secs(1);
+        if crate::render::character::LOCK_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+            timeout = LOCK_FRAME.saturating_sub(self.lock_last.elapsed());
+        }
         for oc in &self.outputs {
             if let Some(due) = oc.due_at {
                 let wait = due.saturating_duration_since(now);
@@ -1251,6 +1346,15 @@ impl App {
     }
 
     fn tick(&mut self) {
+        if crate::render::character::LOCK_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+            // the lock screen went away without saying so
+            if self.lock_heard.elapsed() > Duration::from_secs(15) {
+                crate::render::character::LOCK_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.lock_off();
+            } else if self.lock_last.elapsed() >= LOCK_FRAME {
+                self.render_lock_frame();
+            }
+        }
         if self.last_battery_check.elapsed() > Duration::from_secs(30) {
             if self.config.general.pause_on_battery
                 || self.config.general.low_battery_pause > 0
@@ -1342,6 +1446,27 @@ impl App {
         let Command { request, reply } = cmd;
         let response = match request {
             Request::Ping => Response::ok(format!("anima {} is running", crate::VERSION)),
+            Request::LockScreen { on } => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let was = crate::render::character::LOCK_SCREEN.swap(on, Relaxed);
+                if on {
+                    self.lock_heard = Instant::now();
+                    if !was {
+                        self.lock_last = Instant::now();
+                        log::info!("lock screen: drawing the characters for it");
+                    }
+                } else if was {
+                    self.lock_off();
+                }
+                Response::ok(if on { "lock screen on" } else { "lock screen off" })
+            }
+            Request::CharacterInfo => {
+                let info = self.outputs.iter_mut().find_map(|oc| oc.front_overlay.as_mut().and_then(|f| f.character.as_mut()).map(|ch| ch.status()));
+                match info {
+                    Some(v) => Response::with_data("characters", v),
+                    None => Response::err("no characters on screen"),
+                }
+            }
             Request::Race => {
                 crate::render::character::RACE_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
                 Response::ok("race started")
@@ -1699,7 +1824,9 @@ impl App {
                 Ok(config) if self.only_team_changed(&config) => {
                     // only characters added/removed: keep the others where they are
                     let extra = config.character.extra.clone();
-                    let team_changed = extra != self.config.character.extra;
+                    let source = config.character.source.clone();
+                    let source_changed = source != self.config.character.source;
+                    let team_changed = extra != self.config.character.extra || source_changed;
                     crate::render::tuning::set(config.character.tuning);
                     self.config = config;
                     for oc in self.outputs.iter_mut().filter(|_| team_changed) {
@@ -1709,6 +1836,11 @@ impl App {
                                 (&fo.gl_context, &fo.gl_surface, &fo.gl, fo.character.as_mut())
                             {
                                 if ctx.make_current(surf).is_ok() {
+                                    if source_changed && !ch.promote(&source) {
+                                        ch.config.source = source.clone();
+                                        ch.config.source_happy = String::new();
+                                        let _ = ch.reload_source(gl, w, h);
+                                    }
                                     ch.update_extras(gl, &extra, w, h);
                                 }
                             }
@@ -1748,7 +1880,11 @@ impl App {
                 active_rect,
             } => {
                 self.active_window = active_rect;
-                if self.any_fullscreen != fullscreen || self.any_maximized != maximized {
+                let visits = fullscreen && self.character_may_visit();
+                let visits_changed = visits != self.fs_visits;
+                self.fs_visits = visits;
+                super::desktop::FS_VISIT.store(visits, std::sync::atomic::Ordering::Relaxed);
+                if self.any_fullscreen != fullscreen || self.any_maximized != maximized || visits_changed {
                     log::debug!("fullscreen = {fullscreen}, maximized = {maximized}");
                     self.any_fullscreen = fullscreen;
                     self.any_maximized = maximized;
@@ -2250,3 +2386,69 @@ impl PointerHandler for App {
 delegate_output!(App);
 delegate_layer!(App);
 delegate_registry!(App);
+
+/// Lock screen frames: this often, and this much of the screen from the bottom.
+const LOCK_FRAME: Duration = Duration::from_millis(50);
+const LOCK_BAND: f32 = 0.45;
+
+/// Turns a frame (premultiplied, bottom row first) into a PNG on a worker
+/// thread; a frame that arrives while the last is still being written is
+/// dropped.
+fn lock_write(pixels: Vec<u8>, w: u32, h: u32) {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering::Relaxed;
+    if BUSY.swap(true, Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("anima-lockframe".into()).spawn(move || {
+        // half size (the lock screen scales it back up): a quarter of the
+        // work to write and for the lock screen to read
+        let row = (w * 4) as usize;
+        let (hw, hh) = (w / 2, h / 2);
+        let mut img = vec![0u8; (hw * hh * 4) as usize];
+        for y in 0..hh as usize {
+            // bottom row first in GL
+            let r0 = h as usize - 1 - y * 2;
+            let r1 = r0.saturating_sub(1);
+            for x in 0..hw as usize {
+                let mut sum = [0u32; 4];
+                for r in [r0, r1] {
+                    for c in [x * 2, x * 2 + 1] {
+                        let p = &pixels[r * row + c * 4..][..4];
+                        for k in 0..4 {
+                            sum[k] += p[k] as u32;
+                        }
+                    }
+                }
+                let d = &mut img[(y * hw as usize + x) * 4..][..4];
+                let a = sum[3];
+                if a > 0 {
+                    for k in 0..3 {
+                        d[k] = ((sum[k] * 255 + a / 2) / a).min(255) as u8;
+                    }
+                }
+                d[3] = ((a + 2) / 4) as u8;
+            }
+        }
+        let (w, h) = (hw, hh);
+        let dir = crate::util::runtime_dir().join("anima-lock");
+        let _ = std::fs::create_dir_all(&dir);
+        let tmp = dir.join("frame.tmp.png");
+        let ok = std::fs::File::create(&tmp).ok().is_some_and(|f| {
+            use image::ImageEncoder;
+            let enc = image::codecs::png::PngEncoder::new_with_quality(
+                std::io::BufWriter::new(f),
+                image::codecs::png::CompressionType::Fast,
+                image::codecs::png::FilterType::NoFilter,
+            );
+            enc.write_image(&img, w, h, image::ExtendedColorType::Rgba8).is_ok()
+        });
+        if ok {
+            let _ = std::fs::rename(&tmp, dir.join("frame.png"));
+        }
+        BUSY.store(false, Relaxed);
+    });
+    if spawned.is_err() {
+        BUSY.store(false, Relaxed);
+    }
+}

@@ -238,6 +238,87 @@ pub(super) fn niri_gesture_scroll(dx: f32) {
 pub static STRIP: std::sync::Mutex<Option<Strip>> = std::sync::Mutex::new(None);
 
 /// Columns of tiled windows on the active niri workspace: (x on the strip, width), logical px.
+static OVERVIEW_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FOCUSED_APP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// app_id of the focused window, as last seen.
+pub fn focused_app() -> Option<String> {
+    FOCUSED_APP.lock().unwrap().clone()
+}
+
+static WORKSPACES: std::sync::Mutex<Option<Vec<Space>>> = std::sync::Mutex::new(None);
+static WINDOW_COUNTS: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// How many windows a workspace has.
+pub fn window_count(id: u64) -> usize {
+    WINDOW_COUNTS.lock().unwrap().iter().find(|c| c.0 == id).map_or(0, |c| c.1)
+}
+
+/// A workspace of the focused output, as niri draws it right now.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Space {
+    pub id: u64,
+    /// x, y, width, height, logical px
+    pub rect: [f32; 4],
+    pub active: bool,
+    pub has_windows: bool,
+}
+
+/// None without the `WorkspacesGeometry` request of contrib's niri patch:
+/// the characters then all share the one view, as on other compositors.
+pub fn workspaces() -> Option<Vec<Space>> {
+    WORKSPACES.lock().unwrap().clone()
+}
+
+fn read_workspaces(sock: &Path) -> Option<Vec<Space>> {
+    let reply = niri_request(sock, "\"WorkspacesGeometry\"")?;
+    let list = reply.get("WorkspacesGeometry")?.as_array()?.iter().filter_map(|w| {
+        let f = |k: &str| w.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
+        let b = |k: &str| w.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+        Some(Space { id: w.get("id")?.as_u64()?, rect: [f("x")?, f("y")?, f("width")?, f("height")?], active: b("active"), has_windows: b("has_windows") })
+    });
+    Some(list.collect())
+}
+
+/// Every frame while workspaces are moving (a switch, a swipe, the overview),
+/// a few times a second otherwise: each question costs niri a little.
+fn spawn_workspace_poll(sock: std::path::PathBuf) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("anima-workspaces".into()).spawn(move || {
+            let mut last_ask = std::time::Instant::now() - Duration::from_secs(1);
+            let mut moved_at = last_ask;
+            loop {
+                let woken = NIRI_ACTIVITY.lock().unwrap().is_some_and(|t| t.elapsed() < NIRI_WAKE);
+                let busy = woken
+                    || moved_at.elapsed() < NIRI_SETTLE
+                    || OVERVIEW_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+                    || NIRI_GESTURE.load(std::sync::atomic::Ordering::Relaxed);
+                if busy || last_ask.elapsed() > Duration::from_millis(250) {
+                    last_ask = std::time::Instant::now();
+                    let list = read_workspaces(&sock);
+                    let known = list.is_some();
+                    let mut held = WORKSPACES.lock().unwrap();
+                    if *held != list {
+                        moved_at = last_ask;
+                    }
+                    *held = list;
+                    drop(held);
+                    if !known {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(7));
+            }
+        });
+    });
+}
+
+/// Where a window sits on the strip: (x, width).
+pub fn niri_window_x(id: u64) -> Option<(f32, f32)> {
+    NIRI_WIN_X.lock().unwrap().iter().find(|w| w.0 == id).map(|w| (w.1, w.2))
+}
+
 pub fn niri_columns() -> Vec<(f32, f32)> {
     let mut cols: Vec<(f32, f32)> = Vec::new();
     for &(_, x, w) in NIRI_WIN_X.lock().unwrap().iter() {
@@ -265,6 +346,16 @@ fn update_niri_strip(sock: &Path) {
     else {
         return;
     };
+    {
+        let mut counts: Vec<(u64, usize)> = Vec::new();
+        for id in windows.iter().filter_map(|w| w.get("workspace_id").and_then(|v| v.as_u64())) {
+            match counts.iter_mut().find(|c| c.0 == id) {
+                Some(c) => c.1 += 1,
+                None => counts.push((id, 1)),
+            }
+        }
+        *WINDOW_COUNTS.lock().unwrap() = counts;
+    }
     let screen_w = niri_output_rect(sock).map(|r| r.2).unwrap_or(1920.0);
     let gap = niri_gaps();
     // column index -> width, and the focused column
@@ -438,6 +529,7 @@ fn niri_focused_output(sock: &Path) -> Option<serde_json::Value> {
 
 pub(super) fn query_niri_window(sock: &Path) -> Option<(bool, bool, Option<WindowRect>)> {
     let win = niri_request(sock, "\"FocusedWindow\"")?.get("FocusedWindow").cloned()?;
+    *FOCUSED_APP.lock().unwrap() = win.get("app_id").and_then(|a| a.as_str()).map(String::from);
     if win.is_null() {
         return Some((false, false, None));
     }
@@ -609,10 +701,16 @@ pub(super) fn run_niri(tx: Sender<GovernorEvent>, sock: &Path) {
         })
         .ok();
 
+    spawn_workspace_poll(sock.to_path_buf());
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
+        super::desktop::window_event(&line);
+        if line.starts_with("{\"OverviewOpenedOrClosed\"") {
+            OVERVIEW_OPEN.store(line.contains("\"is_open\":true"), std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         // things that can scroll the strip (title changes etc. can't)
-        if ["WindowFocusChanged", "WindowLayoutsChanged", "WorkspaceActivated", "WindowClosed", "WindowsChanged"]
+        if ["WindowFocusChanged", "WindowLayoutsChanged", "WorkspaceActivated", "WorkspaceActiveWindowChanged", "WindowClosed", "WindowsChanged"]
             .iter()
             .any(|k| line.starts_with(&format!("{{\"{k}\"")))
         {

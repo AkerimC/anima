@@ -145,7 +145,12 @@ enum Cmd {
     Reload,
     /// Make the walking characters race each other.
     Race,
-    /// Start a game now: contest, cursor, long, domino, tug, tag, samba, volley, carrot, gift.
+    /// Tell the characters the lock screen is up (on) or gone (off); the
+    /// DMS lock screen does this to show them.
+    Lockscreen {
+        state: String,
+    },
+    /// Start a game now: contest, cursor, long, domino, tug, tag, samba, volley, carrot, gift, blind, fishing.
     Game {
         name: String,
     },
@@ -364,6 +369,7 @@ fn run() -> Result<()> {
         }
         Cmd::Reload => Request::Reload,
         Cmd::Race => Request::Race,
+        Cmd::Lockscreen { state } => Request::LockScreen { on: state != "off" },
         Cmd::Game { name } => Request::Game { name },
         Cmd::Status { monitor, .. } => Request::Status { monitor },
         Cmd::Monitors => Request::ListMonitors,

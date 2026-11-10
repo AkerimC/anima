@@ -1,0 +1,632 @@
+//! Each character lives on one niri workspace: drawn where niri draws that
+//! workspace (sliding with it, shrunk in the overview), and now and then
+//! moving up or down to the next one. The more at home it feels, and the
+//! better it knows those around it, the more it wants to see who's elsewhere.
+
+use std::sync::atomic::Ordering::Relaxed;
+
+use crate::backend::desktop;
+use crate::backend::governor::{self, Space};
+use crate::render::FrameInfo;
+use crate::render::tuning::get as tn;
+use super::walk::{Act, WalkState};
+use super::{CharacterOverlay, SceneZoom};
+
+// half-heights: far enough to be right out of sight below the floor
+const BELOW: f32 = 2.3;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Leg {
+    Sinking,
+    Rising,
+    Emerging,
+    // ends a fullscreen visit: down and out of sight
+    Vanishing,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Trip {
+    to: u64,
+    leg: Leg,
+    t: f32,
+}
+
+#[derive(Default)]
+pub(super) struct Spaces {
+    list: Vec<Space>,
+    pub(super) active: u64,
+    // scroll position of each workspace when last looked at
+    views: Vec<(u64, [f32; 2])>,
+    tick: f32,
+    // how much each workspace has been looked at lately, seconds
+    used: Vec<(u64, f32)>,
+    // a fullscreen app is up: seconds to the next visit
+    pub(super) fs_on: bool,
+    // where each character was (by name): workspace index, kept between runs
+    places: Option<std::collections::HashMap<String, usize>>,
+    places_save: f32,
+    locked: bool,
+    fs_wait: f32,
+}
+
+impl WalkState {
+    pub(super) fn set_off(&mut self, to: u64, down: bool) {
+        self.trip = Some(Trip { to, leg: if down { Leg::Sinking } else { Leg::Rising }, t: 0.0 });
+        self.act = Act::Travel;
+        self.target = self.x;
+        self.here_t = 0.0;
+    }
+
+    /// Comes up out of the floor for a visit.
+    fn come_out(&mut self, stay: f32) {
+        self.backstage = false;
+        self.visiting = true;
+        self.visit_left = stay;
+        self.trip = Some(Trip { to: self.ws, leg: Leg::Emerging, t: 0.0 });
+        self.act = Act::Travel;
+        self.sink = BELOW;
+        self.target = self.x;
+    }
+
+    fn go_back(&mut self) {
+        self.trip = Some(Trip { to: self.ws, leg: Leg::Vanishing, t: 0.0 });
+        self.act = Act::Travel;
+    }
+
+    /// `top`: the height at which it's out of sight above the screen.
+    fn trip_tick(&mut self, dt: f32, top: f32) {
+        if self.act != Act::Travel {
+            self.trip = None;
+            return;
+        }
+        let Some(mut t) = self.trip else {
+            self.act = Act::Idle;
+            return;
+        };
+        let speed = tn().ws_speed;
+        t.t += dt;
+        match t.leg {
+            Leg::Sinking => {
+                self.sink += speed * dt;
+                if self.sink >= BELOW {
+                    // through the floor and in from the top of the one below
+                    self.ws = t.to;
+                    self.sink = 0.0;
+                    self.air = top;
+                    self.vx = 0.0;
+                    self.vy = 0.0;
+                    self.leaped = self.rand() < 0.7;
+                    self.act = Act::Fall;
+                    self.trip = None;
+                    self.newcomer = true;
+                    return;
+                }
+            }
+            Leg::Vanishing => {
+                self.sink += speed * dt;
+                if self.sink >= BELOW {
+                    self.sink = 0.0;
+                    self.act = Act::Idle;
+                    self.timer = 1.0;
+                    self.trip = None;
+                    self.backstage = true;
+                    self.visiting = false;
+                    return;
+                }
+            }
+            Leg::Rising => {
+                self.air += speed * dt;
+                self.rot = (t.t * 14.0).sin() * 0.09;
+                if self.air >= top {
+                    // up and out, and up through the floor of the one above
+                    self.ws = t.to;
+                    self.air = 0.0;
+                    self.rot = 0.0;
+                    self.sink = BELOW;
+                    t.leg = Leg::Emerging;
+                }
+            }
+            Leg::Emerging => {
+                self.sink -= speed * dt;
+                if self.sink <= 0.0 {
+                    self.sink = 0.0;
+                    self.act = Act::Idle;
+                    self.timer = 1.0;
+                    self.trip = None;
+                    self.newcomer = true;
+                    return;
+                }
+            }
+        }
+        self.trip = Some(t);
+    }
+}
+
+/// How many characters each workspace should have, from how much it's used
+/// and how many windows it has. Everyone gets at least `floor` of the team.
+fn fair_shares(stats: &[(f32, f32)], n: usize, floor: f32, use_weight: f32) -> Vec<usize> {
+    let k = stats.len().max(1) as f32;
+    let floor = floor.clamp(0.0, 1.0 / k);
+    let (used, windows) = stats.iter().fold((0.0, 0.0), |t, s| (t.0 + s.0, t.1 + s.1));
+    let part = |v: f32, total: f32| if total > 0.0 { v / total } else { 1.0 / k };
+    let quota: Vec<f32> = stats
+        .iter()
+        .map(|s| {
+            let score = use_weight * part(s.0, used) + (1.0 - use_weight) * part(s.1, windows);
+            n as f32 * (floor + (1.0 - k * floor) * score)
+        })
+        .collect();
+    let mut seats: Vec<usize> = quota.iter().map(|q| q.floor() as usize).collect();
+    // the seats left over go to the biggest remainders
+    let mut order: Vec<usize> = (0..quota.len()).collect();
+    order.sort_by(|&a, &b| (quota[b].fract()).total_cmp(&quota[a].fract()));
+    let given: usize = seats.iter().sum();
+    for &i in order.iter().take(n.saturating_sub(given)) {
+        seats[i] += 1;
+    }
+    // nobody's left with an empty desktop while there are enough to go round
+    if n >= seats.len() {
+        for i in 0..seats.len() {
+            if seats[i] == 0 {
+                if let Some(big) = (0..seats.len()).max_by_key(|&j| seats[j]) {
+                    seats[big] -= 1;
+                    seats[i] = 1;
+                }
+            }
+        }
+    }
+    seats
+}
+
+fn holds(s: &Space, p: [f32; 2]) -> bool {
+    p[0] >= s.rect[0] && p[0] <= s.rect[0] + s.rect[2] && p[1] >= s.rect[1] && p[1] <= s.rect[1] + s.rect[3]
+}
+
+impl CharacterOverlay {
+    fn actor_ref(&self, i: usize) -> &CharacterOverlay {
+        if i == 0 { self } else { &self.extras[i - 1] }
+    }
+
+    fn actor_mut(&mut self, i: usize) -> &mut CharacterOverlay {
+        if i == 0 { self } else { &mut self.extras[i - 1] }
+    }
+
+    /// Where this frame's workspaces are, for every character.
+    pub(super) fn sync_spaces(&mut self, info: &FrameInfo) {
+        let n = self.extras.len() + 1;
+        let list = governor::workspaces().unwrap_or_default();
+        let size = [info.width.max(1) as f32, info.height.max(1) as f32];
+        let scale = info.scale.max(1.0);
+        self.spaces.active = list.iter().find(|s| s.active).map_or(0, |s| s.id);
+        let locked = super::locked();
+        if locked != self.spaces.locked {
+            self.spaces.locked = locked;
+            let here = self.spaces.active;
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                if locked {
+                    // all on the one screen, back home afterwards
+                    wk.lock_home = Some(wk.ws);
+                    if here != 0 {
+                        wk.ws = here;
+                    }
+                    wk.backstage = false;
+                    wk.visiting = false;
+                    if wk.act == Act::Travel {
+                        wk.trip = None;
+                        wk.sink = 0.0;
+                        wk.air = 0.0;
+                        wk.act = Act::Idle;
+                    }
+                } else if let Some(home) = wk.lock_home.take() {
+                    wk.ws = home;
+                }
+            }
+        }
+        let hosts: Vec<u64> = list.iter().filter(|s| s.active || s.has_windows).map(|s| s.id).collect();
+        for i in 0..n {
+            let a = self.actor_mut(i);
+            a.screen_mouse = info.mouse;
+            if list.is_empty() || locked {
+                a.zoom = None;
+                a.visible = !a.walk.backstage;
+                a.walk.ws = 0;
+            }
+        }
+        if !list.is_empty() && !locked {
+            for i in 0..n {
+                if !list.iter().any(|s| s.id == self.walk_ref(i).ws) {
+                    // back where it was last time, or with its team
+                    if let Some(ws) = self.home_for(i, &list, n) {
+                        self.walk_of(i).ws = ws;
+                        continue;
+                    }
+                    // whichever workspace is shortest of its share
+                    let seats = self.seats(&hosts, n);
+                    let lacking = |h: u64, want: usize| want as i64 - (0..n).filter(|&j| self.walk_ref(j).ws == h).count() as i64;
+                    let to = hosts.iter().zip(&seats).max_by_key(|(h, w)| lacking(**h, **w)).map(|(h, _)| *h);
+                    self.walk_of(i).ws = to.unwrap_or(list[0].id);
+                }
+                let ws = self.walk_ref(i).ws;
+                let Some(s) = list.iter().find(|s| s.id == ws) else { continue };
+                let [x, y, w, h] = s.rect;
+                let on_screen = x * scale < size[0] && (x + w) * scale > 0.0 && y * scale < size[1] && (y + h) * scale > 0.0;
+                let zoom = SceneZoom::new(s.rect, size, scale);
+                let a = self.actor_mut(i);
+                a.zoom = zoom;
+                a.visible = on_screen && !a.walk.backstage;
+            }
+        }
+        self.spaces.list = list;
+    }
+
+    /// Where `i` belongs when it first shows up: its place from last time.
+    fn home_for(&mut self, i: usize, list: &[Space], n: usize) -> Option<u64> {
+        if self.spaces.places.is_none() {
+            let saved = std::fs::read_to_string(places_path()).ok().and_then(|t| serde_json::from_str(&t).ok());
+            self.spaces.places = Some(saved.unwrap_or_default());
+        }
+        let name = self.character_name(i);
+        if let Some(&k) = self.spaces.places.as_ref().and_then(|p| p.get(&name)) {
+            return list.get(k.min(list.len().saturating_sub(1))).map(|s| s.id);
+        }
+        let _ = n;
+        None
+    }
+
+    /// Writes who is on which workspace now and then.
+    fn keep_places(&mut self, dt: f32, n: usize) {
+        self.spaces.places_save -= dt;
+        if self.spaces.places_save > 0.0 || super::locked() {
+            return;
+        }
+        self.spaces.places_save = 20.0;
+        let mut map = self.spaces.places.clone().unwrap_or_default();
+        for i in 0..n {
+            let ws = self.walk_ref(i).ws;
+            if let Some(k) = self.spaces.list.iter().position(|s| s.id == ws) {
+                map.insert(self.character_name(i), k);
+            }
+        }
+        if self.spaces.places.as_ref() != Some(&map) {
+            if let Ok(text) = serde_json::to_string(&map) {
+                let _ = crate::util::atomic_write(&places_path(), text.as_bytes());
+            }
+            self.spaces.places = Some(map);
+        }
+    }
+
+    /// Fair number of characters for each of `hosts`.
+    fn seats(&self, hosts: &[u64], n: usize) -> Vec<usize> {
+        let stats: Vec<(f32, f32)> = hosts
+            .iter()
+            .map(|&h| {
+                let used = self.spaces.used.iter().find(|u| u.0 == h).map_or(0.0, |u| u.1);
+                (used, governor::window_count(h) as f32)
+            })
+            .collect();
+        fair_shares(&stats, n, tn().ws_floor, tn().ws_use_weight)
+    }
+
+    /// The strip's scroll position, as each character's workspace had it.
+    pub(super) fn share_views(&mut self, view: [f32; 2], strip_ws: Option<u64>) {
+        let active = self.spaces.active;
+        // during a switch the strip and the workspace list change at different
+        // moments: file the view under the workspace it was really read from
+        let from = if active == 0 { 0 } else { strip_ws.unwrap_or(active) };
+        if let Some(v) = self.spaces.views.iter_mut().find(|v| v.0 == from) {
+            v.1 = view;
+        } else {
+            self.spaces.views.push((from, view));
+        }
+        let n = self.extras.len() + 1;
+        for i in 0..n {
+            let ws = self.walk_ref(i).ws;
+            let fallback = if ws == active { view } else { [0.0, 0.0] };
+            let own = self.spaces.views.iter().find(|v| v.0 == ws).map_or(fallback, |v| v.1);
+            self.actor_mut(i).own_view = own;
+        }
+    }
+
+    pub(super) fn run_spaces(&mut self, dt: f32, n: usize) {
+        for i in 0..n {
+            let top = self.actor_ref(i).top_air;
+            self.walk_of(i).trip_tick(dt, top);
+        }
+        self.run_visits(dt, n);
+        if self.spaces.list.is_empty() {
+            return;
+        }
+        self.drop_between_spaces(n);
+        self.keep_places(dt, n);
+        for i in 0..n {
+            if self.walk_ref(i).newcomer && self.walk_ref(i).at_leisure() {
+                self.walk_of(i).newcomer = false;
+                self.greet_newcomer(i, n);
+            }
+        }
+        self.spaces.tick -= dt;
+        if self.spaces.tick <= 0.0 && !self.spaces.fs_on && !super::locked() {
+            self.spaces.tick = 1.0;
+            self.roam(n);
+        }
+    }
+
+    /// A fullscreen app we may visit: nearly everyone is out of sight, and
+    /// now and then one to three come out and potter along the bottom.
+    fn run_visits(&mut self, dt: f32, n: usize) {
+        let on = desktop::FS_VISIT.load(Relaxed) && !super::locked();
+        let here = self.spaces.active;
+        if on != self.spaces.fs_on {
+            self.spaces.fs_on = on;
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                wk.backstage = on && (here == 0 || wk.ws == here);
+                wk.visiting = false;
+                wk.visit_left = 0.0;
+            }
+            let roll = self.walk.rand();
+            self.spaces.fs_wait = tn().fs_first * (0.5 + roll);
+        }
+        if !on {
+            return;
+        }
+        for i in 0..n {
+            let wk = self.walk_of(i);
+            if wk.visiting {
+                wk.fret = false;
+                wk.newcomer = false;
+                wk.visit_left -= dt;
+                if wk.visit_left <= 0.0 && wk.at_leisure() {
+                    wk.go_back();
+                }
+            }
+        }
+        self.spaces.fs_wait -= dt;
+        if self.spaces.fs_wait > 0.0 {
+            return;
+        }
+        let (roll, spread) = (self.walk.rand(), self.walk.rand());
+        self.spaces.fs_wait = tn().fs_every * (0.6 + spread * 0.8);
+        if roll >= tn().fs_chance {
+            return;
+        }
+        let want = 1 + (self.walk.rand() * tn().fs_max) as usize;
+        let mut free: Vec<usize> = (0..n).filter(|&i| {
+            let wk = self.walk_ref(i);
+            wk.backstage && wk.at_leisure()
+        }).collect();
+        for _ in 0..want.min(free.len()) {
+            let k = ((self.walk.rand() * free.len() as f32) as usize).min(free.len() - 1);
+            let i = free.swap_remove(k);
+            let a = self.actor_mut(i);
+            let (r, screen) = (a.hit_rect, a.surface[0].max(1.0));
+            let middle = (r[0] + r[2]) * 0.5;
+            let spot = screen * (0.1 + a.walk.rand() * 0.8);
+            let stay = tn().fs_stay_min + a.walk.rand() * tn().fs_stay_rand;
+            a.walk.x += (spot - middle) * 2.0 / screen;
+            a.walk.come_out(stay);
+            // now and then a visitor sits down and fishes for a while
+            if a.walk.rand() < tn().fs_fish {
+                a.walk.fish_on_arrival = true;
+            }
+        }
+    }
+
+    /// A race on the workspace in view: some from the others come over.
+    pub(super) fn call_to_race(&mut self, n: usize) {
+        let here = self.spaces.active;
+        let order: Vec<u64> = self.spaces.list.iter().map(|s| s.id).collect();
+        let Some(at) = order.iter().position(|&w| w == here) else { return };
+        for i in 0..n {
+            let ws = self.walk_ref(i).ws;
+            if ws == here || !self.walk_ref(i).at_leisure() || self.walk_of(i).rand() >= tn().race_travel {
+                continue;
+            }
+            if let Some(from) = order.iter().position(|&w| w == ws) {
+                log::debug!("race: {i} comes over from workspace {ws}");
+                self.walk_of(i).set_off(here, at > from);
+            }
+        }
+    }
+
+    /// Let go of in the overview over another workspace: lands there.
+    fn drop_between_spaces(&mut self, n: usize) {
+        for i in 0..n {
+            let Some(point) = self.walk_of(i).dropped_at.take() else { continue };
+            let Some(old) = self.actor_ref(i).zoom.filter(|z| z.shrunk()) else { continue };
+            let ws = self.walk_ref(i).ws;
+            let Some(to) = self.spaces.list.iter().find(|s| holds(s, point) && s.id != ws).cloned() else { continue };
+            let a = self.actor_ref(i);
+            let r = a.hit_rect;
+            let surface = a.surface;
+            let Some(new) = SceneZoom::new(to.rect, surface, 1.0) else { continue };
+            let (from, into) = (old.to_scene(point), new.to_scene(point));
+            let half = (r[3] - r[1]).max(1.0) / surface[1].max(1.0);
+            let wk = self.walk_of(i);
+            wk.x += (into[0] - from[0]) * 2.0 / surface[0].max(1.0);
+            wk.air = (wk.air - (into[1] - from[1]) * 2.0 / surface[1].max(1.0) / half).max(0.0);
+            wk.target = wk.x;
+            wk.ws = to.id;
+            wk.here_t = 0.0;
+            wk.newcomer = true;
+        }
+    }
+
+    /// Once a second: does anyone feel like seeing the neighbours?
+    fn roam(&mut self, n: usize) {
+        let hosts: Vec<u64> = self.spaces.list.iter().filter(|s| s.active || s.has_windows).map(|s| s.id).collect();
+        for i in 0..n {
+            self.walk_of(i).here_t += 1.0;
+        }
+        if hosts.len() < 2 {
+            return;
+        }
+        let count = |this: &Self, ws: u64| (0..n).filter(|&i| this.walk_ref(i).ws == ws).count();
+        // older use counts for less and less
+        let fade = 0.5f32.powf(1.0 / tn().ws_use_half.max(1.0));
+        self.spaces.used.iter_mut().for_each(|u| u.1 *= fade);
+        let active = self.spaces.active;
+        match self.spaces.used.iter_mut().find(|u| u.0 == active) {
+            Some(u) => u.1 += 1.0,
+            None => self.spaces.used.push((active, 1.0)),
+        }
+        let seats = self.seats(&hosts, n);
+        // positive: more characters there than its fair share
+        let surplus = |this: &Self, at: usize| count(this, hosts[at]) as f32 - seats[at] as f32;
+        let mut moving = (0..n).filter(|&i| self.walk_ref(i).trip.is_some()).count();
+        for i in 0..n {
+            if moving >= tn().ws_max as usize {
+                break;
+            }
+            let wk = self.walk_ref(i);
+            let (ws, here) = (wk.ws, wk.here_t);
+            if !wk.at_leisure() || count(self, ws) <= 1 {
+                continue;
+            }
+            let Some(pos) = hosts.iter().position(|&h| h == ws) else { continue };
+            let mates: Vec<usize> = (0..n).filter(|&j| j != i && self.walk_ref(j).ws == ws).collect();
+            let known = mates.iter().map(|&j| self.bond(i, j).0).sum::<f32>() / mates.len().max(1) as f32;
+            // with its team or close friends here it's happy to stay
+            let stay = if mates.iter().any(|&j| self.close(i, j)) { 0.4 } else { 1.0 };
+            // crowded for how little it's used: time to go; thin already: stay
+            let spare = surplus(self, pos);
+            let balance = if spare > 0.0 { 1.0 + spare * tn().ws_balance } else { 0.25 };
+            let urge = (1.0 + here / tn().ws_bored.max(1.0)) * (1.0 + known * tn().ws_familiar) * balance * stay;
+            let roll = self.walk_of(i).rand();
+            if roll >= urge / tn().ws_every.max(1.0) {
+                continue;
+            }
+            // up or down: towards the faces it knows least
+            let mut choices: Vec<(usize, f32)> = Vec::new();
+            for to in [pos.wrapping_sub(1), pos + 1] {
+                let Some(&h) = hosts.get(to) else { continue };
+                let there: Vec<usize> = (0..n).filter(|&j| self.walk_ref(j).ws == h).collect();
+                let news = there.iter().map(|&j| 1.0 / (1.0 + self.bond(i, j).0)).sum::<f32>();
+                let spare = surplus(self, to);
+                let score = news + 0.5 + (-spare).max(0.0) * 2.0;
+                choices.push((to, if spare > 0.0 { score * 0.3 } else { score }));
+            }
+            let mut pick = self.walk_of(i).rand() * choices.iter().map(|c| c.1).sum::<f32>();
+            let mut to = pos;
+            for c in &choices {
+                to = c.0;
+                pick -= c.1;
+                if pick <= 0.0 {
+                    break;
+                }
+            }
+            if to != pos {
+                log::debug!("workspaces: {i} goes from {ws} to {}", hosts[to]);
+                self.walk_of(i).set_off(hosts[to], to > pos);
+                moving += 1;
+                // close friends and teammates come along
+                for j in 0..n {
+                    if self.close(i, j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure() && self.walk_of(j).rand() < tn().close_follow {
+                        log::debug!("workspaces: {j} goes along with {i}");
+                        self.walk_of(j).set_off(hosts[to], to > pos);
+                        moving += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DT: f32 = 1.0 / 60.0;
+
+    fn walker(ws: u64) -> WalkState {
+        WalkState { act: Act::Idle, timer: 100.0, seed: 9, ws, ..Default::default() }
+    }
+
+    #[test]
+    fn a_visitor_comes_up_and_goes_back_down() {
+        let mut wk = walker(1);
+        wk.backstage = true;
+        wk.come_out(5.0);
+        assert!(!wk.backstage && wk.visiting);
+        for _ in 0..60 * 5 {
+            wk.trip_tick(DT, 12.0);
+        }
+        assert_eq!((wk.act, wk.sink), (Act::Idle, 0.0));
+        wk.go_back();
+        for _ in 0..60 * 5 {
+            wk.trip_tick(DT, 12.0);
+        }
+        assert!(wk.backstage && !wk.visiting && wk.trip.is_none());
+        assert_eq!(wk.ws, 1, "stays on its workspace");
+    }
+
+    #[test]
+    fn busy_workspaces_get_more_but_quiet_ones_keep_some() {
+        // used a lot with many windows, against hardly used with one
+        let seats = fair_shares(&[(900.0, 6.0), (30.0, 1.0)], 13, 0.15, 0.5);
+        assert_eq!(seats.iter().sum::<usize>(), 13);
+        assert!(seats[0] >= 9, "{seats:?}");
+        assert!(seats[1] >= 2, "{seats:?}");
+    }
+
+    #[test]
+    fn with_nothing_known_yet_shares_are_even() {
+        assert_eq!(fair_shares(&[(0.0, 0.0), (0.0, 0.0)], 12, 0.15, 0.5), vec![6, 6]);
+    }
+
+    #[test]
+    fn nobody_is_left_empty() {
+        let seats = fair_shares(&[(1000.0, 9.0), (0.0, 0.0), (0.0, 0.0)], 5, 0.0, 0.5);
+        assert_eq!(seats.iter().sum::<usize>(), 5);
+        assert!(seats.iter().all(|&s| s >= 1), "{seats:?}");
+    }
+
+    #[test]
+    fn goes_down_through_the_floor_and_falls_in_from_the_top() {
+        let mut wk = walker(1);
+        wk.set_off(2, true);
+        for _ in 0..60 * 5 {
+            wk.trip_tick(DT, 12.0);
+            if wk.act != Act::Travel {
+                break;
+            }
+        }
+        assert_eq!((wk.ws, wk.act), (2, Act::Fall));
+        assert_eq!(wk.air, 12.0);
+        assert_eq!(wk.sink, 0.0);
+        assert!(wk.newcomer);
+    }
+
+    #[test]
+    fn goes_up_and_comes_out_of_the_floor_above() {
+        let mut wk = walker(2);
+        wk.set_off(1, false);
+        let mut swapped = false;
+        for _ in 0..60 * 20 {
+            wk.trip_tick(DT, 12.0);
+            swapped |= wk.ws == 1 && wk.act == Act::Travel && wk.sink > 0.0;
+            if wk.act != Act::Travel {
+                break;
+            }
+        }
+        assert!(swapped, "never came up through the floor");
+        assert_eq!((wk.ws, wk.act, wk.air, wk.sink), (1, Act::Idle, 0.0, 0.0));
+        assert!(wk.newcomer && wk.trip.is_none());
+    }
+
+    #[test]
+    fn picked_up_on_the_way_stays_where_it_was() {
+        let mut wk = walker(1);
+        wk.set_off(2, true);
+        wk.trip_tick(DT, 12.0);
+        wk.act = Act::Held;
+        wk.trip_tick(DT, 12.0);
+        assert!(wk.trip.is_none());
+        assert_eq!(wk.ws, 1);
+    }
+}
+
+fn places_path() -> std::path::PathBuf {
+    crate::util::data_dir().join("places.json")
+}

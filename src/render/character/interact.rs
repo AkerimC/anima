@@ -63,15 +63,12 @@ impl CharacterOverlay {
                 self.press = None;
             } else if self.press.is_none() {
                 let [mx, my] = info.mouse;
-                let hit = |a: &CharacterOverlay| a.on_body([mx, my]) && !a.walk.social.is_some_and(|s| s.no_touch);
-                let target = (1..=self.extras.len())
-                    .rev()
-                    .find(|&i| hit(&self.extras[i - 1]))
-                    .or_else(|| hit(self).then_some(0));
+                let hit = |a: &CharacterOverlay| a.touching() && !a.walk.social.is_some_and(|s| s.no_touch);
+                let target = self.topmost(hit);
                 // measure the grab point now: the cursor may be far away by pick-up time
                 let target = target.map(|i| {
                     let a = if i == 0 { &*self } else { &self.extras[i - 1] };
-                    (i, a.body_clip([mx, my]))
+                    (i, a.body_clip(a.scene_mouse()))
                 });
                 self.press = Some((now, [mx, my], target));
             } else if let Some((t0, at, Some((i, grab)))) = self.press {
@@ -85,7 +82,7 @@ impl CharacterOverlay {
                         let flying = matches!(a.walk.act, Act::Fall | Act::Planted);
                         a.walk.sink = 0.0;
                         a.walk.race_down = false;
-                        let grab = if flying { a.body_clip([mx, my]) } else { grab };
+                        let grab = if flying { a.body_clip(a.scene_mouse()) } else { grab };
                         // caught mid-jump: keep it at the height it is drawn at
                         if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
                             let t = 1.0 - (a.walk.jump / a.walk.jump_dur).clamp(0.0, 1.0);
@@ -130,9 +127,11 @@ impl CharacterOverlay {
             let n = crate::backend::pointer::CLICKS.load(std::sync::atomic::Ordering::Relaxed);
             if n != self.clicks {
                 self.clicks = n;
-                let [mx, my] = info.mouse;
                 let keep = |a: &mut CharacterOverlay| {
-                    if a.walk.act == Act::Pat && a.on_body([mx, my]) {
+                    if a.walk.petted > 0.0 && a.touching() {
+                        a.walk.petted = tn().pat_distract;
+                    }
+                    if a.walk.act == Act::Pat && a.touching() {
                         a.walk.timer = a.walk.timer.max(tn().pat_keep);
                         a.patted_again = true;
                     }
@@ -154,12 +153,15 @@ impl CharacterOverlay {
             );
             // only on the ground: petting mid-jump or while carried breaks the motion
             let grounded = |w: &WalkState| !matches!(w.act, Act::Jump | Act::Held | Act::Fall) && !w.social.is_some_and(|s| s.no_touch || s.no_pat);
-            if let Some(e) = self.extras.iter_mut().rev().find(|e| e.on_body([mx, my])) {
-                if grounded(&e.walk) {
-                    e.walk.start_pat();
+            let hit = self.topmost(|a| a.touching());
+            if let Some(i) = hit.filter(|&i| !self.dancing(i)) {
+                if grounded(self.walk_ref(i)) && self.walk_ref(i).race.is_none() {
+                    self.walk_of(i).start_pat();
+                    self.gather_for_pat(i);
+                } else if !matches!(self.walk_ref(i).act, Act::Held) {
+                    // busy in a game or a race: a happy moment, and it carries on
+                    self.walk_of(i).petted = tn().pat_distract;
                 }
-            } else if self.on_body([mx, my]) && grounded(&self.walk) {
-                self.walk.start_pat();
             }
         }
     }
@@ -196,6 +198,16 @@ impl CharacterOverlay {
         [half * w, (0.5 - top) * h, (0.5 - bottom) * h]
     }
 
+    /// The cursor as this character's workspace sees it.
+    pub(super) fn scene_mouse(&self) -> [f32; 2] {
+        self.zoom.map_or(self.screen_mouse, |z| z.to_scene(self.screen_mouse))
+    }
+
+    /// Is the cursor on this character, wherever its workspace is drawn?
+    pub(super) fn touching(&self) -> bool {
+        self.visible && self.on_body(self.scene_mouse())
+    }
+
     /// Is this screen point on the character, not the empty margin of its image?
     pub(super) fn on_body(&self, m: [f32; 2]) -> bool {
         let o = self.body_offset(m);
@@ -222,7 +234,7 @@ impl CharacterOverlay {
     /// Held: follow the cursor; let go: fall back down (thrown).
     pub(super) fn carry(&mut self, info: &FrameInfo, dt: f32, center_clip: [f32; 2], half_clip: [f32; 2]) {
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
-        let [view, extra] = self.view;
+        let [view, extra] = self.own_view;
         let mx = (info.mouse[0] / w) * 2.0 - 1.0;
         let my = 1.0 - (info.mouse[1] / h) * 2.0;
         let down = crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
@@ -270,6 +282,7 @@ impl CharacterOverlay {
             Act::Held => {
                 self.walk.act = Act::Fall;
                 self.walk.held_prev = None;
+                self.walk.dropped_at = Some(self.screen_mouse);
                 // let go mid-swing: keeps spinning the same way until it lands,
                 // now about its own middle, moved so nothing jumps on screen
                 self.walk.tumble = self.walk.swing_v;
@@ -304,7 +317,7 @@ impl CharacterOverlay {
                 }
                 // and the top
                 let top = (1.0 - center_clip[1]) / half_clip[1] - 1.0;
-                if self.walk.air > top {
+                if self.walk.air > top && self.walk.vy > 0.0 {
                     self.walk.air = top;
                     self.walk.vy = -self.walk.vy.abs() * tn().top_bounce;
                 }
@@ -340,11 +353,16 @@ impl CharacterOverlay {
                         self.walk.timer = 1.0;
                     } else {
                         self.walk.dropped = tn().drop_time;
-                        if hard || self.walk.race_down {
+                        let leaped = std::mem::take(&mut self.walk.leaped);
+                        if (hard && !leaped) || self.walk.race_down {
                             self.walk.stick_in();
                         } else {
-                            // land with a little bounce
+                            // land with a little bounce, sometimes a giggle
                             self.walk.start_jump(tn().jump_height * tn().land_hop);
+                            if self.walk.social.is_none() && self.walk.rand() < 0.5 {
+                                let secs = tn().laugh_time * 0.5;
+                                self.walk.laugh(secs);
+                            }
                         }
                     }
                 }

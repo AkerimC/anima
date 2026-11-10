@@ -38,7 +38,8 @@ are what the compositor can tell us and how windows can be placed:
 | strip (`strip()`) | row of workspaces (`hypr_view`) | scrolling columns, exact with the optional patch |
 | cursor | `cursorpos` over IPC | estimated from evdev (exact with the optional patch) |
 | window mode (`can_place_windows`) | with `contrib/hyprland-plugin` | not implemented; overlay is used |
-| game/race window (`columns()`) | whole screen (one workspace) | tiled columns on the active workspace |
+| game/race window (`columns()`) | tiled windows on the active workspace | tiled columns on the active workspace |
+| position of a window that just opened (`window_x()`) | from `j/clients` | from niri's layout |
 
 ## The trait
 
@@ -60,8 +61,10 @@ The rest:
   (logical px). niri: the scrolling strip of columns. Hyprland: the row of
   workspaces. None: just the screen.
 - `columns()`: tiled windows on the active workspace, `(x, width)` on the
-  strip, for games and races that want a wide window. niri reports its
-  columns; Hyprland leaves it empty and the whole screen is used.
+  strip, for games and races that want a wide window. Both backends report
+  them; on a compositor without per-window layout the whole screen is used.
+- `window_x(id)`: where a window that just opened sits, so a character can
+  glance at it. niri answers from its layout, Hyprland from `j/clients`.
 - `cursor()`: for compositors that can be asked where the pointer is
   (patched niri). `pointer.rs` then polls it instead of estimating.
 - `swipe(active)`, `swipe_scroll(dx)`: three/four-finger touchpad swipes,
