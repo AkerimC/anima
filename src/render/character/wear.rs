@@ -247,6 +247,12 @@ pub(super) fn unfound(name: &str, roll: f32) -> Option<usize> {
     (!left.is_empty()).then(|| left[(roll * left.len() as f32) as usize % left.len()])
 }
 
+/// The picture an item is drawn with, if any: its own, or the props
+/// folder's for its kind.
+pub fn picture_of(item: &Item) -> Option<PathBuf> {
+    item.image.clone().or_else(|| super::rope::prop_image(item.kind))
+}
+
 /// The labels of what `name` has found (starters not counted).
 pub(super) fn found_labels(name: &str) -> Vec<String> {
     let shared = wardrobe();

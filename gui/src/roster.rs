@@ -431,6 +431,15 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         }
     };
     let area = gtk::DrawingArea::builder().content_width(300).content_height(340).build();
+    // each item's picture, where it has one, drawn as on the desktop
+    let pictures: Vec<Option<(gtk::cairo::ImageSurface, f64, f64)>> = items
+        .iter()
+        .map(|it| {
+            let p = wear::picture_of(it)?;
+            let (s, img) = sprite_surface(p.to_str()?)?;
+            Some((s, img.width() as f64, img.height() as f64))
+        })
+        .collect();
     {
         let (pick, items, rect_of) = (pick.clone(), items.clone(), rect_of.clone());
         area.set_draw_func(move |_, cr, w, h| {
@@ -447,10 +456,25 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
                 let [x, y, rw, rh] = rect_of(k);
                 let (x, y, rw, rh) = (ox + x * s, oy + y * s, rw * s, rh * s);
                 let chosen = k == pick.get();
+                // the picture fills the box's width at its own shape, about its middle
+                if let Some((pic, pw, ph)) = &pictures[k] {
+                    let (dw, dh) = (rw, rw * ph / pw);
+                    let _ = cr.save();
+                    cr.translate(x, y + rh * 0.5 - dh * 0.5);
+                    cr.scale(dw / pw, dh / ph);
+                    let _ = cr.set_source_surface(pic, 0.0, 0.0);
+                    let _ = cr.paint();
+                    let _ = cr.restore();
+                    if !chosen {
+                        continue;
+                    }
+                }
                 if chosen {
-                    cr.set_source_rgba(1.0, 0.45, 0.65, 0.25);
-                    cr.rectangle(x, y, rw, rh);
-                    let _ = cr.fill();
+                    if pictures[k].is_none() {
+                        cr.set_source_rgba(1.0, 0.45, 0.65, 0.25);
+                        cr.rectangle(x, y, rw, rh);
+                        let _ = cr.fill();
+                    }
                     cr.set_source_rgb(1.0, 0.45, 0.65);
                     cr.set_line_width(2.0);
                 } else {
