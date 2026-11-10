@@ -558,11 +558,14 @@ vec4 crown(vec2 p) {
     return vec4(col, a);
 }
 vec4 picture(vec2 p) {
+    // read the picture for every pixel (no early return): texture lookups
+    // under a branch pick a wrong, blurry level at its edge and leave faint
+    // lines round the box; what's outside the picture is masked after
     vec2 q = p * u_fit;
-    if (abs(q.x) > 1.0 || abs(q.y) > 1.0 || p.y > -1.0 + 2.0 * u_reveal) {
-        return vec4(0.0);
-    }
-    return texture(u_img, u_crop.xy + vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5) * u_crop.zw);
+    vec2 uv = u_crop.xy + clamp(vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5), 0.0, 1.0) * u_crop.zw;
+    vec4 c = texture(u_img, uv);
+    float inside = step(abs(q.x), 1.0) * step(abs(q.y), 1.0) * step(p.y, -1.0 + 2.0 * u_reveal);
+    return c * inside;
 }
 vec4 canopy(vec2 p) {
     // the umbrella's top on its own: a ribbed dome filling the box, rim at the bottom
