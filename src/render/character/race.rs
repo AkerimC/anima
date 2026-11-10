@@ -77,6 +77,14 @@ pub(super) struct Race {
     herald: Option<usize>,
     // said no when asked: they stay out of it
     refused: Vec<usize>,
+    // the workspace it's run on, who from elsewhere won't come, seconds to the next call
+    ws: u64,
+    stay: Vec<usize>,
+    call: f32,
+    // started by hand: everyone's simply in, no going round asking
+    quick: bool,
+    // workspaces the inviter has been down to
+    visited: Vec<u64>,
     // who it has just asked, waiting for the answer
     asking: Option<usize>,
     invite_pause: f32,
@@ -111,11 +119,27 @@ impl CharacterOverlay {
         }
     }
 
+    /// A workspace the inviter hasn't been to with someone on it to ask.
+    fn next_to_invite(&self, race: &Race, n: usize) -> Option<u64> {
+        (0..n)
+            .filter(|&i| {
+                let wk = self.walk_ref(i);
+                wk.ws != race.ws && !race.visited.contains(&wk.ws) && wk.rest.is_none() && wk.race.is_none() && !wk.backstage && !wk.visiting && !race.stay.contains(&i)
+            })
+            .map(|i| self.walk_ref(i).ws)
+            .next()
+    }
+
     /// One racer goes to each of the others in turn, hops and invites them,
     /// and comes back when there's nobody left to tell.
     fn run_herald(&mut self, race: &mut Race, dt: f32, lo: f32, hi: f32, n: usize) {
-        let race_ws = (0..n).find_map(|i| self.walk_ref(i).race.map(|_| self.walk_ref(i).ws)).unwrap_or(self.spaces.active);
-        let free: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).ws == race_ws && self.walk_ref(i).rest.is_none() && self.walk_ref(i).race.is_none() && !race.refused.contains(&i)).collect();
+        // the inviter may be down on another workspace
+        let race_ws = race.herald.map_or(race.ws, |h| self.walk_ref(h).ws);
+        if race.herald.is_some_and(|h| self.walk_ref(h).act == Act::Travel) {
+            return;
+        }
+        let away = race_ws != race.ws;
+        let free: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).ws == race_ws && self.walk_ref(i).rest.is_none() && self.walk_ref(i).race.is_none() && !race.refused.contains(&i) && !race.stay.contains(&i) && self.walk_ref(i).act != Act::Travel).collect();
         if race.herald.is_some_and(|h| self.walk_ref(h).race.is_none()) {
             race.herald = None;
         }
@@ -124,7 +148,7 @@ impl CharacterOverlay {
             let near = |this: &Self, h: usize| free.iter().map(|&f| (this.strip_px(f) - this.strip_px(h)).abs()).fold(f32::MAX, f32::min);
             race.herald = (0..n)
                 .filter(|&i| self.walk_ref(i).race.is_some_and(|r| !matches!(r.leg, Leg::Watch | Leg::Watching)))
-                .filter(|_| !free.is_empty())
+                .filter(|_| !free.is_empty() || self.next_to_invite(race, n).is_some())
                 .min_by(|&a, &b| near(self, a).total_cmp(&near(self, b)));
             if let Some(h) = race.herald {
                 log::debug!("race: {h} goes round inviting {free:?}");
@@ -137,7 +161,15 @@ impl CharacterOverlay {
         }
         if let Some(t) = race.asking.take() {
             if self.walk_ref(t).race.is_none() {
-                if n >= tn().race_refuse_min as usize && self.walk.rand() < tn().race_refuse {
+                if away && self.walk.rand() < 1.0 - tn().race_travel {
+                    // can't be bothered to go all that way
+                    log::debug!("race: {t} stays on its workspace");
+                    race.stay.push(t);
+                } else if away {
+                    log::debug!("race: {t} is in, and comes over");
+                    self.recruit(t, lo, hi);
+                    self.send_to(t, race.ws);
+                } else if n >= tn().race_refuse_min as usize && self.walk.rand() < tn().race_refuse {
                     // no thanks: straight to the finish to watch
                     log::debug!("race: {t} says no to {h}");
                     race.refused.push(t);
@@ -156,8 +188,25 @@ impl CharacterOverlay {
         }
         let x = self.strip_px(h);
         let Some(t) = free.iter().copied().min_by(|&a, &b| (self.strip_px(a) - x).abs().total_cmp(&(self.strip_px(b) - x).abs())) else {
-            // everyone knows: back to the others
+            // everyone here knows: down to the next workspace with someone to ask
+            if !matches!(self.walk_ref(h).act, Act::Idle | Act::Walk) {
+                return;
+            }
+            if let Some(next) = self.next_to_invite(race, n) {
+                log::debug!("race: {h} goes to invite workspace {next}");
+                race.visited.push(next);
+                if let Some(r) = self.walk_of(h).race.as_mut() {
+                    r.leg = Leg::Invite;
+                    r.goal_px = x;
+                }
+                self.send_to(h, next);
+                return;
+            }
+            // nobody left anywhere: back to the others
             log::debug!("race: {h} is done inviting");
+            if away {
+                self.send_to(h, race.ws);
+            }
             let wk = self.walk_of(h);
             let goal_px = lo + wk.rand() * (hi - lo);
             if let Some(r) = wk.race.as_mut() {
@@ -206,7 +255,10 @@ impl CharacterOverlay {
                 return;
             }
             // from one end of the strip to the other, whatever the windows
-            let width = self.strip_width();
+            // on the workspace of the group that called it
+            let crew = self.race_crew.first().copied().filter(|&i| i < n);
+            let ws = crew.map_or(self.spaces.active, |i| self.walk_ref(i).ws);
+            let width = crew.map_or(self.strip_width(), |i| self.strip_width_of(i));
             let (a, b) = (tn().edge_px.min(width * 0.25), (width - tn().edge_px).max(width * 0.75));
             let len = b - a;
             let (start_px, finish_px) = if self.walk.rand() < 0.5 { (a, b) } else { (b, a) };
@@ -226,8 +278,12 @@ impl CharacterOverlay {
                 refused: Vec::new(),
                 asking: None,
                 invite_pause: 0.0,
+                ws,
+                stay: Vec::new(),
+                call: 0.0,
+                quick: crew.is_none(),
+                visited: Vec::new(),
             });
-            self.call_to_race(n);
         }
         let Some(mut race) = self.race.take() else { return };
         race.age += dt;
@@ -250,7 +306,8 @@ impl CharacterOverlay {
                     let pick = if !crew.is_empty() {
                         Some(crew.remove(0))
                     } else if !started {
-                        Some((self.walk.rand() * n as f32) as usize % n)
+                        let local: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).ws == race.ws && self.walk_ref(i).rest.is_none()).collect();
+                        (!local.is_empty()).then(|| local[(self.walk.rand() * local.len() as f32) as usize % local.len()])
                     } else {
                         None
                     };
@@ -261,8 +318,26 @@ impl CharacterOverlay {
                 }
                 let waved = crew.is_empty();
                 self.race_crew = crew;
-                // then one of them goes round everybody else
-                if waved {
+                if race.quick {
+                    // by hand: the other workspaces hear at once, and whoever
+                    // is on this one just goes, quickly
+                    race.call -= dt;
+                    if race.call <= 0.0 {
+                        race.call = 0.3;
+                        self.call_to_race(n, race.ws, &mut race.stay);
+                        for i in 0..n {
+                            let wk = self.walk_ref(i);
+                            if wk.ws == race.ws && wk.race.is_none() && wk.rest.is_none() && grounded(wk) && !wk.backstage && !wk.visiting {
+                                self.recruit(i, lo, hi);
+                                if let Some(r) = self.walk_of(i).race.as_mut() {
+                                    r.speed *= 2.0;
+                                }
+                            }
+                        }
+                    }
+                } else if waved {
+                    // then one of them goes round everybody else, the other
+                    // workspaces too
                     self.run_herald(&mut race, dt, lo, hi, n);
                 }
                 for i in 0..n {
@@ -294,7 +369,17 @@ impl CharacterOverlay {
                     })
                     .count();
                 // stragglers far along the strip don't hold it up forever
-                if here + race.refused.len() == n || (race.age > tn().race_wait && here >= 2 && race.herald.is_none()) {
+                let around = (0..n).filter(|&i| self.walk_ref(i).ws == race.ws).count();
+                let coming = (0..n).any(|i| self.heading_to(i) == Some(race.ws));
+                // busy elsewhere but might still come: give them a little while
+                let may_come = if race.quick {
+                    race.age < 5.0 && (0..n).any(|i| self.walk_ref(i).ws != race.ws && !race.stay.contains(&i) && self.walk_ref(i).rest.is_none())
+                } else {
+                    race.herald.is_some() || self.next_to_invite(&race, n).is_some()
+                };
+                let on_way = (0..n).any(|i| self.walk_ref(i).race.is_some_and(|r| r.leg == Leg::ToStart));
+                let all_in = if race.quick { here >= 2 && !on_way && race.age > 2.0 } else { here + race.refused.len() >= around };
+                if (all_in && !coming && !may_come) || (race.age > tn().race_wait && here >= 2 && race.herald.is_none()) {
                     let (start, finish) = (race.start_px, race.finish_px);
                     for i in 0..n {
                         let wk = self.walk_of(i);
@@ -305,6 +390,8 @@ impl CharacterOverlay {
                                 r.speed = 0.2;
                             }
                             Some(r) if matches!(r.leg, Leg::Watch | Leg::Watching) => {}
+                            // on another workspace: nothing to do with it
+                            _ if wk.ws != race.ws => {}
                             // not in it: they go and cheer at the finish
                             _ => {
                                 let goal_px = finish - dir * (60.0 + wk.rand() * 240.0);

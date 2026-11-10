@@ -33,6 +33,8 @@ pub(super) struct Trip {
 
 #[derive(Default)]
 pub(super) struct Spaces {
+    // seconds until anyone may set off again
+    quiet: f32,
     list: Vec<Space>,
     pub(super) active: u64,
     // scroll position of each workspace when last looked at
@@ -414,13 +416,19 @@ impl CharacterOverlay {
     }
 
     /// A race on the workspace in view: some from the others come over.
-    pub(super) fn call_to_race(&mut self, n: usize) {
-        let here = self.spaces.active;
+    /// Asked again and again while a race gathers on `here`: whoever is
+    /// free on another workspace makes up its mind once (`stay`: not coming).
+    pub(super) fn call_to_race(&mut self, n: usize, here: u64, stay: &mut Vec<usize>) {
         let order: Vec<u64> = self.spaces.list.iter().map(|s| s.id).collect();
         let Some(at) = order.iter().position(|&w| w == here) else { return };
         for i in 0..n {
             let ws = self.walk_ref(i).ws;
-            if ws == here || !self.walk_ref(i).at_leisure() || self.walk_of(i).rand() >= tn().race_travel {
+            let wk = self.walk_ref(i);
+            if ws == here || stay.contains(&i) || !wk.at_leisure() || wk.backstage || wk.visiting {
+                continue;
+            }
+            if self.walk_of(i).rand() >= tn().race_travel {
+                stay.push(i);
                 continue;
             }
             if let Some(from) = order.iter().position(|&w| w == ws) {
@@ -428,6 +436,22 @@ impl CharacterOverlay {
                 self.walk_of(i).set_off(here, at > from);
             }
         }
+    }
+
+    /// Sets `i` off for workspace `to`; false if there's no such way.
+    pub(super) fn send_to(&mut self, i: usize, to: u64) -> bool {
+        let order: Vec<u64> = self.spaces.list.iter().map(|s| s.id).collect();
+        let from = self.walk_ref(i).ws;
+        let (Some(a), Some(b)) = (order.iter().position(|&w| w == from), order.iter().position(|&w| w == to)) else { return false };
+        if a != b {
+            self.walk_of(i).set_off(to, b > a);
+        }
+        a != b
+    }
+
+    /// The workspace `i` is on its way to.
+    pub(super) fn heading_to(&self, i: usize) -> Option<u64> {
+        self.walk_ref(i).trip.map(|t| t.to)
     }
 
     /// Let go of in the overview over another workspace: lands there.
@@ -475,13 +499,19 @@ impl CharacterOverlay {
         // positive: more characters there than its fair share
         let surplus = |this: &Self, at: usize| count(this, hosts[at]) as f32 - seats[at] as f32;
         let mut moving = (0..n).filter(|&i| self.walk_ref(i).trip.is_some()).count();
+        // one departure, then a quiet spell: no streams of them to and fro
+        self.spaces.quiet -= 1.0;
+        if self.spaces.quiet > 0.0 {
+            return;
+        }
         for i in 0..n {
             if moving >= tn().ws_max as usize {
                 break;
             }
             let wk = self.walk_ref(i);
             let (ws, here) = (wk.ws, wk.here_t);
-            if !wk.at_leisure() || count(self, ws) <= 1 {
+            // just got here: stays a while first
+            if !wk.at_leisure() || count(self, ws) <= 1 || here < tn().ws_stay {
                 continue;
             }
             let Some(pos) = hosts.iter().position(|&h| h == ws) else { continue };
@@ -492,7 +522,7 @@ impl CharacterOverlay {
             // crowded for how little it's used: time to go; thin already: stay
             let spare = surplus(self, pos);
             let balance = if spare > 0.0 { 1.0 + spare * tn().ws_balance } else { 0.25 };
-            let urge = (1.0 + here / tn().ws_bored.max(1.0)) * (1.0 + known * tn().ws_familiar) * balance * stay;
+            let urge = ((1.0 + here / tn().ws_bored.max(1.0)) * (1.0 + known * tn().ws_familiar) * balance * stay).min(4.0);
             let roll = self.walk_of(i).rand();
             if roll >= urge / tn().ws_every.max(1.0) {
                 continue;
@@ -520,14 +550,18 @@ impl CharacterOverlay {
                 log::debug!("workspaces: {i} goes from {ws} to {}", hosts[to]);
                 self.walk_of(i).set_off(hosts[to], to > pos);
                 moving += 1;
-                // close friends and teammates come along
-                for j in 0..n {
-                    if self.close(i, j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure() && self.walk_of(j).rand() < tn().close_follow {
+                self.spaces.quiet = tn().ws_gap;
+                // its closest friends may come along, a couple at most, never a crowd
+                let mut pals: Vec<usize> = (0..n).filter(|&j| self.close(i, j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure()).collect();
+                pals.sort_by(|&a, &b| self.bond(i, b).0.total_cmp(&self.bond(i, a).0));
+                for j in pals.into_iter().take(tn().ws_friends as usize) {
+                    if self.walk_of(j).rand() < tn().close_follow {
                         log::debug!("workspaces: {j} goes along with {i}");
                         self.walk_of(j).set_off(hosts[to], to > pos);
                         moving += 1;
                     }
                 }
+                break;
             }
         }
     }

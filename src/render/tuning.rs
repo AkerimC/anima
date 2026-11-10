@@ -75,7 +75,7 @@ tuning! {
         laugh_spread: "Friends nearby laugh along" = 0.6, 0.0, 1.0, 0.05, 2;
         look_around: "Looking around while standing (per s)" = 0.12, 0.0, 2.0, 0.01, 2;
         greet_cool: "Between waves at the same friend (s)" = 90.0, 5.0, 900.0, 5.0, 0;
-        pat_distract: "Happy moment when petted mid-game (s)" = 1.6, 0.2, 10.0, 0.1, 1;
+        pat_distract: "Happy moment when petted mid-game (s)" = 0.7, 0.2, 10.0, 0.1, 1;
     }
     "Social", "Parting" {
         part_stay: "Stay where they are" = 0.25, 0.0, 1.0, 0.05, 2;
@@ -98,7 +98,7 @@ tuning! {
     }
     "Games", "Concert after a race" {
         concert_chance: "Chance of a concert" = 0.8, 0.0, 1.0, 0.05, 2;
-        race_travel: "Come from other workspaces to race" = 0.6, 0.0, 1.0, 0.05, 2;
+        race_travel: "Come from other workspaces to race" = 0.85, 0.0, 1.0, 0.05, 2;
         concert_time: "Concert length (s)" = 20.0, 3.0, 120.0, 1.0, 0;
     }
     "Roaming", "Visiting fullscreen apps" {
@@ -118,6 +118,9 @@ tuning! {
         ws_use_weight: "Use vs window count (1 = use)" = 0.5, 0.0, 1.0, 0.05, 2;
         ws_use_half: "Use halves every (s)" = 900.0, 30.0, 14400.0, 30.0, 0;
         ws_balance: "Urge to leave a crowded one" = 1.0, 0.0, 10.0, 0.5, 1;
+        ws_stay: "Stays at least (s)" = 120.0, 0.0, 3600.0, 10.0, 0;
+        ws_gap: "Quiet after someone leaves (s)" = 45.0, 0.0, 1800.0, 5.0, 0;
+        ws_friends: "Friends who may come along, at most" = 1.0, 0.0, 6.0, 1.0, 0;
         ws_max: "On the way at once" = 2.0, 1.0, 12.0, 1.0, 0;
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
     }
@@ -208,7 +211,7 @@ tuning! {
         land_hop: "Bounce on landing" = 0.3, 0.0, 2.0, 0.05, 2;
     }
     "Touch", "Petting" {
-        pat_keep: "Each click adds (s)" = 0.6, 0.1, 5.0, 0.1, 1;
+        pat_keep: "Each click adds (s)" = 0.3, 0.1, 5.0, 0.1, 1;
         pat_fan: "Spread out while petted (widths)" = 0.5, 0.2, 2.0, 0.05, 2;
         pat_gather: "Call those nearby (screens)" = 0.45, 0.0, 2.0, 0.05, 2;
         pat_gather_chance: "Chance nearby ones come" = 0.35, 0.0, 1.0, 0.05, 2;
@@ -292,10 +295,15 @@ tuning! {
         energy_game_cost: "Cost of a game" = 0.5, 0.0, 1.0, 0.05, 2;
     }
     "Games", "Starting games" {
+        carry_chase: "Chat mates hop after a carried one (speed)" = 0.9, 0.1, 3.0, 0.05, 2;
+        throw_far: "Thrown this far from a game, out of it (widths)" = 6.0, 1.0, 40.0, 0.5, 1;
         game_after: "Start if nobody joins (s)" = 7.0, 0.5, 120.0, 0.5, 1;
         game_chance: "Chat turns into a game" = 0.35, 0.0, 1.0, 0.05, 2;
         game_min: "Fewest players" = 3.0, 2.0, 12.0, 1.0, 0;
         crowd_games: "Fewest for games in a row" = 4.0, 2.0, 12.0, 1.0, 0;
+        encore_keen: "Stays for another game, whatever its energy" = 0.25, 0.0, 1.0, 0.05, 2;
+        encore_energy: "Extra chance from energy" = 0.65, 0.0, 1.0, 0.05, 2;
+        encore_show: "Holds up the next game for (s)" = 2.5, 0.5, 10.0, 0.5, 1;
         max_games: "Most games per group" = 2.0, 1.0, 7.0, 1.0, 0;
         party_min: "Fewest for domino and tag" = 4.0, 2.0, 12.0, 1.0, 0;
         after_game_min: "Chat after a game (s)" = 6.0, 0.0, 60.0, 1.0, 0;
@@ -377,6 +385,7 @@ tuning! {
     }
     "Games", "Volleyball" {
         volley_min: "Fewest characters (even)" = 6.0, 6.0, 12.0, 2.0, 0;
+        volley_hold: "Ball held this long, someone knocks it out (s)" = 1.5, 0.5, 30.0, 0.5, 1;
         volley_reach: "Hit reach (px)" = 55.0, 10.0, 300.0, 5.0, 0;
         volley_big: "Fewest for a net of 4" = 11.0, 7.0, 30.0, 1.0, 0;
         volley_fumble: "Miss the ball (more in a crowd)" = 0.04, 0.0, 1.0, 0.01, 2;

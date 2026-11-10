@@ -2028,10 +2028,18 @@ impl CharacterOverlay {
             self.program.set_vec4(gl, "u_mouth", mouth);
 
             gl.active_texture(glow::TEXTURE0);
-            let happy = matches!(self.walk.act, Act::Jump | Act::Pat | Act::Held | Act::Fall)
-                || self.walk.giggle > 0.0
-                || self.walk.petted > 0.0
-                || self.walk.social.is_some_and(|s| s.happy);
+            // walking or running along the ground is always the calm pose: the
+            // happy one is drawn facing the other way for many characters.
+            // Hopping along (samba, leaps) isn't walking.
+            let afoot = moving
+                && matches!(self.walk.act, Act::Idle | Act::Walk | Act::Chase)
+                && self.walk.air <= 0.0
+                && !self.walk.social.is_some_and(|s| s.leaping);
+            let happy = !afoot
+                && (matches!(self.walk.act, Act::Jump | Act::Pat | Act::Held | Act::Fall)
+                    || self.walk.giggle > 0.0
+                    || self.walk.petted > 0.0
+                    || self.walk.social.is_some_and(|s| s.happy));
             let tex = match (happy, self.sprite_happy) {
                 (true, Some(h)) => h,
                 _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),

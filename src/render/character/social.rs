@@ -29,7 +29,7 @@ pub(super) struct Social {
     // long jump: in the air (spinning this fast), or planted in the ground
     pub(super) flying: bool,
     spin: f32,
-    stuck: bool,
+    pub(super) stuck: bool,
     rot_target: f32,
     sink_target: f32,
     bump_cool: f32,
@@ -46,7 +46,7 @@ pub(super) struct Social {
     pace_goal: f32,
     pace_wait: f32,
     // tag: jumping over "it" to get out of a corner, moving through the air
-    leaping: bool,
+    pub(super) leaping: bool,
     // tag: has reached the playing window, and only now keeps inside it
     inside: bool,
     // on the rope: nothing but the rope itself can be touched
@@ -59,6 +59,9 @@ pub(super) struct Social {
     face_lock: bool,
     // volleyball: standing on the other half of the net
     perched: bool,
+    // picked up by hand mid-game, and where it was (or was heading) then
+    grabbed: bool,
+    grab_px: f32,
     // knocked flying: times it comes back off the ground
     pub(super) bounces: u8,
 }
@@ -118,6 +121,10 @@ struct Volley {
     run_speed: f32,
     top_speed: f32,
     rally: i32,
+    // the ball in someone's hand: for how long
+    held: f32,
+    // who is leaping up to knock it out of the hand
+    knocker: Option<usize>,
 }
 
 impl Volley {
@@ -265,7 +272,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
+        Chat { leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
     }
 }
 
@@ -359,6 +366,12 @@ pub(super) struct Chat {
     long: Option<Long>,
     // scattered by a game: get back together before talking
     regroup: bool,
+    // after a game: who's had enough and wanders off (seconds until each goes)
+    leavers: Vec<(usize, f32)>,
+    // and who's holding up the next game for those staying: proposer, game, seconds left
+    offer: Option<(usize, Game, f32)>,
+    // someone was picked up: turn-taking games wait this long at most for them
+    hold: f32,
     // started from the settings window: play this as soon as they're lined up
     forced: Option<Game>,
     // tag: who was "it" just now and can't be tagged straight back, and for
@@ -443,6 +456,11 @@ fn free_fishing_spot(f: &Fishing, me: usize, x: f32, lo: f32, hi: f32, size: f32
         .map(|k| x + k * gap)
         .find(|&p| p >= min && p <= max && free(p))
         .unwrap_or(x)
+}
+
+/// Still in the hand: no giving up on it yet.
+fn wk_held(this: &CharacterOverlay, c: &Chat) -> bool {
+    c.members.iter().any(|&i| this.walk_ref(i).act == Act::Held)
 }
 
 fn grounded(wk: &WalkState) -> bool {
@@ -878,13 +896,68 @@ impl CharacterOverlay {
         // tag: you can carry someone off and they're still in it when put down
         let tag = matches!(c.stage, Stage::Fishing | Stage::Blind | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Long);
         let mut left = Vec::new();
+        let carried = crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
+        // picked up by hand: still in the game while in the air; put down
+        // near the others it carries on, thrown far off it's out
+        let by_hand = matches!(
+            c.stage,
+            Stage::Contest | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Volley | Stage::Blind | Stage::Concert | Stage::Cheer
+        );
+        // a chat isn't broken off either: the others run after whoever's carried away
+        let talk = matches!(c.stage, Stage::Approach | Stage::Talk | Stage::Stroll);
+        let (mut back, mut out) = (Vec::new(), Vec::new());
+        for k in 0..if by_hand || talk { c.members.len() } else { 0 } {
+            let i = c.members[k];
+            if i >= n {
+                continue;
+            }
+            let x = self.strip_px(i);
+            let wk = self.walk_ref(i);
+            let Some(s) = wk.social.filter(|s| s.chat == id) else { continue };
+            if !s.grabbed {
+                if wk.act == Act::Held && carried && wk.hang <= 0.0 {
+                    let at = if s.moving { s.goal_px } else { x };
+                    if let Some(r) = self.walk_of(i).social.as_mut() {
+                        r.grabbed = true;
+                        r.grab_px = at;
+                        r.lean = 0.0;
+                        // in the hand it's neither flying nor lying where it fell
+                        r.flying = false;
+                        r.stuck = false;
+                    }
+                    if !talk {
+                        c.hold = 10.0;
+                    }
+                }
+            } else if grounded(wk) {
+                let others = c.members.iter().filter(|&&m| m != i && m < n).map(|&m| self.strip_px(m));
+                let (lo, hi) = others.fold((s.grab_px, s.grab_px), |(lo, hi), p| (lo.min(p), hi.max(p)));
+                let far = self.width_of(i) * tn().throw_far;
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.grabbed = false;
+                }
+                // a ball is never out of the game: someone goes and gets it
+                let ball = c.volley.as_ref().is_some_and(|v| v.ball == i);
+                if !ball && !talk && (x < lo - far || x > hi + far) {
+                    out.push(i);
+                } else {
+                    back.push((i, s.grab_px));
+                }
+            }
+        }
+        for (i, px) in back {
+            self.back_in(c, i, px);
+        }
+        if !out.is_empty() {
+            log::debug!("chat {id}: {out:?} thrown too far, out of the game");
+        }
         c.members.retain(|&i| {
-            let stays = i < n && {
+            let stays = i < n && !out.contains(&i) && {
                 let wk = self.walk_ref(i);
                 // hanging off the cursor and dropping from it is the game
                 // (not when someone's picked it up: that's the button held down)
-                let carried = crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
                 let playing = (game && (wk.act == Act::Fall || (wk.act == Act::Held && (wk.hang > 0.0 || !carried))))
+                    || (wk.social.is_some_and(|s| s.grabbed) && matches!(wk.act, Act::Held | Act::Fall))
                     || (tag && matches!(wk.act, Act::Held | Act::Fall));
                 wk.social.is_some_and(|s| s.chat == id) && !wk.circle && (playing || !matches!(wk.act, Act::Held | Act::Fall | Act::Chase))
             };
@@ -914,6 +987,107 @@ impl CharacterOverlay {
             c.turn = 0.0;
         }
         c.members.len() >= 2 || (c.stage == Stage::Fishing && !c.members.is_empty())
+    }
+
+    /// Someone was picked up: the rest wait till it's back in its place.
+    fn held_up(&mut self, c: &mut Chat, dt: f32) -> bool {
+        if c.hold <= 0.0 {
+            return false;
+        }
+        let waiting = c.members.iter().any(|&i| {
+            let wk = self.walk_ref(i);
+            wk.social.is_some_and(|s| s.grabbed || (s.moving && grounded(wk))) || matches!(wk.act, Act::Held | Act::Fall)
+        });
+        // the timer of the game stands still meanwhile
+        c.hold = if waiting { c.hold - dt } else { 0.0 };
+        if waiting && wk_held(self, c) {
+            c.hold = c.hold.max(1.0);
+        }
+        c.timer += dt;
+        c.hold > 0.0
+    }
+
+    /// Someone in the chat is being carried about: the rest hop along
+    /// after it, delighted, and gather underneath.
+    fn chase_carried(&mut self, c: &Chat, h: usize) {
+        let x = self.strip_px(h);
+        let gap = self.width_of(h) * 0.7;
+        let width = self.strip_width_of(h);
+        let mut k = 0;
+        for &i in c.members.iter().filter(|&&i| i != h) {
+            k += 1;
+            let side = if k % 2 == 0 { 1.0 } else { -1.0 };
+            let slot = (x + side * ((k + 1) / 2) as f32 * gap).clamp(0.0, width);
+            let near = (self.strip_px(i) - slot).abs() < gap * 0.4;
+            let wk = self.walk_of(i);
+            if !grounded(wk) || wk.social.is_some_and(|s| s.grabbed) {
+                continue;
+            }
+            // one hop after another; standing under it they just bounce
+            let amp = tn().jump_height * if near { 0.2 } else { 0.35 };
+            wk.start_bob(amp);
+            if let Some(r) = wk.social.as_mut() {
+                r.goal_px = slot;
+                r.speed = tn().carry_chase;
+                r.moving = !near;
+                r.leaping = true;
+                r.face_lock = false;
+                r.happy = true;
+            }
+        }
+    }
+
+    /// Put down near enough after being picked up: back to its place.
+    fn back_in(&mut self, c: &mut Chat, i: usize, px: f32) {
+        log::debug!("chat {}: {i} is put down and carries on", c.id);
+        match c.stage {
+            // the chat moves to wherever it came down: a hop of welcome, and on they talk
+            Stage::Approach | Stage::Talk | Stage::Stroll => {
+                self.arrange(c);
+                for k in 0..c.members.len() {
+                    let m = c.members[k];
+                    let wk = self.walk_of(m);
+                    if m != i && grounded(wk) {
+                        wk.start_bob(tn().jump_height * 0.3);
+                    }
+                }
+            }
+            Stage::Volley => {
+                let Some(v) = c.volley.as_mut() else { return };
+                if i == v.ball {
+                    if c.step == 9 {
+                        self.steer(i, px, 0.3);
+                    } else {
+                        // a dropped ball: served again
+                        v.rest = v.rest.max(1.0);
+                        v.runner = None;
+                        v.fumbled = false;
+                    }
+                } else if let Some(&(_, home)) = v.homes.iter().find(|h| h.0 == i) {
+                    self.run_to(i, home, 0.3);
+                } else {
+                    // part of the net: back to it, and up again
+                    if c.step != 9 && v.net.iter().position(|&m| m == i).is_some_and(|k| k > 0) {
+                        let wk = self.walk_of(i);
+                        wk.air = wk.air.max(0.01);
+                        if let Some(r) = wk.social.as_mut() {
+                            r.perched = true;
+                        }
+                    }
+                    self.steer(i, px, 0.3);
+                }
+            }
+            Stage::Blind => {
+                // "it" gropes on from where it lands; a hider runs back to its place
+                let spot = c.blind.as_ref().and_then(|b| b.hiding.iter().find(|h| h.0 == i).and_then(|h| b.spots.get(h.1))).map(|s| s.0);
+                if let Some(x) = spot {
+                    self.run_to(i, x, tn().tag_run);
+                }
+            }
+            // these chase each other about anyway
+            Stage::Tag | Stage::Carrot | Stage::Samba => {}
+            _ => self.steer(i, px, 0.3),
+        }
     }
 
     fn leave(&mut self, i: usize, id: u32) {
@@ -952,7 +1126,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, bounces: 0 });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0 });
     }
 
     /// Two standing close, on screen and free: maybe they notice each other.
@@ -1322,6 +1496,10 @@ impl CharacterOverlay {
         let talker = self.goal_of(c.talker);
         let mean = c.members.iter().map(|&i| self.goal_of(i)).sum::<f32>() / c.members.len() as f32;
         for &i in &c.members {
+            // still walking over: looks where it's going
+            if !self.arrived(i) {
+                continue;
+            }
             let own = self.goal_of(i);
             let at = if i == c.talker { mean } else { talker };
             if (at - own).abs() > 1.0 {
@@ -1374,7 +1552,8 @@ impl CharacterOverlay {
                 let in_place = self.arrived(i);
                 let wk = self.walk_of(i);
                 if let Some(r) = wk.social.as_mut() {
-                    r.happy = talking || laugh;
+                    // nobody grins while still on the way over
+                    r.happy = in_place && (talking || laugh);
                 }
                 if laugh && in_place {
                     wk.start_bob(tn().jump_height * 0.15);
@@ -1734,7 +1913,7 @@ impl CharacterOverlay {
             ((r[0] + r[2]) * 0.5, r[1] + (r[3] - r[1]) * 0.62)
         };
         let ends = |team: &Vec<usize>| -> Vec<(f32, f32)> {
-            team.iter().filter(|&&i| i < n && c.members.contains(&i)).map(|&i| hand(i)).collect()
+            team.iter().filter(|&&i| i < n && c.members.contains(&i) && !self.walk_ref(i).social.is_some_and(|s| s.grabbed)).map(|&i| hand(i)).collect()
         };
         let (left, right) = (ends(&c.teams.0), ends(&c.teams.1));
         let a = left.iter().copied().min_by(|p, q| p.0.total_cmp(&q.0))?;
@@ -2828,7 +3007,7 @@ impl CharacterOverlay {
                 let lean = [(c.teams.0.clone(), tn().tug_lean + heave - winning), (c.teams.1.clone(), -(tn().tug_lean + heave + winning))];
                 for (team, amount) in lean {
                     for i in team {
-                        if let Some(r) = self.walk_of(i).social.as_mut() {
+                        if let Some(r) = self.walk_of(i).social.as_mut().filter(|r| !r.grabbed) {
                             r.lean = amount;
                         }
                     }
@@ -2920,10 +3099,12 @@ impl CharacterOverlay {
         c.wait = 2.5;
         for &i in &all {
             if let Some(r) = self.walk_of(i).social.as_mut() {
-                r.no_touch = true;
+                // the ball can be picked up and thrown, just not petted
+                r.no_touch = i != ball;
+                r.no_pat = true;
             }
         }
-        c.volley = Some(Volley { lofted: false, teams, homes, ball, net, fumbled: false, mid, lo, hi, score: [0, 0], server: 0, rest: 0.0, runner: None, to: 0.0, react: 0.0, run_speed: 0.0, top_speed: 0.0, rally: 0 });
+        c.volley = Some(Volley { held: 0.0, knocker: None, lofted: false, teams, homes, ball, net, fumbled: false, mid, lo, hi, score: [0, 0], server: 0, rest: 0.0, runner: None, to: 0.0, react: 0.0, run_speed: 0.0, top_speed: 0.0, rally: 0 });
         c.scores.clear();
         c.step = 9;
         c.timer = 60.0;
@@ -2936,6 +3117,81 @@ impl CharacterOverlay {
         let x = self.strip_px(v.ball);
         let air = self.walk_ref(v.ball).air;
         v.clear_time(x, to, air).max(1.2)
+    }
+
+    /// The ball's been in the hand too long: the nearest player runs under
+    /// it, leaps right up to it and knocks it over the net.
+    fn knock_from_hand(&mut self, v: &mut Volley) {
+        let x = self.strip_px(v.ball);
+        let air = self.walk_ref(v.ball).air;
+        if let Some(p) = v.knocker {
+            // in the air: the hit lands when its head gets to the ball
+            let wk = self.walk_ref(p);
+            if wk.act != Act::Fall {
+                v.knocker = None;
+                return;
+            }
+            if wk.air < air - 1.9 && wk.vy > 0.0 {
+                return;
+            }
+            let (a, b) = if v.teams[0].contains(&p) { (v.mid + 100.0, v.hi - 60.0) } else { (v.lo + 60.0, v.mid - 100.0) };
+            let to = a + self.walk.rand() * (b - a).max(0.0);
+            let time = v.clear_time(x, to, air).max(0.9);
+            log::debug!("{p} knocks the ball out of the hand");
+            self.ball_to(v.ball, to, time);
+            // out of the hand for good: it no longer hangs from where it was gripped
+            let ball = self.walk_of(v.ball);
+            ball.grip = false;
+            ball.grab = None;
+            ball.swing = 0.0;
+            ball.swing_v = 0.0;
+            ball.swing_last = None;
+            ball.tumble = 0.0;
+            ball.rolling = false;
+            if let Some(r) = ball.social.as_mut() {
+                r.grabbed = false;
+            }
+            // the hitter drops back with a little kick from the blow
+            let wk = self.walk_of(p);
+            wk.vy = wk.vy.min(0.0) - 2.0;
+            if let Some(&(_, home)) = v.homes.iter().find(|h| h.0 == p) {
+                self.run_to(p, home, 0.25);
+            }
+            v.knocker = None;
+            v.held = 0.0;
+            v.rest = 0.0;
+            v.runner = None;
+            v.fumbled = false;
+            v.lofted = true;
+            v.rally += 1;
+            return;
+        }
+        let free = |this: &Self, p: usize| this.walk_ref(p).petted <= 0.0 && !this.walk_ref(p).social.is_some_and(|s| s.grabbed);
+        let Some(p) = v.teams.iter().flatten().copied().filter(|&p| free(self, p)).min_by(|a, b| (self.strip_px(*a) - x).abs().total_cmp(&(self.strip_px(*b) - x).abs())) else {
+            return;
+        };
+        let px = self.strip_px(p);
+        if (px - x).abs() > 28.0 || !grounded(self.walk_ref(p)) {
+            // right under it, wherever the hand takes it
+            self.run_to(p, x, tn().volley_speed);
+            return;
+        }
+        // up it goes, high enough for its head to reach the ball
+        let w = self.view_w.max(1.0);
+        let apex = (air - 1.2).max(0.6);
+        let vy = (2.0 * tn().gravity * apex).sqrt();
+        let wk = self.walk_of(p);
+        wk.act = Act::Fall;
+        wk.air = wk.air.max(0.02);
+        wk.vy = vy;
+        wk.vx = (x - px) * 2.0 / w / (vy / tn().gravity).max(0.1);
+        wk.jump = 0.0;
+        wk.held_prev = None;
+        wk.left = x < px;
+        if let Some(r) = wk.social.as_mut() {
+            r.moving = false;
+        }
+        v.knocker = Some(p);
     }
 
     /// Send the ball in an arc to `to`, landing in `time` seconds.
@@ -3005,8 +3261,42 @@ impl CharacterOverlay {
         }
         for k in 1..v.net.len() {
             let top = self.walk_of(v.net[k]);
+            if top.social.is_some_and(|s| s.grabbed) {
+                continue;
+            }
             top.air += (k as f32 * 1.7 - top.air) * (dt * 6.0).min(1.0);
         }
+        // the ball is in someone's hand
+        if self.walk_ref(v.ball).social.is_some_and(|s| s.grabbed) {
+            if self.walk_ref(v.ball).act == Act::Held {
+                // held too long: someone runs up, jumps and knocks it out
+                v.held += dt;
+                if v.held > tn().volley_hold {
+                    self.knock_from_hand(&mut v);
+                }
+            } else if self.walk_ref(v.ball).act == Act::Fall {
+                // thrown: a ball in the air like any other
+                let wk = self.walk_of(v.ball);
+                let spin = if wk.vx < 0.0 { 8.0 } else { -8.0 };
+                if let Some(r) = wk.social.as_mut() {
+                    r.grabbed = false;
+                    r.flying = true;
+                    r.stuck = false;
+                    r.moving = false;
+                    r.spin = spin;
+                }
+                v.held = 0.0;
+                v.knocker = None;
+                v.rest = 0.0;
+                v.runner = None;
+                v.fumbled = false;
+                v.lofted = true;
+            }
+            c.volley = Some(v);
+            return;
+        }
+        v.held = 0.0;
+        v.knocker = None;
         if v.rest > 0.0 {
             v.rest -= dt;
             if v.rest <= 0.0 {
@@ -3063,7 +3353,7 @@ impl CharacterOverlay {
         }
         // someone being petted is too happy to play
         let closest = |this: &Self, team: &[usize], at: f32| {
-            team.iter().copied().filter(|&p| this.walk_ref(p).petted <= 0.0).min_by(|a, b| (this.strip_px(*a) - at).abs().total_cmp(&(this.strip_px(*b) - at).abs()))
+            team.iter().copied().filter(|&p| this.walk_ref(p).petted <= 0.0 && !this.walk_ref(p).social.is_some_and(|s| s.grabbed)).min_by(|a, b| (this.strip_px(*a) - at).abs().total_cmp(&(this.strip_px(*b) - at).abs()))
         };
         // where it will really come down, walls included; the chaser follows
         // that as it changes, so a bounce or the net can still be played
@@ -3144,6 +3434,19 @@ impl CharacterOverlay {
     /// Things drawn beside the characters: (kind, surface box, mirrored).
     pub(super) fn props(&self) -> Vec<(i32, [f32; 4], bool, usize)> {
         let mut v: Vec<(i32, [f32; 4], bool, usize)> = self.chats.iter().filter(|c| c.stage == Stage::Carrot && c.step != 9).filter_map(|c| Some((0, self.carrot_rect(c)?, false, *c.members.first()?))).collect();
+        // "let's play this next": held up over the head
+        for c in self.chats.iter().filter(|c| c.stage == Stage::Talk && c.leavers.is_empty()) {
+            let Some((p, game, t)) = c.offer else { continue };
+            let r = if p == 0 { self.hit_rect } else if let Some(e) = self.extras.get(p - 1) { e.hit_rect } else { continue };
+            let h = r[3] - r[1];
+            if h <= 0.0 {
+                continue;
+            }
+            let size = h * 0.42;
+            let x = (r[0] + r[2]) * 0.5;
+            let top = r[1] - size * 0.55 + (t * 9.0).sin() * h * 0.03;
+            v.push((Self::game_icon(game), [x - size * 0.5, top, x + size * 0.5, top + size], false, p));
+        }
         for c in self.chats.iter().filter(|c| c.stage == Stage::Gift) {
             let Some(g) = c.gift.as_ref() else { continue };
             let rect = |i: usize| if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
@@ -4711,6 +5014,117 @@ impl CharacterOverlay {
         }
         let length = tn().after_game_min + self.walk.rand() * tn().after_game_rand;
         self.start_talk(c, length);
+        if c.stage == Stage::Talk {
+            self.plan_encore(c);
+        }
+    }
+
+    /// After a game some have had enough and drift off; the lively and the
+    /// keen stay, and the liveliest holds up what to play next.
+    fn plan_encore(&mut self, c: &mut Chat) {
+        if self.race.is_some() || c.members.len() < 2 {
+            return;
+        }
+        let (mut keen, mut tired) = (Vec::new(), Vec::new());
+        for &i in &c.members.clone() {
+            // energy counts most, but it's a mood too: a tired one may still fancy it
+            let want = (tn().encore_keen + self.walk_ref(i).energy * tn().encore_energy).clamp(0.05, 0.95);
+            if self.walk_of(i).rand() < want { keen.push(i) } else { tired.push(i) }
+        }
+        if keen.len() < 2 {
+            log::debug!("chat {}: nobody much wants another game ({keen:?} of {})", c.id, c.members.len());
+            return;
+        }
+        let rivalry = self.rivalry(&keen);
+        let Some(game) = self.choose_game(&c.played, keen.len(), rivalry) else {
+            log::debug!("chat {}: {keen:?} would play on, but there's nothing new for {}", c.id, keen.len());
+            return;
+        };
+        let proposer = keen.iter().copied().max_by(|&a, &b| self.walk_ref(a).energy.total_cmp(&self.walk_ref(b).energy)).unwrap_or(keen[0]);
+        log::debug!("chat {}: {proposer} wants {game:?} next, {keen:?} stay, {tired:?} have had enough", c.id);
+        let mut last = 0.0f32;
+        c.leavers.clear();
+        for i in tired {
+            let delay = 1.0 + self.walk.rand() * 3.0;
+            last = last.max(delay);
+            c.leavers.push((i, delay));
+        }
+        c.offer = Some((proposer, game, tn().encore_show));
+        c.timer = c.timer.max(last + tn().encore_show + 2.0);
+    }
+
+    /// The talk after a game: the tired go one by one, then the proposer
+    /// shows what's next and off they go. True once the next game starts.
+    fn run_encore(&mut self, c: &mut Chat, dt: f32) -> bool {
+        let mut going = Vec::new();
+        c.leavers.retain_mut(|l| {
+            l.1 -= dt;
+            if l.1 <= 0.0 {
+                going.push(l.0);
+            }
+            l.1 > 0.0
+        });
+        for i in going {
+            if c.members.len() <= 2 || !c.members.contains(&i) {
+                continue;
+            }
+            log::debug!("chat {}: {i} has had enough and goes", c.id);
+            c.members.retain(|&m| m != i);
+            self.leave(i, c.id);
+            self.walk_of(i).start_bob(tn().jump_height * 0.2);
+        }
+        let Some((p, game, t)) = c.offer else { return false };
+        if !c.members.contains(&p) || c.members.len() < 2 {
+            c.offer = None;
+            return false;
+        }
+        if !c.leavers.is_empty() {
+            return false;
+        }
+        if t == tn().encore_show {
+            // "this one!": a hop, and everyone looks
+            c.talker = p;
+            self.look_at_talker(c);
+            let wk = self.walk_of(p);
+            wk.gesture = true;
+            wk.start_bob(tn().jump_height * 0.35);
+        }
+        if let Some(r) = self.walk_of(p).social.as_mut() {
+            r.happy = true;
+        }
+        let t = t - dt;
+        if t > 0.0 {
+            c.offer = Some((p, game, t));
+            c.timer = c.timer.max(1.0);
+            return false;
+        }
+        c.offer = None;
+        for (a, b) in Self::each_pair(&c.members) {
+            self.add_bond(a, b, 0.0, tn().bond_game);
+        }
+        c.played.push(game);
+        c.games += 1;
+        c.quiet = 0.0;
+        for &i in &c.members.clone() {
+            self.spend(i, tn().energy_game_cost);
+            self.walk_of(i).played += 1.0;
+        }
+        self.start_game(c, game);
+        true
+    }
+
+    /// What the proposer holds up for each game (a prop kind).
+    fn game_icon(game: Game) -> i32 {
+        match game {
+            Game::Carrot => 0,
+            Game::Gift => 1,
+            Game::Volley => 2,
+            Game::Tag => 7,
+            Game::Blind => 10,
+            Game::Fishing => 13,
+            Game::Tug => 3,
+            _ => 15,
+        }
     }
 
     /// And their own ways, not all at once: some stay put, friends go off
@@ -4795,6 +5209,15 @@ impl CharacterOverlay {
     /// Run one chat for a frame; false when it's over.
     fn advance(&mut self, c: &mut Chat, dt: f32, mouse: [f32; 2]) -> bool {
         c.timer -= dt;
+        // one of a chat is in the hand or in the air: the talk waits, they chase it
+        if matches!(c.stage, Stage::Approach | Stage::Talk | Stage::Stroll) {
+            if let Some(&h) = c.members.iter().find(|&&i| self.walk_ref(i).social.is_some_and(|s| s.grabbed)) {
+                c.timer += dt;
+                self.chase_carried(c, h);
+                return true;
+            }
+        }
+        let paused = matches!(c.stage, Stage::Contest | Stage::Domino | Stage::Gift) && self.held_up(c, dt);
         match c.stage {
             Stage::Notice => {
                 // the other one looks back a moment later
@@ -4830,6 +5253,12 @@ impl CharacterOverlay {
             Stage::Talk => {
                 c.quiet += dt;
                 c.mood += dt;
+                if (c.offer.is_some() || !c.leavers.is_empty()) && self.run_encore(c, dt) {
+                    return true;
+                }
+                if c.offer.is_some() {
+                    c.quiet = 0.0;
+                }
                 if c.members.len() >= tn().mood_min as usize && c.mood >= tn().mood_after && self.race.is_none() && self.social_age >= tn().warm_small {
                     c.mood = -60.0;
                     if self.mood_split(c) {
@@ -4871,6 +5300,7 @@ impl CharacterOverlay {
                     self.start_talk(c, length);
                 }
             }
+            Stage::Contest | Stage::Domino | Stage::Gift if paused => {}
             Stage::Contest => {
                 c.wait -= dt;
                 // the one whose turn it was got picked up or wandered off

@@ -79,10 +79,16 @@ impl CharacterOverlay {
                     let a = if i == 0 { &mut *self } else { &mut self.extras[i - 1] };
                     if a.walk.act != Act::Held {
                         // caught in flight: it has moved and turned since the press
-                        let flying = matches!(a.walk.act, Act::Fall | Act::Planted);
+                        // (or lying where it landed, or still turning: anything not upright)
+                        let flying = matches!(a.walk.act, Act::Fall | Act::Planted)
+                            || a.walk.rot.abs() > 0.05
+                            || a.walk.social.is_some_and(|s| s.flying || s.stuck);
                         a.walk.sink = 0.0;
                         a.walk.race_down = false;
                         let grab = if flying { a.body_clip(a.scene_mouse()) } else { grab };
+                        // it may have moved on since the press: the hand closes on
+                        // the body all the same, never on the air beside it
+                        let grab = a.on_body_clip(grab);
                         // caught mid-jump: keep it at the height it is drawn at
                         if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
                             let t = 1.0 - (a.walk.jump / a.walk.jump_dur).clamp(0.0, 1.0);
@@ -189,6 +195,14 @@ impl CharacterOverlay {
     fn body_clip(&self, m: [f32; 2]) -> [f32; 2] {
         let o = self.body_offset(m);
         [o[0] * 2.0 / self.surface[0].max(1.0), o[1] * 2.0 / self.surface[1].max(1.0)]
+    }
+
+    /// A grab point pulled in onto the drawn body.
+    fn on_body_clip(&self, g: [f32; 2]) -> [f32; 2] {
+        let [half, top, bottom] = self.body_extent();
+        let (sx, sy) = (2.0 / self.surface[0].max(1.0), 2.0 / self.surface[1].max(1.0));
+        let (mid, tall) = ((top + bottom) * 0.5, (top - bottom) * 0.5);
+        [g[0].clamp(-half * 0.7 * sx, half * 0.7 * sx), g[1].clamp((mid - tall * 0.7) * sy, (mid + tall * 0.7) * sy)]
     }
 
     /// The drawn part of the sprite on an upright box: x half width, top, bottom, px, y up.
