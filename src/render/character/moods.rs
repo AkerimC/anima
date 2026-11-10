@@ -67,8 +67,10 @@ const CRUMB_FPS: f32 = 12.0;
 
 /// Something that fell out of a character's hand: tumbling down, bouncing,
 /// lying on the floor till its owner comes for it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Loose {
+    // what it was, to have it back
+    pub(super) id: String,
     pub(super) kind: i32,
     pub(super) owner: usize,
     // strip x and screen y of its middle, px; speed px/s
@@ -405,6 +407,7 @@ impl CharacterOverlay {
         if !self.moods.started {
             self.moods.started = true;
             desktop::spawn();
+            super::weather::set_place(&self.config.weather_place);
             super::weather::spawn();
             self.moods.seen_opened = desktop::OPENED.load(Relaxed);
             self.moods.seen_closed = desktop::CLOSED.load(Relaxed);
@@ -562,14 +565,23 @@ impl CharacterOverlay {
             }
             // swung about hard in the rain: the umbrella flies out of its hand
             let wk = self.walk_ref(i);
-            if wk.act == Act::Held && w.rain && tn().weather_show >= 0.5 && !wk.umbrella_down {
+            if wk.act == Act::Held {
                 let swing = wk.swing_v.abs();
                 let wk = self.walk_of(i);
                 wk.shake = if swing > tn().drop_swing { wk.shake + dt } else { (wk.shake - dt).max(0.0) };
                 if wk.shake > 0.25 {
                     wk.shake = 0.0;
-                    self.drop_umbrella(i);
+                    self.knock_off(i, 1.0, 0.3);
                 }
+            }
+            // a jolt, a tumble, a crash: what's in its hand and on its head may go flying
+            let wk = self.walk_ref(i);
+            let tumbling = (wk.act == Act::Fall && wk.tumble.abs() > 3.0) || wk.act == Act::Planted || wk.race_down;
+            if tumbling && !wk.jolted {
+                self.walk_of(i).jolted = true;
+                self.knock_off(i, tn().jolt_drop, tn().jolt_drop * 0.7);
+            } else if !tumbling && matches!(wk.act, Act::Idle | Act::Walk) {
+                self.walk_of(i).jolted = false;
             }
             let wk = self.walk_of(i);
             // snow settles on its head while it stands about, and comes off when it jumps or runs
@@ -589,25 +601,52 @@ impl CharacterOverlay {
         }
     }
 
-    /// The umbrella leaves the hand where it is now, flung the way it swung.
-    fn drop_umbrella(&mut self, i: usize) {
+    /// Things go flying: the umbrella out of the hand (with `hand` chance),
+    /// hats off the head (`head` chance), from where they're drawn now.
+    fn knock_off(&mut self, i: usize, hand: f32, head: f32) {
         let a = self.actor_ref(i);
         let (r, pose) = (a.hit_rect, a.pose);
-        let h = r[3] - r[1];
+        let (w, h) = (r[2] - r[0], r[3] - r[1]);
         if h <= 0.0 {
             return;
         }
-        let (cx, top) = ((r[0] + r[2]) * 0.5, r[1] + h * 0.2);
-        let x = cx + a.own_view[0] * self.view_w * 0.5;
+        let worn = a.worn();
+        let view = a.own_view[0] * self.view_w * 0.5;
         // where it would stand: the bottom of its box on the ground, less the empty margin
         let ground = (1.0 - (pose.center[1] - pose.half[1])) * 0.5 * pose.size[1];
-        let floor = ground - h * (1.0 - a.opaque[2]) - h * 0.12;
+        let floor = ground - h * (1.0 - a.opaque[2]);
+        let mut gone: Vec<(String, i32, [f32; 4])> = Vec::new();
+        for t in &worn {
+            if t.id.is_empty() || gone.iter().any(|g| g.0 == t.id) {
+                continue;
+            }
+            let [x0, y0, x1, y1] = t.rect;
+            let px = [r[0] + (x0 + 1.0) * 0.5 * w, r[1] + (1.0 - y1) * 0.5 * h, r[0] + (x1 + 1.0) * 0.5 * w, r[1] + (1.0 - y0) * 0.5 * h];
+            // the umbrella flies as a whole, top and stick together
+            let (kind, px) = if t.id == "umbrella" {
+                (22, [px[0], px[1], px[2], r[1] + h * 0.75])
+            } else {
+                (t.kind, px)
+            };
+            gone.push((t.id.to_string(), kind, px));
+        }
         let wk = self.walk_of(i);
-        let dir = if wk.swing_v > 0.0 { -1.0 } else { 1.0 };
-        let (vx, spin) = (dir * (250.0 + wk.rand() * 300.0), dir * -(6.0 + wk.rand() * 6.0));
-        wk.umbrella_down = true;
-        log::debug!("{i} loses its umbrella");
-        self.moods.loose.push(Loose { kind: 22, owner: i, x, y: top, vx, vy: -350.0, rot: 0.0, spin, floor, size: [h * 0.75, h * 0.9], still: 0.0 });
+        let dir = if wk.swing_v.abs() > 0.5 { -wk.swing_v.signum() } else if wk.vx.abs() > 0.01 { wk.vx.signum() } else if wk.rand() < 0.5 { -1.0 } else { 1.0 };
+        let mut flying = Vec::new();
+        for (id, kind, px) in gone {
+            let chance = if id == "umbrella" { hand } else { head };
+            if wk.rand() >= chance {
+                continue;
+            }
+            let (vx, spin) = (dir * (200.0 + wk.rand() * 300.0), -dir * (5.0 + wk.rand() * 7.0));
+            let size = [px[2] - px[0], px[3] - px[1]];
+            let (x, y) = ((px[0] + px[2]) * 0.5 + view, (px[1] + px[3]) * 0.5);
+            let lie = size[0].min(size[1]) * 0.5;
+            log::debug!("{i} loses its {id}");
+            wk.lost.push(id.clone());
+            flying.push(Loose { id, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0 });
+        }
+        self.moods.loose.extend(flying);
     }
 
     /// Dropped things fall and bounce; their owner, once on its feet, goes
@@ -644,8 +683,8 @@ impl CharacterOverlay {
             let o = l.owner;
             let wk = self.walk_ref(o);
             // not raining any more, or left too long: it's gone, and so is the loss
-            if !raining && l.still > 8.0 || l.still > 120.0 {
-                self.walk_of(o).umbrella_down = false;
+            if (l.id == "umbrella" && !raining && l.still > 8.0) || l.still > 120.0 {
+                self.walk_of(o).lost.retain(|x| x != &l.id);
                 continue;
             }
             let free = matches!(wk.act, Act::Idle | Act::Walk) && wk.social.is_none() && wk.race.is_none();
@@ -655,9 +694,9 @@ impl CharacterOverlay {
                 if (here - l.x).abs() < reach {
                     // got it back
                     let wk = self.walk_of(o);
-                    wk.umbrella_down = false;
+                    wk.lost.retain(|x| x != &l.id);
                     wk.start_bob(tn().jump_height * 0.3);
-                    log::debug!("{o} picks its umbrella up again");
+                    log::debug!("{o} picks its {} up again", l.id);
                     continue;
                 }
                 // over to it

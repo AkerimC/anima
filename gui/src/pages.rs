@@ -241,7 +241,17 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
     let group = adw::PreferencesGroup::builder().title("Play now").description("Starts straight away with the characters nearest the screen, whatever their energy").build();
     group.add(&flow);
     page.add(&group);
+    // whose weather: a town, or empty for wherever the connection is
+    let doc = config::read();
+    let place = adw::EntryRow::builder().title("Weather for (town, empty: guess from the connection)").text(config::text(&doc, "character", "weather_place", "")).show_apply_button(true).build();
+    let u = ui.clone();
+    place.connect_apply(move |e| {
+        config::set("character", "weather_place", e.text().trim().to_string());
+        u.reload_soon();
+        u.say("Weather place set");
+    });
     let try_group = adw::PreferencesGroup::builder().title("Try it out").description("Weather and hats stay as set until you pick Real weather (Santa hats come on by themselves 10 Dec - 6 Jan). Bedtime sends everyone to bed at once.").build();
+    try_group.add(&place);
     try_group.add(&tries);
     page.add(&try_group);
     page.upcast()

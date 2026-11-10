@@ -1063,9 +1063,10 @@ impl CharacterOverlay {
     }
 
     /// Busy in a game (not just chatting).
+    /// Playing a game with its hands full (watching one doesn't count).
     pub(super) fn in_game(&self, i: usize) -> bool {
         self.walk_ref(i).social.is_some_and(|s| {
-            self.chats.iter().any(|c| c.id == s.chat && !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer))
+            self.chats.iter().any(|c| c.id == s.chat && c.members.contains(&i) && !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer))
         })
     }
 

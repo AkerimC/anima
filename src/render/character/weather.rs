@@ -19,6 +19,19 @@ static FORCED: Mutex<Option<Weather>> = Mutex::new(None);
 // sunrise and sunset, minutes after midnight
 /// Asked for by hand: everyone goes to bed at once.
 pub(super) static BEDTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The town the weather is for; empty: guessed from the connection.
+static PLACE: Mutex<String> = Mutex::new(String::new());
+static PLACE_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Look the weather up for this town from now on ("" for wherever we are).
+pub fn set_place(town: &str) {
+    let mut p = PLACE.lock().unwrap();
+    if *p != town.trim() {
+        *p = town.trim().to_string();
+        PLACE_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 static SUN: Mutex<(u32, u32)> = Mutex::new((7 * 60, 19 * 60));
 
 /// Santa hats on (Some(true)), off, or by the calendar (None).
@@ -81,20 +94,32 @@ pub(super) fn spawn() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("anima-weather".into()).spawn(|| loop {
-            if let Some((w, sun)) = look_up() {
+            PLACE_CHANGED.store(false, std::sync::atomic::Ordering::Relaxed);
+            let wait = if let Some((w, sun)) = look_up() {
                 log::debug!("weather: {w:?}, sun {sun:?}");
                 *NOW.lock().unwrap() = w;
                 *SUN.lock().unwrap() = sun;
-                std::thread::sleep(Duration::from_secs(1800));
+                1800
             } else {
-                std::thread::sleep(Duration::from_secs(300));
+                300
+            };
+            // half an hour, or straight away when the town changes
+            for _ in 0..wait / 5 {
+                if PLACE_CHANGED.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(5));
             }
         });
     });
 }
 
 fn look_up() -> Option<(Weather, (u32, u32))> {
-    let out = std::process::Command::new("curl").args(["-s", "-m", "20", "https://wttr.in/?format=j1"]).output().ok()?;
+    let place = PLACE.lock().unwrap().clone();
+    // a town name goes in the address as it is, spaces as +
+    let town: String = place.chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-').collect::<String>().replace(' ', "+");
+    let url = format!("https://wttr.in/{town}?format=j1");
+    let out = std::process::Command::new("curl").args(["-s", "-m", "20", &url]).output().ok()?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let cur = &v["current_condition"][0];
     let code: u32 = cur["weatherCode"].as_str()?.parse().ok()?;

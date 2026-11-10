@@ -248,6 +248,9 @@ pub struct CharacterConfig {
     pub flip_x: bool,
     /// Track mouse cursor with head/eyes/tilt.
     pub look_at_mouse: bool,
+    /// Where the weather is looked up for (a town); empty: wherever the
+    /// internet connection seems to be.
+    pub weather_place: String,
     /// Bounce and lip-sync to desktop audio / music.
     pub audio_reactive: bool,
     /// Legacy alias: when `true` and `placement == Wallpaper`, upgrades to `ScreenFront`.
@@ -309,6 +312,7 @@ impl Default for CharacterConfig {
             opacity: 1.0,
             flip_x: false,
             look_at_mouse: true,
+            weather_place: String::new(),
             audio_reactive: true,
             always_on_top: false,
             fps: 30,
@@ -1029,8 +1033,6 @@ void main() {
 pub(super) struct SpritePose {
     breath: f32,
     tilt: [f32; 2],
-    // clip units
-    lift: f32,
     half: [f32; 2],
     size: [f32; 2],
     // the rest of CHAR_VS's inputs, for drawing worn things the same way
@@ -1044,17 +1046,6 @@ pub(super) struct SpritePose {
     pub(super) flip: bool,
 }
 
-impl SpritePose {
-    /// How far the point `v` of the way down the sprite (0 top, 1 bottom)
-    /// is drawn from where its box says, px: the same sums as CHAR_VS.
-    pub(super) fn shift_at(&self, v: f32) -> [f32; 2] {
-        let y = 1.0 - 2.0 * v;
-        let up = (y + 1.0) * 0.5;
-        let dx = up * self.tilt[0] * 0.055 * self.half[0];
-        let dy = (y + 1.0) * self.breath * 0.025 * self.half[1] + up * self.tilt[1] * 0.025 * self.half[1] + self.lift;
-        [dx * self.size[0] * 0.5, -dy * self.size[1] * 0.5]
-    }
-}
 
 pub struct CharacterOverlay {
     pub config: CharacterConfig,
@@ -1340,6 +1331,7 @@ impl CharacterOverlay {
     /// Swap the extra characters without touching the ones that stay.
     /// Walk and Follow mouse, switched without reloading anyone.
     pub fn set_switches(&mut self, walk: bool, look_at_mouse: bool) {
+        weather::set_place(&self.config.weather_place);
         self.config.walk = walk;
         self.config.look_at_mouse = look_at_mouse;
         for e in &mut self.extras {
@@ -2200,7 +2192,6 @@ impl CharacterOverlay {
             self.pose = SpritePose {
                 breath: breath - squash,
                 tilt: [self.smooth_look[0] + sway, self.smooth_look[1]],
-                lift: self.smooth_bounce + hop - self.walk.sink * half_clip[1],
                 half: half_clip,
                 size: [w, h],
                 center: [center_clip[0] + walk_x, center_clip[1]],
