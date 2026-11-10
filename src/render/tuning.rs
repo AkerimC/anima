@@ -43,6 +43,8 @@ tuning! {
         fish_bored_every: "Then goes fishing within about (s)" = 60.0, 1.0, 1800.0, 5.0, 0;
         fish_join: "Passers-by join in (per s)" = 0.08, 0.0, 2.0, 0.01, 2;
         fish_most: "Most fishing together" = 5.0, 1.0, 12.0, 1.0, 0;
+        fish_real: "A good catch is a real fish (share)" = 0.75, 0.0, 1.0, 0.05, 2;
+        fish_creature: "Of those, a rare sea creature (share)" = 0.15, 0.0, 1.0, 0.05, 2;
         fish_find: "Something to wear on the line (share of catches)" = 0.12, 0.0, 1.0, 0.01, 2;
         fish_boom: "Confetti goes off with a bang" = 0.25, 0.0, 1.0, 0.05, 2;
         fish_boom_reach: "Explosion reach (widths)" = 3.0, 0.5, 15.0, 0.5, 1;

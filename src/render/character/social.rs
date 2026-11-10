@@ -469,12 +469,14 @@ fn wk_held(this: &CharacterOverlay, c: &Chat) -> bool {
 }
 
 /// Things worth keeping, by prop kind.
-fn keepsake_name(kind: i32) -> &'static str {
+fn keepsake_name(kind: i32) -> String {
     match kind {
-        15 => "a star",
-        16 => "a rubber duck",
-        0 => "a carrot",
-        _ => "",
+        15 => "a star".into(),
+        16 => "a rubber duck".into(),
+        0 => "a carrot".into(),
+        // sea creatures are rare enough to keep
+        k if k >= CREATURE => super::rope::sea_name(k).map(|n| format!("a {n}")).unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -520,6 +522,9 @@ struct Practice {
 
 /// A catch that's something to wear: this plus its place in the catalog.
 pub(super) const FOUND: i32 = 30000;
+/// A fish (props/fish) or a sea creature (props/creatures): this plus its place there.
+pub(super) const FISH: i32 = 40000;
+pub(super) const CREATURE: i32 = 41000;
 
 fn grounded(wk: &WalkState) -> bool {
     matches!(wk.act, Act::Idle | Act::Walk)
@@ -1067,7 +1072,7 @@ impl CharacterOverlay {
                 .map(|(other, f, r)| serde_json::json!({ "with": other, "friend": f, "rival": r }))
                 .collect();
             let skills: Vec<serde_json::Value> = self.moods.skills.all(&name).into_iter().map(|(g, v)| serde_json::json!({ "game": g, "skill": v })).collect();
-            let keepsakes: Vec<&str> = self.moods.keepsakes.of(&name).into_iter().map(keepsake_name).collect();
+            let keepsakes: Vec<String> = self.moods.keepsakes.of(&name).into_iter().map(keepsake_name).collect();
             let found = super::wear::found_labels(&name);
             out.push(serde_json::json!({
                 "keepsakes": keepsakes,
@@ -3188,6 +3193,14 @@ impl CharacterOverlay {
                         let pool: Vec<&(i32, f32, bool)> = CATCHES.iter().filter(|x| x.2 == good).collect();
                         let pick = pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()];
                         a.item = pick.0;
+                        // a good one is mostly a real fish, now and then a sea creature
+                        if good && self.walk.rand() < tn().fish_real {
+                            let rare = self.walk.rand() < tn().fish_creature;
+                            let (base, count) = if rare { (CREATURE, super::rope::sea_count(CREATURE)) } else { (FISH, super::rope::sea_count(FISH)) };
+                            if count > 0 {
+                                a.item = base + (self.walk.rand() * count as f32) as i32 % count as i32;
+                            }
+                        }
                         // now and then something to wear it hasn't got yet
                         if self.walk.rand() < tn().fish_find {
                             let name = self.character_name(a.i);
@@ -3211,9 +3224,9 @@ impl CharacterOverlay {
                 4 if a.t > tn().fish_reel => {
                     a.phase = 5;
                     a.t = 0.0;
-                    let (_, points, good) = if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
+                    let (_, points, good) = if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
                     // found something to wear: it's in its things now
-                    if let Some((id, label, _, _)) = (a.item >= FOUND).then(|| super::wear::catalog_entry((a.item - FOUND) as usize)).flatten() {
+                    if let Some((id, label, _, _)) = (FOUND..FISH).contains(&a.item).then(|| super::wear::catalog_entry((a.item - FOUND) as usize)).flatten() {
                         let name = self.character_name(a.i);
                         super::wear::give(&name, &id);
                         log::debug!("chat {}: {} found {label}", c.id, a.i);
@@ -3223,7 +3236,7 @@ impl CharacterOverlay {
                     }
                     // a good catch keeps it interested, junk wears it down
                     a.patience += if good { tn().fish_catch_keeps } else { -tn().fish_lost_cost };
-                    if good && keepsake_name(a.item) != "" {
+                    if good && !keepsake_name(a.item).is_empty() {
                         let name = self.character_name(a.i);
                         self.moods.keepsakes.add(&name, a.item);
                     }
@@ -3243,7 +3256,7 @@ impl CharacterOverlay {
                     let inside = [15, 16, 0, 20];
                     a.item = inside[(self.walk.rand() * inside.len() as f32) as usize % inside.len()];
                     log::debug!("chat {}: {} opens the present: kind {}", c.id, a.i, a.item);
-                    if keepsake_name(a.item) != "" {
+                    if !keepsake_name(a.item).is_empty() {
                         let name = self.character_name(a.i);
                         self.moods.keepsakes.add(&name, a.item);
                     }
@@ -4198,7 +4211,7 @@ impl CharacterOverlay {
         self.mood_props(&mut v);
         // a picture in place of a drawn thing fills the box's width at its own shape
         for p in &mut v {
-            if (21000..FOUND).contains(&p.0) {
+            if (21000..FOUND).contains(&p.0) || p.0 >= FISH {
                 continue;
             }
             if let Some(a) = super::rope::prop_image(p.0).and_then(|f| super::rope::picture_aspect(&f)) {

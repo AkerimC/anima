@@ -739,6 +739,36 @@ fn fit(w: f32, h: f32, aspect: f32) -> [f32; 2] {
     if box_aspect > aspect { [box_aspect / aspect, 1.0] } else { [1.0, aspect / box_aspect] }
 }
 
+/// The fish or sea creatures in the props folder, in name order, read once.
+fn sea_list(base: i32) -> Vec<std::path::PathBuf> {
+    static LISTS: std::sync::LazyLock<[Vec<std::path::PathBuf>; 2]> = std::sync::LazyLock::new(|| {
+        let read = |dir: &str| {
+            let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(crate::util::data_dir().join("props").join(dir))
+                .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "png")).collect())
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+        [read("fish"), read("creatures")]
+    });
+    LISTS[usize::from(base >= super::social::CREATURE)].clone()
+}
+
+pub(super) fn sea_count(base: i32) -> usize {
+    sea_list(base).len()
+}
+
+/// The picture of a fish or a sea creature caught.
+pub(super) fn sea_picture(kind: i32) -> Option<std::path::PathBuf> {
+    let base = if kind >= super::social::CREATURE { super::social::CREATURE } else { super::social::FISH };
+    sea_list(base).get((kind - base) as usize).cloned()
+}
+
+/// Its name: "sea turtle" from sea_turtle.png.
+pub(super) fn sea_name(kind: i32) -> Option<String> {
+    Some(sea_picture(kind)?.file_stem()?.to_string_lossy().replace('_', " "))
+}
+
 /// A picture's width / height, read once.
 pub(super) fn picture_aspect(path: &std::path::Path) -> Option<f32> {
     static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<f32>>>> = std::sync::LazyLock::new(Default::default);
@@ -758,6 +788,9 @@ pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
     use std::time::{Duration, Instant};
     // something to wear, found on a fishing line: its own picture, or the
     // props folder's for its drawn kind
+    if kind >= super::social::FISH {
+        return sea_picture(kind);
+    }
     if kind >= super::social::FOUND {
         let (_, _, image, drawn) = super::wear::catalog_entry((kind - super::social::FOUND) as usize)?;
         return image.or_else(|| prop_image(drawn));
@@ -952,6 +985,7 @@ impl CharacterOverlay {
                     c.program.set_i32(gl, "u_img", 1);
                     100
                 }
+                None if kind >= super::social::FISH => 15,
                 None if kind >= super::social::FOUND => super::wear::catalog_entry((kind - super::social::FOUND) as usize).map_or(15, |e| e.3),
                 None => kind,
             };
