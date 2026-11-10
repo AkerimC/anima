@@ -131,6 +131,10 @@ pub(super) struct WalkState {
     // shook its umbrella out of its hand, and how hard it's been swung (s)
     pub(super) lost: Vec<String>,
     pub(super) shake: f32,
+    // what it does with its umbrella now (social.rs, umbrella_mode), and
+    // whether one is open over it (it then floats down slowly)
+    pub(super) brolly: u8,
+    pub(super) parasol: bool,
     // already knocked about in this tumble
     pub(super) jolted: bool,
     // playing a game right now (not just chatting), kept up by the main character

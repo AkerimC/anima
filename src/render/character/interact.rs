@@ -319,7 +319,13 @@ impl CharacterOverlay {
             Act::Fall => {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
-                self.walk.vy -= tn().gravity * dt;
+                // under an open umbrella it drifts down slowly
+                let floating = self.walk.parasol && self.walk.vy < 0.0;
+                let g = if floating { tn().gravity * tn().parasol_fall } else { tn().gravity };
+                self.walk.vy -= g * dt;
+                if floating {
+                    self.walk.vy = self.walk.vy.max(-tn().parasol_speed);
+                }
                 self.walk.air += self.walk.vy * dt;
                 if !self.walk.tag_fall_run(dt) {
                     self.walk.x += self.walk.vx * dt;

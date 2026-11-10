@@ -815,7 +815,12 @@ impl CharacterOverlay {
         let racing = self.race.is_some();
         for i in 0..n {
             let playing = self.in_game(i);
+            let mode = self.umbrella_mode(i);
             self.walk_of(i).in_game = playing;
+            self.walk_of(i).brolly = mode;
+            let w = super::weather::now();
+            let wk = self.walk_of(i);
+            wk.parasol = w.rain && tn().weather_show >= 0.5 && matches!(mode, 1 | 2) && !wk.lost.iter().any(|l| l == "umbrella");
             let wk = self.walk_of(i);
             let was = wk.act;
             // how long in this state, and whether it's getting anywhere
@@ -1063,6 +1068,34 @@ impl CharacterOverlay {
     }
 
     /// Busy in a game (not just chatting).
+    /// What it does with its umbrella in the rain, by what it's up to: 0 none
+    /// (it's the volleyball), 1 open in the hand (chatting, watching, the
+    /// samba, the top of the volleyball net), 2 open and strapped to its back
+    /// (hands busy but standing about: fishing, giving a present), 3 rolled up
+    /// on its back (running about: every other game, a race).
+    pub(super) fn umbrella_mode(&self, i: usize) -> u8 {
+        let wk = self.walk_ref(i);
+        if wk.race.is_some() {
+            return 3;
+        }
+        let Some(s) = wk.social else { return 1 };
+        let Some(c) = self.chats.iter().chain(self.new_chats.iter()).find(|c| c.id == s.chat) else { return 1 };
+        if !c.members.contains(&i) {
+            return 1;
+        }
+        match c.stage {
+            Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer | Stage::RaceCall | Stage::RaceWait => 1,
+            Stage::Samba | Stage::Concert => 1,
+            Stage::Gift | Stage::Fishing => 2,
+            Stage::Volley => match c.volley.as_ref() {
+                Some(v) if v.ball == i => 0,
+                Some(v) if v.net.last() == Some(&i) => 1,
+                _ => 3,
+            },
+            _ => 3,
+        }
+    }
+
     /// Playing a game with its hands full (watching one doesn't count).
     pub(super) fn in_game(&self, i: usize) -> bool {
         self.walk_ref(i).social.is_some_and(|s| {

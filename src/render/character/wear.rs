@@ -256,28 +256,37 @@ impl CharacterOverlay {
             };
             out.push(Worn { id: "", kind: 24, rect: place(Anchor::Crown, size, pivot, offset), flip: false, behind: false, image: None });
         }
-        // rain: an umbrella in the hand; with its hands full (a game, a race)
-        // or on its way somewhere it's furled and slung on its back; held up
-        // by hand it keeps hold of it, till shaken hard
+        // rain: what it does with the umbrella depends on what it's up to
         let has = weather.rain && tn().weather_show >= 0.5 && !wk.lost.iter().any(|l| l == "umbrella");
-        let busy = wk.race.is_some() || wk.in_game || matches!(wk.act, Act::Travel | Act::Planted);
-        if has && busy && !asleep {
-            out.push(Worn { id: "", kind: 42, rect: place(Anchor::Back, [0.55, 0.9], [0.5, 0.45], [0.0, 0.0]), flip, behind: true, image: None });
-        }
-        if has && !busy && wk.act != Act::Rest {
-            // the top a set size just clear of the head, centred over the hand;
-            // the stick from it down to the hand, however far that is
-            let tex_aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
+        let mode = if !has || asleep || wk.act == Act::Rest {
+            0
+        } else if matches!(wk.act, Act::Travel | Act::Planted) {
+            3
+        } else {
+            wk.brolly
+        };
+        let tex_aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
+        // an open one: the top a set size just clear of the head, the stick from
+        // it down to `hold`, however far that is
+        let mut open = |hold: [f32; 2], behind: bool| {
             let wide = 1.3 * hw;
             let tall = wide * 0.5 * tex_aspect;
             let rim = crown[1] - 0.015;
-            let (x0, x1) = (sx(hand[0] - wide * 0.5), sx(hand[0] + wide * 0.5));
-            out.push(Worn { id: "umbrella", kind: 38, rect: [x0.min(x1), sy(rim), x0.max(x1), sy(rim - tall)], flip: false, behind: false, image: None });
+            let (x0, x1) = (sx(hold[0] - wide * 0.5), sx(hold[0] + wide * 0.5));
+            out.push(Worn { id: "umbrella", kind: 38, rect: [x0.min(x1), sy(rim), x0.max(x1), sy(rim - tall)], flip: false, behind, image: None });
             let thin = wide * 0.04;
+            let (a0, a1) = (sx(hold[0] - thin * 0.5), sx(hold[0] + thin * 0.5));
+            let stick = [a0.min(a1) - (a1 - a0).abs() * 2.5, sy(hold[1] + hh * 0.04), a0.max(a1) + (a1 - a0).abs() * 2.5, sy(rim - tall * 0.9)];
             // the hook turns towards the character
-            let (a0, a1) = (sx(hand[0] - thin * 0.5), sx(hand[0] + thin * 0.5));
-            let stick = [a0.min(a1) - (a1 - a0).abs() * 2.5, sy(hand[1] + hh * 0.04), a0.max(a1) + (a1 - a0).abs() * 2.5, sy(rim - tall * 0.9)];
-            out.push(Worn { id: "umbrella", kind: 39, rect: stick, flip: self.faces_right == flip, behind: false, image: None });
+            out.push(Worn { id: "umbrella", kind: 39, rect: stick, flip: self.faces_right == flip, behind, image: None });
+        };
+        match mode {
+            1 => open(hand, false),
+            // strapped upright to its back, open over its head
+            2 => open([a.back[0], a.back[1]], true),
+            // rolled up and slung across its back, sticking out past the shoulder
+            3 => out.push(Worn { id: "", kind: 42, rect: place(Anchor::Back, [0.85, 1.3], [0.5, 0.5], [0.2, -0.22]), flip, behind: true, image: None }),
+            _ => {}
         }
         out
     }
