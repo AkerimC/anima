@@ -476,7 +476,7 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
                     let (dw, dh) = (rw2, rw2 * ph / pw);
                     let _ = cr.save();
                     cr.translate(ox2, oy2 + rh2 * 0.5 - dh * 0.5);
-                    if !mirror {
+                    if mirror ^ wear::pair_mirrored(-1.0) {
                         cr.translate(dw, 0.0);
                         cr.scale(-1.0, 1.0);
                     }
@@ -490,7 +490,8 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
                     let (dw, dh) = (rw, rw * ph / pw);
                     let _ = cr.save();
                     cr.translate(x, y + rh * 0.5 - dh * 0.5);
-                    if mirror {
+                    let paired = wear::pair_of(&items[k]) > 0.0 && wear::pair_mirrored(1.0);
+                    if mirror ^ paired {
                         cr.translate(dw, 0.0);
                         cr.scale(-1.0, 1.0);
                     }

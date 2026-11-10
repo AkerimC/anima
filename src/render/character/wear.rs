@@ -104,7 +104,7 @@ const PICTURES: [(&str, &str, &str, Anchor, [f32; 2], [f32; 2], [f32; 2], bool, 
     ("teddy", "Teddy bear", "teddy", Anchor::Chest, [0.55, 0.55], [0.5, 0.5], [0.0, 0.0], false, 0.0),
     ("guitar", "Guitar", "guitar", Anchor::Chest, [0.95, 0.95], [0.5, 0.5], [0.0, 0.0], false, 0.0),
     ("medal", "Medal", "medal", Anchor::Neck, [0.42, 0.42], [0.5, 0.1], [0.0, 0.0], false, 0.0),
-    ("wings_feathered", "Feathered wings", "wing", Anchor::Back, [0.85, 0.85], [0.1, 0.55], [0.0, 0.0], true, 0.12),
+    ("wings_feathered", "Feathered wings", "wing", Anchor::Back, [0.8, 0.8], [0.06, 0.6], [0.0, -0.05], true, 0.06),
     ("sneakers", "Sneakers", "sneaker", Anchor::Feet, [0.36, 0.36], [0.5, 0.85], [0.0, 0.0], false, 0.17),
     ("heels", "High heels", "heel", Anchor::Feet, [0.36, 0.36], [0.5, 0.88], [0.0, 0.0], false, 0.17),
     ("flats", "Flat shoes", "flat_shoe", Anchor::Feet, [0.36, 0.3], [0.5, 0.85], [0.0, 0.0], false, 0.17),
@@ -218,12 +218,23 @@ pub fn pair_of(item: &Item) -> f32 {
     item.pair
 }
 
-/// One of a pair: the item moved to its side. A hand-made move left or
-/// right opens or closes the pair rather than shifting both.
+/// One of a pair: the item moved to its side, the left one the mirror
+/// image of the right (its pivot mirrored too, so a wing's root stays at
+/// the back). A hand-made move left or right opens or closes the pair
+/// rather than shifting both. Pictures of pairs face left, as emoji do:
+/// the right one is drawn mirrored (`pair_mirrored`).
 pub fn pair_copy(item: &Item, side: f32, fit: Option<[f32; 4]>) -> (Item, Option<[f32; 4]>) {
     let mut one = item.clone();
     one.offset[0] += side * item.pair;
+    if side < 0.0 {
+        one.pivot[0] = 1.0 - one.pivot[0];
+    }
     (one, fit.map(|f| [f[0] * side, f[1], f[2], f[3]]))
+}
+
+/// Whether this side of a pair is drawn mirrored.
+pub fn pair_mirrored(side: f32) -> bool {
+    side > 0.0
 }
 
 /// Santa hat as an item, so it can be fitted like the rest.
@@ -470,8 +481,8 @@ impl CharacterOverlay {
                     // a pair: one each side, the second mirrored
                     for side in [-1.0f32, 1.0] {
                         let (one, fit) = pair_copy(it, side, fit_for(&it.id));
-                        let t = if side < 0.0 { -turn } else { turn };
-                        out.push(Worn { turn: t, id: "", kind: it.kind, rect: place_with(&one, fit), flip: flip ^ (side < 0.0) ^ mirror, behind: it.behind, image: it.image.clone() });
+                        let t = if pair_mirrored(side) { -turn } else { turn };
+                        out.push(Worn { turn: t, id: "", kind: it.kind, rect: place_with(&one, fit), flip: flip ^ pair_mirrored(side) ^ mirror, behind: it.behind, image: it.image.clone() });
                     }
                 } else {
                     out.push(Worn { turn, id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip: flip ^ mirror, behind: it.behind, image: it.image.clone() });
