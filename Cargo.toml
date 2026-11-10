@@ -20,6 +20,7 @@ path = "src/bin/anima.rs"
 [dependencies]
 smithay-client-toolkit = "0.19.1"
 wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 calloop = "0.14"
 calloop-wayland-source = "0.4"
@@ -37,6 +38,9 @@ log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
 dirs = "6"
+gltf = { version = "1.4.1", default-features = false, features = ["import", "utils", "names"] }
+glam = "0.34.2"
+lewton = "0.10"
 ab_glyph = "0.2.32"
 
 [profile.release]
@@ -45,3 +49,6 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[workspace]
+members = ["gui"]

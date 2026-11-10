@@ -143,6 +143,12 @@ enum Cmd {
     Tui,
     /// Reload the configuration from disk.
     Reload,
+    /// Make the walking characters race each other.
+    Race,
+    /// Start a game now: contest, cursor, long, domino, tug, tag, samba, volley, carrot, gift.
+    Game {
+        name: String,
+    },
     /// Show daemon and monitor status.
     Status {
         #[arg(long)]
@@ -357,6 +363,8 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Reload => Request::Reload,
+        Cmd::Race => Request::Race,
+        Cmd::Game { name } => Request::Game { name },
         Cmd::Status { monitor, .. } => Request::Status { monitor },
         Cmd::Monitors => Request::ListMonitors,
         Cmd::List { .. }
@@ -403,6 +411,9 @@ fn run() -> Result<()> {
         println!("{}", response.message);
         if is_status {
             if let Some(data) = &response.data {
+                if let Some(compositor) = data.get("compositor").and_then(|v| v.as_str()) {
+                    println!("  compositor: {compositor}");
+                }
                 if let Some(monitors) = data.get("monitors").and_then(|m| m.as_array()) {
                     for monitor in monitors {
                         let name = monitor.get("name").and_then(|v| v.as_str()).unwrap_or("?");

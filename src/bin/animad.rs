@@ -32,6 +32,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    use_compositor_gpu();
     let args = Args::parse();
     let filter = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter))
@@ -57,4 +58,24 @@ fn main() -> Result<()> {
         fps: args.fps,
         verbose: args.verbose,
     })
+}
+
+/// On hybrid laptops a shell may force NVIDIA offloading for everything. Our
+/// overlay is redrawn every frame and the compositor usually runs on the iGPU,
+/// so rendering on the dGPU means a full-screen copy between GPUs per frame.
+/// Stay on Mesa unless ANIMA_GPU=nvidia.
+fn use_compositor_gpu() {
+    if std::env::var("ANIMA_GPU").is_ok_and(|v| v == "nvidia") {
+        return;
+    }
+    let mesa = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+    if !std::path::Path::new(mesa).exists() {
+        return;
+    }
+    // still single-threaded here
+    unsafe {
+        std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", mesa);
+        std::env::remove_var("__NV_PRIME_RENDER_OFFLOAD");
+        std::env::remove_var("__GLX_VENDOR_LIBRARY_NAME");
+    }
 }

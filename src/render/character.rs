@@ -26,6 +26,19 @@ use super::gl::{Filter, Program, create_texture};
 use super::image::ImageRenderer;
 use crate::pkg::decode_tex;
 
+mod interact;
+mod race;
+mod rope;
+mod social;
+mod uma;
+mod walk;
+
+use race::Race;
+use social::Chat;
+pub use race::RACE_NOW;
+pub use social::GAME_NOW;
+use walk::{Act, PAT_DUR, WalkState};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Corner {
@@ -125,6 +138,35 @@ pub struct WindowRect {
     pub h: f32,
 }
 
+/// Where each character's sprite is drawn. The front overlay draws them all
+/// on its one surface ([`SharedSurface`]); window mode gives each its own
+/// window (docs/character-windows.md).
+pub trait ActorTarget {
+    /// Called right before actor `actor` (0 = main, then the extras) draws
+    /// its sprite, whose box is `rect` (x0, y0, x1, y1) in overlay pixels.
+    /// Makes the surface to draw into current; false skips the draw.
+    fn begin(&mut self, gl: &glow::Context, actor: usize, rect: [f32; 4]) -> bool;
+    /// After the sprite is drawn.
+    fn end(&mut self, gl: &glow::Context, actor: usize);
+    /// Maps the overlay's clip space onto the target's: (scale x, scale y,
+    /// offset x, offset y). A target wider than the output (all workspaces
+    /// side by side) uses it to fit characters that are off screen.
+    fn clip_xform(&self) -> [f32; 4] {
+        [1.0, 1.0, 0.0, 0.0]
+    }
+}
+
+/// Draw every actor on the surface that is already current.
+pub struct SharedSurface;
+
+impl ActorTarget for SharedSurface {
+    fn begin(&mut self, _: &glow::Context, _: usize, _: [f32; 4]) -> bool {
+        true
+    }
+
+    fn end(&mut self, _: &glow::Context, _: usize) {}
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CharacterConfig {
@@ -153,6 +195,30 @@ pub struct CharacterConfig {
     /// Frame rate cap used when the character animates over a *static*
     /// wallpaper. Animated wallpapers keep running at the wallpaper fps.
     pub fps: u32,
+    /// Walk back and forth along the bottom of the screen.
+    pub walk: bool,
+    /// Optional second sprite shown while jumping (auto-detected for
+    /// Uma Musume "[A]" sprites).
+    pub source_happy: String,
+    /// More sprites that roam alongside the main one.
+    pub extra: Vec<String>,
+    /// Give each walking character its own window where the compositor
+    /// supports placing them (Hyprland with contrib/hyprland-plugin), so
+    /// they move with the workspaces natively.
+    pub windows: bool,
+    /// Light 3D characters from the colours on screen around them (a small
+    /// screen capture once a second, which compositors report as a
+    /// screencast).
+    pub screen_light: bool,
+    /// Say voice lines from a `voice/` folder next to the character's file
+    /// (contrib/ba-voice.py fetches Blue Archive's), and play sound effects
+    /// from ~/.local/share/anima/sounds/ (picking up, letting go).
+    pub voice: bool,
+    pub voice_volume: f32,
+    /// Every number behind the behaviour, see `tuning.rs`.
+    pub tuning: super::tuning::Tuning,
+    /// Show 3D characters' weapons where their animations hold them.
+    pub weapons: bool,
 }
 
 impl CharacterConfig {
@@ -180,6 +246,15 @@ impl Default for CharacterConfig {
             audio_reactive: true,
             always_on_top: false,
             fps: 30,
+            walk: false,
+            source_happy: String::new(),
+            extra: Vec::new(),
+            windows: true,
+            screen_light: true,
+            voice: true,
+            voice_volume: 0.6,
+            tuning: Default::default(),
+            weapons: false,
         }
     }
 }
@@ -195,6 +270,11 @@ uniform vec2 u_tilt;      // Live2D-style mouse look skew/tilt
 uniform float u_breath;   // breathing scale Y
 uniform float u_bounce;   // audio bounce Y offset
 uniform int u_flip_x;
+uniform vec4 u_clip;      // target clip space: xy scale, zw offset
+uniform float u_rot;      // turned about its centre (tumbling, planted)
+uniform float u_sink;     // pushed down into the ground
+uniform float u_aspect;   // output width / height
+uniform vec2 u_pivot;     // the point it turns about, clip offset from its centre
 
 void main() {
     vec2 uv = a_pos * 0.5 + 0.5;
@@ -210,9 +290,17 @@ void main() {
     p.x += height_factor * u_tilt.x * 0.055;
     p.y += height_factor * u_tilt.y * 0.025;
 
-    vec2 clip = u_center + p * u_half_size;
-    clip.y += u_bounce;
-    gl_Position = vec4(clip, 0.0, 1.0);
+    vec2 d = p * u_half_size;
+    d.x *= u_aspect;
+    float c = cos(u_rot), s = sin(u_rot);
+    vec2 piv = vec2(u_pivot.x * u_aspect, u_pivot.y);
+    d -= piv;
+    d = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
+    d += piv;
+    d.x /= u_aspect;
+    vec2 clip = u_center + d;
+    clip.y += u_bounce - u_sink;
+    gl_Position = vec4(clip * u_clip.xy + u_clip.zw, 0.0, 1.0);
 }
 "#;
 
@@ -223,6 +311,8 @@ in vec2 v_uv;
 uniform sampler2D u_tex;
 // 0 = custom texture/sprite, 1 = reze, 2 = neko, 3 = cyber, 4 = spirit
 uniform int u_mode;
+// u_tex is already premultiplied (3D model render target)
+uniform int u_premul;
 uniform float u_time;
 uniform float u_opacity;
 uniform vec2 u_look;  // normalized mouse direction from character (-1..1)
@@ -798,6 +888,7 @@ void main() {
     if (u_mode == 0) {
         vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
         c = texture(u_tex, clamp(uv, 0.0, 1.0));
+        if (u_premul == 1 && c.a > 0.0) c.rgb /= c.a;
         c.a *= u_opacity;
     } else if (u_mode == 1) {
         c = render_reze(v_uv);
@@ -818,14 +909,163 @@ pub struct CharacterOverlay {
     dummy_tex: glow::Texture,
     sprite_renderer: Option<ImageRenderer>,
     sprite_tex: Option<(glow::Texture, u32, u32)>,
+    // optional second pose shown while jumping
+    sprite_happy: Option<glow::Texture>,
+    // sprite artwork looks to the right (Uma Musume chibis do)
+    faces_right: bool,
+    // rigged 3D character drawn into `sprite_tex` every frame
+    model: Option<super::model3d::Model3d>,
+    // index of this character; extras are drawn after the main one
+    actor: usize,
+    extras: Vec<CharacterOverlay>,
+    // drawn sprite box from the last frame, surface pixels (x0, y0, x1, y1)
+    hit_rect: [f32; 4],
+    // surface size that box was measured on
+    surface: [f32; 2],
+    // drawn part of the sprite, image fractions: half width, top, bottom
+    opaque: [f32; 3],
+    // left button press: when, and which actor (0 = main) was under it,
+    // with where on it the press landed (clip offset from its centre)
+    // and where the cursor was
+    press: Option<(f32, [f32; 2], Option<(usize, [f32; 2])>)>,
+    // a race between the walking characters (main character only)
+    race: Option<Race>,
+    // pairs chatting, and when to look for the next (main character only)
+    chats: Vec<Chat>,
+    social_tick: f32,
+    chat_id: u32,
+    rope: Option<rope::RopeGl>,
+    carrot_gl: Option<rope::CarrotGl>,
+    // groups that split off this frame
+    new_chats: Vec<Chat>,
+    // who starts the race a big chat set off
+    // the group that decided to race together, in the order they set off
+    race_crew: Vec<usize>,
+    // seconds before another race can start by itself
+    race_quiet: f32,
+    // seconds since the characters appeared
+    social_age: f32,
+    view_w: f32,
+    // notifications seen so far
+    notified: u32,
+    // left clicks seen so far
+    clicks: u32,
+    // niri strip scroll, smoothed: (view offset, extra strip width) in clip units
+    view: [f32; 2],
     smooth_look: [f32; 2],
     smooth_bounce: f32,
     smooth_pos: Option<[f32; 2]>,
     start: Instant,
+    walk: WalkState,
+    // re-pose at most every this many frames (crowd budget, set by actor 0)
+    pose_every: u64,
+    voice: Option<crate::voice::Voice>,
+    // said hello (only the main character keeps trying until it can)
+    greeted: bool,
+    // horizontal speed on screen (screen widths/s, smoothed) and where the
+    // sprite was last frame, for swaying hair
+    screen_speed: f32,
+    last_x: Option<f32>,
+    // clicked again while being petted: another pat line
+    patted_again: bool,
+    vibe: Vibe,
+    // where its sounds come from, and whether the last throw was hard
+    spot: crate::voice::Spot,
+    thrown_hard: bool,
+    // behaviour last frame, to notice what just started
+    last_act: Act,
+    // placed at a random spot along the strip yet
+    spawned: bool,
 }
+
+/// Music on the desktop: the characters stop talking and wandering and move
+/// to it instead: a side-to-side groove on slow songs, a nod on each beat on
+/// fast ones, a mix in between.
+#[derive(Default)]
+struct Vibe {
+    on: bool,
+    // seconds the audio has been loud / quiet
+    loud: f32,
+    quiet: f32,
+    // the tracker's beat count last time one started here
+    last_beat: i64,
+    // beats so far, and whether one started this frame
+    beats: u32,
+    beat_now: bool,
+    // how much to move: eases in when the music starts, out when it stops
+    amount: f32,
+    // the motion: sideways lean and forward nod
+    sway: f32,
+    nod: f32,
+}
+
+/// Music: loud enough this long (level 0..1, seconds); over after this much
+/// quiet.
+const MUSIC_LEVEL: f32 = 0.06;
+const MUSIC_AFTER: f32 = 2.0;
+const SILENCE_AFTER: f32 = 3.0;
+
+impl Vibe {
+    fn listen(&mut self, level: f32, dt: f32, actor: usize) {
+        // our own voice lines are on the same desktop audio: they're not music
+        if !crate::voice::sounding() {
+            if level > MUSIC_LEVEL {
+                self.loud += dt;
+                self.quiet = 0.0;
+            } else {
+                self.quiet += dt;
+                self.loud = 0.0;
+            }
+            let on = if self.on { self.quiet < SILENCE_AFTER } else { self.loud > MUSIC_AFTER };
+            if on != self.on && actor == 0 {
+                log::info!("music {}", if on { "playing" } else { "stopped" });
+            }
+            self.on = on;
+        }
+        // the beat tracked on the audio thread (crate::tempo)
+        let beat = crate::tempo::current();
+        let pos = beat.position(std::time::Instant::now());
+        let whole = pos.floor() as i64;
+        // a beat starts when the count goes up; the tracker nudging it back
+        // a little doesn't start the same one twice
+        self.beat_now = whole > self.last_beat && self.on;
+        if whole > self.last_beat || whole < self.last_beat - 4 {
+            self.last_beat = whole;
+        }
+        if self.beat_now {
+            self.beats = self.beats.wrapping_add(1);
+        }
+        self.amount += (f32::from(self.on) - self.amount) * (dt * 3.0).min(1.0);
+        let t = pos.rem_euclid(1.0) as f32;
+        // slow songs: a smooth lean that crosses over each beat (sides by the
+        // tracker's count, so it stays smooth when the phase is corrected)
+        let side = if whole.rem_euclid(2) == 0 { 1.0 } else { -1.0 };
+        let groove = side * (std::f32::consts::PI * (t - 0.5)).sin();
+        // fast ones: a nod right on the beat that eases out
+        let bop = (1.0 - t).powi(3);
+        let fast = ((beat.bpm - 100.0) / 30.0).clamp(0.0, 1.0);
+        self.sway = groove * 0.7 * (1.0 - fast * 0.6) * self.amount;
+        self.nod = -bop * 0.55 * fast * self.amount;
+    }
+}
+
+/// How often an on-screen 3D character is re-posed; it still moves every
+/// frame.
+const CONTENT_HZ: f32 = 40.0;
+/// Most 3D re-poses per frame, all characters together.
+const POSE_BUDGET: usize = 24;
+const MIN_POSE_HZ: f32 = 12.0;
+/// A throw this fast (clip units/s sideways, half-heights/s up) makes the
+/// character say ouch when it lands.
+const HARD_THROW: (f32, f32) = (2.0, 6.0);
 
 impl CharacterOverlay {
     pub fn new(gl: &glow::Context, config: CharacterConfig, width: i32, height: i32) -> Result<Self> {
+        super::tuning::set(config.tuning);
+        Self::new_actor(gl, config, width, height, 0)
+    }
+
+    fn new_actor(gl: &glow::Context, config: CharacterConfig, width: i32, height: i32, actor: usize) -> Result<Self> {
         let program = Program::new(gl, CHAR_VS, CHAR_FS)?;
         let (vao, vbo) = create_quad(gl)?;
         let dummy_tex = create_texture(gl, 1, 1, &[0, 0, 0, 0], Filter::Nearest, false)?;
@@ -838,13 +1078,75 @@ impl CharacterOverlay {
             dummy_tex,
             sprite_renderer: None,
             sprite_tex: None,
+            sprite_happy: None,
+            faces_right: false,
+            model: None,
+            actor,
+            extras: Vec::new(),
+            hit_rect: [0.0; 4],
+            surface: [1.0; 2],
+            opaque: [0.5, 0.0, 1.0],
+            press: None,
+            race: None,
+            chats: Vec::new(),
+            social_tick: 0.0,
+            chat_id: 0,
+            rope: None,
+            carrot_gl: None,
+            new_chats: Vec::new(),
+            race_crew: Vec::new(),
+            race_quiet: 0.0,
+            social_age: 0.0,
+            view_w: 1.0,
+            notified: crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            clicks: 0,
+            view: [0.0; 2],
             smooth_look: [0.0, 0.0],
             smooth_bounce: 0.0,
             smooth_pos: None,
             start: Instant::now(),
+            pose_every: 1,
+            voice: None,
+            greeted: false,
+            screen_speed: 0.0,
+            last_x: None,
+            patted_again: false,
+            vibe: Vibe::default(),
+            spot: Default::default(),
+            thrown_hard: false,
+            last_act: Act::Idle,
+            spawned: false,
+            walk: WalkState {
+                seed: (std::process::id() + actor as u32 * 7919).wrapping_mul(2654435761),
+                ..Default::default()
+            },
         };
         this.reload_source(gl, width, height)?;
         Ok(this)
+    }
+
+    /// Swap the extra characters without touching the ones that stay.
+    pub fn update_extras(&mut self, gl: &glow::Context, extra: &[String], width: i32, height: i32) {
+        let mut old = std::mem::take(&mut self.extras);
+        for src in extra {
+            let n = self.extras.len() + 1;
+            if let Some(i) = old.iter().position(|e| &e.config.source == src) {
+                let mut e = old.remove(i);
+                e.actor = n;
+                self.extras.push(e);
+                continue;
+            }
+            let mut cfg = self.config.clone();
+            cfg.source = src.clone();
+            cfg.source_happy = String::new();
+            cfg.extra = Vec::new();
+            match Self::new_actor(gl, cfg, width, height, n) {
+                Ok(e) => self.extras.push(e),
+                Err(err) => log::warn!("character {src}: {err:#}"),
+            }
+        }
+        self.config.extra = extra.to_vec();
+        self.clear_chats();
     }
 
     pub fn reload_source(&mut self, gl: &glow::Context, _width: i32, _height: i32) -> Result<()> {
@@ -852,7 +1154,27 @@ impl CharacterOverlay {
             unsafe { gl.delete_texture(old) };
         }
         self.sprite_tex = None;
+        self.sprite_happy = None;
         self.sprite_renderer = None;
+        self.faces_right = false;
+        self.model = None;
+
+        if self.actor == 0 {
+            self.chats.clear();
+            self.walk.social = None;
+            self.extras.clear();
+            for src in &self.config.extra {
+                let mut cfg = self.config.clone();
+                cfg.source = src.clone();
+                cfg.source_happy = String::new();
+                cfg.extra = Vec::new();
+                // numbered by what loaded: windows and hit boxes go by actor
+                match Self::new_actor(gl, cfg, _width, _height, self.extras.len() + 1) {
+                    Ok(e) => self.extras.push(e),
+                    Err(err) => log::warn!("character {src}: {err:#}"),
+                }
+            }
+        }
 
         let src = self.config.source.trim();
         if matches!(
@@ -863,6 +1185,17 @@ impl CharacterOverlay {
         }
 
         let path = crate::util::expand_path(src, std::env::current_dir().ok().as_deref());
+        self.voice = if self.config.voice { crate::voice::Voice::load(&path) } else { None };
+        if path.is_file() && super::model3d::is_model_path(&path) {
+            // render at ~1.5x the on-screen height for smooth edges
+            let px = (540.0 * self.config.scale.clamp(0.2, 4.0)).clamp(256.0, 1024.0) as u32;
+            let model = super::model3d::Model3d::load(gl, &path, px, self.config.weapons)?;
+            self.sprite_tex = Some(model.texture());
+            // drawn turned to the right, mirrored when walking left
+            self.faces_right = true;
+            self.model = Some(model);
+            return Ok(());
+        }
         if path.is_file() {
             let ext = path
                 .extension()
@@ -879,10 +1212,67 @@ impl CharacterOverlay {
                     .to_rgba8()
             };
             let (w, h) = img.dimensions();
+            // both ways round, the sprite gets flipped when it walks
+            let (mut half, mut top, mut bottom) = (0.0f32, h, 0);
+            for (x, y, _) in img.enumerate_pixels().filter(|(_, _, p)| p[3] > 25) {
+                half = half.max((x as f32 + 0.5 - w as f32 * 0.5).abs());
+                top = top.min(y);
+                bottom = bottom.max(y + 1);
+            }
+            if bottom > top {
+                self.opaque = [half / w as f32, top as f32 / h as f32, bottom as f32 / h as f32];
+            }
             let tex = create_texture(gl, w, h, img.as_raw(), Filter::Linear, true)?;
             self.sprite_tex = Some((tex, w, h));
+
+            // happy pose: explicit `source_happy`, else an Uma Musume sprite's sibling
+            let happy = if !self.config.source_happy.trim().is_empty() {
+                Some(crate::util::expand_path(self.config.source_happy.trim(), None))
+            } else {
+                self.faces_right = uma::faces_right(&path);
+                uma::happy_pose(&path)
+            };
+            if let Some(hp) = happy.filter(|p| p.is_file()) {
+                if let Ok(img) = image::ImageReader::open(&hp).and_then(|r| r.with_guessed_format()) {
+                    if let Ok(img) = img.decode() {
+                        let img = img.to_rgba8();
+                        let (hw, hh) = img.dimensions();
+                        self.sprite_happy =
+                            create_texture(gl, hw, hh, img.as_raw(), Filter::Linear, true).ok();
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Boxes of all drawn characters (surface pixels), for the input region.
+    pub fn hit_rects(&self) -> Vec<[f32; 4]> {
+        let mut v = vec![self.hit_rect];
+        v.extend(self.extras.iter().map(|e| e.hit_rect));
+        v
+    }
+
+    /// Boxes that must be repainted: a turned character reaches past its box.
+    pub fn damage_rects(&self) -> Vec<[f32; 4]> {
+        std::iter::once(self)
+            .chain(self.extras.iter())
+            .map(|a| {
+                let [x0, y0, x1, y1] = a.hit_rect;
+                let pad = if a.walk.rot.abs() > 0.01 { (y1 - y0) * 1.5 } else { 0.0 };
+                [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
+            })
+            // the rope spans the gap between the two sides
+            .chain(self.props().into_iter().map(|p| p.1))
+            .chain(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0]))
+            .collect()
+    }
+
+    /// Where the cursor belongs to us: the characters, and a rope in play.
+    pub fn input_rects(&self) -> Vec<[f32; 4]> {
+        let mut v: Vec<[f32; 4]> = std::iter::once(self).chain(self.extras.iter()).map(|a| a.body_box()).collect();
+        v.extend(self.rope_ends().into_iter().map(|[x0, y0, x1, y1]| [x0, y0.min(y1) - 16.0, x1, y0.max(y1) + 16.0]));
+        v
     }
 
     pub fn uses_audio(&self) -> bool {
@@ -896,7 +1286,10 @@ impl CharacterOverlay {
         scale_factor: f32,
         active_window: Option<WindowRect>,
     ) -> (f32, f32, f32, f32) {
-        let base_h = (360.0 * self.config.scale.clamp(0.2, 4.0) * scale_factor).max(64.0);
+        // a 3D frame bigger than the body (a weapon) makes the sprite bigger,
+        // and lower by the part below the feet, so bodies keep one size
+        let (frame, below) = self.model.as_ref().map_or((1.0, 0.0), |m| m.framing());
+        let base_h = (360.0 * self.config.scale.clamp(0.2, 4.0) * scale_factor * frame).max(64.0);
         let aspect = if let Some((_, tw, th)) = self.sprite_tex {
             (tw.max(1) as f32) / (th.max(1) as f32)
         } else {
@@ -904,7 +1297,7 @@ impl CharacterOverlay {
         };
         let base_w = (base_h * aspect).max(64.0);
         let ox = self.config.offset[0] * scale_factor;
-        let oy = self.config.offset[1] * scale_factor;
+        let oy = self.config.offset[1] * scale_factor - below * base_h;
         let sw = out_w as f32;
         let sh = out_h as f32;
 
@@ -997,19 +1390,120 @@ impl CharacterOverlay {
         (x, y, base_w, base_h)
     }
 
+    /// Sound for what just started: effects for picking up and letting go,
+    /// voice lines for petting, a chase, a gesture or landing after a hard
+    /// throw; a greeting at first and a monologue now and then. All of it
+    /// comes from where the character is on screen.
+    fn speak(&mut self, info: &FrameInfo) {
+        use crate::voice::{Cue, Effect};
+        let [x0, y0, x1, y1] = self.hit_rect;
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let distance = (cx - info.mouse[0]).hypot(cy - info.mouse[1]) / info.scale.max(1.0);
+        self.spot.set(cx / info.width.max(1) as f32, distance);
+
+        let act = self.walk.act;
+        let started = (act != self.last_act).then_some(act);
+        if started.is_some() {
+            log::debug!(
+                "actor {}: {:?} -> {:?} (x {:.2} air {:.2} vx {:.2} vy {:.2})",
+                self.actor, self.last_act, act, self.walk.x, self.walk.air, self.walk.vx, self.walk.vy
+            );
+        }
+        let released = self.last_act == Act::Held && act != Act::Held;
+        let landed = self.last_act == Act::Fall && act != Act::Fall;
+        self.last_act = act;
+        let volume = self.config.voice_volume;
+        if !self.config.voice {
+            return;
+        }
+        if started == Some(Act::Held) {
+            crate::voice::effect(Effect::PickUp, volume, &self.spot);
+        } else if released {
+            crate::voice::effect(Effect::Release, volume, &self.spot);
+            self.thrown_hard = self.walk.vx.abs() > HARD_THROW.0 || self.walk.vy > HARD_THROW.1;
+        }
+        let hurt = landed && std::mem::take(&mut self.thrown_hard);
+        // dancing to music: no talking over it
+        if self.vibe.on {
+            return;
+        }
+        let gesture = self.model.as_mut().and_then(|m| m.take_gesture());
+        let chase_roll = self.walk.rand();
+        let Some(voice) = self.voice.as_mut() else { return };
+        let spot = &self.spot;
+        if hurt {
+            voice.say(Cue::Hurt, volume, spot);
+        }
+        if let Some(name) = gesture {
+            let cue = if name.contains("Victory") {
+                Cue::Victory
+            } else if name.starts_with("Exs") {
+                Cue::Ex
+            } else {
+                Cue::Gesture
+            };
+            voice.say(cue, volume, spot);
+        }
+        let patted = std::mem::take(&mut self.patted_again);
+        match started {
+            Some(Act::Pat) => {
+                voice.say(Cue::Pat, volume, spot);
+            }
+            _ if patted => {
+                voice.say(Cue::Pat, volume, spot);
+            }
+            Some(Act::Chase) if chase_roll < 0.4 => {
+                voice.say(Cue::Chase, volume, spot);
+            }
+            _ => {}
+        }
+        if !self.greeted {
+            self.greeted = voice.say(Cue::Hello, volume, spot) || self.actor > 0;
+        } else if act == Act::Idle {
+            voice.idle(volume, spot);
+        }
+    }
+
     pub fn render(
         &mut self,
         gl: &glow::Context,
         info: &FrameInfo,
         active_window: Option<WindowRect>,
+        target: &mut dyn ActorTarget,
     ) -> Result<()> {
         if !self.config.enabled || self.config.opacity <= 0.001 {
             return Ok(());
         }
 
+        if self.actor == 0 {
+            self.handle_input(info);
+        }
+
         let w = info.width.max(1) as f32;
         let h = info.height.max(1) as f32;
         let dt = (info.delta as f32).clamp(0.001, 0.1);
+        // the compositor's strip: followed directly when exact, eased when
+        // estimated
+        if self.actor == 0 {
+            let strip = crate::backend::compositor::current().strip();
+            // logical px -> clip units (assumes output scale 1)
+            let to_clip = 2.0 / w;
+            let target = strip.map_or([0.0, 0.0], |st| {
+                [st.view_x * to_clip, ((st.width - w) * to_clip).max(0.0)]
+            });
+            let exact = strip.is_some_and(|st| st.exact);
+            let k = if exact { 1.0 } else { (dt * 20.0).min(1.0) };
+            self.view[0] += (target[0] - self.view[0]) * k;
+            self.view[1] = target[1];
+            let view = self.view;
+            for e in &mut self.extras {
+                e.view = view;
+            }
+            if self.config.walk {
+                self.run_race(dt, w);
+                self.run_social(dt, info.mouse);
+            }
+        }
         let (tx, ty, pw, ph) = self.target_bounds(info.width, info.height, 1.0, active_window);
 
         let pos = match &mut self.smooth_pos {
@@ -1079,6 +1573,60 @@ impl CharacterOverlay {
             [0.0; 4]
         };
 
+        // A 3D pose is rendered into the model's own texture, which the
+        // sprite pass reuses: re-pose at ~40 Hz (staggered across actors),
+        // ~10 Hz off screen, while the sprite still moves every frame.
+        // With a crowd on screen, at most POSE_BUDGET re-poses per frame
+        // (the GPU's limit), but never slower than MIN_POSE_HZ.
+        let offscreen = self.hit_rect[2] < 0.0 || self.hit_rect[0] > w;
+        self.vibe.listen(info.audio[3], dt, self.actor);
+        // horizontal speed on screen, for swaying hair (lightly smoothed)
+        let x = (self.hit_rect[0] + self.hit_rect[2]) * 0.5 / w;
+        if let Some(last) = self.last_x.replace(x) {
+            let v = ((x - last) / dt).clamp(-20.0, 20.0);
+            self.screen_speed += (v - self.screen_speed) * (dt * 20.0).min(1.0);
+        }
+        if self.actor == 0 {
+            let on_screen = std::iter::once(self.hit_rect)
+                .chain(self.extras.iter().map(|e| e.hit_rect))
+                .filter(|r| r[2] >= 0.0 && r[0] <= w)
+                .count();
+            let crowd = on_screen.div_ceil(POSE_BUDGET).max(1) as u64;
+            let slowest = ((1.0 / MIN_POSE_HZ) / dt).round().max(1.0) as u64;
+            self.pose_every = crowd.min(slowest);
+            for e in &mut self.extras {
+                e.pose_every = self.pose_every;
+            }
+        }
+        let hz = if offscreen { 10.0 } else { CONTENT_HZ };
+        let every = (((1.0 / hz) / dt).round().clamp(1.0, 16.0) as u64).max(if offscreen { 1 } else { self.pose_every });
+        let redraw = (info.frame + self.actor as u64) % every == 0;
+        self.walk.model_dt += dt;
+        if let (Some(model), true) = (&mut self.model, redraw) {
+            use super::model3d::Pose;
+            let pose = match self.walk.act {
+                Act::Walk => Pose::Walk,
+                Act::Chase => Pose::Run,
+                Act::Pat => Pose::Pat,
+                Act::Held => Pose::Held,
+                Act::Fall | Act::Planted => Pose::Fall,
+                Act::Idle | Act::Jump => Pose::Idle,
+            };
+            // light around where the character was drawn last frame
+            let [x0, y0, x1, y1] = self.hit_rect;
+            let light = self.config.screen_light.then(|| crate::backend::envlight::light_at(
+                (info.width.max(1) as u32, info.height.max(1) as u32),
+                (x0 + x1) * 0.5,
+                (y0 + y1) * 0.5,
+            )
+            ).flatten().unwrap_or_default();
+            let mirrored = self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right);
+            // moving to music: lean the upper body, nod the head
+            let (lean, nod) = if self.walk.act == Act::Idle { (self.vibe.sway * 0.35, self.vibe.nod * -0.6) } else { (0.0, 0.0) };
+            model.set_groove(lean, nod);
+            model.draw(gl, std::mem::take(&mut self.walk.model_dt), pose, light, mirrored, self.screen_speed);
+        }
+
         unsafe {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
@@ -1088,13 +1636,139 @@ impl CharacterOverlay {
                 .set_vec2(gl, "u_center", center_clip[0], center_clip[1]);
             self.program
                 .set_vec2(gl, "u_half_size", half_clip[0], half_clip[1]);
+            // walking: positions live on niri's scrolling strip (offset from
+            // the anchor when the strip isn't scrolled); `view` converts to screen
+            let [view, extra] = self.view;
+            let (walk_x, moving, jump) = if self.config.walk {
+                let left_room = -(center_clip[0] - half_clip[0] + 1.0);
+                let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
+                if !self.walk.placed {
+                    // everyone at once, anywhere along the strip
+                    self.walk.placed = true;
+                    self.walk.energy = self.walk.rand();
+                    self.walk.x = left_room + self.walk.rand() * (right_room - left_room);
+                    self.walk.target = self.walk.x;
+                    self.walk.timer = self.walk.rand() * 1.5;
+                }
+                // a drawn circle: aim for its centre, otherwise for the cursor
+                // the cursor wandered off from the circle: follow the cursor instead
+                if let Some([cx, cy, cr]) = self.walk.circle_target {
+                    let far = cr.max(60.0) * 3.0;
+                    if (info.mouse[0] - cx).powi(2) + (info.mouse[1] - cy).powi(2) > far * far {
+                        self.walk.circle_target = None;
+                    }
+                }
+                let circle = self
+                    .walk
+                    .circle_target
+                    .filter(|_| self.walk.circle || self.walk.act == Act::Chase)
+                    .map(|c| [c[0], c[1]]);
+                let aim = circle.unwrap_or(info.mouse);
+                let mouse = (self.config.look_at_mouse && aim != [0.0, 0.0])
+                    .then(|| (aim[0] / w) * 2.0 - 1.0 - center_clip[0] + view);
+                let aim_y = 1.0 - (aim[1] / h) * 2.0;
+                // jump height (half-heights): head to the cursor, or body into the circle
+                let reach = if circle.is_some() {
+                    (aim_y - center_clip[1]) / half_clip[1]
+                } else {
+                    (aim_y - (center_clip[1] + half_clip[1])) / half_clip[1] + 0.1
+                };
+                // start somewhere random along niri's strip, not all on the first column
+                if !self.spawned {
+                    self.spawned = true;
+                    self.walk.x = left_room + self.walk.rand() * (right_room - left_room).max(0.0);
+                    self.walk.target = self.walk.x;
+                }
+                if let Some(r) = self.walk.race.as_mut() {
+                    r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
+                }
+                self.walk.reach = reach;
+                if let Some(r) = self.walk.social.as_mut() {
+                    r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
+                }
+                let r = self.walk.step(dt, left_room, right_room, mouse, reach);
+                if std::mem::take(&mut self.walk.gesture) {
+                    if let Some(m) = self.model.as_mut() {
+                        m.gesture_now();
+                    }
+                }
+                // music: a gesture every eight beats
+                if self.vibe.on && self.vibe.beat_now && self.walk.act == Act::Idle {
+                    if self.vibe.beats % 8 == 0 {
+                        if let Some(m) = self.model.as_mut() {
+                            m.gesture_now();
+                        }
+                    }
+                }
+                if !self.walk.circle && self.walk.act != Act::Chase {
+                    self.walk.circle_target = None;
+                }
+                r
+            } else {
+                (0.0, false, 0.0)
+            };
+            // held: follow the cursor; released: fall back down
+            let walk_x = if self.config.walk || self.walk.act == Act::Held {
+                self.carry(info, dt, center_clip, half_clip);
+                self.walk.x - view
+            } else {
+                walk_x
+            };
+            let air = self.walk.air * half_clip[1];
             self.program
-                .set_vec2(gl, "u_tilt", self.smooth_look[0], self.smooth_look[1]);
-            self.program.set_f32(gl, "u_breath", breath);
-            self.program.set_f32(gl, "u_bounce", self.smooth_bounce);
+                .set_vec2(gl, "u_center", center_clip[0] + walk_x, center_clip[1]);
+            {
+                self.catch_cling(info);
+                // sprite box for click hit-testing (surface pixels)
+                let lift_now = (jump * self.walk.jump_amp) * half_clip[1] + air;
+                self.surface = [w, h];
+                self.hit_rect = [
+                    (center_clip[0] + walk_x - half_clip[0] + 1.0) * 0.5 * w,
+                    (1.0 - (center_clip[1] + half_clip[1] + lift_now)) * 0.5 * h,
+                    (center_clip[0] + walk_x + half_clip[0] + 1.0) * 0.5 * w,
+                    (1.0 - (center_clip[1] - half_clip[1] + lift_now)) * 0.5 * h,
+                ];
+                self.pat_leaves(info);
+            }
+            // sprites have no rig: idle sway + hop, quicker hops while walking
+            let (sway, hop, squash) = if mode == 0 && self.walk.act == Act::Pat {
+                // pat pat: quick downward squashes, no sway
+                let p = (self.walk.timer / PAT_DUR * std::f32::consts::PI * 5.0).sin().abs();
+                (0.0, 0.0, p * 5.0)
+            } else if mode == 0 && self.model.is_some() {
+                // the rig animates itself: only lift for jumps and drags,
+                // and sway and bob to the music
+                (0.0, jump * self.walk.jump_amp * half_clip[1] + air, 0.0)
+            } else if mode == 0 {
+                let (freq, amp) = if moving { (7.0, 0.10) } else { (3.0, 0.05) };
+                let hop = (time * freq).sin().abs();
+                let (hop, amp) = if matches!(self.walk.act, Act::Held | Act::Fall) { (0.0, 0.0) } else { (hop, amp) };
+                let lift = (hop * amp * (1.0 - jump) + jump * self.walk.jump_amp) * half_clip[1] + air;
+                ((time * 1.5).sin() * 0.6, lift, (1.0 - hop) * 1.5 * (1.0 - jump))
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            self.program.set_vec2(
+                gl,
+                "u_tilt",
+                self.smooth_look[0] + sway,
+                self.smooth_look[1],
+            );
+            self.program.set_f32(gl, "u_breath", breath - squash);
+            self.program.set_f32(gl, "u_bounce", self.smooth_bounce + hop);
+            self.program.set_f32(gl, "u_rot", self.walk.rot);
+            self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
+            self.program.set_f32(gl, "u_aspect", w / h);
+            let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
+                (true, _, Some(g)) => g,
+                (_, true, _) => [0.0, -half_clip[1]],
+                _ => [0.0, 0.0],
+            };
+            self.program.set_vec2(gl, "u_pivot", pivot[0], pivot[1]);
             self.program
-                .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x));
+                .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right)));
             self.program.set_i32(gl, "u_mode", mode);
+            self.program.set_i32(gl, "u_premul", i32::from(self.model.is_some()));
             self.program.set_f32(gl, "u_time", time);
             self.program.set_f32(gl, "u_opacity", self.config.opacity);
             self.program
@@ -1104,20 +1778,36 @@ impl CharacterOverlay {
             self.program.set_vec4(gl, "u_mouth", mouth);
 
             gl.active_texture(glow::TEXTURE0);
-            let tex = self
-                .sprite_tex
-                .map(|(t, _, _)| t)
-                .unwrap_or(self.dummy_tex);
+            let happy = matches!(self.walk.act, Act::Jump | Act::Pat | Act::Held | Act::Fall)
+                || self.walk.social.is_some_and(|s| s.happy);
+            let tex = match (happy, self.sprite_happy) {
+                (true, Some(h)) => h,
+                _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),
+            };
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             self.program.set_i32(gl, "u_tex", 0);
 
-            gl.bind_vertex_array(Some(self.vao));
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-            gl.bind_vertex_array(None);
+            if target.begin(gl, self.actor, self.hit_rect) {
+                let [sx, sy, ox, oy] = target.clip_xform();
+                self.program.set_vec4(gl, "u_clip", [sx, sy, ox, oy]);
+                gl.bind_vertex_array(Some(self.vao));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.bind_vertex_array(None);
+                target.end(gl, self.actor);
+            }
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.disable(glow::BLEND);
         }
 
+        self.speak(info);
+
+        for e in &mut self.extras {
+            e.render(gl, info, active_window, target)?;
+        }
+        if self.actor == 0 {
+            self.draw_ropes(gl, info, target);
+            self.draw_carrot(gl, info, target);
+        }
         Ok(())
     }
 }

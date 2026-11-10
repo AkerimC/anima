@@ -32,15 +32,21 @@ use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
+use smithay_client_toolkit::reexports::client::protocol::{wl_pointer, wl_seat};
+use smithay_client_toolkit::shell::xdg::XdgShell;
+use smithay_client_toolkit::shell::xdg::window::{Window, WindowConfigure, WindowHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, registry_handlers,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
 
 use crate::audio::AudioAnalyzer;
 use crate::config::Config;
 use crate::ipc::{self, Command, Request, Response};
 use crate::lyrics::{LyricsEngine, fuse_mouth_visemes};
-use crate::render::character::{CharacterOverlay, Corner, Placement, WindowRect};
+use crate::render::character::{CharacterOverlay, Corner, Placement, SharedSurface, WindowRect};
 use crate::render::image::ImageRenderer;
 use crate::render::scene::SceneRenderer;
 use crate::render::shader::{FallbackRenderer, ShaderRenderer};
@@ -50,6 +56,8 @@ use crate::render::{FrameInfo, Renderer};
 use crate::util;
 use crate::wallpaper::{self, Wallpaper, WallpaperKind};
 
+use self::super::charwin::WorkspaceWindows;
+use self::super::compositor;
 use self::super::governor::{GovernorEvent, spawn_governor};
 
 /// Options passed from the CLI to the daemon.
@@ -69,6 +77,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
     if let Some(fps) = opts.fps {
         config.general.fps = fps.clamp(1, 360);
     }
+    compositor::configure(&config.general.compositor);
 
     let conn = Connection::connect_to_env()
         .context("connecting to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
@@ -82,6 +91,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
     )?;
     let output_state = OutputState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
+    let seat_state = SeatState::new(&globals, &qh);
 
     let display_ptr = conn.backend().display_ptr() as *mut c_void;
     if display_ptr.is_null() {
@@ -106,8 +116,11 @@ pub fn run(opts: RunOptions) -> Result<()> {
     let socket = util::socket_path();
     let mut app = App {
         registry: registry_state,
+        seat_state,
+        pointer: None,
         compositor,
         layer_shell,
+        xdg_shell: XdgShell::bind(&globals, &qh).ok(),
         output_state,
         qh: qh.clone(),
         egl_display,
@@ -229,6 +242,14 @@ struct FrontOverlayCtx {
     gl_context: Option<glutin::context::PossiblyCurrentContext>,
     gl: Option<glow::Context>,
     character: Option<CharacterOverlay>,
+    // character boxes drawn last frame (they must be repainted when they move)
+    prev_rects: Vec<[f32; 4]>,
+    input_boxes: Vec<[i32; 4]>,
+    input_at: Instant,
+    /// Window mode: the characters are drawn into one window per workspace,
+    /// placed by the compositor backend; this surface is a 1x1 frame clock.
+    windowed: bool,
+    windows: WorkspaceWindows,
 }
 
 struct OutputCtx {
@@ -259,6 +280,7 @@ struct OutputCtx {
     last_render: Instant,
     start: Instant,
     frames: u64,
+    fps_since: Instant,
 }
 
 impl OutputCtx {
@@ -290,14 +312,18 @@ impl OutputCtx {
             last_render: Instant::now(),
             start: Instant::now(),
             frames: 0,
+            fps_since: Instant::now(),
         }
     }
 }
 
 pub struct App {
     registry: RegistryState,
+    seat_state: SeatState,
+    pointer: Option<wl_pointer::WlPointer>,
     compositor: CompositorState,
     layer_shell: LayerShell,
+    xdg_shell: Option<XdgShell>,
     output_state: OutputState,
     qh: QueueHandle<App>,
     egl_display: Display,
@@ -371,7 +397,11 @@ impl App {
                         fo.character.is_some() && !self.outputs[idx].overlay_hidden
                     }));
             if !wallpaper_animated && character_active {
-                fps = fps.min(self.config.character.fps.clamp(1, 144));
+                // nothing else animates: the character's own fps decides
+                fps = self.config.character.fps.clamp(1, 360);
+                if self.on_battery {
+                    fps = fps.min(self.config.general.battery_fps.max(1));
+                }
             }
         }
         fps.clamp(1, 360)
@@ -426,6 +456,14 @@ impl App {
             self.outputs[idx].character = None;
 
             if self.outputs[idx].front_overlay.is_none() {
+                let windowed = ch_cfg.windows
+                    && ch_cfg.walk
+                    && self.xdg_shell.is_some()
+                    && compositor::current().can_place_windows();
+                compositor::current().set_window_mode(windowed);
+                if windowed {
+                    log::info!("characters: one window per workspace ({})", compositor::current().name());
+                }
                 let surface = self.compositor.create_surface(&self.qh);
                 // Set an empty 0x0 input region so clicks pass straight through!
                 if let Ok(empty_region) = Region::new(&self.compositor) {
@@ -438,10 +476,15 @@ impl App {
                     Some("anima-character"),
                     Some(&self.outputs[idx].output),
                 );
-                layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+                if windowed {
+                    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+                    layer.set_size(1, 1);
+                } else {
+                    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+                    layer.set_size(0, 0);
+                }
                 layer.set_exclusive_zone(-1);
                 layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-                layer.set_size(0, 0);
                 layer.commit();
 
                 self.outputs[idx].overlay_hidden = true;
@@ -453,6 +496,11 @@ impl App {
                     gl_context: None,
                     gl: None,
                     character: None,
+                    prev_rects: Vec::new(),
+                    input_boxes: Vec::new(),
+                    input_at: Instant::now(),
+                    windowed,
+                    windows: WorkspaceWindows::default(),
                 });
             } else {
                 let (w, h) = (self.outputs[idx].width, self.outputs[idx].height);
@@ -500,6 +548,8 @@ impl App {
         let Some(fo) = self.outputs[idx].front_overlay.as_mut() else {
             return;
         };
+        // the character still works in output pixels; only the surface shrinks
+        let (surf_w, surf_h) = if fo.windowed { (scale, scale) } else { (width, height) };
 
         // Ensure click-through input region stays empty on configure.
         if let Ok(empty_region) = Region::new(&self.compositor) {
@@ -523,8 +573,8 @@ impl App {
                 return;
             };
             let (Some(w), Some(h)) = (
-                NonZeroU32::new(width as u32),
-                NonZeroU32::new(height as u32),
+                NonZeroU32::new(surf_w as u32),
+                NonZeroU32::new(surf_h as u32),
             ) else {
                 return;
             };
@@ -553,8 +603,8 @@ impl App {
             fo.gl = Some(gl);
         } else if let (Some(ctx), Some(surface)) = (&fo.gl_context, &fo.gl_surface) {
             if let (Some(w), Some(h)) = (
-                NonZeroU32::new(width as u32),
-                NonZeroU32::new(height as u32),
+                NonZeroU32::new(surf_w as u32),
+                NonZeroU32::new(surf_h as u32),
             ) {
                 let _ = surface.resize(ctx, w, h);
             }
@@ -620,6 +670,9 @@ impl App {
         let name = oc.name.clone().unwrap_or_default();
 
         let built: Result<Box<dyn Renderer>> = match &oc.wallpaper {
+            None if oc.error.is_none() => Ok(Box::new(
+                crate::render::shader::TransparentRenderer::new(w, h),
+            ) as Box<dyn Renderer>),
             None => FallbackRenderer::new(
                 gl,
                 w,
@@ -823,6 +876,8 @@ impl App {
         let fused_mouth = fuse_mouth_visemes(audio_snap.mouth, &lyric_snap);
         let cursor = self.cursor_pos;
         let active_win = self.active_window;
+        let compositor = &self.compositor;
+        let (xdg, qh, egl_display, egl_config) = (self.xdg_shell.as_ref(), &self.qh, &self.egl_display, &self.egl_alpha_config);
         let oc = &mut self.outputs[idx];
         let (Some(gl), Some(ctx), Some(gl_surface)) =
             (oc.gl.as_ref(), oc.gl_context.as_ref(), oc.gl_surface.as_ref())
@@ -878,7 +933,7 @@ impl App {
                 Ok(mut keep_going) => {
                     if let Some(ch) = oc.character.as_mut() {
                         if ch.config.enabled {
-                            let _ = ch.render(gl, &info, active_win);
+                            let _ = ch.render(gl, &info, active_win, &mut SharedSurface);
                             keep_going = true;
                         }
                     }
@@ -913,8 +968,79 @@ impl App {
                             fo_gl.clear_color(0.0, 0.0, 0.0, 0.0);
                             fo_gl.clear(glow::COLOR_BUFFER_BIT);
                         }
-                        let _ = ch.render(fo_gl, &info, active_win);
-                        let _ = fo_surf.swap_buffers(fo_ctx);
+                        if fo.windowed {
+                            if let (Some(xdg), Some(row)) = (xdg, compositor::current().row()) {
+                                let size = (info.width, info.height);
+                                fo.windows.sync(fo_gl, row, size, oc.scale, xdg, compositor, qh, egl_display, egl_config, fo_ctx);
+                                let _ = fo_ctx.make_current(fo_surf);
+                            }
+                            if let Some(mut target) = fo.windows.begin_frame(fo_gl) {
+                                let _ = ch.render(fo_gl, &info, active_win, &mut target);
+                                let mut place = |slot| compositor::current().place_workspace_window(slot);
+                                fo.windows.present(fo_gl, fo_ctx, compositor, &ch.hit_rects(), &mut place);
+                            }
+                            let _ = fo_ctx.make_current(fo_surf);
+                        } else {
+                            let _ = ch.render(fo_gl, &info, active_win, &mut SharedSurface);
+                        }
+                        // only the characters take clicks, the rest passes through
+                        if fo.windowed {
+                        } else {
+                            // the compositor redoes its bookkeeping for every one of
+                            // these: only when it changed, 30 times a second at most
+                            let sc = oc.scale.max(1) as f32;
+                            let boxes: Vec<[i32; 4]> = ch
+                                .input_rects()
+                                .iter()
+                                .map(|r| [(r[0] / sc) as i32, (r[1] / sc) as i32, ((r[2] - r[0]) / sc) as i32, ((r[3] - r[1]) / sc) as i32])
+                                .filter(|b| b[2] > 0 && b[3] > 0)
+                                .collect();
+                            if boxes != fo.input_boxes && fo.input_at.elapsed() >= Duration::from_millis(33) {
+                                if let Ok(region) = Region::new(compositor) {
+                                    for b in &boxes {
+                                        region.add(b[0], b[1], b[2], b[3]);
+                                    }
+                                    fo.layer.wl_surface().set_input_region(Some(region.wl_region()));
+                                    fo.input_boxes = boxes;
+                                    fo.input_at = Instant::now();
+                                }
+                            }
+                        }
+                        // tell the compositor only the character boxes changed, not
+                        // the whole screen, so it doesn't recomposite everything each
+                        // frame (window mode damages its own windows)
+                        let rects = if fo.windowed { Vec::new() } else { ch.damage_rects() };
+                        let (bw, bh) = (info.width as f32, info.height as f32);
+                        let damage: Vec<glutin::surface::Rect> = rects
+                            .iter()
+                            .chain(fo.prev_rects.iter())
+                            .filter(|r| r[2] > r[0] && r[3] > r[1])
+                            .map(|r| {
+                                // margin for sway/squash; EGL rects start bottom-left
+                                const M: f32 = 32.0;
+                                let x0 = (r[0] - M).clamp(0.0, bw);
+                                let x1 = (r[2] + M).clamp(0.0, bw);
+                                let y0 = (r[1] - M).clamp(0.0, bh);
+                                let y1 = (r[3] + M).clamp(0.0, bh);
+                                glutin::surface::Rect::new(
+                                    x0 as i32,
+                                    (bh - y1) as i32,
+                                    (x1 - x0).ceil() as i32,
+                                    (y1 - y0).ceil() as i32,
+                                )
+                            })
+                            .filter(|r| r.width > 0 && r.height > 0)
+                            .collect();
+                        fo.prev_rects = rects;
+                        let swapped = match (fo_surf, fo_ctx) {
+                            (
+                                glutin::surface::Surface::Egl(s),
+                                glutin::context::PossiblyCurrentContext::Egl(c),
+                            ) if !damage.is_empty() => s.swap_buffers_with_damage(c, &damage),
+                            #[allow(unreachable_patterns)]
+                            _ => fo_surf.swap_buffers(fo_ctx),
+                        };
+                        let _ = swapped;
                         keep_going = true;
                     }
                 }
@@ -924,6 +1050,12 @@ impl App {
         if skip_wallpaper && keep_going {
             oc.last_render = Instant::now();
             oc.frames += 1;
+        }
+        // frame rate, for tuning (RUST_LOG=anima::backend::wayland=debug)
+        if oc.frames % 300 == 0 && oc.frames > 0 {
+            let fps = 300.0 / oc.fps_since.elapsed().as_secs_f32();
+            log::debug!("monitor {name}: {fps:.0} fps");
+            oc.fps_since = Instant::now();
         }
         oc.animating = keep_going;
         keep_going
@@ -986,11 +1118,29 @@ impl App {
     /// compositor treats that as an unmap and rejects the next buffer until a
     /// fresh configure arrives. Clearing to alpha 0 hides the character while
     /// keeping the surface mapped and cheap to re-show.
+    /// The new config differs from the running one only in `character.extra`.
+    fn only_team_changed(&self, new: &Config) -> bool {
+        let strip = |c: &Config| {
+            let mut v = serde_json::to_value(c).unwrap_or_default();
+            if let Some(ch) = v.get_mut("character").and_then(|c| c.as_object_mut()) {
+                ch.remove("extra");
+                ch.remove("tuning");
+            }
+            v
+        };
+        (self.config.character.extra != new.character.extra || self.config.character.tuning != new.character.tuning)
+            && strip(&self.config) == strip(new)
+    }
+
     fn hide_front_overlay(&mut self, idx: usize) {
         let (width, height) = (self.outputs[idx].width, self.outputs[idx].height);
         let Some(fo) = self.outputs[idx].front_overlay.as_mut() else {
             return;
         };
+        // hidden characters must not swallow clicks
+        if let Ok(empty) = Region::new(&self.compositor) {
+            fo.layer.wl_surface().set_input_region(Some(empty.wl_region()));
+        }
         if !fo.configured {
             return;
         }
@@ -1192,6 +1342,14 @@ impl App {
         let Command { request, reply } = cmd;
         let response = match request {
             Request::Ping => Response::ok(format!("anima {} is running", crate::VERSION)),
+            Request::Race => {
+                crate::render::character::RACE_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
+                Response::ok("race started")
+            }
+            Request::Game { name } => {
+                *crate::render::character::GAME_NOW.lock().unwrap() = Some(name);
+                Response::ok("game started")
+            }
             Request::Quit => {
                 self.exit = true;
                 Response::ok("shutting down")
@@ -1239,6 +1397,7 @@ impl App {
                     format!("{} monitor(s)", monitors.len()),
                     serde_json::json!({
                         "version": crate::VERSION,
+                        "compositor": compositor::current().name(),
                         "uptime_secs": self.started.elapsed().as_secs(),
                         "focused_monitor": self.focused_monitor,
                         "fullscreen": self.any_fullscreen,
@@ -1537,6 +1696,33 @@ impl App {
                 )
             }
             Request::Reload => match Config::load(&self.config_path) {
+                Ok(config) if self.only_team_changed(&config) => {
+                    // only characters added/removed: keep the others where they are
+                    let extra = config.character.extra.clone();
+                    let team_changed = extra != self.config.character.extra;
+                    crate::render::tuning::set(config.character.tuning);
+                    self.config = config;
+                    for oc in self.outputs.iter_mut().filter(|_| team_changed) {
+                        let (w, h) = (oc.width, oc.height);
+                        if let Some(fo) = oc.front_overlay.as_mut() {
+                            if let (Some(ctx), Some(surf), Some(gl), Some(ch)) =
+                                (&fo.gl_context, &fo.gl_surface, &fo.gl, fo.character.as_mut())
+                            {
+                                if ctx.make_current(surf).is_ok() {
+                                    ch.update_extras(gl, &extra, w, h);
+                                }
+                            }
+                        }
+                        if let (Some(ctx), Some(surf), Some(gl), Some(ch)) =
+                            (&oc.gl_context, &oc.gl_surface, &oc.gl, oc.character.as_mut())
+                        {
+                            if ctx.make_current(surf).is_ok() {
+                                ch.update_extras(gl, &extra, w, h);
+                            }
+                        }
+                    }
+                    Response::ok("characters updated")
+                }
                 Ok(config) => {
                     self.config = config;
                     for idx in 0..self.outputs.len() {
@@ -1802,7 +1988,7 @@ impl ProvidesRegistryState for App {
         &mut self.registry
     }
 
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 impl App {
@@ -1892,7 +2078,7 @@ impl App {
                 .with_context_api(ContextApi::Gles(None))
                 .build(Some(raw_window));
             let not_current =
-                match unsafe { self.egl_display.create_context(&self.egl_config, &attrs) } {
+                match unsafe { self.egl_display.create_context(&self.egl_alpha_config, &attrs) } {
                     Ok(ctx) => ctx,
                     Err(err) => {
                         log::error!(
@@ -1913,7 +2099,7 @@ impl App {
                 SurfaceAttributesBuilder::<WindowSurface>::new().build(raw_window, w, h);
             let gl_surface = match unsafe {
                 self.egl_display
-                    .create_window_surface(&self.egl_config, &surface_attrs)
+                    .create_window_surface(&self.egl_alpha_config, &surface_attrs)
             } {
                 Ok(s) => s,
                 Err(err) => {
@@ -1987,6 +2173,80 @@ fn read_battery() -> (bool, Option<u8>) {
 }
 
 delegate_compositor!(App);
+delegate_xdg_shell!(App);
+delegate_xdg_window!(App);
+
+// character windows (window mode, see charwin.rs)
+impl WindowHandler for App {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {}
+
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &Window, _: WindowConfigure, _: u32) {
+        for oc in &mut self.outputs {
+            if let Some(fo) = oc.front_overlay.as_mut() {
+                if fo.windows.configure(window) {
+                    return;
+                }
+            }
+        }
+    }
+}
+delegate_seat!(App);
+delegate_pointer!(App);
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
+    }
+
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Pointer {
+            if let Some(p) = self.pointer.take() {
+                p.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for App {
+    // the pointer only reaches us over a character: use the exact position
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for ev in events {
+            if !matches!(ev.kind, PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }) {
+                continue;
+            }
+            // the overlay covers the output; a character window sits at its
+            // last drawn spot
+            let Some((oc, (wx, wy))) = self.outputs.iter().find_map(|oc| {
+                let fo = oc.front_overlay.as_ref()?;
+                if fo.layer.wl_surface() == &ev.surface {
+                    return Some((oc, (0, 0)));
+                }
+                let (x, y) = fo.windows.origin_of(&ev.surface)?;
+                let s = oc.scale.max(1);
+                Some((oc, (x / s, y / s)))
+            }) else {
+                continue;
+            };
+            let (ox, oy) = self
+                .output_state
+                .info(&oc.output)
+                .and_then(|i| i.logical_position)
+                .unwrap_or((0, 0));
+            let p = ((ox + wx) as f32 + ev.position.0 as f32, (oy + wy) as f32 + ev.position.1 as f32);
+            *crate::backend::pointer::SYNC.lock().unwrap() = Some(p);
+        }
+    }
+}
 delegate_output!(App);
 delegate_layer!(App);
 delegate_registry!(App);

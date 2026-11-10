@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Anima
+Comment=Masaüstü karakteri seç, aç/kapat
+Exec=anima-gui
+Icon=preferences-desktop-wallpaper
+Categories=Utility;
+StartupWMClass=dev.anima.Anima

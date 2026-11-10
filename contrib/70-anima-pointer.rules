@@ -1,0 +1,5 @@
+# Let the logged-in user read mice and touchpads (not keyboards) so anima can
+# follow the cursor on compositors without a cursor IPC (niri) and read
+# clicks/drags/gestures on Hyprland and niri.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}!="1", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}!="1", ENV{ID_INPUT_TOUCHPAD}=="1", TAG+="uaccess"

@@ -72,6 +72,12 @@ pub enum Request {
         always_on_top: Option<bool>,
     },
     Reload,
+    /// Walking characters gather and race each other.
+    Race,
+    /// Start a game among the characters right now.
+    Game {
+        name: String,
+    },
     Quit,
 }
 

@@ -478,3 +478,45 @@ pub fn should_check(last: &mut Instant, interval: std::time::Duration) -> bool {
         false
     }
 }
+
+/// Fully transparent background, used when no wallpaper is set so the
+/// compositor/shell wallpaper underneath stays visible.
+pub struct TransparentRenderer {
+    width: i32,
+    height: i32,
+}
+
+impl TransparentRenderer {
+    pub fn new(width: i32, height: i32) -> Self {
+        Self { width, height }
+    }
+}
+
+impl Renderer for TransparentRenderer {
+    fn render(&mut self, gl: &glow::Context, _info: &FrameInfo) -> Result<bool> {
+        unsafe {
+            gl.viewport(0, 0, self.width, self.height);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        Ok(false)
+    }
+
+    fn resize(&mut self, _gl: &glow::Context, width: i32, height: i32) -> Result<()> {
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
+    fn set_paused(&mut self, _paused: bool) {}
+
+    fn set_volume(&mut self, _volume: f32) {}
+
+    fn describe(&self) -> String {
+        "none (transparent)".into()
+    }
+
+    fn is_animated(&self) -> bool {
+        false
+    }
+}

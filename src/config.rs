@@ -53,6 +53,10 @@ pub struct General {
     pub low_battery_pause: u8,
     /// mpv hardware decoding mode: `auto-safe`, `auto`, `vaapi`, `nvdec`, `no`...
     pub hwdec: String,
+    /// Compositor backend: `auto` (detect), `hyprland`, `niri` or `generic`.
+    /// `ANIMA_COMPOSITOR` overrides this. Changing it needs an animad restart.
+    #[serde(default = "default_compositor")]
+    pub compositor: String,
     /// Fallback wallpaper used for monitors without an explicit entry.
     pub default_wallpaper: Option<String>,
     /// Where `anima list` looks for wallpapers.
@@ -64,6 +68,10 @@ pub struct General {
     /// Explicit playlist entries (paths, names or Workshop IDs). If empty, all
     /// wallpapers in `wallpapers_dir` are used for `anima next` / `anima prev`.
     pub playlist: Vec<String>,
+}
+
+fn default_compositor() -> String {
+    "auto".into()
 }
 
 impl Default for General {
@@ -80,6 +88,7 @@ impl Default for General {
             battery_fps: 30,
             low_battery_pause: 15,
             hwdec: "auto-safe".into(),
+            compositor: default_compositor(),
             default_wallpaper: None,
             wallpapers_dir: None,
             playlist_interval_secs: 0,

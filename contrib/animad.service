@@ -9,10 +9,14 @@ Type=simple
 ExecStart=%h/Projects/anima/target/release/animad
 Restart=always
 RestartSec=2
-# Hyprland session variables must reach the user manager:
+# The session variables must reach the user manager. Hyprland users:
 #   systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR \
 #     XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
-PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+# niri users:
+#   systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR \
+#     XDG_CURRENT_DESKTOP NIRI_SOCKET
+# To force a backend instead of auto-detecting: Environment=ANIMA_COMPOSITOR=niri
+PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE NIRI_SOCKET DBUS_SESSION_BUS_ADDRESS
 Environment=RUST_LOG=info
 
 [Install]
