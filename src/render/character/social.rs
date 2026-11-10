@@ -1074,8 +1074,8 @@ impl CharacterOverlay {
     /// What it does with its umbrella in the rain, by what it's up to: 0 none
     /// (it's the volleyball), 1 open in the hand (chatting, watching, the
     /// samba, the top of the volleyball net), 2 open and strapped to its back
-    /// (any other game, a race: hands free, and it slows them down), 3 rolled
-    /// up on its back (the long jump, domino).
+    /// (any other game, a race: hands free, it slows them down, and long
+    /// jumpers float down with it), 3 rolled up on its back (domino).
     pub(super) fn umbrella_mode(&self, i: usize) -> u8 {
         let wk = self.walk_ref(i);
         if wk.race.is_some() {
@@ -1089,8 +1089,8 @@ impl CharacterOverlay {
         match c.stage {
             Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer | Stage::RaceCall | Stage::RaceWait => 1,
             Stage::Samba | Stage::Concert => 1,
-            // jumping for distance or toppling over: rolled up out of the way
-            Stage::Long | Stage::Domino => 3,
+            // toppling over: rolled up out of the way
+            Stage::Domino => 3,
             Stage::Volley => match c.volley.as_ref() {
                 Some(v) if v.ball == i => 0,
                 Some(v) if v.net.last() == Some(&i) => 1,
