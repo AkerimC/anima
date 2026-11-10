@@ -206,6 +206,59 @@ pub fn santa_item() -> Item {
     Item { id: "santa".into(), label: "Santa hat (Christmas)".into(), kind: 25, image: None, anchor: Anchor::Crown, size: [0.95, 0.72], pivot: [0.5, 1.0], offset: [0.0, 0.2], behind: false, pair: 0.0 }
 }
 
+/// What each character has found (character name -> item ids), beyond what
+/// everyone starts with.
+pub fn inventory_path() -> PathBuf {
+    crate::util::data_dir().join("inventory.json")
+}
+
+/// Everyone has these from the start (the umbrella and the Santa hat come
+/// with the weather and the season anyway).
+pub const STARTERS: [&str; 1] = ["scarf"];
+
+pub type Inventory = HashMap<String, Vec<String>>;
+
+fn read_inventory() -> Inventory {
+    std::fs::read_to_string(inventory_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Whether `name` has `id` to wear.
+pub fn owns(inv: &Inventory, name: &str, id: &str) -> bool {
+    STARTERS.contains(&id) || inv.get(name).is_some_and(|v| v.iter().any(|x| x == id))
+}
+
+/// `name` found `id`: it's theirs from now on.
+pub(super) fn give(name: &str, id: &str) {
+    let mut inv = read_inventory();
+    let mine = inv.entry(name.to_string()).or_default();
+    if !mine.iter().any(|x| x == id) {
+        mine.push(id.to_string());
+        if let Ok(text) = serde_json::to_string_pretty(&inv) {
+            let _ = crate::util::atomic_write(&inventory_path(), text.as_bytes());
+        }
+    }
+}
+
+/// Something `name` hasn't found yet, at random (`roll` 0..1), as its place
+/// in the catalog; None once it has everything.
+pub(super) fn unfound(name: &str, roll: f32) -> Option<usize> {
+    let shared = wardrobe();
+    let left: Vec<usize> = (0..shared.1.len()).filter(|&k| !owns(&shared.3, name, &shared.1[k].id) && shared.1[k].id != "sleep_mask").collect();
+    (!left.is_empty()).then(|| left[(roll * left.len() as f32) as usize % left.len()])
+}
+
+/// The labels of what `name` has found (starters not counted).
+pub(super) fn found_labels(name: &str) -> Vec<String> {
+    let shared = wardrobe();
+    shared.3.get(name).map(|ids| ids.iter().filter_map(|id| shared.1.iter().find(|i| &i.id == id).map(|i| i.label.clone())).collect()).unwrap_or_default()
+}
+
+/// A catalog entry by its place: its label, and its picture or drawn kind.
+pub(super) fn catalog_entry(k: usize) -> Option<(String, String, Option<PathBuf>, i32)> {
+    let shared = wardrobe();
+    shared.1.get(k).map(|it| (it.id.clone(), it.label.clone(), it.image.clone(), it.kind))
+}
+
 pub fn wardrobe_path() -> PathBuf {
     crate::util::data_dir().join("wardrobe.json")
 }
@@ -264,7 +317,7 @@ pub fn catalog() -> Vec<Item> {
 
 /// The wardrobe as saved and the catalog, read again whenever the file or
 /// the accessories folder changes; shared, as it's asked for every frame.
-type Wardrobe = std::sync::Arc<(HashMap<String, Vec<String>>, Vec<Item>, Fits)>;
+type Wardrobe = std::sync::Arc<(HashMap<String, Vec<String>>, Vec<Item>, Fits, Inventory)>;
 
 fn wardrobe() -> Wardrobe {
     type State = (Option<Instant>, Option<SystemTime>, Wardrobe);
@@ -276,12 +329,13 @@ fn wardrobe() -> Wardrobe {
         let stamp = std::fs::metadata(wardrobe_path()).and_then(|m| m.modified()).ok();
         let dir_stamp = std::fs::metadata(accessories_dir()).and_then(|m| m.modified()).ok();
         let fit_stamp = std::fs::metadata(fit_path()).and_then(|m| m.modified()).ok();
-        let both = stamp.max(dir_stamp).max(fit_stamp);
+        let inv_stamp = std::fs::metadata(inventory_path()).and_then(|m| m.modified()).ok();
+        let both = stamp.max(dir_stamp).max(fit_stamp).max(inv_stamp);
         if both != s.1 || s.2.1.is_empty() {
             s.1 = both;
             let saved = std::fs::read_to_string(wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
             let fits: Fits = std::fs::read_to_string(fit_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-            s.2 = std::sync::Arc::new((saved, catalog(), fits));
+            s.2 = std::sync::Arc::new((saved, catalog(), fits, read_inventory()));
         }
     }
     s.2.clone()
@@ -367,7 +421,7 @@ impl CharacterOverlay {
             for id in ids {
                 let Some(it) = items.iter().find(|i| &i.id == id) else { continue };
                 // the sleep mask only goes on in its sleep
-                if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id) {
+                if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id) || !owns(&shared.3, &name, &it.id) {
                     continue;
                 }
                 if it.pair > 0.0 {
@@ -420,18 +474,8 @@ impl CharacterOverlay {
         let tex_aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
         // an open one: the top a set size just clear of the head, the stick from
         // it down to `hold`, however far that is
-        let picture = super::rope::prop_image(22).is_some();
         let mut open = |hold: [f32; 2], behind: bool| {
             let wide = 1.3 * hw;
-            if picture {
-                // the picture's handle at the bottom: the whole umbrella from above the
-                // head down to the hand
-                let rim = crown[1] - 0.015;
-                let top = rim - wide * 0.55 * tex_aspect;
-                let (x0, x1) = (sx(hold[0] - wide * 0.5), sx(hold[0] + wide * 0.5));
-                out.push(Worn { id: "umbrella", kind: 22, rect: [x0.min(x1), sy(hold[1] + hh * 0.05), x0.max(x1), sy(top)], flip: false, behind, image: None });
-                return;
-            }
             let tall = wide * 0.5 * tex_aspect;
             let rim = crown[1] - 0.015;
             let (x0, x1) = (sx(hold[0] - wide * 0.5), sx(hold[0] + wide * 0.5));
@@ -440,7 +484,7 @@ impl CharacterOverlay {
             let (a0, a1) = (sx(hold[0] - thin * 0.5), sx(hold[0] + thin * 0.5));
             let stick = [a0.min(a1) - (a1 - a0).abs() * 2.5, sy(hold[1] + hh * 0.04), a0.max(a1) + (a1 - a0).abs() * 2.5, sy(rim - tall * 0.9)];
             // the hook turns towards the character
-            out.push(Worn { id: "umbrella", kind: 39, rect: stick, flip: self.faces_right == flip, behind, image: None });
+            out.push(Worn { id: "umbrella", kind: 39, rect: stick, flip: self.faces_right == flip, behind: true, image: None });
         };
         match mode {
             1 => open(hand, false),
@@ -453,7 +497,7 @@ impl CharacterOverlay {
         // a picture fills its box's width at its own shape, about the box's middle
         let (bw, bh) = (self.pose.half[0] * self.pose.size[0], self.pose.half[1] * self.pose.size[1]);
         if bw > 0.0 && bh > 0.0 {
-            for w in &mut out {
+            for w in out.iter_mut().filter(|w| w.kind != 38) {
                 let picture = w.image.clone().or_else(|| super::rope::prop_image(w.kind));
                 let Some(aspect) = picture.and_then(|p| super::rope::picture_aspect(&p)) else { continue };
                 let [x0, y0, x1, y1] = w.rect;

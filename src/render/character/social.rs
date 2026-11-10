@@ -518,6 +518,9 @@ struct Practice {
     intro: f32,
 }
 
+/// A catch that's something to wear: this plus its place in the catalog.
+pub(super) const FOUND: i32 = 30000;
+
 fn grounded(wk: &WalkState) -> bool {
     matches!(wk.act, Act::Idle | Act::Walk)
 }
@@ -1065,8 +1068,10 @@ impl CharacterOverlay {
                 .collect();
             let skills: Vec<serde_json::Value> = self.moods.skills.all(&name).into_iter().map(|(g, v)| serde_json::json!({ "game": g, "skill": v })).collect();
             let keepsakes: Vec<&str> = self.moods.keepsakes.of(&name).into_iter().map(keepsake_name).collect();
+            let found = super::wear::found_labels(&name);
             out.push(serde_json::json!({
                 "keepsakes": keepsakes,
+                "found": found,
                 "skills": skills,
                 "name": name,
                 "doing": doing,
@@ -3183,6 +3188,14 @@ impl CharacterOverlay {
                         let pool: Vec<&(i32, f32, bool)> = CATCHES.iter().filter(|x| x.2 == good).collect();
                         let pick = pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()];
                         a.item = pick.0;
+                        // now and then something to wear it hasn't got yet
+                        if self.walk.rand() < tn().fish_find {
+                            let name = self.character_name(a.i);
+                            let roll = self.walk.rand();
+                            if let Some(k) = super::wear::unfound(&name, roll) {
+                                a.item = FOUND + k as i32;
+                            }
+                        }
                         a.phase = 4;
                         log::debug!("chat {}: {} reels in kind {}", c.id, a.i, a.item);
                     } else {
@@ -3198,7 +3211,13 @@ impl CharacterOverlay {
                 4 if a.t > tn().fish_reel => {
                     a.phase = 5;
                     a.t = 0.0;
-                    let (_, points, good) = *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]);
+                    let (_, points, good) = if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
+                    // found something to wear: it's in its things now
+                    if let Some((id, label, _, _)) = (a.item >= FOUND).then(|| super::wear::catalog_entry((a.item - FOUND) as usize)).flatten() {
+                        let name = self.character_name(a.i);
+                        super::wear::give(&name, &id);
+                        log::debug!("chat {}: {} found {label}", c.id, a.i);
+                    }
                     if let Some(s) = c.scores.iter_mut().find(|s| s.0 == a.i) {
                         s.1 += points;
                     }
@@ -4179,7 +4198,7 @@ impl CharacterOverlay {
         self.mood_props(&mut v);
         // a picture in place of a drawn thing fills the box's width at its own shape
         for p in &mut v {
-            if p.0 >= 21000 {
+            if (21000..FOUND).contains(&p.0) {
                 continue;
             }
             if let Some(a) = super::rope::prop_image(p.0).and_then(|f| super::rope::picture_aspect(&f)) {

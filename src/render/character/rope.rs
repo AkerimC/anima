@@ -194,6 +194,7 @@ uniform int u_flip;
 uniform vec4 u_rect;
 uniform sampler2D u_img;
 uniform vec2 u_fit;      // a picture kept to its own shape inside the box
+uniform vec4 u_crop;     // the part of the picture used: x, y, width, height (0..1)
 uniform float u_reveal;  // shown from the bottom up to this share (rising out of the ground)
 uniform float u_time;
 uniform float u_saspect; // screen width / height
@@ -561,7 +562,7 @@ vec4 picture(vec2 p) {
     if (abs(q.x) > 1.0 || abs(q.y) > 1.0 || p.y > -1.0 + 2.0 * u_reveal) {
         return vec4(0.0);
     }
-    return texture(u_img, vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5));
+    return texture(u_img, u_crop.xy + vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5) * u_crop.zw);
 }
 vec4 canopy(vec2 p) {
     // the umbrella's top on its own: a ribbed dome filling the box, rim at the bottom
@@ -702,6 +703,9 @@ impl CarrotGl {
     }
 }
 
+/// The canopy of the umbrella picture: the top part, above the stick.
+const CANOPY: [f32; 4] = [0.0, 0.08, 1.0, 0.52];
+
 /// How much to stretch the box's coordinates so a picture of `aspect`
 /// (width / height) keeps its shape inside a box `w` x `h`, centred.
 fn fit(w: f32, h: f32, aspect: f32) -> [f32; 2] {
@@ -726,6 +730,12 @@ pub(super) fn picture_box(r: [f32; 4], aspect: f32) -> [f32; 4] {
 /// `~/.local/share/anima/props/` (looked for again every few seconds).
 pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
     use std::time::{Duration, Instant};
+    // something to wear, found on a fishing line: its own picture, or the
+    // props folder's for its drawn kind
+    if kind >= super::social::FOUND {
+        let (_, _, image, drawn) = super::wear::catalog_entry((kind - super::social::FOUND) as usize)?;
+        return image.or_else(|| prop_image(drawn));
+    }
     let name = match kind {
         0 => "carrot",
         1 => "gift",
@@ -736,7 +746,7 @@ pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
         17 => "boot",
         18 => "can",
         21 => "beast",
-        22 => "umbrella",
+        22 | 38 => "umbrella",
         42 => "umbrella_closed",
         23 => "snowflake",
         28 => "top_hat",
@@ -814,6 +824,10 @@ impl CharacterOverlay {
             let mut kind = w.kind;
             if let Some(path) = picture {
                 let Some((tex, aspect)) = c.picture(gl, &path) else { continue };
+                // the umbrella's top: just the canopy of the picture
+                let crop = if w.kind == 38 { CANOPY } else { [0.0, 0.0, 1.0, 1.0] };
+                let aspect = aspect * crop[2] / crop[3];
+                c.program.set_vec4(gl, "u_crop", crop);
                 // the box in px, to keep the picture to its own shape
                 let [x0, y0, x1, y1] = w.rect;
                 let (bw, bh) = ((x1 - x0) * 0.5 * pose.half[0] * pose.size[0], (y1 - y0) * 0.5 * pose.half[1] * pose.size[1]);
@@ -881,7 +895,13 @@ impl CharacterOverlay {
         c.program.set_f32(gl, "c_aspect", w / h);
         for (kind, rect, flip, spin, zoom, image) in props {
             // the creature rising out of the ground says how far it's up in its kind
-            let (kind, reveal) = if kind >= 21000 { (21, (kind - 21000) as f32 / 1000.0) } else { (kind, 1.0) };
+            let (kind, reveal) = if kind >= super::social::FOUND {
+                (kind, 1.0)
+            } else if kind >= 21000 {
+                (21, (kind - 21000) as f32 / 1000.0)
+            } else {
+                (kind, 1.0)
+            };
             let picture = image.or_else(|| prop_image(kind));
             c.program.bind(gl);
             c.program.set_f32(gl, "u_spin", spin);
@@ -895,6 +915,7 @@ impl CharacterOverlay {
             c.program.set_f32(gl, "u_reveal", reveal);
             let kind = match picture.and_then(|p| c.picture(gl, &p)) {
                 Some((tex, aspect)) => {
+                    c.program.set_vec4(gl, "u_crop", [0.0, 0.0, 1.0, 1.0]);
                     let f = fit(x1 - x0, y1 - y0, aspect);
                     c.program.set_vec2(gl, "u_fit", f[0], f[1]);
                     unsafe {
@@ -905,6 +926,7 @@ impl CharacterOverlay {
                     c.program.set_i32(gl, "u_img", 1);
                     100
                 }
+                None if kind >= super::social::FOUND => super::wear::catalog_entry((kind - super::social::FOUND) as usize).map_or(15, |e| e.3),
                 None => kind,
             };
             c.program.set_i32(gl, "u_kind", kind);

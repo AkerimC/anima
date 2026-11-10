@@ -593,18 +593,28 @@ fn wardrobe_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gt
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(280).build();
     b.append(&back_header(r, pop, i, name, "Wardrobe"));
     let hint = gtk::Label::builder()
-        .label("Worn at once, on top of what the weather brings (umbrellas, snow, Santa hats).")
+        .label("Worn at once, on top of what the weather brings (umbrellas, snow, Santa hats). Locked things are found while fishing.")
         .wrap(true)
         .xalign(0.0)
         .build();
     hint.add_css_class("dim-label");
     b.append(&hint);
     let on: Vec<String> = wardrobe_all().get(name).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let inv: wear::Inventory = std::fs::read_to_string(wear::inventory_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
-    for item in wear::catalog() {
+    // what it owns first, then the rest, locked till it fishes them up
+    let mut all = wear::catalog();
+    all.sort_by_key(|it| !wear::owns(&inv, name, &it.id));
+    for item in all {
+        let owned = wear::owns(&inv, name, &item.id);
         let row = gtk::Box::builder().spacing(8).build();
-        row.append(&gtk::Label::builder().label(&item.label).xalign(0.0).hexpand(true).build());
-        let sw = gtk::Switch::builder().active(on.contains(&item.id)).valign(gtk::Align::Center).build();
+        let label = gtk::Label::builder().label(if owned { item.label.clone() } else { format!("🔒 {}", item.label) }).xalign(0.0).hexpand(true).build();
+        if !owned {
+            label.add_css_class("dim-label");
+            label.set_tooltip_text(Some("Not found yet: it turns up on a fishing line"));
+        }
+        row.append(&label);
+        let sw = gtk::Switch::builder().active(owned && on.contains(&item.id)).sensitive(owned).valign(gtk::Align::Center).build();
         let (who, id, u) = (name.to_string(), item.id.clone(), r.ui.clone());
         sw.connect_active_notify(move |s| {
             let mut all = wardrobe_all();
@@ -702,6 +712,10 @@ fn status_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk:
         }
         let text = seen.iter().map(|(k, n)| if *n > 1 { format!("{k} ×{n}") } else { k.to_string() }).collect::<Vec<_>>().join(", ");
         b.append(&line("Keepsakes", text));
+    }
+    let found: Vec<&str> = me["found"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    if !found.is_empty() {
+        b.append(&line("Found", found.join(", ")));
     }
     let played = me["played"].as_f64().unwrap_or(0.0);
     if played >= 0.5 {
