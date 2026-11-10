@@ -25,6 +25,7 @@ pub(super) fn happy_pose(path: &Path) -> Option<PathBuf> {
 /// first (a chibi's head is wide, its neck narrow, ears too thin to count),
 /// then the eyes inside it: dark iris next to a white sparkle. Where they
 /// can't be made out, the place a chibi's eyes usually are in its head.
+#[allow(dead_code)]
 pub(super) fn mask_eyes(img: &image::RgbaImage) -> Option<([f32; 4], [f32; 4], [f32; 3])> {
     let (w, h) = img.dimensions();
     let (wu, hu) = (w as usize, h as usize);
@@ -106,6 +107,7 @@ pub(super) fn mask_eyes(img: &image::RgbaImage) -> Option<([f32; 4], [f32; 4], [
 
 /// Sleep mask spots set by hand in the settings (`eyes.json`: sprite path ->
 /// [x, y] in texture units), read again whenever the file changes.
+#[allow(dead_code)]
 pub(super) fn eye_fix(source: &str) -> Option<[f32; 2]> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant, SystemTime};
@@ -122,4 +124,36 @@ pub(super) fn eye_fix(source: &str) -> Option<[f32; 2]> {
         }
     }
     f.2.get(source).copied()
+}
+
+
+/// The head on a sprite, found from its outline: (left, top, right, neck)
+/// in texture units. The top is below the ear tips.
+pub(super) fn head_box(img: &image::RgbaImage) -> Option<[f32; 4]> {
+    let (w, h) = img.dimensions();
+    let (wu, hu) = (w as usize, h as usize);
+    let solid = |x: u32, y: u32| img.get_pixel(x, y)[3] > 40;
+    let rows: Vec<u32> = (0..h).map(|y| (0..w).filter(|&x| solid(x, y)).count() as u32).collect();
+    let top = rows.iter().position(|&c| c > 0)?;
+    let bot = rows.iter().rposition(|&c| c > 0)?;
+    if bot <= top + 20 {
+        return None;
+    }
+    let all = (bot - top) as f32;
+    let smooth: Vec<f32> = (0..hu).map(|y| (y.saturating_sub(3)..(y + 4).min(hu)).map(|k| rows[k] as f32).sum::<f32>() / 7.0).collect();
+    let upper = smooth[top..top + (all * 0.5) as usize].iter().copied().fold(0.0, f32::max);
+    let htop = (top..bot).find(|&y| smooth[y] >= upper * 0.45)?;
+    let (lo, hi) = (top + (all * 0.38) as usize, top + (all * 0.62) as usize);
+    let mut neck = (lo..hi).min_by(|&a, &b| smooth[a].total_cmp(&smooth[b]))?;
+    if ((neck - htop) as f32) < all * 0.32 {
+        neck = htop + (all * 0.4) as usize;
+    }
+    let head_rows = (neck - htop).max(1) as u32;
+    let cols: Vec<usize> = (0..wu).filter(|&x| (htop..neck).filter(|&y| solid(x as u32, y as u32)).count() as u32 * 10 >= head_rows * 4).collect();
+    let (hl, hr) = (*cols.first()?, *cols.last()?);
+    // the top of the hair itself: the first row across the middle of the head that's solid
+    let mid = (hl + hr) / 2;
+    let span = ((hr - hl) / 6).max(1);
+    let crown = (top..neck).find(|&y| (mid - span..=mid + span).filter(|&x| solid(x as u32, y as u32)).count() > span)?;
+    Some([hl as f32 / w as f32, crown as f32 / h as f32, hr as f32 / w as f32, neck as f32 / h as f32])
 }

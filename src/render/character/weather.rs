@@ -21,8 +21,30 @@ static FORCED: Mutex<Option<Weather>> = Mutex::new(None);
 pub(super) static BEDTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SUN: Mutex<(u32, u32)> = Mutex::new((7 * 60, 19 * 60));
 
-/// "rain", "snow", "night", "bedtime", "clear" or "auto".
+/// Santa hats on (Some(true)), off, or by the calendar (None).
+static XMAS: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Christmas time: mid December to Epiphany, or switched on by hand.
+pub(super) fn christmas() -> bool {
+    if let Some(on) = *XMAS.lock().unwrap() {
+        return on;
+    }
+    let t = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    (tm.tm_mon == 11 && tm.tm_mday >= 10) || (tm.tm_mon == 0 && tm.tm_mday <= 6)
+}
+
+/// "rain", "snow", "night", "bedtime", "clear", "xmas", "noxmas" or "auto".
 pub fn force(name: &str) -> bool {
+    match name {
+        "xmas" | "noxmas" => {
+            *XMAS.lock().unwrap() = Some(name == "xmas");
+            return true;
+        }
+        "auto" => *XMAS.lock().unwrap() = None,
+        _ => {}
+    }
     BEDTIME.store(name == "bedtime", std::sync::atomic::Ordering::Relaxed);
     let w = match name {
         "bedtime" => Some(Weather { night: true, ..Default::default() }),

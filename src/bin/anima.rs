@@ -154,7 +154,8 @@ enum Cmd {
     Game {
         name: String,
     },
-    /// Set the weather by hand: rain, snow, night, bedtime (everyone to bed now), clear, or auto.
+    /// Set the weather by hand: rain, snow, night, bedtime (everyone to bed now), clear,
+    /// xmas / noxmas (Santa hats), or auto.
     Weather {
         name: String,
     },

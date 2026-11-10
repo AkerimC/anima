@@ -205,13 +205,15 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         .column_spacing(10)
         .homogeneous(true)
         .build();
-    let actions: [(&str, &str, &'static str, &'static str); 7] = [
+    let actions: [(&str, &str, &'static str, &'static str); 9] = [
         ("Train", "applications-science-symbolic", "game", "train"),
         ("Rain", "weather-showers-symbolic", "weather", "rain"),
         ("Snow", "weather-snow-symbolic", "weather", "snow"),
         ("Night", "weather-clear-night-symbolic", "weather", "night"),
         ("Bedtime now", "night-light-symbolic", "weather", "bedtime"),
         ("Clear sky", "weather-clear-symbolic", "weather", "clear"),
+        ("Santa hats", "starred-symbolic", "weather", "xmas"),
+        ("No hats", "non-starred-symbolic", "weather", "noxmas"),
         ("Real weather", "find-location-symbolic", "weather", "auto"),
     ];
     for (label, icon, cmd, arg) in actions {
@@ -239,7 +241,7 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
     let group = adw::PreferencesGroup::builder().title("Play now").description("Starts straight away with the characters nearest the screen, whatever their energy").build();
     group.add(&flow);
     page.add(&group);
-    let try_group = adw::PreferencesGroup::builder().title("Try it out").description("Weather stays as set until you pick Real weather. Bedtime sends everyone to bed at once.").build();
+    let try_group = adw::PreferencesGroup::builder().title("Try it out").description("Weather and hats stay as set until you pick Real weather (Santa hats come on by themselves 10 Dec - 6 Jan). Bedtime sends everyone to bed at once.").build();
     try_group.add(&tries);
     page.add(&try_group);
     page.upcast()

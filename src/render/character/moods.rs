@@ -534,6 +534,15 @@ impl CharacterOverlay {
                 wk.keepsake = None;
             }
             let wk = self.walk_of(i);
+            // snow settles on its head while it stands about, and comes off when it jumps or runs
+            let shaken = matches!(wk.act, Act::Jump | Act::Fall | Act::Held | Act::Chase | Act::Planted) || wk.rot.abs() > 0.3;
+            wk.snow_pile = if shaken {
+                (wk.snow_pile - dt * 3.0).max(0.0)
+            } else if w.snow {
+                (wk.snow_pile + dt / tn().snow_settle.max(1.0)).min(1.0)
+            } else {
+                (wk.snow_pile - dt / 40.0).max(0.0)
+            };
             if w.snow && wk.at_leisure() && wk.rand() < dt * tn().snow_hop {
                 let h = tn().jump_height * (0.5 + wk.rand() * 0.5);
                 wk.start_jump(h);
@@ -543,6 +552,42 @@ impl CharacterOverlay {
     }
 
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
+        // on the head: a Santa hat at Christmas, snow that has settled on it
+        let xmas = super::weather::christmas();
+        for k in 0..self.extras.len() + 1 {
+            let a = if k == 0 { self } else { &self.extras[k - 1] };
+            let (wk, r) = (&a.walk, a.hit_rect);
+            let Some(hb) = a.head else { continue };
+            let pile = wk.snow_pile;
+            if !a.visible || (!xmas && pile < 0.05) || wk.rot.abs() > 0.35 || matches!(wk.act, Act::Rest | Act::Travel) {
+                continue;
+            }
+            let (w, h) = (r[2] - r[0], r[3] - r[1]);
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            let flip = a.config.flip_x ^ (a.drawn_left == a.faces_right);
+            let sx = |u: f32| r[0] + if flip { 1.0 - u } else { u } * w;
+            let (l, rr) = (sx(hb[0]).min(sx(hb[2])), sx(hb[0]).max(sx(hb[2])));
+            let (hw, hh) = (rr - l, (hb[3] - hb[1]) * h);
+            let cx = (l + rr) * 0.5;
+            let crown = r[1] + hb[1] * h;
+            if xmas {
+                // tip falls to the side it's facing away from
+                let (ww, tall) = (hw * 0.95, hh * 0.72);
+                let brim = crown + hh * 0.2;
+                v.push((25, [cx - ww * 0.5, brim - tall, cx + ww * 0.5, brim], !flip, k));
+                if pile >= 0.05 {
+                    let (pw, ph) = (ww * 0.5, hh * 0.12 * pile);
+                    let top = brim - tall * 0.62;
+                    v.push((24, [cx - pw * 0.5, top - ph, cx + pw * 0.5, top + ph * 0.2], false, k));
+                }
+            } else {
+                let (pw, ph) = (hw * 0.82, hh * 0.24 * pile.max(0.15));
+                let base = crown + hh * 0.07;
+                v.push((24, [cx - pw * 0.5, base - ph, cx + pw * 0.5, base], false, k));
+            }
+        }
         // keepsakes: lying beside whoever's resting
         let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
         for (k, (wk, r, seen)) in actors.enumerate() {

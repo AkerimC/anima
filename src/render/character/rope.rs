@@ -136,7 +136,8 @@ void main() {
 // 4 a sleeping Z, 5 a drop of sweat, 6 a crumb of carrot, 7 the arrow over "it",
 // 8 a blindfold, 9 a bush, 10 a barrel, 11 a crate, 12 a music note,
 // 13 a fishing rod, 14 a line and float, 15 a star, 16 a rubber duck, 17 an old boot, 18 a tin can,
-// 20 confetti, 21 a beast out of the ground, 22 an umbrella, 23 a snowflake
+// 20 confetti, 21 a beast out of the ground, 22 an umbrella, 23 a snowflake,
+// 24 snow settled on a head, 25 a Santa hat (flipped: tip to the right)
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
@@ -344,6 +345,28 @@ vec4 umbrella(vec2 p) {
     col = mix(col, vec3(0.32, 0.22, 0.16), stick);
     return vec4(col, max(dome, stick));
 }
+vec4 snowpile(vec2 p) {
+    // a soft lumpy cap of snow, flat underneath
+    float top = -1.0 + 1.9 * sqrt(max(0.0, 1.0 - p.x * p.x)) + 0.12 * sin(p.x * 9.0) * (1.0 - abs(p.x));
+    float a = (1.0 - smoothstep(top - 0.06, top, p.y)) * step(-1.0, p.y);
+    vec3 col = mix(vec3(0.82, 0.88, 0.98), vec3(1.0), clamp((p.y + 1.0) * 0.6, 0.0, 1.0));
+    return vec4(col, a);
+}
+vec4 santa(vec2 p) {
+    // the hat: a red cone curving over to one side, fur brim, a bobble
+    float brim = sdBox(p - vec2(0.0, -0.78), vec2(0.92, 0.2), 0.18);
+    float t = clamp((p.y + 0.6) / 1.45, 0.0, 1.0);
+    float bend = 0.55 * t * t;
+    float halfw = 0.82 * (1.0 - t) + 0.06;
+    float cone = step(-0.62, p.y) * step(p.y, 0.85) * (1.0 - smoothstep(halfw - 0.03, halfw, abs(p.x - bend)));
+    float bobble = 1.0 - smoothstep(0.17, 0.21, length(p - vec2(0.62, 0.78)));
+    float fur = max(1.0 - smoothstep(-0.02, 0.02, brim), bobble);
+    vec3 red = mix(vec3(0.72, 0.05, 0.1), vec3(0.92, 0.18, 0.2), clamp(0.5 - (p.x - bend) * 0.6, 0.0, 1.0));
+    vec3 col = mix(red, vec3(0.98, 0.98, 1.0), fur);
+    // a little texture on the fur
+    col -= fur * 0.06 * step(0.6, fract(sin(dot(floor(p * 18.0), vec2(12.9, 78.2))) * 43758.5));
+    return vec4(col, max(cone, fur));
+}
 vec4 snowflake(vec2 p) {
     float a = atan(p.y, p.x);
     float r = length(p);
@@ -362,7 +385,7 @@ vec4 confetti(vec2 p) {
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;

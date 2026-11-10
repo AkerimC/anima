@@ -198,10 +198,6 @@ fn choices(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, path: &str) -> gtk::Wid
     let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
     friends.connect_clicked(move |_| p.set_child(Some(&friends_view(&rr, &p, i, &n))));
     list.append(&friends);
-    let mask = menu_button("Sleep mask", "night-light-symbolic");
-    let (rr, p, n, pth) = (r.clone(), pop.clone(), name.clone(), path.to_string());
-    mask.connect_clicked(move |_| p.set_child(Some(&mask_view(&rr, &p, i, &n, &pth))));
-    list.append(&mask);
     list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let remove = menu_button("Remove from line-up", "user-trash-symbolic");
     let (rr, p) = (r.clone(), pop.clone());
@@ -246,6 +242,7 @@ fn save_eye_fixes(m: &serde_json::Map<String, serde_json::Value>) {
 }
 
 /// Click on the character's eyes: its sleep mask goes there from now on.
+#[allow(dead_code)]
 fn mask_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str) -> gtk::Widget {
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(260).build();
     b.append(&back_header(r, pop, i, name, "Sleep mask"));

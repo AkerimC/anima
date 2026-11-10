@@ -135,6 +135,7 @@ tuning! {
         sleep_after: "Untouched for (s)" = 300.0, 25.0, 3600.0, 15.0, 0;
         night_sleep: "Go to bed at night (share)" = 0.5, 0.0, 1.0, 0.05, 2;
         night_spread: "Going to bed one by one (s)" = 90.0, 0.0, 1800.0, 5.0, 0;
+        snow_settle: "Snow piles up on heads over (s)" = 45.0, 1.0, 600.0, 5.0, 0;
         snow_hop: "Hop after snowflakes (per s)" = 0.06, 0.0, 2.0, 0.01, 2;
         sleep_spread: "Dozing off one by one (s)" = 15.0, 0.0, 120.0, 1.0, 0;
         sleep_sink: "Sinking while lying down" = 0.55, 0.0, 1.0, 0.05, 2;

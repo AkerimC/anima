@@ -1116,8 +1116,10 @@ pub struct CharacterOverlay {
     pending: Option<glow::Texture>,
     // what's drawn: the side it faces and the pose, each changed half way
     // through a short turn or squash so nothing snaps from one frame to the next
-    // where the sleep mask goes on the calm sprite
+    // where the sleep mask goes on the calm sprite (off for now)
     eyes: Option<([f32; 4], [f32; 4], [f32; 3])>,
+    // its head on the calm sprite (left, crown, right, neck), for hats and snow
+    pub(super) head: Option<[f32; 4]>,
     // the mask, 0 off .. 1 on
     lids: f32,
     drawn_left: bool,
@@ -1277,6 +1279,7 @@ impl CharacterOverlay {
             spawned: false,
             pending: None,
             eyes: None,
+            head: None,
             lids: 0.0,
             drawn_left: false,
             drawn_happy: false,
@@ -1405,7 +1408,7 @@ impl CharacterOverlay {
             if bottom > top {
                 self.opaque = [half / w as f32, top as f32 / h as f32, bottom as f32 / h as f32];
             }
-            self.eyes = uma::mask_eyes(&img);
+            self.head = uma::head_box(&img);
             let tex = create_texture(gl, w, h, img.as_raw(), Filter::Linear, true)?;
             self.sprite_tex = Some((tex, w, h));
 
