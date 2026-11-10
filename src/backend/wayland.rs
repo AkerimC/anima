@@ -189,6 +189,14 @@ pub fn run(opts: RunOptions) -> Result<()> {
 
     app.audio.stop();
     app.lyrics.stop();
+    // Tear outputs down while the EGL display and Wayland connection are still
+    // alive. `App`'s fields drop in declaration order, which would destroy the
+    // EGL display before the per-output surfaces and contexts, crashing in the
+    // GL driver.
+    while !app.outputs.is_empty() {
+        let last = app.outputs.len() - 1;
+        app.teardown_output(last);
+    }
     let _ = std::fs::remove_file(&app.socket);
     log::info!("anima stopped");
     Ok(())
@@ -1810,6 +1818,10 @@ impl App {
             }
             fo.character = None;
             fo.gl = None;
+            // Same ordering rule as below: the EGL surface must be destroyed
+            // while its Wayland surface is alive.
+            drop(fo.gl_surface.take());
+            drop(fo.gl_context.take());
         }
         if let (Some(c), Some(s)) = (ctx.gl_context.as_ref(), ctx.gl_surface.as_ref()) {
             let _ = c.make_current(s);
