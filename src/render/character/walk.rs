@@ -279,8 +279,10 @@ impl WalkState {
         self.catch_jump = false;
         self.act = Act::Jump;
         self.jump_amp = amp;
-        // higher jumps hang in the air a bit longer
-        self.jump_dur = tn().jump_time * (amp / tn().jump_height).sqrt().max(1.0);
+        // higher jumps hang in the air a bit longer, and longer still under an
+        // open umbrella (carrot grab, tag, any game in the rain)
+        let hang = if self.parasol { tn().parasol_hang } else { 1.0 };
+        self.jump_dur = tn().jump_time * (amp / tn().jump_height).sqrt().max(1.0) * hang;
         self.jump = self.jump_dur;
     }
 
