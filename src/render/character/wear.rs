@@ -230,8 +230,33 @@ impl CharacterOverlay {
 
     /// What it has on right now: its wardrobe, and what the weather and the
     /// season put on it.
+    /// The anchors of the pose drawn now. The happy pose often has its eyes
+    /// shut in a smile and its arms elsewhere: what can't be seen there is
+    /// taken from the calm pose, in the same place relative to the head.
+    fn pose_anchors(&self) -> Option<crate::render::anchors::Anchors> {
+        let calm = self.anchors?;
+        if !self.drawn_happy {
+            return Some(calm);
+        }
+        let Some(mut happy) = self.anchors_happy else { return Some(calm) };
+        let rel = |p: [f32; 2], from: &[f32; 4], to: &[f32; 4]| {
+            let (fw, fh) = ((from[2] - from[0]).max(0.01), (from[3] - from[1]).max(0.01));
+            [to[0] + (p[0] - from[0]) / fw * (to[2] - to[0]), to[1] + (p[1] - from[1]) / fh * (to[3] - to[1])]
+        };
+        if !happy.eyes_found {
+            happy.eyes = [rel(calm.eyes[0], &calm.head, &happy.head), rel(calm.eyes[1], &calm.head, &happy.head)];
+            happy.eye_size = calm.eye_size;
+        }
+        for k in 0..2 {
+            if !happy.hands_found[k] {
+                happy.hands[k] = rel(calm.hands[k], &calm.body, &happy.body);
+            }
+        }
+        Some(happy)
+    }
+
     pub(super) fn worn(&self) -> Vec<Worn> {
-        let Some(a) = self.anchors else { return Vec::new() };
+        let Some(a) = self.pose_anchors() else { return Vec::new() };
         let flip = self.pose.flip;
         let (hw, hh) = (a.head[2] - a.head[0], a.head[3] - a.head[1]);
         if hw <= 0.0 || hh <= 0.0 {

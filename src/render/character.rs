@@ -1149,6 +1149,8 @@ pub struct CharacterOverlay {
     pub(super) head: Option<[f32; 4]>,
     // where things are worn and held on it (calm sprite)
     pub(super) anchors: Option<crate::render::anchors::Anchors>,
+    // the same on the happy pose, a picture of its own
+    pub(super) anchors_happy: Option<crate::render::anchors::Anchors>,
     // the mask, 0 off .. 1 on
     lids: f32,
     // how the sprite is drawn this frame: breathing, leaning, hopping
@@ -1313,6 +1315,7 @@ impl CharacterOverlay {
             eyes: None,
             head: None,
             anchors: None,
+            anchors_happy: None,
             lids: 0.0,
             pose: SpritePose::default(),
             drawn_left: false,
@@ -1464,6 +1467,7 @@ impl CharacterOverlay {
                             img = image::imageops::flip_horizontal(&img);
                         }
                         let (hw, hh) = img.dimensions();
+                        self.anchors_happy = crate::render::anchors::find(&img);
                         self.sprite_happy =
                             create_texture(gl, hw, hh, img.as_raw(), Filter::Linear, true).ok();
                     }
