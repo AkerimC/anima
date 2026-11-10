@@ -709,6 +709,19 @@ fn fit(w: f32, h: f32, aspect: f32) -> [f32; 2] {
     if box_aspect > aspect { [box_aspect / aspect, 1.0] } else { [1.0, aspect / box_aspect] }
 }
 
+/// A picture's width / height, read once.
+pub(super) fn picture_aspect(path: &std::path::Path) -> Option<f32> {
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<f32>>>> = std::sync::LazyLock::new(Default::default);
+    *SEEN.lock().unwrap().entry(path.to_path_buf()).or_insert_with(|| image::image_dimensions(path).ok().map(|(w, h)| w as f32 / h.max(1) as f32))
+}
+
+/// A box made as tall as a picture of `aspect` needs at the box's width,
+/// about its middle (screen px, y down).
+pub(super) fn picture_box(r: [f32; 4], aspect: f32) -> [f32; 4] {
+    let (cy, h) = ((r[1] + r[3]) * 0.5, (r[2] - r[0]) / aspect.max(0.01));
+    [r[0], cy - h * 0.5, r[2], cy + h * 0.5]
+}
+
 /// The picture standing in for a drawn prop: a PNG named after it in
 /// `~/.local/share/anima/props/` (looked for again every few seconds).
 pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
@@ -835,17 +848,17 @@ impl CharacterOverlay {
     pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         // (kind, surface box, mirrored, turned by, where)
-        let mut props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, 0.0f32, z))).collect();
+        let mut props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, 0.0f32, z, None::<std::path::PathBuf>))).collect();
         // dropped things, turning as they fall
         for l in &self.moods.loose {
             let Some(a) = (if l.owner == 0 { Some(&*self) } else { self.extras.get(l.owner - 1) }) else { continue };
             let Some(z) = self.placed(l.owner) else { continue };
             let x = l.x - a.own_view[0] * self.view_w * 0.5;
-            props.push((l.kind, [x - l.size[0] * 0.5, l.y - l.size[1] * 0.5, x + l.size[0] * 0.5, l.y + l.size[1] * 0.5], false, l.rot, z));
+            props.push((l.kind, [x - l.size[0] * 0.5, l.y - l.size[1] * 0.5, x + l.size[0] * 0.5, l.y + l.size[1] * 0.5], false, l.rot, z, l.image.clone()));
         }
         // the weather over the whole screen, under everything else
         if let Some(kind) = self.weather_sheet() {
-            props.insert(0, (kind, [0.0, 0.0, w, h], false, 0.0, None));
+            props.insert(0, (kind, [0.0, 0.0, w, h], false, 0.0, None, None));
         }
         if props.is_empty() {
             return;
@@ -866,10 +879,10 @@ impl CharacterOverlay {
         c.program.set_f32(gl, "u_time", time);
         c.program.set_f32(gl, "u_saspect", w / h);
         c.program.set_f32(gl, "c_aspect", w / h);
-        for (kind, rect, flip, spin, zoom) in props {
+        for (kind, rect, flip, spin, zoom, image) in props {
             // the creature rising out of the ground says how far it's up in its kind
             let (kind, reveal) = if kind >= 21000 { (21, (kind - 21000) as f32 / 1000.0) } else { (kind, 1.0) };
-            let picture = prop_image(kind);
+            let picture = image.or_else(|| prop_image(kind));
             c.program.bind(gl);
             c.program.set_f32(gl, "u_spin", spin);
             if !target.begin(gl, 0, rect) {

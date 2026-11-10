@@ -4177,6 +4177,15 @@ impl CharacterOverlay {
             v.push((0, [x - size * 0.5, top, x + size * 0.5, top + size], false, b.giver));
         }
         self.mood_props(&mut v);
+        // a picture in place of a drawn thing fills the box's width at its own shape
+        for p in &mut v {
+            if p.0 >= 21000 {
+                continue;
+            }
+            if let Some(a) = super::rope::prop_image(p.0).and_then(|f| super::rope::picture_aspect(&f)) {
+                p.1 = super::rope::picture_box(p.1, a);
+            }
+        }
         v
     }
 

@@ -75,6 +75,8 @@ pub(super) struct Loose {
     owner_name: String,
     helper_name: Option<String>,
     pub(super) kind: i32,
+    // a picture of its own (a wardrobe picture), else the props folder's for its kind
+    pub(super) image: Option<std::path::PathBuf>,
     pub(super) owner: usize,
     // strip x and screen y of its middle, px; speed px/s
     pub(super) x: f32,
@@ -622,7 +624,7 @@ impl CharacterOverlay {
         // where it would stand: the bottom of its box on the ground, less the empty margin
         let ground = (1.0 - (pose.center[1] - pose.half[1])) * 0.5 * pose.size[1];
         let floor = ground - h * (1.0 - a.opaque[2]);
-        let mut gone: Vec<(String, i32, [f32; 4])> = Vec::new();
+        let mut gone: Vec<(String, i32, [f32; 4], Option<std::path::PathBuf>)> = Vec::new();
         for t in &worn {
             if t.id.is_empty() || gone.iter().any(|g| g.0 == t.id) {
                 continue;
@@ -635,12 +637,12 @@ impl CharacterOverlay {
             } else {
                 (t.kind, px)
             };
-            gone.push((t.id.to_string(), kind, px));
+            gone.push((t.id.to_string(), kind, px, t.image.clone()));
         }
         let wk = self.walk_of(i);
         let dir = if wk.swing_v.abs() > 0.5 { -wk.swing_v.signum() } else if wk.vx.abs() > 0.01 { wk.vx.signum() } else if wk.rand() < 0.5 { -1.0 } else { 1.0 };
         let mut flying = Vec::new();
-        for (id, kind, px) in gone {
+        for (id, kind, px, image) in gone {
             let chance = if id == "umbrella" { hand } else { head };
             if wk.rand() >= chance {
                 continue;
@@ -651,7 +653,7 @@ impl CharacterOverlay {
             let lie = size[0].min(size[1]) * 0.5;
             log::debug!("{i} loses its {id}");
             wk.lost.push(id.clone());
-            flying.push(Loose { id, owner_name: owner_name.clone(), helper_name: None, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
+            flying.push(Loose { id, image, owner_name: owner_name.clone(), helper_name: None, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
         }
         self.moods.loose.extend(flying);
     }

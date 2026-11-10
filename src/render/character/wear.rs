@@ -36,6 +36,10 @@ pub enum Anchor {
     Hand,
     // the middle of the chest, where it holds things close
     Chest,
+    // the other hand, the one at the back
+    OffHand,
+    // the feet (shoes come in pairs)
+    Feet,
 }
 
 impl Anchor {
@@ -46,6 +50,9 @@ impl Anchor {
             "neck" => Self::Neck,
             "back" => Self::Back,
             "hand" => Self::Hand,
+            "chest" => Self::Chest,
+            "offhand" | "other_hand" => Self::OffHand,
+            "feet" | "foot" => Self::Feet,
             _ => return None,
         })
     }
@@ -64,7 +71,46 @@ pub struct Item {
     pivot: [f32; 2],
     offset: [f32; 2],
     behind: bool,
+    /// worn twice, mirrored, this far either side (head widths): shoes, wings
+    pair: f32,
 }
+
+/// Pictures in the props folder worn like the rest: id, label, file, anchor,
+/// size, pivot (where the picture is held or sits), offset, behind, pair.
+#[allow(clippy::type_complexity)]
+const PICTURES: [(&str, &str, &str, Anchor, [f32; 2], [f32; 2], [f32; 2], bool, f32); 31] = [
+    ("helmet", "Helmet", "helmet", Anchor::Crown, [1.05, 0.95], [0.5, 0.72], [0.0, 0.42], false, 0.0),
+    ("cap", "Cap", "cap", Anchor::Crown, [0.85, 0.7], [0.45, 0.8], [0.05, 0.25], false, 0.0),
+    ("grad_cap", "Graduation cap", "grad_cap", Anchor::Crown, [0.9, 0.8], [0.5, 0.75], [0.0, 0.22], false, 0.0),
+    ("chick", "Chick on the head", "chick", Anchor::Crown, [0.42, 0.42], [0.5, 0.92], [0.1, 0.12], false, 0.0),
+    ("butterfly", "Butterfly", "butterfly", Anchor::Crown, [0.32, 0.32], [0.5, 0.5], [-0.32, 0.14], false, 0.0),
+    ("sword", "Sword", "sword", Anchor::Hand, [0.8, 0.8], [0.8, 0.22], [0.0, 0.0], false, 0.0),
+    ("shield", "Shield", "shield", Anchor::OffHand, [0.62, 0.62], [0.5, 0.5], [0.0, 0.0], false, 0.0),
+    ("swords", "Swords on the back", "swords", Anchor::Back, [1.0, 1.0], [0.5, 0.5], [0.0, -0.3], true, 0.0),
+    ("wand", "Magic wand", "wand", Anchor::Hand, [0.6, 0.6], [0.2, 0.85], [0.0, 0.0], false, 0.0),
+    ("bow_arrow", "Bow and arrow", "bow_arrow", Anchor::Hand, [0.8, 0.8], [0.3, 0.6], [0.0, 0.0], false, 0.0),
+    ("axe", "Axe", "axe", Anchor::Hand, [0.7, 0.7], [0.65, 0.85], [0.0, 0.0], false, 0.0),
+    ("hammer", "Hammer", "hammer", Anchor::Hand, [0.7, 0.7], [0.7, 0.8], [0.0, 0.0], false, 0.0),
+    ("broom", "Broom", "broom", Anchor::Hand, [1.1, 1.1], [0.72, 0.28], [0.0, 0.0], false, 0.0),
+    ("mic", "Microphone", "mic", Anchor::Hand, [0.5, 0.5], [0.75, 0.82], [0.0, 0.0], false, 0.0),
+    ("lollipop", "Lollipop", "lollipop", Anchor::Hand, [0.5, 0.5], [0.85, 0.85], [0.0, 0.0], false, 0.0),
+    ("ice_cream", "Ice cream", "ice_cream", Anchor::Hand, [0.45, 0.45], [0.5, 0.7], [0.0, 0.0], false, 0.0),
+    ("bubble_tea", "Bubble tea", "bubble_tea", Anchor::Hand, [0.4, 0.5], [0.5, 0.7], [0.0, 0.0], false, 0.0),
+    ("trophy", "Trophy", "trophy", Anchor::Hand, [0.5, 0.5], [0.5, 0.9], [0.0, 0.0], false, 0.0),
+    ("handbag", "Handbag", "handbag", Anchor::Hand, [0.5, 0.5], [0.5, 0.12], [0.0, 0.0], false, 0.0),
+    ("flashlight", "Flashlight", "flashlight", Anchor::Hand, [0.55, 0.55], [0.75, 0.75], [0.0, 0.0], false, 0.0),
+    ("crystal_ball", "Crystal ball", "crystal_ball", Anchor::Hand, [0.45, 0.45], [0.5, 0.7], [0.0, 0.0], false, 0.0),
+    ("gem", "Gem", "gem", Anchor::Hand, [0.32, 0.32], [0.5, 0.5], [0.0, 0.0], false, 0.0),
+    ("teddy", "Teddy bear", "teddy", Anchor::Chest, [0.55, 0.55], [0.5, 0.5], [0.0, 0.0], false, 0.0),
+    ("guitar", "Guitar", "guitar", Anchor::Chest, [0.95, 0.95], [0.5, 0.5], [0.0, 0.0], false, 0.0),
+    ("medal", "Medal", "medal", Anchor::Neck, [0.42, 0.42], [0.5, 0.1], [0.0, 0.0], false, 0.0),
+    ("wings_feathered", "Feathered wings", "wing", Anchor::Back, [0.85, 0.85], [0.1, 0.55], [0.0, 0.0], true, 0.12),
+    ("sneakers", "Sneakers", "sneaker", Anchor::Feet, [0.36, 0.36], [0.5, 0.85], [0.0, 0.0], false, 0.17),
+    ("heels", "High heels", "heel", Anchor::Feet, [0.36, 0.36], [0.5, 0.88], [0.0, 0.0], false, 0.17),
+    ("flats", "Flat shoes", "flat_shoe", Anchor::Feet, [0.36, 0.3], [0.5, 0.85], [0.0, 0.0], false, 0.17),
+    ("boots", "Boots", "hiking_boot", Anchor::Feet, [0.36, 0.36], [0.5, 0.88], [0.0, 0.0], false, 0.17),
+    ("ballet", "Ballet shoes", "ballet", Anchor::Feet, [0.6, 0.45], [0.5, 0.85], [0.0, 0.0], false, 0.0),
+];
 
 /// What the wardrobe offers: id, label, kind, anchor, size, pivot, offset, behind.
 const BUILT_IN: [(&str, &str, i32, Anchor, [f32; 2], [f32; 2], [f32; 2], bool); 12] = [
@@ -117,6 +163,8 @@ pub fn anchor_point(a: &crate::render::anchors::Anchors, anchor: Anchor, faces_r
         Anchor::Back => a.back,
         Anchor::Hand => if faces_right { a.hands[1] } else { a.hands[0] },
         Anchor::Chest => [(a.hands[0][0] + a.hands[1][0]) * 0.5, a.neck[1] + (a.feet[1] - a.neck[1]) * 0.2],
+        Anchor::OffHand => if faces_right { a.hands[0] } else { a.hands[1] },
+        Anchor::Feet => a.feet,
     }
 }
 
@@ -155,7 +203,7 @@ pub fn happy_path(calm: &str) -> Option<String> {
 
 /// Santa hat as an item, so it can be fitted like the rest.
 pub fn santa_item() -> Item {
-    Item { id: "santa".into(), label: "Santa hat (Christmas)".into(), kind: 25, image: None, anchor: Anchor::Crown, size: [0.95, 0.72], pivot: [0.5, 1.0], offset: [0.0, 0.2], behind: false }
+    Item { id: "santa".into(), label: "Santa hat (Christmas)".into(), kind: 25, image: None, anchor: Anchor::Crown, size: [0.95, 0.72], pivot: [0.5, 1.0], offset: [0.0, 0.2], behind: false, pair: 0.0 }
 }
 
 pub fn wardrobe_path() -> PathBuf {
@@ -176,8 +224,16 @@ pub fn catalog() -> Vec<Item> {
             pivot,
             offset,
             behind,
+            pair: 0.0,
         })
         .collect();
+    let props = crate::util::data_dir().join("props");
+    for &(id, label, file, anchor, size, pivot, offset, behind, pair) in &PICTURES {
+        let image = props.join(format!("{file}.png"));
+        if image.is_file() {
+            v.push(Item { id: id.into(), label: label.into(), kind: 100, image: Some(image), anchor, size, pivot, offset, behind, pair });
+        }
+    }
     let Ok(dir) = std::fs::read_dir(accessories_dir()) else { return v };
     let mut pngs: Vec<PathBuf> = dir.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))).collect();
     pngs.sort();
@@ -200,6 +256,7 @@ pub fn catalog() -> Vec<Item> {
             pivot: pair("pivot", [0.5, 1.0]),
             offset: pair("offset", [0.0, 0.12]),
             behind: spec.get("behind").and_then(|v| v.as_bool()).unwrap_or(false),
+            pair: spec.get("pair").and_then(|v| v.as_float()).unwrap_or(0.0) as f32,
         });
     }
     v
@@ -246,13 +303,11 @@ pub(super) struct Worn {
 
 /// Things that can be knocked off or out of the hand (hats, the umbrella).
 fn droppable(id: &str) -> &'static str {
-    match id {
-        "party_hat" => "party_hat",
-        "top_hat" => "top_hat",
-        "crown" => "crown",
-        "headphones" => "headphones",
-        _ => "",
-    }
+    const LOOSE: [&str; 24] = [
+        "party_hat", "top_hat", "crown", "headphones", "helmet", "cap", "grad_cap", "chick", "sword", "shield", "wand", "bow_arrow", "axe", "hammer", "broom",
+        "mic", "lollipop", "ice_cream", "bubble_tea", "trophy", "handbag", "flashlight", "crystal_ball", "gem",
+    ];
+    LOOSE.iter().copied().find(|&x| x == id).unwrap_or("")
 }
 
 impl CharacterOverlay {
@@ -279,18 +334,10 @@ impl CharacterOverlay {
         if hw <= 0.0 || hh <= 0.0 {
             return Vec::new();
         }
-        let crown = [(a.head[0] + a.head[2]) * 0.5, a.head[1]];
-        let eyes = [(a.eyes[0][0] + a.eyes[1][0]) * 0.5, (a.eyes[0][1] + a.eyes[1][1]) * 0.5];
+        let crown = anchor_point(&a, Anchor::Crown, self.faces_right);
         // the hand on the side it faces holds things
-        let hand = if self.faces_right { a.hands[1] } else { a.hands[0] };
-        let at = |anchor: Anchor| match anchor {
-            Anchor::Crown => crown,
-            Anchor::Eyes => eyes,
-            Anchor::Neck => a.neck,
-            Anchor::Back => a.back,
-            Anchor::Hand => hand,
-            Anchor::Chest => [(a.hands[0][0] + a.hands[1][0]) * 0.5, a.neck[1] + (a.feet[1] - a.neck[1]) * 0.2],
-        };
+        let hand = anchor_point(&a, Anchor::Hand, self.faces_right);
+        let at = |anchor: Anchor| anchor_point(&a, anchor, self.faces_right);
         // texture units -> sprite space, mirrored as the sprite is
         let sx = |u: f32| (if flip { 1.0 - u } else { u }) * 2.0 - 1.0;
         let sy = |v: f32| 1.0 - 2.0 * v;
@@ -323,7 +370,16 @@ impl CharacterOverlay {
                 if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id) {
                     continue;
                 }
-                out.push(Worn { id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip, behind: it.behind, image: it.image.clone() });
+                if it.pair > 0.0 {
+                    // a pair: one each side, the second mirrored
+                    for side in [-1.0f32, 1.0] {
+                        let mut one = it.clone();
+                        one.offset[0] += side * it.pair;
+                        out.push(Worn { id: "", kind: it.kind, rect: fitted(&one), flip: flip ^ (side < 0.0), behind: it.behind, image: it.image.clone() });
+                    }
+                } else {
+                    out.push(Worn { id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip, behind: it.behind, image: it.image.clone() });
+                }
             }
         }
         // its favourite keepsake: hugged to its chest in its sleep, now and
@@ -393,6 +449,18 @@ impl CharacterOverlay {
             // rolled up and slung across its back, sticking out past the shoulder
             3 => out.push(Worn { id: "", kind: 42, rect: place(Anchor::Back, [0.85, 1.3], [0.5, 0.5], [0.2, -0.22]), flip, behind: true, image: None }),
             _ => {}
+        }
+        // a picture fills its box's width at its own shape, about the box's middle
+        let (bw, bh) = (self.pose.half[0] * self.pose.size[0], self.pose.half[1] * self.pose.size[1]);
+        if bw > 0.0 && bh > 0.0 {
+            for w in &mut out {
+                let picture = w.image.clone().or_else(|| super::rope::prop_image(w.kind));
+                let Some(aspect) = picture.and_then(|p| super::rope::picture_aspect(&p)) else { continue };
+                let [x0, y0, x1, y1] = w.rect;
+                let want = (x1 - x0) * bw / aspect / bh;
+                let mid = (y0 + y1) * 0.5;
+                w.rect = [x0, mid - want * 0.5, x1, mid + want * 0.5];
+            }
         }
         out
     }
