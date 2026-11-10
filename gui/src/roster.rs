@@ -430,7 +430,9 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         let (items, fit_of) = (items.clone(), fit_of.clone());
         move |k: usize| -> [f64; 4] {
             let it = &items[k];
-            let [l, t, w, h] = wear::layout(&anchors, it, faces_right, fit_of(&it.id));
+            // a pair: the right one is the one you hold
+            let (it, fit) = if wear::pair_of(it) > 0.0 { wear::pair_copy(it, 1.0, fit_of(&it.id)) } else { (it.clone(), fit_of(&it.id)) };
+            let [l, t, w, h] = wear::layout(&anchors, &it, faces_right, fit);
             [l as f64 * iw, t as f64 * ih, w as f64 * iw, h as f64 * ih]
         }
     };
@@ -445,7 +447,7 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         })
         .collect();
     {
-        let (pick, items, rect_of, turn_of) = (pick.clone(), items.clone(), rect_of.clone(), turn_of.clone());
+        let (pick, items, rect_of, turn_of, fit_of) = (pick.clone(), items.clone(), rect_of.clone(), turn_of.clone(), fit_of.clone());
         area.set_draw_func(move |_, cr, w, h| {
             let (s, ox, oy) = place(w as f64, h as f64);
             cr.set_source_rgb(0.16, 0.16, 0.18);
@@ -466,6 +468,23 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
                 cr.translate(x + rw * 0.5, y + rh * 0.5);
                 cr.rotate(-turn as f64);
                 cr.translate(-(x + rw * 0.5), -(y + rh * 0.5));
+                // the other one of a pair, mirrored, where it'll be worn
+                if let (true, Some((pic, pw, ph))) = (wear::pair_of(&items[k]) > 0.0, &pictures[k]) {
+                    let (other, fit) = wear::pair_copy(&items[k], -1.0, fit_of(&items[k].id));
+                    let [l, t, ww, hh] = wear::layout(&anchors, &other, faces_right, fit);
+                    let (ox2, oy2, rw2, rh2) = (ox + l as f64 * iw * s, oy + t as f64 * ih * s, ww as f64 * iw * s, hh as f64 * ih * s);
+                    let (dw, dh) = (rw2, rw2 * ph / pw);
+                    let _ = cr.save();
+                    cr.translate(ox2, oy2 + rh2 * 0.5 - dh * 0.5);
+                    if !mirror {
+                        cr.translate(dw, 0.0);
+                        cr.scale(-1.0, 1.0);
+                    }
+                    cr.scale(dw / pw, dh / ph);
+                    let _ = cr.set_source_surface(pic, 0.0, 0.0);
+                    let _ = cr.paint();
+                    let _ = cr.restore();
+                }
                 // the picture fills the box's width at its own shape, about its middle
                 if let Some((pic, pw, ph)) = &pictures[k] {
                     let (dw, dh) = (rw, rw * ph / pw);

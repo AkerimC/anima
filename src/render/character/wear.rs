@@ -213,6 +213,19 @@ pub fn happy_path(calm: &str) -> Option<String> {
     name.contains("_0010.").then(|| p.with_file_name(name.replace("[A]", "[B]").replace("_0010.", "_0011.")).to_string_lossy().into_owned())
 }
 
+/// How far apart a pair is worn (head widths), 0 for a single thing.
+pub fn pair_of(item: &Item) -> f32 {
+    item.pair
+}
+
+/// One of a pair: the item moved to its side. A hand-made move left or
+/// right opens or closes the pair rather than shifting both.
+pub fn pair_copy(item: &Item, side: f32, fit: Option<[f32; 4]>) -> (Item, Option<[f32; 4]>) {
+    let mut one = item.clone();
+    one.offset[0] += side * item.pair;
+    (one, fit.map(|f| [f[0] * side, f[1], f[2], f[3]]))
+}
+
 /// Santa hat as an item, so it can be fitted like the rest.
 pub fn santa_item() -> Item {
     Item { id: "santa".into(), label: "Santa hat (Christmas)".into(), kind: 25, image: None, anchor: Anchor::Crown, size: [0.95, 0.72], pivot: [0.5, 1.0], offset: [0.0, 0.2], behind: false, pair: 0.0 }
@@ -431,8 +444,14 @@ impl CharacterOverlay {
         let name = self.own_name();
         let fits = shared.2.get(&name);
         let happy = self.drawn_happy;
+        let fit_for = |id: &str| fits.and_then(|f| f.get(&fit_key(id, happy)).or_else(|| f.get(id))).copied();
+        let place_with = |it: &Item, fit: Option<[f32; 4]>| {
+            let [l, t, w, h] = layout(&a, it, self.faces_right, fit);
+            let (x0, x1) = (sx(l), sx(l + w));
+            [x0.min(x1), sy(t + h), x0.max(x1), sy(t)]
+        };
         let fitted = |it: &Item| {
-            let fit = fits.and_then(|f| f.get(&fit_key(&it.id, happy)).or_else(|| f.get(&it.id))).copied();
+            let fit = fit_for(&it.id);
             let [l, t, w, h] = layout(&a, it, self.faces_right, fit);
             let (x0, x1) = (sx(l), sx(l + w));
             [x0.min(x1), sy(t + h), x0.max(x1), sy(t)]
@@ -450,10 +469,9 @@ impl CharacterOverlay {
                 if it.pair > 0.0 {
                     // a pair: one each side, the second mirrored
                     for side in [-1.0f32, 1.0] {
-                        let mut one = it.clone();
-                        one.offset[0] += side * it.pair;
+                        let (one, fit) = pair_copy(it, side, fit_for(&it.id));
                         let t = if side < 0.0 { -turn } else { turn };
-                        out.push(Worn { turn: t, id: "", kind: it.kind, rect: fitted(&one), flip: flip ^ (side < 0.0) ^ mirror, behind: it.behind, image: it.image.clone() });
+                        out.push(Worn { turn: t, id: "", kind: it.kind, rect: place_with(&one, fit), flip: flip ^ (side < 0.0) ^ mirror, behind: it.behind, image: it.image.clone() });
                     }
                 } else {
                     out.push(Worn { turn, id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip: flip ^ mirror, behind: it.behind, image: it.image.clone() });
