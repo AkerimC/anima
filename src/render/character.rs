@@ -35,6 +35,7 @@ mod social;
 mod spaces;
 mod uma;
 mod walk;
+pub mod wear;
 pub mod weather;
 
 use race::Race;
@@ -1032,6 +1033,15 @@ pub(super) struct SpritePose {
     lift: f32,
     half: [f32; 2],
     size: [f32; 2],
+    // the rest of CHAR_VS's inputs, for drawing worn things the same way
+    pub(super) center: [f32; 2],
+    pub(super) rot: f32,
+    pub(super) sink: f32,
+    pub(super) aspect: f32,
+    pub(super) pivot: [f32; 2],
+    pub(super) bounce: f32,
+    pub(super) xscale: f32,
+    pub(super) flip: bool,
 }
 
 impl SpritePose {
@@ -1144,6 +1154,8 @@ pub struct CharacterOverlay {
     eyes: Option<([f32; 4], [f32; 4], [f32; 3])>,
     // its head on the calm sprite (left, crown, right, neck), for hats and snow
     pub(super) head: Option<[f32; 4]>,
+    // where things are worn and held on it (calm sprite)
+    pub(super) anchors: Option<crate::render::anchors::Anchors>,
     // the mask, 0 off .. 1 on
     lids: f32,
     // how the sprite is drawn this frame: breathing, leaning, hopping
@@ -1306,6 +1318,7 @@ impl CharacterOverlay {
             pending: None,
             eyes: None,
             head: None,
+            anchors: None,
             lids: 0.0,
             pose: SpritePose::default(),
             drawn_left: false,
@@ -1436,6 +1449,7 @@ impl CharacterOverlay {
                 self.opaque = [half / w as f32, top as f32 / h as f32, bottom as f32 / h as f32];
             }
             self.head = uma::head_box(&img);
+            self.anchors = crate::render::anchors::find(&img);
             let tex = create_texture(gl, w, h, img.as_raw(), Filter::Linear, true)?;
             self.sprite_tex = Some((tex, w, h));
 
@@ -1550,10 +1564,17 @@ impl CharacterOverlay {
             self.program.set_i32(gl, "u_tex", 0);
             if target.begin(gl, self.actor, self.hit_rect) {
                 let clip = self.zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform());
+                // worn and held things: those behind it first, then it, then the rest
+                let worn = self.worn();
+                self.draw_worn(gl, &worn, clip, true);
+                self.program.bind(gl);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 self.program.set_vec4(gl, "u_clip", clip);
                 gl.bind_vertex_array(Some(self.vao));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_vertex_array(None);
+                self.draw_worn(gl, &worn, clip, false);
                 target.end(gl, self.actor);
             }
             gl.bind_texture(glow::TEXTURE_2D, None);
@@ -2157,6 +2178,14 @@ impl CharacterOverlay {
                 lift: self.smooth_bounce + hop - self.walk.sink * half_clip[1],
                 half: half_clip,
                 size: [w, h],
+                center: [center_clip[0] + walk_x, center_clip[1]],
+                rot: self.walk.rot,
+                sink: self.walk.sink * half_clip[1],
+                aspect: w / h,
+                pivot: [0.0, 0.0],
+                bounce: self.smooth_bounce + hop,
+                xscale: 1.0,
+                flip: false,
             };
             self.program.set_f32(gl, "u_aspect", w / h);
             let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
@@ -2165,6 +2194,7 @@ impl CharacterOverlay {
                 _ => [0.0, 0.0],
             };
             self.program.set_vec2(gl, "u_pivot", pivot[0], pivot[1]);
+            self.pose.pivot = pivot;
             // turning round: narrows to a sliver, flips, opens out again
             const TURN: f32 = 0.16;
             let airborne = matches!(self.walk.act, Act::Held | Act::Fall | Act::Planted | Act::Travel) || self.walk.rot.abs() > 0.05;
@@ -2185,6 +2215,8 @@ impl CharacterOverlay {
                 xscale = 0.2 + 0.8 * k;
             }
             self.program.set_f32(gl, "u_xscale", xscale);
+            self.pose.xscale = xscale;
+            self.pose.flip = self.config.flip_x ^ (self.drawn_left == self.faces_right);
             self.program
                 .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.drawn_left == self.faces_right)));
             self.program.set_i32(gl, "u_mode", mode);

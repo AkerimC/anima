@@ -198,6 +198,10 @@ fn choices(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, path: &str) -> gtk::Wid
     let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
     friends.connect_clicked(move |_| p.set_child(Some(&friends_view(&rr, &p, i, &n))));
     list.append(&friends);
+    let wear = menu_button("Wardrobe", "applications-graphics-symbolic");
+    let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
+    wear.connect_clicked(move |_| p.set_child(Some(&wardrobe_view(&rr, &p, i, &n))));
+    list.append(&wear);
     list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let remove = menu_button("Remove from line-up", "user-trash-symbolic");
     let (rr, p) = (r.clone(), pop.clone());
@@ -303,6 +307,63 @@ fn mask_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &st
         u.say("Sleep mask found automatically again");
     });
     b.append(&reset);
+    b.upcast()
+}
+
+fn wardrobe_all() -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(anima::render::character::wear::wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// What the character wears: a switch for each thing there is. The weather
+/// and Christmas put on their own things on top of these.
+fn wardrobe_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk::Widget {
+    use anima::render::character::wear;
+    let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(280).build();
+    b.append(&back_header(r, pop, i, name, "Wardrobe"));
+    let hint = gtk::Label::builder()
+        .label("Worn at once, on top of what the weather brings (umbrellas, snow, Santa hats).")
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    hint.add_css_class("dim-label");
+    b.append(&hint);
+    let on: Vec<String> = wardrobe_all().get(name).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    for item in wear::catalog() {
+        let row = gtk::Box::builder().spacing(8).build();
+        row.append(&gtk::Label::builder().label(&item.label).xalign(0.0).hexpand(true).build());
+        let sw = gtk::Switch::builder().active(on.contains(&item.id)).valign(gtk::Align::Center).build();
+        let (who, id, u) = (name.to_string(), item.id.clone(), r.ui.clone());
+        sw.connect_active_notify(move |s| {
+            let mut all = wardrobe_all();
+            let mut mine: Vec<String> = all.get(&who).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            mine.retain(|x| x != &id);
+            if s.is_active() {
+                mine.push(id.clone());
+            }
+            if mine.is_empty() {
+                all.remove(&who);
+            } else {
+                all.insert(who.clone(), serde_json::json!(mine));
+            }
+            if let Ok(text) = serde_json::to_string_pretty(&all) {
+                let _ = anima::util::atomic_write(&wear::wardrobe_path(), text.as_bytes());
+            }
+            u.say(if s.is_active() { "Put on" } else { "Taken off" });
+        });
+        row.append(&sw);
+        list.append(&row);
+    }
+    let scroll = gtk::ScrolledWindow::builder().child(&list).min_content_height(260).max_content_height(360).propagate_natural_height(true).build();
+    b.append(&scroll);
+    let add = gtk::Button::with_label("Add your own…");
+    add.set_tooltip_text(Some("Drop a PNG in this folder, with a .toml of the same name to say where it goes (see wear.rs)"));
+    add.connect_clicked(|_| {
+        let dir = wear::accessories_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    });
+    b.append(&add);
     b.upcast()
 }
 

@@ -125,8 +125,42 @@ layout(location = 0) in vec2 a_pos;
 out vec2 v_pos;
 uniform vec4 u_rect; // x0, y0, x1, y1 in clip space
 uniform vec4 u_clip;
+// worn on a character: a box in its sprite space, moved exactly as CHAR_VS
+// moves the sprite (breathing, leaning, turning, hopping)
+uniform int u_attach;
+uniform vec4 u_sub;
+uniform vec2 c_center;
+uniform vec2 c_half;
+uniform vec2 c_tilt;
+uniform float c_breath;
+uniform float c_bounce;
+uniform float c_rot;
+uniform float c_sink;
+uniform float c_aspect;
+uniform vec2 c_pivot;
+uniform float c_xscale;
 void main() {
     v_pos = a_pos;
+    if (u_attach == 1) {
+        vec2 p = mix(u_sub.xy, u_sub.zw, a_pos * 0.5 + 0.5);
+        float hf = (p.y + 1.0) * 0.5;
+        p.y = -1.0 + (p.y + 1.0) * (1.0 + c_breath * 0.025);
+        p.x += hf * c_tilt.x * 0.055;
+        p.y += hf * c_tilt.y * 0.025;
+        p.x *= c_xscale;
+        vec2 d = p * c_half;
+        d.x *= c_aspect;
+        float c = cos(c_rot), s = sin(c_rot);
+        vec2 piv = vec2(c_pivot.x * c_aspect, c_pivot.y);
+        d -= piv;
+        d = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
+        d += piv;
+        d.x /= c_aspect;
+        vec2 clip = c_center + d;
+        clip.y += c_bounce - c_sink;
+        gl_Position = vec4(clip * u_clip.xy + u_clip.zw, 0.0, 1.0);
+        return;
+    }
     vec2 p = mix(u_rect.xy, u_rect.zw, a_pos * 0.5 + 0.5);
     gl_Position = vec4(p * u_clip.xy + u_clip.zw, 0.0, 1.0);
 }
@@ -137,7 +171,9 @@ void main() {
 // 8 a blindfold, 9 a bush, 10 a barrel, 11 a crate, 12 a music note,
 // 13 a fishing rod, 14 a line and float, 15 a star, 16 a rubber duck, 17 an old boot, 18 a tin can,
 // 20 confetti, 21 a beast out of the ground, 22 an umbrella, 23 a snowflake,
-// 24 snow settled on a head, 25 a Santa hat (flipped: tip to the right)
+// 24 snow settled on a head, 25 a Santa hat (flipped: tip to the right), 26 a sleep
+// mask, 27 party hat, 28 top hat, 29 bow, 30 glasses, 31 sunglasses, 32 flower,
+// 33 scarf, 34 backpack, 35 wings, 36 headphones, 37 crown, 100 a picture (u_img)
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
@@ -145,6 +181,7 @@ out vec4 fragColor;
 uniform int u_kind;
 uniform int u_flip;
 uniform vec4 u_rect;
+uniform sampler2D u_img;
 float blade(vec2 p, float x, float lean) {
     float t = clamp((p.y - 0.25) / 0.7, 0.0, 1.0);
     float d = abs(p.x - x - lean * t) - 0.17 * (1.0 - t);
@@ -392,6 +429,120 @@ vec4 santa(vec2 p) {
     col -= fur * 0.06 * step(0.6, fract(sin(dot(floor(p * 18.0), vec2(12.9, 78.2))) * 43758.5));
     return vec4(col, max(cone, fur));
 }
+vec4 sleepmask(vec2 p) {
+    // a padded mask with stitched closed eyes, polka dots and a bow
+    float d = sdBox(p, vec2(0.92, 0.62), 0.55);
+    float a = 1.0 - smoothstep(-0.02, 0.02, d);
+    vec3 col = vec3(0.98, 0.72, 0.82);
+    vec2 cell = fract(p * vec2(4.0, 2.6)) - 0.5;
+    col = mix(col, vec3(1.0, 0.95, 0.97), (1.0 - smoothstep(0.12, 0.18, length(cell))) * 0.85);
+    for (int k = 0; k < 2; k++) {
+        vec2 q = (p - vec2(k == 0 ? -0.45 : 0.45, -0.02)) / vec2(0.3, 0.3);
+        float curve = q.y - (0.1 - 0.5 * q.x * q.x);
+        col = mix(col, vec3(0.42, 0.18, 0.3), smoothstep(0.22, 0.1, abs(curve)) * step(abs(q.x), 0.9));
+    }
+    col = mix(col, vec3(0.86, 0.5, 0.64), smoothstep(-0.12, 0.0, d) * 0.6);
+    vec2 b = (p - vec2(0.82, 0.5)) / 0.32;
+    float loops = (1.0 - smoothstep(0.95, 1.05, length(vec2(abs(b.x) - 0.5, b.y * 1.3) / vec2(0.48, 0.42)))) * step(0.08, abs(b.x));
+    float knot = 1.0 - smoothstep(0.16, 0.22, length(b));
+    float bow = max(loops, knot);
+    col = mix(col, mix(vec3(0.93, 0.36, 0.53), vec3(0.76, 0.24, 0.42), knot), bow);
+    return vec4(col, max(a, bow));
+}
+vec4 partyhat(vec2 p) {
+    float t = clamp((p.y + 1.0) / 1.75, 0.0, 1.0);
+    float cone = step(-1.0, p.y) * step(p.y, 0.75) * (1.0 - smoothstep(0.88 * (1.0 - t) - 0.03, 0.88 * (1.0 - t), abs(p.x)));
+    float stripe = step(0.5, fract((p.y + p.x * 0.4) * 2.2));
+    vec3 col = mix(vec3(0.35, 0.65, 1.0), vec3(1.0, 0.85, 0.3), stripe);
+    float pom = 1.0 - smoothstep(0.17, 0.21, length(p - vec2(0.0, 0.8)));
+    col = mix(col, vec3(1.0, 0.45, 0.6), pom);
+    return vec4(col, max(cone, pom));
+}
+vec4 tophat(vec2 p) {
+    float brim = sdBox(p - vec2(0.0, -0.85), vec2(0.95, 0.12), 0.1);
+    float body = sdBox(p - vec2(0.0, 0.05), vec2(0.6, 0.85), 0.06);
+    float a = 1.0 - smoothstep(-0.02, 0.02, min(brim, body));
+    vec3 col = mix(vec3(0.1, 0.1, 0.14), vec3(0.22, 0.22, 0.28), clamp(p.x * 0.5 + 0.5, 0.0, 1.0));
+    float band = step(abs(p.y + 0.5), 0.13) * step(body, 0.0);
+    col = mix(col, vec3(0.75, 0.15, 0.25), band);
+    return vec4(col, a);
+}
+vec4 bigbow(vec2 p) {
+    vec2 b = p / vec2(1.0, 0.95);
+    float loops = (1.0 - smoothstep(0.95, 1.05, length(vec2(abs(b.x) - 0.5, b.y * 1.15) / vec2(0.5, 0.75)))) * step(0.1, abs(b.x));
+    float knot = 1.0 - smoothstep(0.22, 0.28, length(b * vec2(1.0, 0.8)));
+    vec3 col = mix(vec3(0.95, 0.35, 0.5), vec3(0.75, 0.18, 0.35), knot);
+    col = mix(col, vec3(1.0, 0.6, 0.72), step(0.6, abs(b.x)) * step(0.0, b.y) * 0.4);
+    return vec4(col, max(loops, knot));
+}
+vec4 glasses(vec2 p, bool dark) {
+    float l = abs(length((p - vec2(-0.48, 0.0)) / vec2(0.42, 0.85)) - 1.0);
+    float r = abs(length((p - vec2(0.48, 0.0)) / vec2(0.42, 0.85)) - 1.0);
+    float rim = 1.0 - smoothstep(0.1, 0.18, min(l, r));
+    float bridge = bar(p, vec2(-0.08, 0.15), vec2(0.08, 0.3));
+    float lens = max(1.0 - step(1.0, length((p - vec2(-0.48, 0.0)) / vec2(0.42, 0.85))), 1.0 - step(1.0, length((p - vec2(0.48, 0.0)) / vec2(0.42, 0.85))));
+    vec3 frame = dark ? vec3(0.08) : vec3(0.35, 0.22, 0.15);
+    vec4 glass = dark ? vec4(0.05, 0.05, 0.1, 0.85) : vec4(0.85, 0.95, 1.0, 0.18);
+    float frm = max(rim, bridge);
+    vec3 col = mix(glass.rgb, frame, frm);
+    return vec4(col, max(frm, lens * glass.a));
+}
+vec4 flower(vec2 p) {
+    float a = atan(p.y, p.x);
+    float r = length(p);
+    float petals = 1.0 - smoothstep(0.0, 0.05, r - (0.62 + 0.3 * cos(a * 5.0)));
+    float core = 1.0 - smoothstep(0.24, 0.3, r);
+    vec3 col = mix(vec3(1.0, 0.7, 0.82), vec3(1.0, 0.85, 0.3), core);
+    return vec4(col, max(petals, core));
+}
+vec4 scarf(vec2 p) {
+    float wrap = sdBox(p - vec2(0.0, 0.35), vec2(0.95, 0.4), 0.3);
+    float tail = sdBox(p - vec2(0.45, -0.35), vec2(0.18, 0.55), 0.12);
+    float a = 1.0 - smoothstep(-0.02, 0.02, min(wrap, tail));
+    float stripe = step(0.5, fract(p.y * 3.0 + p.x * 0.3));
+    vec3 col = mix(vec3(0.85, 0.2, 0.25), vec3(0.98, 0.95, 0.9), stripe * 0.9);
+    return vec4(col, a);
+}
+vec4 backpack(vec2 p) {
+    float bag = sdBox(p - vec2(0.0, -0.05), vec2(0.8, 0.85), 0.3);
+    float a = 1.0 - smoothstep(-0.02, 0.02, bag);
+    vec3 col = vec3(0.98, 0.62, 0.3);
+    float pocket = 1.0 - smoothstep(-0.02, 0.02, sdBox(p - vec2(0.0, -0.4), vec2(0.5, 0.3), 0.15));
+    col = mix(col, vec3(0.92, 0.5, 0.22), pocket);
+    return vec4(col, a);
+}
+vec4 wings(vec2 p) {
+    vec2 q = vec2(abs(p.x), p.y);
+    float wing = 0.0;
+    for (int k = 0; k < 3; k++) {
+        float fk = float(k);
+        vec2 c = vec2(0.35 + fk * 0.2, 0.25 - fk * 0.28);
+        wing = max(wing, 1.0 - smoothstep(0.95, 1.0, length((q - c) / vec2(0.42 - fk * 0.05, 0.3))));
+    }
+    wing *= step(0.12, q.x);
+    vec3 col = mix(vec3(0.88, 0.92, 1.0), vec3(1.0), clamp(p.y * 0.5 + 0.5, 0.0, 1.0));
+    return vec4(col, wing * 0.95);
+}
+vec4 headphones(vec2 p) {
+    float band = abs(length((p - vec2(0.0, -0.3)) / vec2(0.9, 1.15)) - 1.0);
+    float arc = (1.0 - smoothstep(0.05, 0.1, band)) * step(-0.3, p.y);
+    float cups = max(1.0 - smoothstep(-0.02, 0.02, sdBox(p - vec2(-0.86, -0.45), vec2(0.14, 0.3), 0.1)),
+                     1.0 - smoothstep(-0.02, 0.02, sdBox(p - vec2(0.86, -0.45), vec2(0.14, 0.3), 0.1)));
+    vec3 col = mix(vec3(0.3, 0.3, 0.38), vec3(0.95, 0.45, 0.65), cups);
+    return vec4(col, max(arc, cups));
+}
+vec4 crown(vec2 p) {
+    float base = step(-1.0, p.y) * step(p.y, -0.3) * step(abs(p.x), 0.9);
+    float spikes = step(-0.3, p.y) * step(p.y, 0.9 - abs(fract(p.x * 1.5 + 0.5) - 0.5) * 3.6) * step(abs(p.x), 0.9);
+    float a = max(base, spikes);
+    vec3 col = mix(vec3(0.95, 0.75, 0.2), vec3(1.0, 0.9, 0.45), clamp(p.y * 0.5 + 0.5, 0.0, 1.0));
+    float gem = 1.0 - smoothstep(0.12, 0.16, length(p - vec2(0.0, -0.62)));
+    col = mix(col, vec3(0.85, 0.15, 0.3), gem);
+    return vec4(col, a);
+}
+vec4 picture(vec2 p) {
+    return texture(u_img, vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));
+}
 vec4 snowflake(vec2 p) {
     float a = atan(p.y, p.x);
     float r = length(p);
@@ -410,7 +561,7 @@ vec4 confetti(vec2 p) {
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : u_kind == 26 ? sleepmask(p) : u_kind == 27 ? partyhat(p) : u_kind == 28 ? tophat(p) : u_kind == 29 ? bigbow(p) : u_kind == 30 ? glasses(p, false) : u_kind == 31 ? glasses(p, true) : u_kind == 32 ? flower(p) : u_kind == 33 ? scarf(p) : u_kind == 34 ? backpack(p) : u_kind == 35 ? wings(p) : u_kind == 36 ? headphones(p) : u_kind == 37 ? crown(p) : u_kind == 100 ? picture(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
@@ -420,6 +571,8 @@ pub(super) struct CarrotGl {
     vao: glow::VertexArray,
     #[allow(dead_code)]
     vbo: glow::Buffer,
+    // accessories' pictures, loaded once (None: couldn't be read)
+    images: std::collections::HashMap<std::path::PathBuf, Option<glow::Texture>>,
 }
 
 impl CarrotGl {
@@ -435,12 +588,78 @@ impl CarrotGl {
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
             gl.bind_vertex_array(None);
-            Ok(Self { program, vao, vbo })
+            Ok(Self { program, vao, vbo, images: Default::default() })
         }
     }
 }
 
 impl CharacterOverlay {
+    /// Worn and held things, drawn with the sprite's own transform: `behind`
+    /// picks the ones that go behind it. Called between the sprite's
+    /// target begin and end.
+    pub(super) fn draw_worn(&mut self, gl: &glow::Context, worn: &[super::wear::Worn], clip: [f32; 4], behind: bool) {
+        if !worn.iter().any(|w| w.behind == behind) {
+            return;
+        }
+        if self.carrot_gl.is_none() {
+            match CarrotGl::new(gl) {
+                Ok(c) => self.carrot_gl = Some(c),
+                Err(e) => {
+                    log::warn!("worn things: {e:#}");
+                    return;
+                }
+            }
+        }
+        let pose = self.pose;
+        let Some(c) = self.carrot_gl.as_mut() else { return };
+        c.program.bind(gl);
+        c.program.set_vec4(gl, "u_clip", clip);
+        c.program.set_i32(gl, "u_attach", 1);
+        c.program.set_vec2(gl, "c_center", pose.center[0], pose.center[1]);
+        c.program.set_vec2(gl, "c_half", pose.half[0], pose.half[1]);
+        c.program.set_vec2(gl, "c_tilt", pose.tilt[0], pose.tilt[1]);
+        c.program.set_f32(gl, "c_breath", pose.breath);
+        c.program.set_f32(gl, "c_bounce", pose.bounce);
+        c.program.set_f32(gl, "c_rot", pose.rot);
+        c.program.set_f32(gl, "c_sink", pose.sink);
+        c.program.set_f32(gl, "c_aspect", pose.aspect);
+        c.program.set_vec2(gl, "c_pivot", pose.pivot[0], pose.pivot[1]);
+        c.program.set_f32(gl, "c_xscale", pose.xscale);
+        for w in worn.iter().filter(|w| w.behind == behind) {
+            if w.kind == 100 {
+                let Some(path) = w.image.as_ref() else { continue };
+                let tex = *c.images.entry(path.clone()).or_insert_with(|| {
+                    let img = image::open(path).ok()?.to_rgba8();
+                    let (iw, ih) = img.dimensions();
+                    crate::render::gl::create_texture(gl, iw, ih, img.as_raw(), crate::render::gl::Filter::Linear, true).ok()
+                });
+                let Some(tex) = tex else { continue };
+                unsafe {
+                    gl.active_texture(glow::TEXTURE1);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                }
+                c.program.set_i32(gl, "u_img", 1);
+            }
+            c.program.set_vec4(gl, "u_sub", w.rect);
+            c.program.set_i32(gl, "u_kind", w.kind);
+            c.program.set_i32(gl, "u_flip", i32::from(w.flip));
+            unsafe {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                gl.bind_vertex_array(Some(c.vao));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.bind_vertex_array(None);
+            }
+            if w.kind == 100 {
+                unsafe {
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                    gl.active_texture(glow::TEXTURE0);
+                }
+            }
+        }
+        c.program.set_i32(gl, "u_attach", 0);
+    }
+
     pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
         let props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, z))).collect();
         if props.is_empty() {

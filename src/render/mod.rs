@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+pub mod anchors;
 pub mod character;
 pub mod gl;
 pub mod image;

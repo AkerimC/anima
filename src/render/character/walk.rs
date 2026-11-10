@@ -128,6 +128,8 @@ pub(super) struct WalkState {
     pub(super) bored: f32,
     // snow settled on its head, 0..1
     pub(super) snow_pile: f32,
+    // playing a game right now (not just chatting), kept up by the main character
+    pub(super) in_game: bool,
     // trained a while ago: not again for a bit
     pub(super) train_cool: f32,
     // its favourite keepsake while resting (-1: has none)

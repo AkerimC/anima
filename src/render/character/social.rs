@@ -814,6 +814,8 @@ impl CharacterOverlay {
         let ids: Vec<(u32, Stage)> = self.chats.iter().chain(self.new_chats.iter()).map(|c| (c.id, c.stage)).collect();
         let racing = self.race.is_some();
         for i in 0..n {
+            let playing = self.in_game(i);
+            self.walk_of(i).in_game = playing;
             let wk = self.walk_of(i);
             let was = wk.act;
             // how long in this state, and whether it's getting anywhere
