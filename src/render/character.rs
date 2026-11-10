@@ -1022,6 +1022,30 @@ void main() {
 }
 "#;
 
+/// What the vertex shader does to the sprite this frame, beyond its box:
+/// stretched by breathing from the feet up, sheared by leaning, lifted.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SpritePose {
+    breath: f32,
+    tilt: [f32; 2],
+    // clip units
+    lift: f32,
+    half: [f32; 2],
+    size: [f32; 2],
+}
+
+impl SpritePose {
+    /// How far the point `v` of the way down the sprite (0 top, 1 bottom)
+    /// is drawn from where its box says, px: the same sums as CHAR_VS.
+    pub(super) fn shift_at(&self, v: f32) -> [f32; 2] {
+        let y = 1.0 - 2.0 * v;
+        let up = (y + 1.0) * 0.5;
+        let dx = up * self.tilt[0] * 0.055 * self.half[0];
+        let dy = (y + 1.0) * self.breath * 0.025 * self.half[1] + up * self.tilt[1] * 0.025 * self.half[1] + self.lift;
+        [dx * self.size[0] * 0.5, -dy * self.size[1] * 0.5]
+    }
+}
+
 pub struct CharacterOverlay {
     pub config: CharacterConfig,
     program: Program,
@@ -1122,8 +1146,8 @@ pub struct CharacterOverlay {
     pub(super) head: Option<[f32; 4]>,
     // the mask, 0 off .. 1 on
     lids: f32,
-    // the sprite's own bobbing and sway this frame, px (x at the top, y)
-    pub(super) draw_shift: [f32; 2],
+    // how the sprite is drawn this frame: breathing, leaning, hopping
+    pub(super) pose: SpritePose,
     drawn_left: bool,
     drawn_happy: bool,
     turn_t: f32,
@@ -1283,7 +1307,7 @@ impl CharacterOverlay {
             eyes: None,
             head: None,
             lids: 0.0,
-            draw_shift: [0.0; 2],
+            pose: SpritePose::default(),
             drawn_left: false,
             drawn_happy: false,
             turn_t: 0.0,
@@ -2125,11 +2149,15 @@ impl CharacterOverlay {
             self.program.set_f32(gl, "u_bounce", self.smooth_bounce + hop);
             self.program.set_f32(gl, "u_rot", self.walk.rot);
             self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
-            // how far the drawn sprite is off its box this frame (hops, sway): px,
-            // at the top of the head; things worn or held move with it
-            let lean = (self.smooth_look[0] + sway) * 0.055 * half_clip[0] * w * 0.5;
-            let lift = (self.smooth_bounce + hop - self.walk.sink * half_clip[1]) * h * 0.5;
-            self.draw_shift = [lean, -lift];
+            // how the sprite is bent and lifted this frame, so things worn or held
+            // can follow any point of it exactly (see `shift_at`)
+            self.pose = SpritePose {
+                breath: breath - squash,
+                tilt: [self.smooth_look[0] + sway, self.smooth_look[1]],
+                lift: self.smooth_bounce + hop - self.walk.sink * half_clip[1],
+                half: half_clip,
+                size: [w, h],
+            };
             self.program.set_f32(gl, "u_aspect", w / h);
             let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
                 (true, _, Some(g)) => g,
@@ -2194,6 +2222,7 @@ impl CharacterOverlay {
                 }
                 let k = (std::f32::consts::PI * (1.0 - self.swap_t.max(0.0) / SWAP)).sin();
                 self.program.set_f32(gl, "u_breath", breath - squash - k * 4.0);
+                self.pose.breath = breath - squash - k * 4.0;
             }
             let tex = match (self.drawn_happy, self.sprite_happy) {
                 (true, Some(h)) => h,

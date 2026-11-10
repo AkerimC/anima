@@ -571,7 +571,7 @@ impl CharacterOverlay {
             let (l, rr) = (sx(hb[0]).min(sx(hb[2])), sx(hb[0]).max(sx(hb[2])));
             let (hw, hh) = (rr - l, (hb[3] - hb[1]) * h);
             let cx = (l + rr) * 0.5;
-            let [dx, dy] = a.draw_shift;
+            let [dx, dy] = a.pose.shift_at(hb[1]);
             let (cx, crown) = (cx + dx, r[1] + hb[1] * h + dy);
             if xmas {
                 // tip falls to the side it's facing away from
@@ -628,7 +628,8 @@ impl CharacterOverlay {
                         let tall = (hand_y - head) / 0.435;
                         let top = head - tall * 0.475;
                         let wide = (body * 2.8).max(tall * 0.75);
-                        let [dx, dy] = if k == 0 { self.draw_shift } else { self.extras[k - 1].draw_shift };
+                        let pose = if k == 0 { self.pose } else { self.extras[k - 1].pose };
+                        let [dx, dy] = pose.shift_at(o[1] + 0.04);
                         let (x, top) = (hand_x + dx * 0.6, top + dy);
                         v.push((22, [x - wide * 0.5, top, x + wide * 0.5, top + tall], false, k));
                     }
