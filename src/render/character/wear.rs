@@ -278,7 +278,8 @@ fn read_inventory() -> Inventory {
 
 /// Whether `name` has `id` to wear.
 pub fn owns(inv: &Inventory, name: &str, id: &str) -> bool {
-    STARTERS.contains(&id) || inv.get(name).is_some_and(|v| v.iter().any(|x| x == id))
+    // "*" in the inventory: everything is open to everyone
+    STARTERS.contains(&id) || inv.contains_key("*") || inv.get(name).is_some_and(|v| v.iter().any(|x| x == id))
 }
 
 /// `name` found `id`: it's theirs from now on.
