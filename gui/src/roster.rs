@@ -441,7 +441,7 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
     let pictures: Vec<Option<(gtk::cairo::ImageSurface, f64, f64)>> = items
         .iter()
         .map(|it| {
-            let p = wear::picture_of(it)?;
+            let p = wear::picture_for(it, &who)?;
             let (s, img) = sprite_surface(p.to_str()?)?;
             Some((s, img.width() as f64, img.height() as f64))
         })

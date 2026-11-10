@@ -78,7 +78,9 @@ pub struct Item {
 /// Pictures in the props folder worn like the rest: id, label, file, anchor,
 /// size, pivot (where the picture is held or sits), offset, behind, pair.
 #[allow(clippy::type_complexity)]
-const PICTURES: [(&str, &str, &str, Anchor, [f32; 2], [f32; 2], [f32; 2], bool, f32); 31] = [
+const PICTURES: [(&str, &str, &str, Anchor, [f32; 2], [f32; 2], [f32; 2], bool, f32); 32] = [
+    // one of the pixel swords in props/swords, a different one for each character
+    ("pixel_sword", "Pixel sword", "swords/sword_00", Anchor::Hand, [0.75, 0.75], [0.15, 0.85], [0.0, 0.0], false, 0.0),
     ("helmet", "Helmet", "helmet", Anchor::Crown, [1.05, 0.95], [0.5, 0.72], [0.0, 0.42], false, 0.0),
     ("cap", "Cap", "cap", Anchor::Crown, [0.85, 0.7], [0.45, 0.8], [0.05, 0.25], false, 0.0),
     ("grad_cap", "Graduation cap", "grad_cap", Anchor::Crown, [0.9, 0.8], [0.5, 0.75], [0.0, 0.22], false, 0.0),
@@ -213,6 +215,22 @@ pub fn happy_path(calm: &str) -> Option<String> {
     name.contains("_0010.").then(|| p.with_file_name(name.replace("[A]", "[B]").replace("_0010.", "_0011.")).to_string_lossy().into_owned())
 }
 
+/// The picture `name` sees for `item`: some items come in variants (the
+/// pixel swords), one each, picked by the character's name.
+pub fn picture_for(item: &Item, name: &str) -> Option<PathBuf> {
+    if item.id == "pixel_sword" {
+        let dir = crate::util::data_dir().join("props").join("swords");
+        let mut all: Vec<PathBuf> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "png")).collect();
+        all.sort();
+        if all.is_empty() {
+            return None;
+        }
+        let h = name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
+        return Some(all[h as usize % all.len()].clone());
+    }
+    picture_of(item)
+}
+
 /// How far apart a pair is worn (head widths), 0 for a single thing.
 pub fn pair_of(item: &Item) -> f32 {
     item.pair
@@ -329,6 +347,20 @@ pub fn catalog() -> Vec<Item> {
             v.push(Item { id: id.into(), label: label.into(), kind: 100, image: Some(image), anchor, size, pivot, offset, behind, pair });
         }
     }
+    // weapons in props/weapons: each one held in the hand, handle at the
+    // bottom left of its picture, tip up and away
+    if let Ok(dir) = std::fs::read_dir(props.join("weapons")) {
+        let mut found: Vec<PathBuf> = dir.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "png")).collect();
+        found.sort();
+        for p in found {
+            let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut label: String = stem.replace('_', " ");
+            if let Some(c) = label.get_mut(0..1) {
+                c.make_ascii_uppercase();
+            }
+            v.push(Item { id: format!("weapon:{stem}"), label, kind: 100, image: Some(p), anchor: Anchor::Hand, size: [0.85, 0.85], pivot: [0.2, 0.8], offset: [0.0, 0.0], behind: false, pair: 0.0 });
+        }
+    }
     let Ok(dir) = std::fs::read_dir(accessories_dir()) else { return v };
     let mut pngs: Vec<PathBuf> = dir.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))).collect();
     pngs.sort();
@@ -401,10 +433,15 @@ pub(super) struct Worn {
 
 /// Things that can be knocked off or out of the hand (hats, the umbrella).
 fn droppable(id: &str) -> &'static str {
-    const LOOSE: [&str; 24] = [
-        "party_hat", "top_hat", "crown", "headphones", "helmet", "cap", "grad_cap", "chick", "sword", "shield", "wand", "bow_arrow", "axe", "hammer", "broom",
+    const LOOSE: [&str; 25] = [
+        "pixel_sword", "party_hat", "top_hat", "crown", "headphones", "helmet", "cap", "grad_cap", "chick", "sword", "shield", "wand", "bow_arrow", "axe", "hammer", "broom",
         "mic", "lollipop", "ice_cream", "bubble_tea", "trophy", "handbag", "flashlight", "crystal_ball", "gem",
     ];
+    if id.starts_with("weapon:") {
+        // weapons fly out of the hand too; one id for all of them is enough to
+        // know it's lost and to have it back
+        return "weapon";
+    }
     LOOSE.iter().copied().find(|&x| x == id).unwrap_or("")
 }
 
@@ -471,7 +508,7 @@ impl CharacterOverlay {
             for id in ids {
                 let Some(it) = items.iter().find(|i| &i.id == id) else { continue };
                 // the sleep mask only goes on in its sleep
-                if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id) || !owns(&shared.3, &name, &it.id) {
+                if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id || (l == "weapon" && it.id.starts_with("weapon:"))) || !owns(&shared.3, &name, &it.id) {
                     continue;
                 }
                 // turned and mirrored by hand; on a mirrored sprite the turn goes the other way
@@ -485,7 +522,8 @@ impl CharacterOverlay {
                         out.push(Worn { turn: t, id: "", kind: it.kind, rect: place_with(&one, fit), flip: flip ^ pair_mirrored(side) ^ mirror, behind: it.behind, image: it.image.clone() });
                     }
                 } else {
-                    out.push(Worn { turn, id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip: flip ^ mirror, behind: it.behind, image: it.image.clone() });
+                    let image = if it.kind == 100 { picture_for(it, &name) } else { None };
+                    out.push(Worn { turn, id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip: flip ^ mirror, behind: it.behind, image });
                 }
             }
         }
