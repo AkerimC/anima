@@ -422,6 +422,10 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         let (fits, who) = (fits.clone(), who.clone());
         move |id: &str| fits.borrow().get(&who).and_then(|m| m.get(&wear::fit_key(id, happy)).or_else(|| m.get(id))).copied()
     };
+    let turn_of = {
+        let (fits, who) = (fits.clone(), who.clone());
+        move |id: &str| wear::turn_of(fits.borrow().get(&who), id, happy)
+    };
     let rect_of = {
         let (items, fit_of) = (items.clone(), fit_of.clone());
         move |k: usize| -> [f64; 4] {
@@ -441,7 +445,7 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         })
         .collect();
     {
-        let (pick, items, rect_of) = (pick.clone(), items.clone(), rect_of.clone());
+        let (pick, items, rect_of, turn_of) = (pick.clone(), items.clone(), rect_of.clone(), turn_of.clone());
         area.set_draw_func(move |_, cr, w, h| {
             let (s, ox, oy) = place(w as f64, h as f64);
             cr.set_source_rgb(0.16, 0.16, 0.18);
@@ -456,16 +460,27 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
                 let [x, y, rw, rh] = rect_of(k);
                 let (x, y, rw, rh) = (ox + x * s, oy + y * s, rw * s, rh * s);
                 let chosen = k == pick.get();
+                // turned and mirrored as it'll be worn (y down here: the angle the other way)
+                let (turn, mirror) = turn_of(&items[k].id);
+                let _ = cr.save();
+                cr.translate(x + rw * 0.5, y + rh * 0.5);
+                cr.rotate(-turn as f64);
+                cr.translate(-(x + rw * 0.5), -(y + rh * 0.5));
                 // the picture fills the box's width at its own shape, about its middle
                 if let Some((pic, pw, ph)) = &pictures[k] {
                     let (dw, dh) = (rw, rw * ph / pw);
                     let _ = cr.save();
                     cr.translate(x, y + rh * 0.5 - dh * 0.5);
+                    if mirror {
+                        cr.translate(dw, 0.0);
+                        cr.scale(-1.0, 1.0);
+                    }
                     cr.scale(dw / pw, dh / ph);
                     let _ = cr.set_source_surface(pic, 0.0, 0.0);
                     let _ = cr.paint();
                     let _ = cr.restore();
                     if !chosen {
+                        let _ = cr.restore();
                         continue;
                     }
                 }
@@ -491,6 +506,7 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
                 cr.set_font_size(10.0);
                 cr.move_to(x + 2.0, y - 3.0);
                 let _ = cr.show_text(&items[k].label);
+                let _ = cr.restore();
             }
         });
     }
@@ -563,10 +579,28 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
     }
     area.add_controller(drag);
     // the wheel sizes the one picked
+    // ctrl + wheel turns the one picked
+    let set_turn_scroll: Rc<dyn Fn(&dyn Fn(f32, bool) -> (f32, bool))> = {
+        let (fits, who, save, area2, pick, items) = (fits.clone(), who.clone(), save.clone(), area.clone(), pick.clone(), items.clone());
+        Rc::new(move |change: &dyn Fn(f32, bool) -> (f32, bool)| {
+            let id = items[pick.get()].id.clone();
+            let (t, m) = wear::turn_of(fits.borrow().get(&who), &id, happy);
+            let (t, m) = change(t, m);
+            fits.borrow_mut().entry(who.clone()).or_default().insert(wear::turn_key(&id, happy), [t, if m { 1.0 } else { 0.0 }, 0.0, 0.0]);
+            save();
+            area2.queue_draw();
+        })
+    };
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     {
         let (pick, items, set_fit, fit_of, area2, save) = (pick.clone(), items.clone(), set_fit.clone(), fit_of.clone(), area.clone(), save.clone());
-        scroll.connect_scroll(move |_, _, dy| {
+        let st = set_turn_scroll.clone();
+        scroll.connect_scroll(move |ec, _, dy| {
+            if ec.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                let step = if dy < 0.0 { 5f32 } else { -5.0 };
+                st(&|t, m| (t + step.to_radians(), m));
+                return gtk::glib::Propagation::Stop;
+            }
             let id = items[pick.get()].id.clone();
             let f = fit_of(&id).unwrap_or([0.0, 0.0, 1.0, 1.0]);
             let k = if dy < 0.0 { 1.06 } else { 1.0 / 1.06 };
@@ -592,6 +626,24 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         names.insert(&btn, -1);
     }
     b.append(&names);
+    // turn the one picked, or mirror it
+    let set_turn = set_turn_scroll.clone();
+    let turns = gtk::Box::builder().spacing(4).halign(gtk::Align::Center).build();
+    for (icon, tip, step) in [("object-rotate-left-symbolic", "Turn left", 1.0f32), ("object-rotate-right-symbolic", "Turn right", -1.0)] {
+        let b = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
+        let st = set_turn.clone();
+        b.connect_clicked(move |_| st(&|t, m| (t + step * 10f32.to_radians(), m)));
+        turns.append(&b);
+    }
+    let flip_b = gtk::Button::builder().icon_name("object-flip-horizontal-symbolic").tooltip_text("Mirror").build();
+    let st = set_turn.clone();
+    flip_b.connect_clicked(move |_| st(&|t, m| (-t, !m)));
+    turns.append(&flip_b);
+    let straight = gtk::Button::builder().label("Straight").tooltip_text("No turn, not mirrored").build();
+    let st = set_turn.clone();
+    straight.connect_clicked(move |_| st(&|_, _| (0.0, false)));
+    turns.append(&straight);
+    b.append(&turns);
     let reset = gtk::Button::with_label("Reset the one picked");
     {
         let (pick, items, fits, who, area2, save) = (pick.clone(), items.clone(), fits.clone(), who.clone(), area.clone(), save.clone());

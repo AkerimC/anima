@@ -123,7 +123,7 @@ const BUILT_IN: [(&str, &str, i32, Anchor, [f32; 2], [f32; 2], [f32; 2], bool); 
     ("glasses", "Round glasses", 30, Anchor::Eyes, [0.8, 0.22], [0.5, 0.5], [0.0, 0.0], false),
     ("sunglasses", "Sunglasses", 31, Anchor::Eyes, [0.82, 0.24], [0.5, 0.5], [0.0, 0.0], false),
     ("sleep_mask", "Sleep mask (asleep)", 26, Anchor::Eyes, [0.95, 0.3], [0.5, 0.5], [0.0, 0.0], false),
-    ("scarf", "Scarf", 33, Anchor::Neck, [0.8, 0.32], [0.5, 0.3], [0.0, 0.0], false),
+    ("scarf", "Scarf", 33, Anchor::Neck, [0.78, 0.5], [0.5, 0.3], [0.0, 0.0], false),
     ("backpack", "Backpack", 34, Anchor::Back, [0.62, 0.62], [0.5, 0.5], [0.0, 0.05], true),
     ("wings", "Angel wings", 35, Anchor::Back, [1.9, 0.9], [0.5, 0.5], [0.0, 0.0], true),
 ];
@@ -139,6 +139,18 @@ pub fn fit_path() -> PathBuf {
 }
 
 pub type Fits = HashMap<String, HashMap<String, [f32; 4]>>;
+
+/// The key an item's turn is kept under: [angle (radians, anticlockwise),
+/// mirrored (1) or not (0), 0, 0].
+pub fn turn_key(id: &str, happy: bool) -> String {
+    format!("{}~turn", fit_key(id, happy))
+}
+
+/// (angle, mirrored) set by hand for `id`, the happy pose's own if it has one.
+pub fn turn_of(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, happy: bool) -> (f32, bool) {
+    let f = fits.and_then(|f| f.get(&turn_key(id, happy)).or_else(|| f.get(&turn_key(id, false))));
+    f.map_or((0.0, false), |t| (t[0], t[1] > 0.5))
+}
 
 /// Where `item` goes on a sprite with these anchors: left, top, width,
 /// height in texture units of the calm sprite (not mirrored), with the
@@ -356,6 +368,8 @@ pub(super) struct Worn {
     pub(super) id: &'static str,
     pub(super) kind: i32,
     pub(super) rect: [f32; 4],
+    // turned about its middle (radians), by hand in the fitting
+    pub(super) turn: f32,
     pub(super) flip: bool,
     pub(super) behind: bool,
     pub(super) image: Option<PathBuf>,
@@ -430,15 +444,19 @@ impl CharacterOverlay {
                 if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id) || !owns(&shared.3, &name, &it.id) {
                     continue;
                 }
+                // turned and mirrored by hand; on a mirrored sprite the turn goes the other way
+                let (turn, mirror) = turn_of(fits, &it.id, happy);
+                let turn = if flip { -turn } else { turn };
                 if it.pair > 0.0 {
                     // a pair: one each side, the second mirrored
                     for side in [-1.0f32, 1.0] {
                         let mut one = it.clone();
                         one.offset[0] += side * it.pair;
-                        out.push(Worn { id: "", kind: it.kind, rect: fitted(&one), flip: flip ^ (side < 0.0), behind: it.behind, image: it.image.clone() });
+                        let t = if side < 0.0 { -turn } else { turn };
+                        out.push(Worn { turn: t, id: "", kind: it.kind, rect: fitted(&one), flip: flip ^ (side < 0.0) ^ mirror, behind: it.behind, image: it.image.clone() });
                     }
                 } else {
-                    out.push(Worn { id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip, behind: it.behind, image: it.image.clone() });
+                    out.push(Worn { turn, id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip: flip ^ mirror, behind: it.behind, image: it.image.clone() });
                 }
             }
         }
@@ -446,9 +464,9 @@ impl CharacterOverlay {
         // then carried on its back
         if let Some(kind) = wk.keepsake {
             if asleep {
-                out.push(Worn { id: "", kind, rect: place(Anchor::Chest, [0.46, 0.4], [0.5, 0.5], [0.0, 0.0]), flip, behind: false, image: None });
+                out.push(Worn { turn: 0.0, id: "", kind, rect: place(Anchor::Chest, [0.46, 0.4], [0.5, 0.5], [0.0, 0.0]), flip, behind: false, image: None });
             } else if wk.carry && wk.act != Act::Rest {
-                out.push(Worn { id: "", kind, rect: place(Anchor::Back, [0.5, 0.44], [0.5, 0.5], [0.0, -0.05]), flip, behind: true, image: None });
+                out.push(Worn { turn: 0.0, id: "", kind, rect: place(Anchor::Back, [0.5, 0.44], [0.5, 0.5], [0.0, -0.05]), flip, behind: true, image: None });
             }
         }
         let weather = super::weather::now();
@@ -456,7 +474,7 @@ impl CharacterOverlay {
         let xmas = super::weather::christmas();
         let hatted = xmas || out.iter().any(|w| matches!(w.kind, 27 | 28 | 37 | 36) || (w.kind == 100));
         if xmas && !wk.lost.iter().any(|l| l == "santa") {
-            out.push(Worn { id: "santa", kind: 25, rect: fitted(&santa_item()), flip: !flip, behind: false, image: None });
+            out.push(Worn { turn: 0.0, id: "santa", kind: 25, rect: fitted(&santa_item()), flip: !flip, behind: false, image: None });
         }
         // snow that has settled on its head (or hat)
         let pile = wk.snow_pile;
@@ -466,7 +484,7 @@ impl CharacterOverlay {
             } else {
                 ([0.6 + 0.3 * pile, 0.12 + 0.42 * pile], [0.5, 0.8], [0.0, 0.1])
             };
-            out.push(Worn { id: "", kind: 24, rect: place(Anchor::Crown, size, pivot, offset), flip: false, behind: false, image: None });
+            out.push(Worn { turn: 0.0, id: "", kind: 24, rect: place(Anchor::Crown, size, pivot, offset), flip: false, behind: false, image: None });
         }
         // rain: what it does with the umbrella depends on what it's up to
         let has = weather.rain && tn().weather_show >= 0.5 && !wk.lost.iter().any(|l| l == "umbrella");
@@ -485,19 +503,19 @@ impl CharacterOverlay {
             let tall = wide * 0.5 * tex_aspect;
             let rim = crown[1] - 0.015;
             let (x0, x1) = (sx(hold[0] - wide * 0.5), sx(hold[0] + wide * 0.5));
-            out.push(Worn { id: "umbrella", kind: 38, rect: [x0.min(x1), sy(rim), x0.max(x1), sy(rim - tall)], flip: false, behind, image: None });
+            out.push(Worn { turn: 0.0, id: "umbrella", kind: 38, rect: [x0.min(x1), sy(rim), x0.max(x1), sy(rim - tall)], flip: false, behind, image: None });
             let thin = wide * 0.04;
             let (a0, a1) = (sx(hold[0] - thin * 0.5), sx(hold[0] + thin * 0.5));
             let stick = [a0.min(a1) - (a1 - a0).abs() * 2.5, sy(hold[1] + hh * 0.04), a0.max(a1) + (a1 - a0).abs() * 2.5, sy(rim - tall * 0.9)];
             // the hook turns towards the character
-            out.push(Worn { id: "umbrella", kind: 39, rect: stick, flip: self.faces_right == flip, behind: true, image: None });
+            out.push(Worn { turn: 0.0, id: "umbrella", kind: 39, rect: stick, flip: self.faces_right == flip, behind: true, image: None });
         };
         match mode {
             1 => open(hand, false),
             // strapped upright to its back, open over its head
             2 => open([a.back[0], a.back[1]], true),
             // rolled up and slung across its back, sticking out past the shoulder
-            3 => out.push(Worn { id: "", kind: 42, rect: place(Anchor::Back, [0.85, 1.3], [0.5, 0.5], [0.2, -0.22]), flip, behind: true, image: None }),
+            3 => out.push(Worn { turn: 0.0, id: "", kind: 42, rect: place(Anchor::Back, [0.85, 1.3], [0.5, 0.5], [0.2, -0.22]), flip, behind: true, image: None }),
             _ => {}
         }
         // a picture fills its box's width at its own shape, about the box's middle

@@ -130,6 +130,7 @@ uniform vec4 u_clip;
 uniform int u_attach;
 uniform vec4 u_sub;
 uniform float u_spin;
+uniform float u_turn; // a worn thing turned about its middle
 uniform vec2 c_center;
 uniform vec2 c_half;
 uniform vec2 c_tilt;
@@ -144,6 +145,14 @@ void main() {
     v_pos = a_pos;
     if (u_attach == 1) {
         vec2 p = mix(u_sub.xy, u_sub.zw, a_pos * 0.5 + 0.5);
+        if (u_turn != 0.0) {
+            // turned in screen proportions, about the middle of its box
+            vec2 m = (u_sub.xy + u_sub.zw) * 0.5;
+            vec2 k = c_half * vec2(c_aspect, 1.0);
+            vec2 v = (p - m) * k;
+            float c = cos(u_turn), s = sin(u_turn);
+            p = m + vec2(c * v.x - s * v.y, s * v.x + c * v.y) / k;
+        }
         float hf = (p.y + 1.0) * 0.5;
         p.y = -1.0 + (p.y + 1.0) * (1.0 + c_breath * 0.025);
         p.x += hf * c_tilt.x * 0.055;
@@ -513,11 +522,25 @@ vec4 flower(vec2 p) {
     return vec4(col, max(petals, core));
 }
 vec4 scarf(vec2 p) {
-    float wrap = sdBox(p - vec2(0.0, 0.35), vec2(0.95, 0.4), 0.3);
-    float tail = sdBox(p - vec2(0.45, -0.35), vec2(0.18, 0.55), 0.12);
-    float a = 1.0 - smoothstep(-0.02, 0.02, min(wrap, tail));
-    float stripe = step(0.5, fract(p.y * 3.0 + p.x * 0.3));
-    vec3 col = mix(vec3(0.85, 0.2, 0.25), vec3(0.98, 0.95, 0.9), stripe * 0.9);
+    // worn: a thick knitted wrap curving under the chin, one end hanging
+    // down the front with a fringe
+    float bend = 0.28 * (1.0 - p.x * p.x);
+    float y = p.y + bend;
+    float wrap = step(abs(p.x), 0.97) * (1.0 - smoothstep(0.24, 0.3, abs(y - 0.38)));
+    // the knot and the hanging end, on the right of the box
+    float knot = 1.0 - smoothstep(0.17, 0.22, length((p - vec2(0.3, 0.15)) / vec2(1.0, 1.1)));
+    float tail_x = 0.3 + 0.08 * (p.y + 0.2);
+    float tail = step(abs(p.x - tail_x), 0.15 - 0.02 * p.y) * step(-0.75, p.y) * step(p.y, 0.2);
+    float fringe = step(-0.95, p.y) * step(p.y, -0.75) * step(abs(p.x - tail_x), 0.15) * step(0.5, fract((p.x - tail_x) * 13.0));
+    float a = max(max(wrap, knot), max(tail, fringe));
+    // red and cream stripes, knit ridges, shade towards the edges
+    float stripes = step(0.5, fract((tail > 0.0 && wrap <= 0.0 ? p.y * 3.0 : p.x * 2.6) + 0.25));
+    vec3 col = mix(vec3(0.82, 0.18, 0.24), vec3(0.98, 0.93, 0.85), stripes * 0.85);
+    float ridge = 0.08 * sin((tail > 0.0 && wrap <= 0.0 ? p.x : y) * 60.0);
+    col *= 0.92 + ridge;
+    col *= mix(0.78, 1.0, 1.0 - smoothstep(0.1, 0.3, abs(y - 0.38)) * wrap * 0.0 - 0.0);
+    col = mix(col, col * 0.75, (1.0 - smoothstep(0.0, 0.12, 0.3 - abs(y - 0.38))) * wrap);
+    col = mix(col, vec3(0.7, 0.13, 0.18), knot * (1.0 - wrap) * 0.6);
     return vec4(col, a);
 }
 vec4 backpack(vec2 p) {
@@ -757,7 +780,6 @@ pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
         30 => "glasses",
         31 => "sunglasses",
         32 => "flower",
-        33 => "scarf",
         34 => "backpack",
         36 => "headphones",
         37 => "crown",
@@ -843,6 +865,7 @@ impl CharacterOverlay {
                 kind = 100;
             }
             c.program.set_vec4(gl, "u_sub", w.rect);
+            c.program.set_f32(gl, "u_turn", w.turn);
             c.program.set_i32(gl, "u_kind", kind);
             c.program.set_i32(gl, "u_flip", i32::from(w.flip));
             unsafe {

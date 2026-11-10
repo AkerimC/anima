@@ -1504,10 +1504,12 @@ impl CharacterOverlay {
                 let (w, h) = (x1 - x0, y1 - y0);
                 // turned or tumbling: anywhere round it
                 let pad = if a.walk.rot.abs() > 0.01 { h * 1.5 } else { h * 0.08 };
+                let pad_turned = h * 0.5;
                 a.worn()
                     .into_iter()
                     .map(move |t| {
                         let [sx0, sy0, sx1, sy1] = t.rect;
+                        let pad = if t.turn != 0.0 { pad.max(pad_turned) } else { pad };
                         let r = [x0 + (sx0 + 1.0) * 0.5 * w - pad, y0 + (1.0 - sy1) * 0.5 * h - pad, x0 + (sx1 + 1.0) * 0.5 * w + pad, y0 + (1.0 - sy0) * 0.5 * h + pad];
                         a.zoom.map_or(r, |z| z.to_screen(r))
                     })
