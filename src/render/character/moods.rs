@@ -557,11 +557,12 @@ impl CharacterOverlay {
             let dir = if head_left { -1.0 } else { 1.0 };
             let head = cx + dir * long * 0.5;
             // the pillow, under the head
-            let (pw, ph) = (long * 0.4, thick * 0.5);
-            let px = head - dir * long * 0.14;
+            let (pw, ph) = (long * 0.46, thick * 0.5);
+            let px = head - dir * long * 0.2;
             v.push((25, [px - pw * 0.5, floor - ph, px + pw * 0.5, floor + ph * 0.06], false, k));
             // the blanket from the shoulders to past the feet, low over the body
-            let from = head - dir * long * 0.34;
+            // a chibi's head is nearly half of it: the blanket stops at the neck
+            let from = head - dir * long * 0.48;
             let to = cx - dir * long * 0.55;
             let (x0, x1) = (from.min(to), from.max(to));
             v.push((24, [x0, floor - thick * 0.55, x1, floor + thick * 0.04], !head_left, k));
