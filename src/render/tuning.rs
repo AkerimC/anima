@@ -140,7 +140,8 @@ tuning! {
         parasol_peak: "Under an umbrella, the top of a jump comes at (share of it)" = 0.3, 0.1, 0.5, 0.05, 2;
         parasol_fall: "Gravity under an open umbrella (share)" = 0.22, 0.05, 1.0, 0.05, 2;
         parasol_speed: "Fastest fall under an open umbrella" = 2.0, 0.2, 20.0, 0.1, 1;
-        drop_swing: "Swung this hard, the umbrella flies off" = 5.0, 0.5, 30.0, 0.5, 1;
+        drop_speed: "Shaken this fast (px/s), the umbrella flies off" = 2200.0, 200.0, 10000.0, 100.0, 0;
+        drop_swing: "Spun this fast (turns), the umbrella flies off" = 10.0, 0.5, 30.0, 0.5, 1;
         snow_settle: "Snow piles up on heads over (s)" = 45.0, 1.0, 600.0, 5.0, 0;
         snow_hop: "Hop after snowflakes (per s)" = 0.06, 0.0, 2.0, 0.01, 2;
         night_sleep: "Go to bed at night (share)" = 0.5, 0.0, 1.0, 0.05, 2;

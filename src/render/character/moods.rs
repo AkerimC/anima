@@ -593,17 +593,21 @@ impl CharacterOverlay {
             // swung about hard in the rain: the umbrella flies out of its hand
             let wk = self.walk_ref(i);
             if wk.act == Act::Held {
-                let swing = wk.swing_v.abs();
+                // only real shaking: the cursor whipped about fast, or the character
+                // spun round hard, for a moment; just lifting it up isn't that
+                let speed = (wk.swing_vel[0] * wk.swing_vel[0] + wk.swing_vel[1] * wk.swing_vel[1]).sqrt();
+                let whipped = speed > tn().drop_speed || wk.swing_v.abs() > tn().drop_swing;
                 let wk = self.walk_of(i);
-                wk.shake = if swing > tn().drop_swing { wk.shake + dt } else { (wk.shake - dt).max(0.0) };
-                if wk.shake > 0.25 {
+                wk.shake = if whipped { wk.shake + dt } else { (wk.shake - dt * 2.0).max(0.0) };
+                if wk.shake > 0.35 {
                     wk.shake = 0.0;
                     self.knock_off(i, 1.0, 0.3);
                 }
             }
             // a jolt, a tumble, a crash: what's in its hand and on its head may go flying
             let wk = self.walk_ref(i);
-            let tumbling = (wk.act == Act::Fall && wk.tumble.abs() > 3.0) || wk.act == Act::Planted || wk.race_down;
+            // let go spinning fast, crashed into the ground, knocked over in a race
+            let tumbling = (wk.act == Act::Fall && wk.tumble.abs() > 9.0) || wk.act == Act::Planted || wk.race_down;
             if tumbling && !wk.jolted {
                 self.walk_of(i).jolted = true;
                 self.knock_off(i, tn().jolt_drop, tn().jolt_drop * 0.7);
