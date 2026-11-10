@@ -84,6 +84,10 @@ pub enum Request {
     Game {
         name: String,
     },
+    /// rain, snow, night, clear, or auto (the real weather).
+    Weather {
+        name: String,
+    },
     Quit,
 }
 

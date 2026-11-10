@@ -78,10 +78,13 @@ pub(super) struct Moods {
     seen_opened: u32,
     seen_closed: u32,
     started: bool,
+    // the weather as last seen, to notice the night coming and going
+    pub(super) weather: super::weather::Weather,
     // a new window, and how long until its place is known
     pending: Option<(Option<u64>, f32)>,
     pub(super) bonds: Bonds,
     pub(super) skills: Skills,
+    pub(super) keepsakes: Keepsakes,
     pub(super) bond_tick: f32,
 }
 
@@ -91,7 +94,7 @@ impl WalkState {
     }
 
     /// `until`: a nap of that many seconds; 0 sleeps until someone's back.
-    fn lie_down(&mut self, until: f32) {
+    pub(super) fn lie_down(&mut self, until: f32) {
         let turn = if self.rand() < 0.5 { FRAC_PI_2 } else { -FRAC_PI_2 };
         self.rest = Some(Rest { kind: RestKind::Sleep, t: 0.0, until, wake: None, turn });
         self.act = Act::Rest;
@@ -106,6 +109,7 @@ impl WalkState {
     }
 
     fn get_up(&mut self) {
+        self.night_sleep = false;
         self.rest = None;
         self.act = Act::Idle;
         self.timer = 0.5 + self.rand();
@@ -171,6 +175,8 @@ impl WalkState {
             (RestKind::Sleep, None) if r.until > 0.0 && r.t < r.until => {
                 self.energy = (self.energy + dt / r.until).min(1.0);
             }
+            // gone to bed for the night: up when the night is over, not before
+            (RestKind::Sleep, None) if self.night_sleep => {}
             (RestKind::Sleep, None) if r.until > 0.0 || !idle => {
                 // some jump up with a start, the rest take their time
                 if self.rand() < tn().wake_jump {
@@ -377,6 +383,7 @@ impl CharacterOverlay {
         if !self.moods.started {
             self.moods.started = true;
             desktop::spawn();
+            super::weather::spawn();
             self.moods.seen_opened = desktop::OPENED.load(Relaxed);
             self.moods.seen_closed = desktop::CLOSED.load(Relaxed);
         }
@@ -389,6 +396,7 @@ impl CharacterOverlay {
         for i in 0..n {
             self.walk_of(i).rest_tick(dt, idle, drowsy, crowded);
         }
+        self.run_weather(dt, n);
 
         let load = desktop::CPU.load(Relaxed) as f32 / 1000.0;
         if self.moods.fretting {
@@ -471,7 +479,112 @@ impl CharacterOverlay {
     }
 
     /// Zs over those asleep, sweat on those fretting.
+    /// Night: about half of them go to bed one by one and get up again in
+    /// the morning. Snow: they hop after the flakes now and then.
+    fn run_weather(&mut self, dt: f32, n: usize) {
+        let w = super::weather::now();
+        let was = self.moods.weather;
+        self.moods.weather = w;
+        if w.night && !was.night {
+            // who's sleepy tonight
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                wk.night_wait = if wk.rand() < tn().night_sleep { Some(wk.rand() * tn().night_spread) } else { None };
+            }
+        }
+        if !w.night && was.night {
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                wk.night_wait = None;
+                if wk.night_sleep {
+                    // morning: up they get, one by one
+                    wk.night_sleep = false;
+                    let wake = 1.0 + wk.rand() * tn().night_spread * 0.3;
+                    if let Some(r) = wk.rest.as_mut() {
+                        r.wake = Some(wake);
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            let wk = self.walk_of(i);
+            if let Some(t) = wk.night_wait {
+                if !wk.at_leisure() {
+                    continue;
+                }
+                if t - dt <= 0.0 {
+                    wk.night_wait = None;
+                    wk.lie_down(0.0);
+                    wk.night_sleep = true;
+                } else {
+                    wk.night_wait = Some(t - dt);
+                }
+            }
+            // in bed or sitting about: its favourite thing beside it
+            if wk.act == Act::Rest {
+                if wk.keepsake.is_none() {
+                    let name = self.character_name(i);
+                    let fav = self.moods.keepsakes.favourite(&name);
+                    self.walk_of(i).keepsake = Some(fav.unwrap_or(-1));
+                }
+            } else if wk.keepsake.is_some() {
+                wk.keepsake = None;
+            }
+            let wk = self.walk_of(i);
+            if w.snow && wk.at_leisure() && wk.rand() < dt * tn().snow_hop {
+                let h = tn().jump_height * (0.5 + wk.rand() * 0.5);
+                wk.start_jump(h);
+                wk.gesture = true;
+            }
+        }
+    }
+
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
+        // keepsakes: lying beside whoever's resting
+        let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
+        for (k, (wk, r, seen)) in actors.enumerate() {
+            let Some(kind) = wk.keepsake.filter(|&k| k >= 0) else { continue };
+            let h = r[3] - r[1];
+            if h <= 0.0 || !seen {
+                continue;
+            }
+            let size = h * 0.3;
+            let side = if wk.left { 1.0 } else { -1.0 };
+            let x = (r[0] + r[2]) * 0.5 + side * h * 0.42;
+            v.push((kind, [x - size * 0.5, r[3] - size, x + size * 0.5, r[3]], false, k));
+        }
+        // rain: an umbrella over everyone not busy in a game; snow: flakes about them
+        let w = self.moods.weather;
+        if w.rain || w.snow {
+            let time = self.start.elapsed().as_secs_f32();
+            let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
+            for (k, (wk, r, seen)) in actors.enumerate() {
+                let h = r[3] - r[1];
+                if h <= 0.0 || !seen || matches!(wk.act, Act::Held | Act::Fall | Act::Travel | Act::Planted) {
+                    continue;
+                }
+                let cx = (r[0] + r[2]) * 0.5;
+                if w.rain {
+                    let busy = wk.race.is_some() || (wk.social.is_some() && self.in_game(k));
+                    let asleep = wk.act == Act::Rest;
+                    if !busy && !asleep {
+                        let size = h * 0.95;
+                        let lean = if wk.left { -1.0 } else { 1.0 } * h * 0.04;
+                        let top = r[1] - h * 0.18;
+                        v.push((22, [cx + lean - size * 0.5, top, cx + lean + size * 0.5, top + size * 0.62], false, k));
+                    }
+                } else {
+                    for f in 0..3 {
+                        let seed = k as f32 * 7.31 + f as f32 * 2.17;
+                        let t = (time * 0.18 + seed * 0.37).fract();
+                        let x = cx + ((seed * 3.7).sin() * 0.9 + (time * 1.3 + seed).sin() * 0.15) * h * 0.6;
+                        let y = r[1] - h * 0.5 + t * h * 1.4;
+                        let s = h * 0.09;
+                        v.push((23, [x - s, y - s, x + s, y + s], false, k));
+                    }
+                }
+            }
+        }
         for &(kind, owner, x, y, size, left) in &self.moods.effects {
             let a = if owner == 0 { self } else if let Some(e) = self.extras.get(owner - 1) { e } else { continue };
             // grows quickly, then fades by shrinking
@@ -619,6 +732,64 @@ impl CharacterOverlay {
 
 /// How good each character is at each game (0 to 1), by name, kept in
 /// `skills.json` in the data folder. Everyone starts clumsy.
+/// Little things each character found and keeps: prop kinds, newest last.
+#[derive(Default)]
+pub(super) struct Keepsakes {
+    map: HashMap<String, Vec<i32>>,
+    loaded: bool,
+    dirty: bool,
+    save_in: f32,
+}
+
+impl Keepsakes {
+    fn path() -> std::path::PathBuf {
+        crate::util::data_dir().join("keepsakes.json")
+    }
+
+    fn load(&mut self) {
+        if !self.loaded {
+            self.loaded = true;
+            if let Ok(text) = std::fs::read_to_string(Self::path()) {
+                self.map = serde_json::from_str(&text).unwrap_or_default();
+            }
+        }
+    }
+
+    pub(super) fn add(&mut self, name: &str, kind: i32) {
+        self.load();
+        let v = self.map.entry(name.to_string()).or_default();
+        v.push(kind);
+        // a pocketful at most: the oldest goes
+        if v.len() > 12 {
+            v.remove(0);
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn of(&mut self, name: &str) -> Vec<i32> {
+        self.load();
+        self.map.get(name).cloned().unwrap_or_default()
+    }
+
+    /// The one it's fondest of: whatever it has most of, the newest on a tie.
+    pub(super) fn favourite(&mut self, name: &str) -> Option<i32> {
+        let v = self.of(name);
+        let count = |k: i32| v.iter().filter(|&&x| x == k).count();
+        v.iter().rev().copied().max_by_key(|&k| count(k))
+    }
+
+    pub(super) fn tick(&mut self, dt: f32) {
+        self.save_in -= dt;
+        if self.dirty && self.save_in <= 0.0 {
+            self.save_in = 60.0;
+            self.dirty = false;
+            if let Ok(text) = serde_json::to_string(&self.map) {
+                let _ = crate::util::atomic_write(&Self::path(), text.as_bytes());
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Skills {
     map: HashMap<String, HashMap<String, f32>>,

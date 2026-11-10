@@ -1465,6 +1465,13 @@ impl App {
                 *crate::render::character::GAME_NOW.lock().unwrap() = Some(name);
                 Response::ok("game started")
             }
+            Request::Weather { name } => {
+                if crate::render::character::weather::force(&name) {
+                    Response::ok(format!("weather: {name}"))
+                } else {
+                    Response::err("weather: rain, snow, night, clear or auto")
+                }
+            }
             Request::Quit => {
                 self.exit = true;
                 Response::ok("shutting down")

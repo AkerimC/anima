@@ -89,6 +89,8 @@ enum Stage {
     Blind,
     // rods out along the floor, reeling in whatever bites
     Fishing,
+    // practising alone, or shown how by someone better at it
+    Practice,
     Cheer,
     Part,
     // someone's said "let's race": the group talks it over, then sets off
@@ -272,7 +274,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
+        Chat { practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
     }
 }
 
@@ -368,6 +370,7 @@ pub(super) struct Chat {
     regroup: bool,
     // after a game: who's had enough and wanders off (seconds until each goes)
     leavers: Vec<(usize, f32)>,
+    practice: Option<Practice>,
     // just finished a game: the next talk decides who plays on
     encore_due: bool,
     // and who's holding up the next game for those staying: proposer, game, seconds left
@@ -463,6 +466,56 @@ fn free_fishing_spot(f: &Fishing, me: usize, x: f32, lo: f32, hi: f32, size: f32
 /// Still in the hand: no giving up on it yet.
 fn wk_held(this: &CharacterOverlay, c: &Chat) -> bool {
     c.members.iter().any(|&i| this.walk_ref(i).act == Act::Held)
+}
+
+/// Things worth keeping, by prop kind.
+fn keepsake_name(kind: i32) -> &'static str {
+    match kind {
+        15 => "a star",
+        16 => "a rubber duck",
+        0 => "a carrot",
+        _ => "",
+    }
+}
+
+/// Games that can be practised alone, and how.
+const DRILLS: [(&str, Drill); 7] = [
+    ("jumping contest", Drill::High),
+    ("long jump", Drill::Long),
+    ("volleyball", Drill::High),
+    ("tag", Drill::Dash),
+    ("carrot grab", Drill::Dash),
+    ("samba", Drill::Steps),
+    ("tug of war", Drill::Pull),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drill {
+    // jumps on the spot, higher each time
+    High,
+    // a run-up and a leap forward, then back to the mark
+    Long,
+    // a sprint out and back
+    Dash,
+    // samba steps from side to side
+    Steps,
+    // leaning back hard on an imaginary rope
+    Pull,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Practice {
+    game: &'static str,
+    drill: Drill,
+    learner: usize,
+    mentor: Option<usize>,
+    // where it trains, reps left, whose go it is (true: the mentor's), seconds to the next move
+    at: f32,
+    reps: u32,
+    showing: bool,
+    wait: f32,
+    // shows what it's about to train first
+    intro: f32,
 }
 
 fn grounded(wk: &WalkState) -> bool {
@@ -673,6 +726,7 @@ impl CharacterOverlay {
             // nothing to do and nobody to do it with: getting bored
             wk.bored = if wk.social.is_none() && wk.at_leisure() { wk.bored + dt } else { 0.0 };
             wk.fish_cool = (wk.fish_cool - dt).max(0.0);
+            wk.train_cool = (wk.train_cool - dt).max(0.0);
             wk.petted = (wk.petted - dt).max(0.0);
             wk.dropped = (wk.dropped - dt).max(0.0);
             wk.team = n as f32;
@@ -695,6 +749,11 @@ impl CharacterOverlay {
         let asked = GAME_NOW.lock().unwrap().take();
         if let Some(name) = asked {
             self.force_game(&mut chats, &name, n);
+        }
+        if self.forced_train.is_some() {
+            if let Some(c) = self.start_training(n, 0.0) {
+                chats.push(c);
+            }
         }
         chats.retain_mut(|c| {
             let keep = self.prune(c, n) && self.advance(c, dt, mouse);
@@ -727,6 +786,9 @@ impl CharacterOverlay {
                 }
                 self.seek_company(n, tn().look_every);
                 if let Some(c) = self.bored_fishing(n, tn().look_every) {
+                    chats.push(c);
+                }
+                if let Some(c) = self.start_training(n, tn().look_every) {
                     chats.push(c);
                 }
                 for c in chats.iter_mut().filter(|c| c.stage == Stage::Fishing) {
@@ -877,6 +939,7 @@ impl CharacterOverlay {
     fn grow_bonds(&mut self, dt: f32) {
         self.moods.bonds.tick(dt);
         self.moods.skills.tick(dt);
+        self.moods.keepsakes.tick(dt);
         self.moods.bond_tick -= dt;
         if self.moods.bond_tick > 0.0 {
             return;
@@ -946,6 +1009,7 @@ impl CharacterOverlay {
                 Stage::Volley => "volleyball",
                 Stage::Blind => "blind man's buff",
                 Stage::Fishing => "fishing",
+                Stage::Practice => "training",
                 Stage::Concert => "concert",
                 Stage::Cheer => "celebrating",
                 Stage::RaceCall | Stage::RaceWait => "getting ready to race",
@@ -980,7 +1044,9 @@ impl CharacterOverlay {
                 .map(|(other, f, r)| serde_json::json!({ "with": other, "friend": f, "rival": r }))
                 .collect();
             let skills: Vec<serde_json::Value> = self.moods.skills.all(&name).into_iter().map(|(g, v)| serde_json::json!({ "game": g, "skill": v })).collect();
+            let keepsakes: Vec<&str> = self.moods.keepsakes.of(&name).into_iter().map(keepsake_name).collect();
             out.push(serde_json::json!({
+                "keepsakes": keepsakes,
                 "skills": skills,
                 "name": name,
                 "doing": doing,
@@ -992,6 +1058,13 @@ impl CharacterOverlay {
             }));
         }
         serde_json::Value::Array(out)
+    }
+
+    /// Busy in a game (not just chatting).
+    pub(super) fn in_game(&self, i: usize) -> bool {
+        self.walk_ref(i).social.is_some_and(|s| {
+            self.chats.iter().any(|c| c.id == s.chat && !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer))
+        })
     }
 
     /// Dancing the samba, or being the net or the ball: petting would only
@@ -1114,7 +1187,7 @@ impl CharacterOverlay {
         if !c.members.contains(&c.talker) {
             c.turn = 0.0;
         }
-        c.members.len() >= 2 || (c.stage == Stage::Fishing && !c.members.is_empty())
+        c.members.len() >= 2 || (matches!(c.stage, Stage::Fishing | Stage::Practice) && !c.members.is_empty())
     }
 
     /// Someone was picked up: the rest wait till it's back in its place.
@@ -1887,6 +1960,33 @@ impl CharacterOverlay {
     /// A game asked for by hand: whoever is nearest the middle of the
     /// screen plays right now, whatever they were up to and however tired.
     fn force_game(&mut self, chats: &mut Vec<Chat>, name: &str, n: usize) {
+        // training on request: whoever is free right now, with a teacher if there is one
+        if name == "train" {
+            let busy: Vec<usize> = chats.iter().flat_map(|c| c.members.iter().copied()).collect();
+            let middle = self.view[0] * self.view_w * 0.5 + self.view_w * 0.5;
+            let pick = (0..n)
+                .filter(|&i| !busy.contains(&i) && self.on_screen(i) && matches!(self.walk_ref(i).act, Act::Idle | Act::Walk))
+                .min_by(|&a, &b| (self.strip_px(a) - middle).abs().total_cmp(&(self.strip_px(b) - middle).abs()));
+            if let Some(i) = pick {
+                for k in 0..n {
+                    if busy.contains(&k) {
+                        continue;
+                    }
+                    let wk = self.walk_of(k);
+                    if k == i {
+                        wk.social = None;
+                        wk.race = None;
+                        wk.rest = None;
+                        wk.act = Act::Idle;
+                        wk.energy = wk.energy.max(tn().train_energy);
+                        wk.bored = tn().train_bored;
+                        wk.train_cool = 0.0;
+                    }
+                }
+                self.forced_train = Some(i);
+            }
+            return;
+        }
         let t = tn();
         let (game, need) = match name {
             "contest" => (Game::Contest, t.game_min),
@@ -2530,6 +2630,206 @@ impl CharacterOverlay {
         }
     }
 
+    /// Full of energy with nothing to do: off to practise the game it's worst
+    /// at. Someone much better at it may come over and show it how.
+    fn start_training(&mut self, n: usize, every: f32) -> Option<Chat> {
+        if self.forced_train.is_none() && (self.social_age < tn().warm_small || self.moods.fretting || self.race.is_some()) {
+            return None;
+        }
+        let forced = self.forced_train.take();
+        let i = forced.or_else(|| {
+            (0..n).find(|&i| {
+                let wk = self.walk_ref(i);
+                wk.at_leisure() && wk.act == Act::Idle && wk.energy >= tn().train_energy && wk.bored >= tn().train_bored && wk.train_cool <= 0.0 && self.on_screen(i)
+            })
+        })?;
+        if forced.is_none() && self.walk_of(i).rand() >= every / tn().train_every.max(1.0) {
+            return None;
+        }
+        // the weakest of what can be practised alone
+        let (game, drill) = DRILLS.iter().copied().min_by(|a, b| self.skill(i, a.0).total_cmp(&self.skill(i, b.0)))?;
+        let own = self.skill(i, game);
+        let x = self.strip_px(i);
+        let ws = self.walk_ref(i).ws;
+        // a better one close by and at a loose end may come and teach
+        let near: Vec<usize> = (0..n)
+            .filter(|&j| j != i && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure() && (self.strip_px(j) - x).abs() < self.view_w * 0.6)
+            .collect();
+        let mut best: Option<(usize, f32)> = None;
+        for j in near {
+            let s = self.skill(j, game);
+            let score = s + self.bond(i, j).0 * 0.2;
+            if s >= (own + tn().mentor_gap).max(0.35) && best.is_none_or(|b| score > b.1) {
+                best = Some((j, score));
+            }
+        }
+        let mentor = best.map(|b| b.0).filter(|_| forced.is_some() || self.walk.rand() < tn().mentor_chance);
+        self.walk_of(i).bored = 0.0;
+        self.chat_id = self.chat_id.wrapping_add(1);
+        let id = self.chat_id;
+        let mut members = vec![i];
+        members.extend(mentor);
+        for &m in &members {
+            self.enlist(m, id);
+        }
+        let size = self.width_of(i);
+        let width = self.strip_width_of(i);
+        let at = x.clamp(size * 3.0, (width - size * 3.0).max(size * 3.0));
+        self.go(i, at, 0.14);
+        if let Some(m) = mentor {
+            let side = if self.strip_px(m) < at { -1.0 } else { 1.0 };
+            self.go(m, at + side * size * 1.4, 0.16);
+        }
+        log::debug!("chat {id}: {i} goes to practise {game} ({own:.2}){}", mentor.map_or(String::new(), |m| format!(", {m} shows how")));
+        let mut c = Chat::new(id, members, Stage::Practice, 0.0);
+        let reps = tn().train_reps as u32 + (self.walk.rand() * 3.0) as u32;
+        c.practice = Some(Practice { game, drill, learner: i, mentor, at, reps, showing: mentor.is_some(), wait: 0.0, intro: 2.0 });
+        c.step = 9;
+        c.timer = 120.0;
+        Some(c)
+    }
+
+    /// One go at the drill for `who`, from the mark `at`. True while it's
+    /// still underway.
+    fn drill_move(&mut self, who: usize, p: &Practice, start: bool) -> bool {
+        let size = self.width_of(who);
+        let dir = if self.walk_ref(who).left { -1.0 } else { 1.0 };
+        let home = if Some(who) == p.mentor { self.goal_of(who) } else { p.at };
+        if start {
+            match p.drill {
+                Drill::High => {
+                    let h = tn().jump_height * (0.9 + self.walk.rand() * 0.8);
+                    self.walk_of(who).start_jump(h);
+                }
+                Drill::Long => {
+                    let wk = self.walk_of(who);
+                    wk.start_jump(tn().jump_height * 0.9);
+                    if let Some(r) = wk.social.as_mut() {
+                        r.goal_px = home + dir * size * 2.2;
+                        r.speed = 0.45;
+                        r.moving = true;
+                        r.leaping = true;
+                    }
+                }
+                Drill::Dash => {
+                    self.run_to(who, home + dir * size * 4.0, 0.6);
+                }
+                Drill::Steps => {
+                    let side = if self.walk.rand() < 0.5 { -1.0 } else { 1.0 };
+                    let wk = self.walk_of(who);
+                    wk.start_bob(tn().jump_height * 0.2);
+                    if let Some(r) = wk.social.as_mut() {
+                        r.goal_px = home + side * size * 0.4;
+                        r.speed = 0.3;
+                        r.moving = true;
+                        r.leaping = true;
+                    }
+                }
+                Drill::Pull => {
+                    if let Some(r) = self.walk_of(who).social.as_mut() {
+                        r.lean = if r.face_left { -tn().tug_lean * 1.3 } else { tn().tug_lean * 1.3 };
+                    }
+                }
+            }
+            return true;
+        }
+        // back to the mark once the move is done
+        let wk = self.walk_ref(who);
+        let busy = !grounded(wk) || wk.social.is_some_and(|s| s.moving);
+        if busy {
+            return true;
+        }
+        if (self.strip_px(who) - home).abs() > 6.0 {
+            self.go(who, home, 0.3);
+            return true;
+        }
+        if let Some(r) = self.walk_of(who).social.as_mut() {
+            r.lean = 0.0;
+        }
+        false
+    }
+
+    /// Training: the mentor shows each move, the learner copies it; alone it
+    /// just goes through its reps. It gets better faster with a teacher.
+    fn run_practice(&mut self, c: &mut Chat, dt: f32) -> bool {
+        let Some(mut p) = c.practice.take() else { return false };
+        if !c.members.contains(&p.learner) || c.timer <= 0.0 {
+            return false;
+        }
+        if p.mentor.is_some_and(|m| !c.members.contains(&m)) {
+            p.mentor = None;
+            p.showing = false;
+        }
+        if c.step == 9 {
+            if self.all_arrived(c) {
+                c.step = 0;
+                if let Some(m) = p.mentor {
+                    self.face(m, p.learner);
+                    self.face(p.learner, m);
+                    self.walk_of(m).gesture = true;
+                }
+            }
+            c.practice = Some(p);
+            return true;
+        }
+        // first it holds up what it's going to work on
+        if p.intro > 0.0 {
+            p.intro -= dt;
+            c.practice = Some(p);
+            return true;
+        }
+        let who = if p.showing { p.mentor.unwrap_or(p.learner) } else { p.learner };
+        if c.step == 1 {
+            if self.drill_move(who, &p, false) {
+                c.practice = Some(p);
+                return true;
+            }
+            c.step = 0;
+            p.wait = 0.5 + self.walk.rand() * 0.6;
+            if who == p.learner {
+                p.reps = p.reps.saturating_sub(1);
+                // the teacher's pleased with it
+                if let Some(m) = p.mentor {
+                    let wk = self.walk_of(m);
+                    wk.start_bob(tn().jump_height * 0.25);
+                    wk.laugh(0.6);
+                }
+            }
+            if p.mentor.is_some() {
+                p.showing = !p.showing;
+                if let (Some(m), true) = (p.mentor, p.showing) {
+                    self.face(p.learner, m);
+                }
+            }
+        }
+        if p.reps == 0 {
+            // done: that's sunk in, and it's tired
+            let name = self.character_name(p.learner);
+            let teach = p.mentor.map_or(0.0, |m| (self.skill(m, p.game) - self.skill(p.learner, p.game)).max(0.0) * tn().mentor_boost);
+            self.moods.skills.practice(&name, p.game, teach);
+            if let Some(m) = p.mentor {
+                let mn = self.character_name(m);
+                self.moods.skills.practice(&mn, p.game, 0.0);
+                self.add_bond(p.learner, m, tn().bond_game, 0.0);
+            }
+            log::debug!("chat {}: {} finished practising {}{}", c.id, p.learner, p.game, if p.mentor.is_some() { " with a teacher" } else { "" });
+            for &i in &c.members.clone() {
+                self.spend(i, tn().train_cost);
+                let wk = self.walk_of(i);
+                wk.train_cool = tn().train_again;
+                wk.start_jump(tn().jump_height * 0.7);
+            }
+            return false;
+        }
+        p.wait -= dt;
+        if c.step == 0 && p.wait <= 0.0 {
+            self.drill_move(who, &p, true);
+            c.step = 1;
+        }
+        c.practice = Some(p);
+        true
+    }
+
     /// Now and then something comes up beside the anglers: they drop
     /// everything and run, and it sinks back after 2-3 seconds.
     fn run_beast(&mut self, f: &mut Fishing, first: usize, dt: f32) {
@@ -2812,6 +3112,10 @@ impl CharacterOverlay {
                     }
                     // a good catch keeps it interested, junk wears it down
                     a.patience += if good { tn().fish_catch_keeps } else { -tn().fish_lost_cost };
+                    if good && keepsake_name(a.item) != "" {
+                        let name = self.character_name(a.i);
+                        self.moods.keepsakes.add(&name, a.item);
+                    }
                     if good {
                         // a good one: up it jumps, high and happy
                         let wk = self.walk_of(a.i);
@@ -2828,6 +3132,10 @@ impl CharacterOverlay {
                     let inside = [15, 16, 0, 20];
                     a.item = inside[(self.walk.rand() * inside.len() as f32) as usize % inside.len()];
                     log::debug!("chat {}: {} opens the present: kind {}", c.id, a.i, a.item);
+                    if keepsake_name(a.item) != "" {
+                        let name = self.character_name(a.i);
+                        self.moods.keepsakes.add(&name, a.item);
+                    }
                     let wk = self.walk_of(a.i);
                     wk.start_jump(tn().jump_height * 1.2);
                     wk.laugh(tn().laugh_time);
@@ -3565,6 +3873,24 @@ impl CharacterOverlay {
     /// Things drawn beside the characters: (kind, surface box, mirrored).
     pub(super) fn props(&self) -> Vec<(i32, [f32; 4], bool, usize)> {
         let mut v: Vec<(i32, [f32; 4], bool, usize)> = self.chats.iter().filter(|c| c.stage == Stage::Carrot && c.step != 9).filter_map(|c| Some((0, self.carrot_rect(c)?, false, *c.members.first()?))).collect();
+        // training: what it's about to practise, over its head
+        for c in self.chats.iter().filter(|c| c.stage == Stage::Practice && c.step != 9) {
+            let Some(p) = c.practice else { continue };
+            if p.intro <= 0.0 {
+                continue;
+            }
+            let r = if p.learner == 0 { self.hit_rect } else if let Some(e) = self.extras.get(p.learner - 1) { e.hit_rect } else { continue };
+            let h = r[3] - r[1];
+            let icon = match p.drill {
+                Drill::High | Drill::Long => 15,
+                Drill::Dash => 7,
+                Drill::Steps => 20,
+                Drill::Pull => 3,
+            };
+            let size = h * 0.4;
+            let x = (r[0] + r[2]) * 0.5;
+            v.push((icon, [x - size * 0.5, r[1] - size * 0.6, x + size * 0.5, r[1] - size * 0.6 + size], false, p.learner));
+        }
         // "let's play this next": held up over the head
         for c in self.chats.iter().filter(|c| c.stage == Stage::Talk && c.leavers.is_empty()) {
             let Some((p, game, t)) = c.offer else { continue };
@@ -5528,6 +5854,7 @@ impl CharacterOverlay {
             Stage::Volley => self.run_volley(c, dt),
             Stage::Blind => self.run_blind(c, dt),
             Stage::Fishing => self.run_fishing(c, dt),
+            Stage::Practice => return self.run_practice(c, dt),
             Stage::Cheer => {
                 if c.timer <= 0.0 {
                     c.all_cheer = false;

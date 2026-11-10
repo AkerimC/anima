@@ -61,6 +61,15 @@ tuning! {
     "Games", "Getting better" {
         skill_rate: "Learning per game played" = 0.1, 0.0, 1.0, 0.01, 2;
         skill_teach: "Learning from a better friend" = 0.15, 0.0, 1.0, 0.01, 2;
+        train_energy: "Energy to go and train alone" = 0.6, 0.0, 1.0, 0.05, 2;
+        train_bored: "Idle before training (s)" = 40.0, 0.0, 1800.0, 5.0, 0;
+        train_every: "Goes to train within about (s)" = 120.0, 1.0, 3600.0, 5.0, 0;
+        train_reps: "Moves per session" = 6.0, 1.0, 30.0, 1.0, 0;
+        train_cost: "Energy a session costs" = 0.3, 0.0, 1.0, 0.05, 2;
+        train_again: "Rest before training again (s)" = 600.0, 0.0, 7200.0, 30.0, 0;
+        mentor_chance: "A better one comes to teach" = 0.6, 0.0, 1.0, 0.05, 2;
+        mentor_gap: "Teacher at least this much better" = 0.25, 0.0, 1.0, 0.05, 2;
+        mentor_boost: "Learning from a teacher" = 0.5, 0.0, 2.0, 0.05, 2;
         skill_volley: "Beginners miss the ball" = 0.3, 0.0, 1.0, 0.05, 2;
     }
     "Games", "Blind man's buff" {
@@ -123,6 +132,9 @@ tuning! {
     }
     "Roaming", "Sleep" {
         sleep_after: "Untouched for (s)" = 300.0, 25.0, 3600.0, 15.0, 0;
+        night_sleep: "Go to bed at night (share)" = 0.5, 0.0, 1.0, 0.05, 2;
+        night_spread: "Going to bed one by one (s)" = 90.0, 0.0, 1800.0, 5.0, 0;
+        snow_hop: "Hop after snowflakes (per s)" = 0.06, 0.0, 2.0, 0.01, 2;
         sleep_spread: "Dozing off one by one (s)" = 15.0, 0.0, 120.0, 1.0, 0;
         sleep_sink: "Sinking while lying down" = 0.55, 0.0, 1.0, 0.05, 2;
         nap_games: "Games before a nap" = 3.0, 1.0, 20.0, 1.0, 0;

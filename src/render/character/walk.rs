@@ -126,6 +126,13 @@ pub(super) struct WalkState {
     pub(super) greet_cool: f32,
     // seconds with nothing to do and nobody around
     pub(super) bored: f32,
+    // trained a while ago: not again for a bit
+    pub(super) train_cool: f32,
+    // its favourite keepsake while resting (-1: has none)
+    pub(super) keepsake: Option<i32>,
+    // night: seconds until it goes to bed, and whether it's in bed for the night
+    pub(super) night_wait: Option<f32>,
+    pub(super) night_sleep: bool,
     // the state machine's bookkeeping: current state, seconds in it, and
     // whether a walk is getting anywhere
     pub(super) state_act: Act,

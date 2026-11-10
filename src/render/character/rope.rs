@@ -136,7 +136,7 @@ void main() {
 // 4 a sleeping Z, 5 a drop of sweat, 6 a crumb of carrot, 7 the arrow over "it",
 // 8 a blindfold, 9 a bush, 10 a barrel, 11 a crate, 12 a music note,
 // 13 a fishing rod, 14 a line and float, 15 a star, 16 a rubber duck, 17 an old boot, 18 a tin can,
-// 20 confetti, 21 a beast out of the ground
+// 20 confetti, 21 a beast out of the ground, 22 an umbrella, 23 a snowflake
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
@@ -310,6 +310,26 @@ vec4 beast(vec2 p) {
     if (eyes > 0.0) col = pupils > 0.0 ? vec3(0.8, 0.05, 0.05) : vec3(1.0, 0.95, 0.6);
     return vec4(col, max(max(body, arm), horn));
 }
+vec4 umbrella(vec2 p) {
+    // canopy: a half disc with scalloped rim, on a hooked handle
+    float d = length(p - vec2(0.0, -0.75));
+    float top = step(-0.75, p.y) * (1.0 - smoothstep(1.48, 1.53, d));
+    float rim = 0.12 * abs(sin((p.x + 1.0) * 3.14159 * 2.5));
+    top *= step(-0.75 + rim, p.y);
+    float stick = bar(p, vec2(-0.03, -1.0), vec2(0.03, -0.72));
+    float tip = disc(p, vec2(0.0, 0.8), 0.06);
+    float panel = step(0.0, sin(atan(p.y + 0.75, p.x) * 8.0));
+    vec3 col = mix(vec3(0.95, 0.45, 0.55), vec3(1.0, 0.85, 0.9), panel);
+    if (stick > 0.0 || tip > 0.0) col = vec3(0.35, 0.25, 0.2);
+    return vec4(col, max(max(top, stick), tip));
+}
+vec4 snowflake(vec2 p) {
+    float a = atan(p.y, p.x);
+    float r = length(p);
+    float arms = smoothstep(0.18, 0.05, abs(sin(a * 3.0)) * r) * step(r, 0.9);
+    float core = disc(p, vec2(0.0), 0.2);
+    return vec4(vec3(0.95, 0.97, 1.0), max(arms, core) * 0.9);
+}
 vec4 confetti(vec2 p) {
     vec2 cell = floor((p + 1.0) * 4.0);
     vec2 f = fract((p + 1.0) * 4.0) - 0.5;
@@ -321,7 +341,7 @@ vec4 confetti(vec2 p) {
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;

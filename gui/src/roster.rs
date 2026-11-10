@@ -278,6 +278,19 @@ fn status_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk:
         }
         b.append(&grid);
     }
+    let keeps: Vec<&str> = me["keepsakes"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    if !keeps.is_empty() {
+        // "a star ×3, a rubber duck"
+        let mut seen: Vec<(&str, usize)> = Vec::new();
+        for k in keeps {
+            match seen.iter_mut().find(|s| s.0 == k) {
+                Some(s) => s.1 += 1,
+                None => seen.push((k, 1)),
+            }
+        }
+        let text = seen.iter().map(|(k, n)| if *n > 1 { format!("{k} ×{n}") } else { k.to_string() }).collect::<Vec<_>>().join(", ");
+        b.append(&line("Keepsakes", text));
+    }
     let played = me["played"].as_f64().unwrap_or(0.0);
     if played >= 0.5 {
         b.append(&line("Games lately", format!("{played:.0}")));

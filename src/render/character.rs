@@ -35,6 +35,7 @@ mod social;
 mod spaces;
 mod uma;
 mod walk;
+pub mod weather;
 
 use race::Race;
 use social::Chat;
@@ -377,6 +378,10 @@ precision highp float;
 in vec2 v_uv;
 
 uniform sampler2D u_tex;
+uniform float u_sleep;   // eyes closed (0..1)
+uniform vec4 u_eye_l;
+uniform vec4 u_eye_r;
+uniform vec3 u_skin;
 // 0 = custom texture/sprite, 1 = reze, 2 = neko, 3 = cyber, 4 = spirit
 uniform int u_mode;
 // u_tex is already premultiplied (3D model render target)
@@ -957,6 +962,24 @@ void main() {
         vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
         c = texture(u_tex, clamp(uv, 0.0, 1.0));
         if (u_premul == 1 && c.a > 0.0) c.rgb /= c.a;
+        // asleep: eyelids over both eyes, a soft closed line on each
+        if (u_sleep > 0.0 && c.a > 0.5) {
+            for (int k = 0; k < 2; k++) {
+                vec4 e = k == 0 ? u_eye_l : u_eye_r;
+                vec2 mid = (e.xy + e.zw) * 0.5;
+                vec2 rad = max((e.zw - e.xy) * 0.62, vec2(0.004));
+                vec2 q = (uv - mid) / rad;
+                float r = length(q);
+                if (r < 1.0) {
+                    float lid = smoothstep(1.0, 0.85, r) * u_sleep;
+                    c.rgb = mix(c.rgb, u_skin, lid);
+                    // the closed eye: a curve smiling down, thicker in the middle
+                    float curve = q.y - (0.12 + 0.35 * q.x * q.x);
+                    float line = smoothstep(0.16, 0.05, abs(curve)) * smoothstep(0.95, 0.6, abs(q.x));
+                    c.rgb = mix(c.rgb, vec3(0.28, 0.17, 0.18), line * u_sleep);
+                }
+            }
+        }
         c.a *= u_opacity;
     } else if (u_mode == 1) {
         c = render_reze(v_uv);
@@ -1019,6 +1042,8 @@ pub struct CharacterOverlay {
     // who starts the race a big chat set off
     // the group that decided to race together, in the order they set off
     race_crew: Vec<usize>,
+    // `anima game train`: who's been sent to practise
+    forced_train: Option<usize>,
     // seconds before another race can start by itself
     race_quiet: f32,
     // seconds since the characters appeared
@@ -1060,8 +1085,12 @@ pub struct CharacterOverlay {
     pending: Option<glow::Texture>,
     // what's drawn: the side it faces and the pose, each changed half way
     // through a short turn or squash so nothing snaps from one frame to the next
+    // where its eyes are on the calm sprite, and its skin colour: lids for sleeping
+    eyes: Option<([f32; 4], [f32; 4], [f32; 3])>,
     drawn_left: bool,
     drawn_happy: bool,
+    // eyelids, 0 open .. 1 shut
+    lids: f32,
     turn_t: f32,
     swap_t: f32,
     // where it stands among those level with it; reshuffled when it sets off
@@ -1193,6 +1222,7 @@ impl CharacterOverlay {
             carrot_gl: None,
             new_chats: Vec::new(),
             race_crew: Vec::new(),
+            forced_train: None,
             race_quiet: 0.0,
             social_age: 0.0,
             view_w: 1.0,
@@ -1215,8 +1245,10 @@ impl CharacterOverlay {
             last_act: Act::Idle,
             spawned: false,
             pending: None,
+            eyes: None,
             drawn_left: false,
             drawn_happy: false,
+            lids: 0.0,
             turn_t: 0.0,
             swap_t: 0.0,
             active: None,
@@ -1342,6 +1374,7 @@ impl CharacterOverlay {
             if bottom > top {
                 self.opaque = [half / w as f32, top as f32 / h as f32, bottom as f32 / h as f32];
             }
+            self.eyes = uma::find_eyes(&img);
             let tex = create_texture(gl, w, h, img.as_raw(), Filter::Linear, true)?;
             self.sprite_tex = Some((tex, w, h));
 
@@ -2124,6 +2157,17 @@ impl CharacterOverlay {
                 (true, Some(h)) => h,
                 _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),
             };
+            // asleep in the calm pose: eyes shut, slowly
+            let asleep = !self.drawn_happy && self.walk.rest.is_some_and(|r| r.kind == moods::RestKind::Sleep) && self.walk.act == Act::Rest;
+            let goal = if asleep && self.eyes.is_some() { 1.0 } else { 0.0 };
+            self.lids += (goal - self.lids) * (dt * 3.0).min(1.0);
+            let lids = if self.lids < 0.02 { 0.0 } else { self.lids };
+            self.program.set_f32(gl, "u_sleep", lids);
+            if let Some((l, r, skin)) = self.eyes {
+                self.program.set_vec4(gl, "u_eye_l", l);
+                self.program.set_vec4(gl, "u_eye_r", r);
+                self.program.set_vec3(gl, "u_skin", skin[0], skin[1], skin[2]);
+            }
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             self.program.set_i32(gl, "u_tex", 0);
 

@@ -154,6 +154,10 @@ enum Cmd {
     Game {
         name: String,
     },
+    /// Set the weather by hand: rain, snow, night, clear, or auto.
+    Weather {
+        name: String,
+    },
     /// Show daemon and monitor status.
     Status {
         #[arg(long)]
@@ -371,6 +375,7 @@ fn run() -> Result<()> {
         Cmd::Race => Request::Race,
         Cmd::Lockscreen { state } => Request::LockScreen { on: state != "off" },
         Cmd::Game { name } => Request::Game { name },
+        Cmd::Weather { name } => Request::Weather { name },
         Cmd::Status { monitor, .. } => Request::Status { monitor },
         Cmd::Monitors => Request::ListMonitors,
         Cmd::List { .. }
