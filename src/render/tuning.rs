@@ -135,6 +135,7 @@ tuning! {
         carry_keepsake: "Carries its favourite keepsake on its back (share of the time)" = 0.4, 0.0, 1.0, 0.05, 2;
         weather_show: "Weather shown: 0 off, 1 around them, 2 whole screen" = 1.0, 0.0, 2.0, 1.0, 0;
         jolt_drop: "A tumble knocks the umbrella out of the hand" = 0.7, 0.0, 1.0, 0.05, 2;
+        parasol_drag: "Open umbrella on the back slows games (speed share)" = 0.85, 0.3, 1.0, 0.05, 2;
         parasol_fall: "Gravity under an open umbrella (share)" = 0.3, 0.05, 1.0, 0.05, 2;
         parasol_speed: "Fastest fall under an open umbrella" = 2.0, 0.2, 20.0, 0.1, 1;
         drop_swing: "Swung this hard, the umbrella flies off" = 5.0, 0.5, 30.0, 0.5, 1;

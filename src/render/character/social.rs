@@ -525,6 +525,7 @@ fn grounded(wk: &WalkState) -> bool {
 impl WalkState {
     /// In a chat, on the ground: walk to the goal or stand facing the others.
     pub(super) fn social_step(&mut self, dt: f32) -> Option<(f32, bool, f32)> {
+        let drag = self.drag();
         if !grounded(self) {
             return None;
         }
@@ -535,7 +536,7 @@ impl WalkState {
         r.leaping = false;
         if r.moving {
             let d = r.goal - self.x;
-            let s = r.speed * dt;
+            let s = r.speed * dt * drag;
             if d.abs() > s {
                 self.x += d.signum() * s;
                 self.left = if r.face_lock { r.face_left } else { d < 0.0 };
@@ -666,11 +667,12 @@ impl WalkState {
 
     /// Tag, dropped by hand: already running on the way down. True if it did.
     pub(super) fn tag_fall_run(&mut self, dt: f32) -> bool {
+        let drag = self.drag();
         let Some(r) = self.social.as_mut().filter(|r| r.inside && !r.flying) else { return false };
         self.vx = 0.0;
         if r.moving {
             let d = r.goal - self.x;
-            let s = r.speed * dt;
+            let s = r.speed * dt * drag;
             if d.abs() > 1e-4 {
                 self.left = d < 0.0;
             }
@@ -681,9 +683,10 @@ impl WalkState {
 
     /// Leaping over someone: keeps moving while in the air.
     pub(super) fn social_hop(&mut self, dt: f32) {
+        let drag = self.drag();
         let Some(r) = self.social.as_mut().filter(|r| r.leaping && r.moving) else { return };
         let d = r.goal - self.x;
-        let s = r.speed * dt;
+        let s = r.speed * dt * drag;
         if r.face_lock {
             self.left = r.face_left;
         } else if d.abs() > 1e-4 {
@@ -1071,12 +1074,12 @@ impl CharacterOverlay {
     /// What it does with its umbrella in the rain, by what it's up to: 0 none
     /// (it's the volleyball), 1 open in the hand (chatting, watching, the
     /// samba, the top of the volleyball net), 2 open and strapped to its back
-    /// (hands busy but standing about: fishing, giving a present), 3 rolled up
-    /// on its back (running about: every other game, a race).
+    /// (any other game, a race: hands free, and it slows them down), 3 rolled
+    /// up on its back (the long jump, domino).
     pub(super) fn umbrella_mode(&self, i: usize) -> u8 {
         let wk = self.walk_ref(i);
         if wk.race.is_some() {
-            return 3;
+            return 2;
         }
         let Some(s) = wk.social else { return 1 };
         let Some(c) = self.chats.iter().chain(self.new_chats.iter()).find(|c| c.id == s.chat) else { return 1 };
@@ -1086,13 +1089,15 @@ impl CharacterOverlay {
         match c.stage {
             Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer | Stage::RaceCall | Stage::RaceWait => 1,
             Stage::Samba | Stage::Concert => 1,
-            Stage::Gift | Stage::Fishing => 2,
+            // jumping for distance or toppling over: rolled up out of the way
+            Stage::Long | Stage::Domino => 3,
             Stage::Volley => match c.volley.as_ref() {
                 Some(v) if v.ball == i => 0,
                 Some(v) if v.net.last() == Some(&i) => 1,
-                _ => 3,
+                _ => 2,
             },
-            _ => 3,
+            // everything else: open on its back, and it catches the air
+            _ => 2,
         }
     }
 

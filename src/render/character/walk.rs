@@ -172,6 +172,12 @@ pub(super) struct WalkState {
 pub(super) const PAT_DUR: f32 = 1.4;
 
 impl WalkState {
+    /// An open umbrella on its back in a game or a race catches the air:
+    /// a bit slower on its feet.
+    pub(super) fn drag(&self) -> f32 {
+        if self.parasol && self.brolly == 2 { tn().parasol_drag } else { 1.0 }
+    }
+
     /// Up or on its way to somewhere else, not on the ground strolling.
     pub(super) fn climb_like(&self) -> bool {
         self.trip.is_some() || self.rest.is_some()

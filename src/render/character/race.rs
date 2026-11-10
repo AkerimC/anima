@@ -592,6 +592,7 @@ impl WalkState {
     /// A racer on the ground: walk to the goal the race gives, stand about
     /// once there. None when not racing (or busy jumping, held, ...).
     pub(super) fn race_step(&mut self, dt: f32) -> Option<(f32, bool, f32)> {
+        let drag = self.drag();
         if let Some(r) = self.race.as_mut().filter(|_| matches!(self.act, Act::Idle | Act::Walk | Act::Chase)) {
             // carried off the start line: back to it
             if r.leg == Leg::Lined && (r.goal - self.x).abs() > 0.02 {
@@ -603,7 +604,7 @@ impl WalkState {
             }
             let walking = matches!(r.leg, Leg::ToStart | Leg::Mill | Leg::Watch | Leg::Invite | Leg::Line | Leg::Run);
             let d = r.goal - self.x;
-            let s = r.speed * dt;
+            let s = r.speed * dt * drag;
             if walking && d.abs() > s {
                 self.x += d.signum() * s;
                 self.left = d < 0.0;
@@ -632,13 +633,14 @@ impl WalkState {
 
     /// Hopping over someone mid-race: keep going.
     pub(super) fn race_hop(&mut self, dt: f32) {
+        let drag = self.drag();
         // getting up from a fall isn't running
         if self.race_down {
             return;
         }
         if let Some(r) = self.race.as_mut().filter(|r| r.leg == Leg::Run) {
             let d = r.goal - self.x;
-            let s = r.speed * dt;
+            let s = r.speed * dt * drag;
             if d.abs() <= s {
                 self.x = r.goal;
                 r.leg = Leg::Done;
