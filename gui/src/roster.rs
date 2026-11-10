@@ -202,6 +202,10 @@ fn choices(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, path: &str) -> gtk::Wid
     let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
     wear.connect_clicked(move |_| p.set_child(Some(&wardrobe_view(&rr, &p, i, &n))));
     list.append(&wear);
+    let fit = menu_button("Fit accessories", "object-flip-horizontal-symbolic");
+    let (rr, p, n, pth) = (r.clone(), pop.clone(), name.clone(), path.to_string());
+    fit.connect_clicked(move |_| p.set_child(Some(&fit_view(&rr, &p, i, &n, &pth))));
+    list.append(&fit);
     list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let remove = menu_button("Remove from line-up", "user-trash-symbolic");
     let (rr, p) = (r.clone(), pop.clone());
@@ -316,6 +320,244 @@ fn wardrobe_all() -> serde_json::Map<String, serde_json::Value> {
 
 /// What the character wears: a switch for each thing there is. The weather
 /// and Christmas put on their own things on top of these.
+fn fits_all() -> anima::render::character::wear::Fits {
+    std::fs::read_to_string(anima::render::character::wear::fit_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn save_fits(f: &anima::render::character::wear::Fits) {
+    if let Ok(text) = serde_json::to_string_pretty(f) {
+        let _ = anima::util::atomic_write(&anima::render::character::wear::fit_path(), text.as_bytes());
+    }
+}
+
+/// The calm sprite as a cairo surface, premultiplied as cairo wants it.
+fn sprite_surface(path: &str) -> Option<(gtk::cairo::ImageSurface, image::RgbaImage)> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let mut surf = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, w as i32, h as i32).ok()?;
+    let stride = surf.stride() as usize;
+    {
+        let mut data = surf.data().ok()?;
+        for (x, y, p) in img.enumerate_pixels() {
+            let a = p[3] as u32;
+            let o = y as usize * stride + x as usize * 4;
+            data[o] = (p[2] as u32 * a / 255) as u8;
+            data[o + 1] = (p[1] as u32 * a / 255) as u8;
+            data[o + 2] = (p[0] as u32 * a / 255) as u8;
+            data[o + 3] = a as u8;
+        }
+    }
+    Some((surf, img))
+}
+
+/// Fitting what it wears by hand: each accessory is a box on the picture;
+/// drag it to move it, drag its corner or scroll to size it. Saved as it's
+/// done, and shown on the desktop at once.
+fn fit_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str) -> gtk::Widget {
+    use anima::render::character::wear;
+    use std::cell::{Cell, RefCell};
+    let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(320).build();
+    b.append(&back_header(r, pop, i, name, "Fit accessories"));
+    // what it wears, plus the Santa hat
+    let on: Vec<String> = wardrobe_all().get(name).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let mut items: Vec<wear::Item> = wear::catalog().into_iter().filter(|it| on.contains(&it.id)).collect();
+    items.push(wear::santa_item());
+    let Some((surf, img)) = sprite_surface(path) else {
+        b.append(&gtk::Label::new(Some("Couldn't read its picture")));
+        return b.upcast();
+    };
+    let Some(anchors) = anima::render::anchors::find(&img) else {
+        b.append(&gtk::Label::new(Some("Couldn't find its head on the picture")));
+        return b.upcast();
+    };
+    let hint = gtk::Label::builder()
+        .label("Pick one, then drag its box to move it, drag the corner or scroll over it to size it.")
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    hint.add_css_class("dim-label");
+    b.append(&hint);
+    let faces_right = path.contains("_0010.") || path.contains("_0011.");
+    let fits: Rc<RefCell<wear::Fits>> = Rc::new(RefCell::new(fits_all()));
+    let pick: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let items = Rc::new(items);
+    let who = name.to_string();
+    let (iw, ih) = (img.width() as f64, img.height() as f64);
+    // the picture inside the widget: scale and offset
+    let place = move |w: f64, h: f64| {
+        let s = (w / iw).min(h / ih);
+        (s, (w - iw * s) * 0.5, (h - ih * s) * 0.5)
+    };
+    let fit_of = {
+        let (fits, who) = (fits.clone(), who.clone());
+        move |id: &str| fits.borrow().get(&who).and_then(|m| m.get(id)).copied()
+    };
+    let rect_of = {
+        let (items, fit_of) = (items.clone(), fit_of.clone());
+        move |k: usize| -> [f64; 4] {
+            let it = &items[k];
+            let [l, t, w, h] = wear::layout(&anchors, it, faces_right, fit_of(&it.id));
+            [l as f64 * iw, t as f64 * ih, w as f64 * iw, h as f64 * ih]
+        }
+    };
+    let area = gtk::DrawingArea::builder().content_width(300).content_height(340).build();
+    {
+        let (pick, items, rect_of) = (pick.clone(), items.clone(), rect_of.clone());
+        area.set_draw_func(move |_, cr, w, h| {
+            let (s, ox, oy) = place(w as f64, h as f64);
+            cr.set_source_rgb(0.16, 0.16, 0.18);
+            let _ = cr.paint();
+            let _ = cr.save();
+            cr.translate(ox, oy);
+            cr.scale(s, s);
+            let _ = cr.set_source_surface(&surf, 0.0, 0.0);
+            let _ = cr.paint();
+            let _ = cr.restore();
+            for k in 0..items.len() {
+                let [x, y, rw, rh] = rect_of(k);
+                let (x, y, rw, rh) = (ox + x * s, oy + y * s, rw * s, rh * s);
+                let chosen = k == pick.get();
+                if chosen {
+                    cr.set_source_rgba(1.0, 0.45, 0.65, 0.25);
+                    cr.rectangle(x, y, rw, rh);
+                    let _ = cr.fill();
+                    cr.set_source_rgb(1.0, 0.45, 0.65);
+                    cr.set_line_width(2.0);
+                } else {
+                    cr.set_source_rgba(0.8, 0.8, 0.85, 0.7);
+                    cr.set_line_width(1.0);
+                }
+                cr.rectangle(x, y, rw, rh);
+                let _ = cr.stroke();
+                if chosen {
+                    // the corner to size it by
+                    cr.rectangle(x + rw - 5.0, y + rh - 5.0, 10.0, 10.0);
+                    let _ = cr.fill();
+                }
+                cr.set_font_size(10.0);
+                cr.move_to(x + 2.0, y - 3.0);
+                let _ = cr.show_text(&items[k].label);
+            }
+        });
+    }
+    // dragging: move, or size from the corner
+    let save = {
+        let fits = fits.clone();
+        move || save_fits(&fits.borrow())
+    };
+    let set_fit = {
+        let (fits, who) = (fits.clone(), who.clone());
+        move |id: &str, f: [f32; 4]| {
+            fits.borrow_mut().entry(who.clone()).or_default().insert(id.to_string(), f);
+        }
+    };
+    let drag = gtk::GestureDrag::new();
+    let start: Rc<Cell<Option<([f32; 4], bool)>>> = Rc::new(Cell::new(None));
+    {
+        let (pick, items, rect_of, start, fit_of, area2) = (pick.clone(), items.clone(), rect_of.clone(), start.clone(), fit_of.clone(), area.clone());
+        drag.connect_drag_begin(move |g, x, y| {
+            let Some(w) = g.widget() else { return };
+            let (s, ox, oy) = place(w.width() as f64, w.height() as f64);
+            let (px, py) = ((x - ox) / s, (y - oy) / s);
+            // the corner of the one picked, else whichever box it's in (smallest first)
+            let [cx, cy, cw, ch] = rect_of(pick.get());
+            let corner = ((px - (cx + cw)).abs() * s < 9.0) && ((py - (cy + ch)).abs() * s < 9.0);
+            if !corner {
+                let mut hit: Option<(usize, f64)> = None;
+                for k in 0..items.len() {
+                    let [rx, ry, rw, rh] = rect_of(k);
+                    if px >= rx && px <= rx + rw && py >= ry && py <= ry + rh && hit.is_none_or(|h| rw * rh < h.1) {
+                        hit = Some((k, rw * rh));
+                    }
+                }
+                if let Some((k, _)) = hit {
+                    pick.set(k);
+                }
+            }
+            let id = &items[pick.get()].id;
+            start.set(Some((fit_of(id).unwrap_or([0.0, 0.0, 1.0, 1.0]), corner)));
+            area2.queue_draw();
+        });
+    }
+    {
+        let (pick, items, start, set_fit, area2, rect_of) = (pick.clone(), items.clone(), start.clone(), set_fit.clone(), area.clone(), rect_of.clone());
+        drag.connect_drag_update(move |g, dx, dy| {
+            let Some(w) = g.widget() else { return };
+            let Some((f, corner)) = start.get() else { return };
+            let (s, _, _) = place(w.width() as f64, w.height() as f64);
+            let (du, dv) = ((dx / s / iw) as f32, (dy / s / ih) as f32);
+            let id = items[pick.get()].id.clone();
+            let next = if corner {
+                // grow from the corner: the box's size at the start of the drag, plus the pull
+                let base = rect_of(pick.get());
+                let k = ((du / (base[2] / iw) as f32 + dv / (base[3] / ih) as f32) * 0.5).max(-0.9);
+                [f[0], f[1], (f[2] * (1.0 + k)).max(0.1), (f[3] * (1.0 + k)).max(0.1)]
+            } else {
+                [f[0] + du, f[1] + dv, f[2], f[3]]
+            };
+            set_fit(&id, next);
+            area2.queue_draw();
+        });
+    }
+    {
+        let (save, start, u) = (save.clone(), start.clone(), r.ui.clone());
+        drag.connect_drag_end(move |_, _, _| {
+            start.set(None);
+            save();
+            u.say("Fitted");
+        });
+    }
+    area.add_controller(drag);
+    // the wheel sizes the one picked
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    {
+        let (pick, items, set_fit, fit_of, area2, save) = (pick.clone(), items.clone(), set_fit.clone(), fit_of.clone(), area.clone(), save.clone());
+        scroll.connect_scroll(move |_, _, dy| {
+            let id = items[pick.get()].id.clone();
+            let f = fit_of(&id).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+            let k = if dy < 0.0 { 1.06 } else { 1.0 / 1.06 };
+            set_fit(&id, [f[0], f[1], (f[2] * k).clamp(0.1, 6.0), (f[3] * k).clamp(0.1, 6.0)]);
+            area2.queue_draw();
+            save();
+            gtk::glib::Propagation::Stop
+        });
+    }
+    area.add_controller(scroll);
+    let frame = gtk::Frame::builder().child(&area).build();
+    b.append(&frame);
+    // which one: buttons by name
+    let names = gtk::FlowBox::builder().selection_mode(gtk::SelectionMode::None).max_children_per_line(3).build();
+    for k in 0..items.len() {
+        let btn = gtk::Button::with_label(&items[k].label);
+        btn.add_css_class("flat");
+        let (pick, area2) = (pick.clone(), area.clone());
+        btn.connect_clicked(move |_| {
+            pick.set(k);
+            area2.queue_draw();
+        });
+        names.insert(&btn, -1);
+    }
+    b.append(&names);
+    let reset = gtk::Button::with_label("Reset the one picked");
+    {
+        let (pick, items, fits, who, area2, save) = (pick.clone(), items.clone(), fits.clone(), who.clone(), area.clone(), save.clone());
+        reset.connect_clicked(move |_| {
+            if let Some(m) = fits.borrow_mut().get_mut(&who) {
+                m.remove(&items[pick.get()].id);
+            }
+            save();
+            area2.queue_draw();
+        });
+    }
+    b.append(&reset);
+    if on.is_empty() {
+        let none = gtk::Label::builder().label("It wears nothing yet: pick things in Wardrobe (the Santa hat is here to fit for Christmas).").wrap(true).xalign(0.0).build();
+        none.add_css_class("dim-label");
+        b.append(&none);
+    }
+    b.upcast()
+}
+
 fn wardrobe_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk::Widget {
     use anima::render::character::wear;
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(280).build();

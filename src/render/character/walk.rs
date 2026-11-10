@@ -369,7 +369,7 @@ impl WalkState {
                 let speed = if chase {
                     tn().chase_speed
                 } else if self.fret {
-                    tn().walk_speed * tn().cpu_run
+                    tn().walk_speed * 4.0
                 } else {
                     tn().walk_speed
                 };

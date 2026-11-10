@@ -86,6 +86,45 @@ pub fn accessories_dir() -> PathBuf {
     crate::util::data_dir().join("accessories")
 }
 
+/// Hand-made adjustments: character name -> item id -> [dx, dy, wide, tall]:
+/// moved by dx, dy (texture units of the calm sprite) and scaled.
+pub fn fit_path() -> PathBuf {
+    crate::util::data_dir().join("fit.json")
+}
+
+pub type Fits = HashMap<String, HashMap<String, [f32; 4]>>;
+
+/// Where `item` goes on a sprite with these anchors: left, top, width,
+/// height in texture units of the calm sprite (not mirrored), with the
+/// hand-made `fit` applied. `faces_right`: the sprite looks right (Uma
+/// sprites do), so the right hand is the one in front.
+pub fn layout(a: &crate::render::anchors::Anchors, item: &Item, faces_right: bool, fit: Option<[f32; 4]>) -> [f32; 4] {
+    let (hw, hh) = ((a.head[2] - a.head[0]).max(0.01), (a.head[3] - a.head[1]).max(0.01));
+    let p = anchor_point(a, item.anchor, faces_right);
+    let [dx, dy, sw, sh] = fit.unwrap_or([0.0, 0.0, 1.0, 1.0]);
+    let (w, h) = (item.size[0] * hw * sw, item.size[1] * hh * sh);
+    // scaled about where it sits, then moved
+    let left = p[0] + item.offset[0] * hw - item.pivot[0] * w + dx;
+    let top = p[1] + item.offset[1] * hh - item.pivot[1] * h + dy;
+    [left, top, w, h]
+}
+
+pub fn anchor_point(a: &crate::render::anchors::Anchors, anchor: Anchor, faces_right: bool) -> [f32; 2] {
+    match anchor {
+        Anchor::Crown => [(a.head[0] + a.head[2]) * 0.5, a.head[1]],
+        Anchor::Eyes => [(a.eyes[0][0] + a.eyes[1][0]) * 0.5, (a.eyes[0][1] + a.eyes[1][1]) * 0.5],
+        Anchor::Neck => a.neck,
+        Anchor::Back => a.back,
+        Anchor::Hand => if faces_right { a.hands[1] } else { a.hands[0] },
+        Anchor::Chest => [(a.hands[0][0] + a.hands[1][0]) * 0.5, a.neck[1] + (a.feet[1] - a.neck[1]) * 0.2],
+    }
+}
+
+/// Santa hat as an item, so it can be fitted like the rest.
+pub fn santa_item() -> Item {
+    Item { id: "santa".into(), label: "Santa hat (Christmas)".into(), kind: 25, image: None, anchor: Anchor::Crown, size: [0.95, 0.72], pivot: [0.5, 1.0], offset: [0.0, 0.2], behind: false }
+}
+
 pub fn wardrobe_path() -> PathBuf {
     crate::util::data_dir().join("wardrobe.json")
 }
@@ -135,21 +174,24 @@ pub fn catalog() -> Vec<Item> {
 
 /// The wardrobe as saved and the catalog, read again whenever the file or
 /// the accessories folder changes; shared, as it's asked for every frame.
-type Wardrobe = std::sync::Arc<(HashMap<String, Vec<String>>, Vec<Item>)>;
+type Wardrobe = std::sync::Arc<(HashMap<String, Vec<String>>, Vec<Item>, Fits)>;
 
 fn wardrobe() -> Wardrobe {
     type State = (Option<Instant>, Option<SystemTime>, Wardrobe);
     static STATE: std::sync::LazyLock<Mutex<State>> = std::sync::LazyLock::new(|| Mutex::new((None, None, Wardrobe::default())));
     let mut s = STATE.lock().unwrap();
-    if s.0.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+    // checked twice a second: fitting by hand shows on the desktop as it's done
+    if s.0.is_none_or(|t| t.elapsed() > Duration::from_millis(500)) {
         s.0 = Some(Instant::now());
         let stamp = std::fs::metadata(wardrobe_path()).and_then(|m| m.modified()).ok();
         let dir_stamp = std::fs::metadata(accessories_dir()).and_then(|m| m.modified()).ok();
-        let both = stamp.max(dir_stamp);
+        let fit_stamp = std::fs::metadata(fit_path()).and_then(|m| m.modified()).ok();
+        let both = stamp.max(dir_stamp).max(fit_stamp);
         if both != s.1 || s.2.1.is_empty() {
             s.1 = both;
             let saved = std::fs::read_to_string(wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-            s.2 = std::sync::Arc::new((saved, catalog()));
+            let fits: Fits = std::fs::read_to_string(fit_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            s.2 = std::sync::Arc::new((saved, catalog(), fits));
         }
     }
     s.2.clone()
@@ -223,14 +265,21 @@ impl CharacterOverlay {
         let asleep = wk.act == Act::Rest && wk.rest.is_some_and(|r| r.kind == super::moods::RestKind::Sleep);
         let shared = wardrobe();
         let (wardrobe, items) = (&shared.0, &shared.1);
-        if let Some(ids) = wardrobe.get(&self.own_name()) {
+        let name = self.own_name();
+        let fits = shared.2.get(&name);
+        let fitted = |it: &Item| {
+            let [l, t, w, h] = layout(&a, it, self.faces_right, fits.and_then(|f| f.get(&it.id)).copied());
+            let (x0, x1) = (sx(l), sx(l + w));
+            [x0.min(x1), sy(t + h), x0.max(x1), sy(t)]
+        };
+        if let Some(ids) = wardrobe.get(&name) {
             for id in ids {
                 let Some(it) = items.iter().find(|i| &i.id == id) else { continue };
                 // the sleep mask only goes on in its sleep
                 if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id) {
                     continue;
                 }
-                out.push(Worn { id: droppable(&it.id), kind: it.kind, rect: place(it.anchor, it.size, it.pivot, it.offset), flip, behind: it.behind, image: it.image.clone() });
+                out.push(Worn { id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip, behind: it.behind, image: it.image.clone() });
             }
         }
         // its favourite keepsake: hugged to its chest in its sleep, now and
@@ -247,7 +296,7 @@ impl CharacterOverlay {
         let xmas = super::weather::christmas();
         let hatted = xmas || out.iter().any(|w| matches!(w.kind, 27 | 28 | 37 | 36) || (w.kind == 100));
         if xmas && !wk.lost.iter().any(|l| l == "santa") {
-            out.push(Worn { id: "santa", kind: 25, rect: place(Anchor::Crown, [0.95, 0.72], [0.5, 1.0], [0.0, 0.2]), flip: !flip, behind: false, image: None });
+            out.push(Worn { id: "santa", kind: 25, rect: fitted(&santa_item()), flip: !flip, behind: false, image: None });
         }
         // snow that has settled on its head (or hat)
         let pile = wk.snow_pile;

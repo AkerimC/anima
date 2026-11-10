@@ -102,7 +102,6 @@ pub(super) struct Moods {
     pub(super) loose: Vec<Loose>,
     crumb_tick: f32,
     idle_t: f32,
-    hot_t: f32,
     pub(super) fretting: bool,
     seen_opened: u32,
     seen_closed: u32,
@@ -429,30 +428,6 @@ impl CharacterOverlay {
         }
         self.run_weather(dt, n);
         self.run_loose(dt, n);
-
-        let load = desktop::CPU.load(Relaxed) as f32 / 1000.0;
-        if self.moods.fretting {
-            if load < tn().cpu_calm {
-                self.moods.fretting = false;
-                self.moods.hot_t = 0.0;
-                for i in 0..n {
-                    self.walk_of(i).fret = false;
-                }
-            }
-        } else if load >= tn().cpu_hot {
-            self.moods.hot_t += dt;
-            if self.moods.hot_t >= tn().cpu_for {
-                self.moods.fretting = true;
-                // those in a game or a race carry on with it
-                for i in 0..n {
-                    let wk = self.walk_of(i);
-                    wk.crowd = None;
-                    wk.fret = wk.rand() < tn().cpu_share;
-                }
-            }
-        } else {
-            self.moods.hot_t = 0.0;
-        }
 
         let opened = desktop::OPENED.load(Relaxed);
         if opened != self.moods.seen_opened {

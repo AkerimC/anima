@@ -169,13 +169,6 @@ tuning! {
         sit_rand: "Random extra sit (s)" = 12.0, 0.0, 120.0, 1.0, 0;
         sit_sink: "Lowering when sitting" = 0.2, 0.0, 1.0, 0.05, 2;
     }
-    "Roaming", "Busy processor panic" {
-        cpu_hot: "Load to start" = 0.75, 0.1, 1.0, 0.05, 2;
-        cpu_calm: "Load to calm down" = 0.55, 0.0, 1.0, 0.05, 2;
-        cpu_for: "Lasting for (s)" = 4.0, 0.0, 60.0, 1.0, 0;
-        cpu_share: "Share who panic" = 1.0, 0.0, 1.0, 0.05, 2;
-        cpu_run: "Speed while panicking" = 4.0, 1.0, 6.0, 0.1, 1;
-    }
     "Social", "Friendship and rivalry" {
         close_friend: "Counts as a close friend" = 1.5, 0.1, 3.0, 0.1, 1;
         close_follow: "Close friend moves along" = 0.7, 0.0, 1.0, 0.05, 2;
