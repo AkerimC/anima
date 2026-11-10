@@ -571,21 +571,23 @@ impl CharacterOverlay {
             let (l, rr) = (sx(hb[0]).min(sx(hb[2])), sx(hb[0]).max(sx(hb[2])));
             let (hw, hh) = (rr - l, (hb[3] - hb[1]) * h);
             let cx = (l + rr) * 0.5;
-            let crown = r[1] + hb[1] * h;
+            let [dx, dy] = a.draw_shift;
+            let (cx, crown) = (cx + dx, r[1] + hb[1] * h + dy);
             if xmas {
                 // tip falls to the side it's facing away from
                 let (ww, tall) = (hw * 0.95, hh * 0.72);
                 let brim = crown + hh * 0.2;
                 v.push((25, [cx - ww * 0.5, brim - tall, cx + ww * 0.5, brim], !flip, k));
                 if pile >= 0.05 {
-                    let (pw, ph) = (ww * 0.5, hh * 0.12 * pile);
-                    let top = brim - tall * 0.62;
-                    v.push((24, [cx - pw * 0.5, top - ph, cx + pw * 0.5, top + ph * 0.2], false, k));
+                    let (pw, ph) = (ww * 0.5, hh * (0.08 + 0.2 * pile));
+                    let top = brim - tall * 0.5;
+                    v.push((24, [cx - pw * 0.5, top - ph, cx + pw * 0.5, top + ph * 0.25], false, k));
                 }
             } else {
-                let (pw, ph) = (hw * 0.82, hh * 0.24 * pile.max(0.15));
-                let base = crown + hh * 0.07;
-                v.push((24, [cx - pw * 0.5, base - ph, cx + pw * 0.5, base], false, k));
+                // a mound that grows taller as it piles up, sitting into the hair a little
+                let (pw, ph) = (hw * (0.6 + 0.3 * pile), hh * (0.12 + 0.42 * pile));
+                let base = crown + hh * 0.1;
+                v.push((24, [cx - pw * 0.5, base - ph * 0.8, cx + pw * 0.5, base + ph * 0.2], false, k));
             }
         }
         // keepsakes: lying beside whoever's resting
@@ -626,7 +628,9 @@ impl CharacterOverlay {
                         let tall = (hand_y - head) / 0.435;
                         let top = head - tall * 0.475;
                         let wide = (body * 2.8).max(tall * 0.75);
-                        v.push((22, [hand_x - wide * 0.5, top, hand_x + wide * 0.5, top + tall], false, k));
+                        let [dx, dy] = if k == 0 { self.draw_shift } else { self.extras[k - 1].draw_shift };
+                        let (x, top) = (hand_x + dx * 0.6, top + dy);
+                        v.push((22, [x - wide * 0.5, top, x + wide * 0.5, top + tall], false, k));
                     }
                 } else {
                     for f in 0..3 {

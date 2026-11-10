@@ -1122,6 +1122,8 @@ pub struct CharacterOverlay {
     pub(super) head: Option<[f32; 4]>,
     // the mask, 0 off .. 1 on
     lids: f32,
+    // the sprite's own bobbing and sway this frame, px (x at the top, y)
+    pub(super) draw_shift: [f32; 2],
     drawn_left: bool,
     drawn_happy: bool,
     turn_t: f32,
@@ -1281,6 +1283,7 @@ impl CharacterOverlay {
             eyes: None,
             head: None,
             lids: 0.0,
+            draw_shift: [0.0; 2],
             drawn_left: false,
             drawn_happy: false,
             turn_t: 0.0,
@@ -2122,6 +2125,11 @@ impl CharacterOverlay {
             self.program.set_f32(gl, "u_bounce", self.smooth_bounce + hop);
             self.program.set_f32(gl, "u_rot", self.walk.rot);
             self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
+            // how far the drawn sprite is off its box this frame (hops, sway): px,
+            // at the top of the head; things worn or held move with it
+            let lean = (self.smooth_look[0] + sway) * 0.055 * half_clip[0] * w * 0.5;
+            let lift = (self.smooth_bounce + hop - self.walk.sink * half_clip[1]) * h * 0.5;
+            self.draw_shift = [lean, -lift];
             self.program.set_f32(gl, "u_aspect", w / h);
             let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
                 (true, _, Some(g)) => g,

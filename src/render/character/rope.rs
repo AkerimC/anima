@@ -345,11 +345,36 @@ vec4 umbrella(vec2 p) {
     col = mix(col, vec3(0.32, 0.22, 0.16), stick);
     return vec4(col, max(dome, stick));
 }
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
 vec4 snowpile(vec2 p) {
-    // a soft lumpy cap of snow, flat underneath
-    float top = -1.0 + 1.9 * sqrt(max(0.0, 1.0 - p.x * p.x)) + 0.12 * sin(p.x * 9.0) * (1.0 - abs(p.x));
-    float a = (1.0 - smoothstep(top - 0.06, top, p.y)) * step(-1.0, p.y);
-    vec3 col = mix(vec3(0.82, 0.88, 0.98), vec3(1.0), clamp((p.y + 1.0) * 0.6, 0.0, 1.0));
+    // lumps of snow heaped up into a little mound, a few blobs hanging over the edge
+    float d = length(p - vec2(0.0, -0.3)) - 0.62;
+    d = smin(d, length(p - vec2(-0.52, -0.45)) - 0.42, 0.18);
+    d = smin(d, length(p - vec2(0.5, -0.42)) - 0.45, 0.18);
+    d = smin(d, length(p - vec2(-0.18, 0.18)) - 0.4, 0.18);
+    d = smin(d, length(p - vec2(0.24, 0.08)) - 0.38, 0.18);
+    d = smin(d, length(p - vec2(0.04, 0.58)) - 0.26, 0.16);
+    // flat where it sits, except for the drips over the edge
+    float base = p.y + 0.62;
+    float drips = min(min(length(p - vec2(-0.8, -0.66)) - 0.13, length(p - vec2(-0.32, -0.7)) - 0.1),
+                      min(length(p - vec2(0.38, -0.68)) - 0.12, length(p - vec2(0.84, -0.64)) - 0.11));
+    float body = max(d, -base);
+    float shape = min(body, drips);
+    float a = 1.0 - smoothstep(-0.02, 0.02, shape);
+    // lit from above: white on top, bluish in the folds and underneath
+    float inner = clamp(-shape / 0.25, 0.0, 1.0);
+    vec3 col = mix(vec3(0.74, 0.82, 0.96), vec3(1.0), clamp(0.35 + p.y * 0.45 + inner * 0.4, 0.0, 1.0));
+    // the creases between lumps
+    col = mix(col, vec3(0.8, 0.86, 0.97), (1.0 - smoothstep(0.0, 0.05, abs(d + 0.08))) * 0.25 * step(-0.5, p.y));
+    // a few sparkles
+    vec2 g = floor(p * 9.0);
+    float h = fract(sin(dot(g, vec2(41.3, 289.1))) * 43758.5);
+    float spark = step(0.93, h) * (1.0 - smoothstep(0.03, 0.08, length(fract(p * 9.0) - 0.5)));
+    col = mix(col, vec3(1.0), spark);
+    col = mix(col, vec3(0.86, 0.93, 1.0), spark * 0.0);
     return vec4(col, a);
 }
 vec4 santa(vec2 p) {
