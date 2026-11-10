@@ -1498,6 +1498,22 @@ impl CharacterOverlay {
                 a.zoom.map_or(r, |z| z.to_screen(r))
             })
             .chain(self.props().into_iter().filter_map(|p| shown(p.1, p.3)))
+            // worn and held things reach outside the sprite's box (an umbrella
+            // above the head, wings to the sides): they change too
+            .chain(std::iter::once(self).chain(self.extras.iter()).filter(|a| a.visible).flat_map(|a| {
+                let [x0, y0, x1, y1] = a.hit_rect;
+                let (w, h) = (x1 - x0, y1 - y0);
+                // turned or tumbling: anywhere round it
+                let pad = if a.walk.rot.abs() > 0.01 { h * 1.5 } else { h * 0.08 };
+                a.worn()
+                    .into_iter()
+                    .map(move |t| {
+                        let [sx0, sy0, sx1, sy1] = t.rect;
+                        let r = [x0 + (sx0 + 1.0) * 0.5 * w - pad, y0 + (1.0 - sy1) * 0.5 * h - pad, x0 + (sx1 + 1.0) * 0.5 * w + pad, y0 + (1.0 - sy0) * 0.5 * h + pad];
+                        a.zoom.map_or(r, |z| z.to_screen(r))
+                    })
+                    .collect::<Vec<_>>()
+            }))
             // the rope spans the gap between the two sides
             .chain(self.ropes_owned().into_iter().filter_map(|([x0, y0, x1, y1], o)| shown([x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0], o)))
             .collect()
