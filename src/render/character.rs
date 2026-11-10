@@ -1100,6 +1100,8 @@ pub struct CharacterOverlay {
     race_crew: Vec<usize>,
     // `anima game train`: who's been sent to practise
     forced_train: Option<usize>,
+    // a game asked for by hand, still waiting for players: name, seconds left, to the next try
+    game_wait: Option<(String, f32, f32)>,
     // seconds before another race can start by itself
     race_quiet: f32,
     // seconds since the characters appeared
@@ -1285,6 +1287,7 @@ impl CharacterOverlay {
             new_chats: Vec::new(),
             race_crew: Vec::new(),
             forced_train: None,
+            game_wait: None,
             race_quiet: 0.0,
             social_age: 0.0,
             view_w: 1.0,

@@ -749,9 +749,19 @@ impl CharacterOverlay {
         self.run_spaces(dt, n);
         self.grow_bonds(dt);
         let mut chats = std::mem::take(&mut self.chats);
-        let asked = GAME_NOW.lock().unwrap().take();
-        if let Some(name) = asked {
-            self.force_game(&mut chats, &name, n);
+        // asked for by hand: tried again for a while if players have to come over first
+        if let Some(name) = GAME_NOW.lock().unwrap().take() {
+            self.game_wait = Some((name, 20.0, 0.0));
+        }
+        if let Some((name, left, next)) = self.game_wait.take() {
+            let (left, next) = (left - dt, next - dt);
+            if next <= 0.0 {
+                if !self.force_game(&mut chats, &name, n) && left > 0.0 {
+                    self.game_wait = Some((name, left, 1.0));
+                }
+            } else if left > 0.0 {
+                self.game_wait = Some((name, left, next));
+            }
         }
         if self.forced_train.is_some() {
             if let Some(c) = self.start_training(n, 0.0) {
@@ -2008,7 +2018,8 @@ impl CharacterOverlay {
 
     /// A game asked for by hand: whoever is nearest the middle of the
     /// screen plays right now, whatever they were up to and however tired.
-    fn force_game(&mut self, chats: &mut Vec<Chat>, name: &str, n: usize) {
+    /// True once the game is under way (or can't ever be).
+    fn force_game(&mut self, chats: &mut Vec<Chat>, name: &str, n: usize) -> bool {
         // training on request: whoever is free right now, with a teacher if there is one
         if name == "train" {
             let busy: Vec<usize> = chats.iter().flat_map(|c| c.members.iter().copied()).collect();
@@ -2034,7 +2045,7 @@ impl CharacterOverlay {
                 }
                 self.forced_train = Some(i);
             }
-            return;
+            return true;
         }
         let t = tn();
         let (game, need) = match name {
@@ -2050,12 +2061,12 @@ impl CharacterOverlay {
             "volley" => (Game::Volley, t.volley_min),
             "blind" => (Game::Blind, t.blind_min),
             "fishing" => (Game::Fishing, t.fish_min),
-            _ => return,
+            _ => return true,
         };
         let need = need as usize;
         if self.race.is_some() || n < need {
             log::debug!("game {name}: can't start now ({n} characters, needs {need})");
-            return;
+            return true;
         }
         // whoever is already playing carries on; the game goes to the others
         let playing: Vec<usize> = chats
@@ -2067,14 +2078,45 @@ impl CharacterOverlay {
             .flat_map(|c| c.members.iter().copied())
             .collect();
         let middle = self.view[0] * self.view_w * 0.5 + self.view_w * 0.5;
+        let here = |this: &Self, i: usize| this.spaces.active == 0 || this.walk_ref(i).ws == this.spaces.active;
+        // asked for by hand: those asleep here get up for it, a hop doesn't count against anyone
+        for i in 0..n {
+            if !playing.contains(&i) && here(self, i) && self.walk_ref(i).act == Act::Rest {
+                let wk = self.walk_of(i);
+                wk.rest = None;
+                wk.night_sleep = false;
+                wk.act = Act::Idle;
+                wk.timer = 1.0;
+            }
+        }
         let mut free: Vec<(usize, f32)> = (0..n)
-            .filter(|&i| !playing.contains(&i) && (self.spaces.active == 0 || self.walk_ref(i).ws == self.spaces.active) && !self.walk_ref(i).circle && grounded(self.walk_ref(i)))
+            .filter(|&i| !playing.contains(&i) && here(self, i) && !self.walk_ref(i).circle && matches!(self.walk_ref(i).act, Act::Idle | Act::Walk | Act::Jump))
             .map(|i| (i, (self.strip_px(i) - middle).abs()))
             .collect();
         free.sort_by(|a, b| a.1.total_cmp(&b.1));
         if free.len() < need {
-            log::debug!("game {name}: only {} free, needs {need}", free.len());
-            return;
+            // not enough here: the others are called over from their workspaces
+            let active = self.spaces.active;
+            let mut called = 0;
+            for i in 0..n {
+                let wk = self.walk_ref(i);
+                if active != 0 && wk.ws != active && wk.trip.is_none() && !playing.contains(&i) && free.len() + called < need + 1 && !wk.visiting && !wk.backstage {
+                    if matches!(wk.act, Act::Idle | Act::Walk | Act::Rest | Act::Jump) {
+                        let wk = self.walk_of(i);
+                        wk.rest = None;
+                        wk.social = None;
+                        if wk.act == Act::Rest {
+                            wk.act = Act::Idle;
+                        }
+                        if self.send_to(i, active) {
+                            called += 1;
+                        }
+                    }
+                }
+            }
+            let coming = (0..n).filter(|&i| self.heading_to(i) == Some(active)).count();
+            log::debug!("game {name}: only {} free here, {coming} on the way, needs {need}", free.len());
+            return free.len() + coming < need && coming == 0 && called == 0;
         }
         let count = if game == Game::Gift { 2 } else if game == Game::Volley { free.len() } else { need.max(FORCED_PLAYERS.min(free.len())) };
         let members: Vec<usize> = free.iter().take(count).map(|f| f.0).collect();
@@ -2088,6 +2130,7 @@ impl CharacterOverlay {
         c.forced = Some(game);
         self.arrange(&c);
         chats.push(c);
+        true
     }
 
     fn steer(&mut self, i: usize, x: f32, speed: f32) {
