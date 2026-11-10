@@ -84,6 +84,9 @@ pub(super) struct Loose {
     pub(super) size: [f32; 2],
     // seconds lying still
     still: f32,
+    // a friend fetching it for its owner, and whether it has it in hand yet
+    helper: Option<usize>,
+    carried: bool,
 }
 
 #[derive(Default)]
@@ -644,7 +647,7 @@ impl CharacterOverlay {
             let lie = size[0].min(size[1]) * 0.5;
             log::debug!("{i} loses its {id}");
             wk.lost.push(id.clone());
-            flying.push(Loose { id, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0 });
+            flying.push(Loose { id, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
         }
         self.moods.loose.extend(flying);
     }
@@ -688,7 +691,71 @@ impl CharacterOverlay {
                 continue;
             }
             let free = matches!(wk.act, Act::Idle | Act::Walk) && wk.social.is_none() && wk.race.is_none();
+            let ready = |this: &Self, j: usize| {
+                let w = this.walk_ref(j);
+                matches!(w.act, Act::Idle | Act::Walk) && w.social.is_none() && w.race.is_none() && w.crowd.is_none()
+            };
+            // the owner's busy: a friend at a loose end fetches it and brings it over
+            if l.still > 0.6 && !free {
+                if l.helper.is_some_and(|h| h >= n || !ready(self, h)) {
+                    // the helper got caught up in something: down it goes where it is
+                    if let Some(h) = l.helper.filter(|_| l.carried) {
+                        l.x = self.strip_px(h);
+                        l.y = l.floor;
+                        l.rot = std::f32::consts::FRAC_PI_2;
+                    }
+                    l.helper = None;
+                    l.carried = false;
+                }
+                if l.helper.is_none() && l.still > 3.0 {
+                    let ws = wk.ws;
+                    let x = l.x;
+                    l.helper = (0..n)
+                        .filter(|&j| j != o && self.walk_ref(j).ws == ws && ready(self, j) && (self.strip_px(j) - x).abs() < self.view_w * 0.6)
+                        .max_by(|&a, &b| {
+                            let score = |j: usize| self.bond(o, j).0 * 400.0 - (self.strip_px(j) - x).abs();
+                            score(a).total_cmp(&score(b))
+                        });
+                    if let Some(h) = l.helper {
+                        log::debug!("{h} goes to fetch {o}'s {}", l.id);
+                    }
+                }
+                if let Some(h) = l.helper {
+                    let reach = (self.actor_ref(h).hit_rect[3] - self.actor_ref(h).hit_rect[1]) * 0.35;
+                    let hx = self.strip_px(h);
+                    if !l.carried {
+                        if (hx - l.x).abs() < reach {
+                            l.carried = true;
+                            self.walk_of(h).start_bob(tn().jump_height * 0.2);
+                        } else {
+                            self.walk_toward(h, l.x);
+                        }
+                    }
+                    if l.carried {
+                        // held up in its hand on the way over
+                        let r = self.actor_ref(h).hit_rect;
+                        let side = if self.walk_ref(h).left { -1.0 } else { 1.0 };
+                        l.x = hx + side * (r[2] - r[0]) * 0.25;
+                        l.y = r[1] + (r[3] - r[1]) * 0.45;
+                        l.rot = 0.0;
+                        let ox = self.strip_px(o);
+                        if (hx - ox).abs() < reach * 2.0 {
+                            // here you are
+                            self.walk_of(o).lost.retain(|x| x != &l.id);
+                            self.walk_of(h).start_bob(tn().jump_height * 0.3);
+                            let secs = tn().laugh_time * 0.6;
+                            self.walk_of(o).laugh(secs);
+                            self.add_bond(o, h, tn().bond_game, 0.0);
+                            log::debug!("{h} brings {o} its {}", l.id);
+                            continue;
+                        }
+                        self.walk_toward(h, ox);
+                    }
+                }
+            }
             if l.still > 0.6 && free {
+                l.helper = None;
+                l.carried = false;
                 let here = self.strip_px(o);
                 let reach = (self.actor_ref(o).hit_rect[3] - self.actor_ref(o).hit_rect[1]) * 0.35;
                 if (here - l.x).abs() < reach {
@@ -709,6 +776,16 @@ impl CharacterOverlay {
             keep.push(l);
         }
         self.moods.loose = keep;
+    }
+
+    /// Sends `i` walking (on its own, not in a chat) to strip x `x`.
+    fn walk_toward(&mut self, i: usize, x: f32) {
+        let a = self.actor_ref(i);
+        let (pose, view) = (a.pose, a.own_view[0]);
+        let to_clip = (x - view * self.view_w * 0.5) * 2.0 / self.view_w.max(1.0) - 1.0;
+        let wk = self.walk_of(i);
+        wk.target = wk.x + (to_clip - pose.center[0]);
+        wk.act = Act::Walk;
     }
 
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
