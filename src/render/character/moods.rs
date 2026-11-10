@@ -137,7 +137,7 @@ impl WalkState {
         self.target = self.x;
     }
 
-    fn get_up(&mut self) {
+    pub(super) fn get_up(&mut self) {
         self.night_sleep = false;
         self.rest = None;
         self.act = Act::Idle;
@@ -526,6 +526,16 @@ impl CharacterOverlay {
                 wk.night_wait = if wk.rand() < share { Some(wk.rand() * spread) } else { None };
             }
         }
+        // rain coming on: a drop on the face and up they get, umbrella in hand
+        // (not those in bed for the night)
+        if w.rain && !was.rain {
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                if wk.act == Act::Rest && !wk.night_sleep {
+                    wk.rain_wake = Some(wk.rand() * 1.5);
+                }
+            }
+        }
         if !w.night && was.night {
             for i in 0..n {
                 let wk = self.walk_of(i);
@@ -542,6 +552,17 @@ impl CharacterOverlay {
         }
         for i in 0..n {
             let wk = self.walk_of(i);
+            if let Some(t) = wk.rain_wake {
+                if t - dt <= 0.0 {
+                    wk.rain_wake = None;
+                    if wk.act == Act::Rest {
+                        wk.get_up();
+                        wk.start_jump(tn().jump_height * 0.7);
+                    }
+                } else {
+                    wk.rain_wake = Some(t - dt);
+                }
+            }
             if let Some(t) = wk.night_wait {
                 if !wk.at_leisure() {
                     continue;

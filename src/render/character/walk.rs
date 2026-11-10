@@ -151,6 +151,8 @@ pub(super) struct WalkState {
     // night: seconds until it goes to bed, and whether it's in bed for the night
     pub(super) night_wait: Option<f32>,
     pub(super) night_sleep: bool,
+    // woken by the rain starting: seconds till it's up
+    pub(super) rain_wake: Option<f32>,
     // the state machine's bookkeeping: current state, seconds in it, and
     // whether a walk is getting anywhere
     pub(super) state_act: Act,
