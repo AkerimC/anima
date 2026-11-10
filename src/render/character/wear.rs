@@ -234,9 +234,19 @@ impl CharacterOverlay {
         let busy = wk.race.is_some() || wk.in_game;
         let free = !matches!(wk.act, Act::Held | Act::Fall | Act::Travel | Act::Planted | Act::Rest);
         if weather.rain && !busy && free {
-            // the handle in the hand, the canopy just clear of the head
-            let tall = ((hand[1] - (crown[1] - 0.02)) / 0.435 / hh).max(0.8);
-            out.push(Worn { kind: 22, rect: place(Anchor::Hand, [1.3, tall], [0.5, 0.91], [0.0, 0.0]), flip: false, behind: false, image: None });
+            // the top a set size just clear of the head, centred over the hand;
+            // the stick from it down to the hand, however far that is
+            let tex_aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
+            let wide = 1.3 * hw;
+            let tall = wide * 0.5 * tex_aspect;
+            let rim = crown[1] - 0.015;
+            let (x0, x1) = (sx(hand[0] - wide * 0.5), sx(hand[0] + wide * 0.5));
+            out.push(Worn { kind: 38, rect: [x0.min(x1), sy(rim), x0.max(x1), sy(rim - tall)], flip: false, behind: false, image: None });
+            let thin = wide * 0.04;
+            // the hook turns towards the character
+            let (a0, a1) = (sx(hand[0] - thin * 0.5), sx(hand[0] + thin * 0.5));
+            let stick = [a0.min(a1) - (a1 - a0).abs() * 2.5, sy(hand[1] + hh * 0.04), a0.max(a1) + (a1 - a0).abs() * 2.5, sy(rim - tall * 0.9)];
+            out.push(Worn { kind: 39, rect: stick, flip: self.faces_right == flip, behind: false, image: None });
         }
         out
     }

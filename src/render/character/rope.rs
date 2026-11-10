@@ -543,6 +543,34 @@ vec4 crown(vec2 p) {
 vec4 picture(vec2 p) {
     return texture(u_img, vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));
 }
+vec4 canopy(vec2 p) {
+    // the umbrella's top on its own: a ribbed dome filling the box, rim at the bottom
+    vec2 q = (p - vec2(0.0, -0.85)) / vec2(0.98, 1.72);
+    float dome = step(0.0, q.y) * (1.0 - smoothstep(0.97, 1.0, length(q)));
+    float seg = fract((p.x + 0.98) / 0.49);
+    float edge = -0.85 + 0.22 * sin(3.14159 * seg);
+    dome *= smoothstep(edge - 0.03, edge + 0.02, p.y);
+    float ribs = 0.0;
+    for (int k = 0; k < 5; k++) {
+        vec2 a = vec2(0.0, 0.87), b = vec2(-0.98 + 0.49 * float(k), -0.85);
+        vec2 ab = b - a;
+        float t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+        ribs = max(ribs, 1.0 - smoothstep(0.015, 0.04, length(p - a - ab * t)));
+    }
+    float light = clamp(q.y * 0.6 + 0.4, 0.0, 1.0);
+    vec3 cloth = mix(vec3(0.82, 0.33, 0.45), vec3(1.0, 0.62, 0.72), light);
+    vec3 col = mix(cloth, vec3(0.62, 0.2, 0.3), ribs * 0.8);
+    float tip = 1.0 - smoothstep(0.06, 0.1, length(p - vec2(0.0, 0.9)));
+    col = mix(col, vec3(0.32, 0.22, 0.16), tip);
+    return vec4(col, max(dome, tip));
+}
+vec4 shaft(vec2 p) {
+    // a thin stick down to a hooked handle at the bottom
+    float stick = step(abs(p.x), 0.18) * step(-0.86, p.y);
+    vec2 h = (p - vec2(0.42, -0.86)) / vec2(0.42, 0.07);
+    float hook = step(h.y, 0.0) * (1.0 - smoothstep(0.75, 1.0, abs(length(h) - 1.0) * 6.0)) * step(-1.2, h.y);
+    return vec4(vec3(0.32, 0.22, 0.16), max(stick, hook));
+}
 vec4 snowflake(vec2 p) {
     float a = atan(p.y, p.x);
     float r = length(p);
@@ -561,7 +589,7 @@ vec4 confetti(vec2 p) {
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : u_kind == 26 ? sleepmask(p) : u_kind == 27 ? partyhat(p) : u_kind == 28 ? tophat(p) : u_kind == 29 ? bigbow(p) : u_kind == 30 ? glasses(p, false) : u_kind == 31 ? glasses(p, true) : u_kind == 32 ? flower(p) : u_kind == 33 ? scarf(p) : u_kind == 34 ? backpack(p) : u_kind == 35 ? wings(p) : u_kind == 36 ? headphones(p) : u_kind == 37 ? crown(p) : u_kind == 100 ? picture(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : u_kind == 26 ? sleepmask(p) : u_kind == 27 ? partyhat(p) : u_kind == 28 ? tophat(p) : u_kind == 29 ? bigbow(p) : u_kind == 30 ? glasses(p, false) : u_kind == 31 ? glasses(p, true) : u_kind == 32 ? flower(p) : u_kind == 33 ? scarf(p) : u_kind == 34 ? backpack(p) : u_kind == 35 ? wings(p) : u_kind == 36 ? headphones(p) : u_kind == 37 ? crown(p) : u_kind == 38 ? canopy(p) : u_kind == 39 ? shaft(p) : u_kind == 100 ? picture(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
