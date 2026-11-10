@@ -378,11 +378,6 @@ precision highp float;
 in vec2 v_uv;
 
 uniform sampler2D u_tex;
-uniform float u_sleep;   // eyes closed (0..1)
-uniform vec4 u_eye_l;
-uniform vec4 u_eye_r;
-uniform vec3 u_skin;
-uniform float u_tex_aspect; // sprite width / height
 // 0 = custom texture/sprite, 1 = reze, 2 = neko, 3 = cyber, 4 = spirit
 uniform int u_mode;
 // u_tex is already premultiplied (3D model render target)
@@ -963,55 +958,6 @@ void main() {
         vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
         c = texture(u_tex, clamp(uv, 0.0, 1.0));
         if (u_premul == 1 && c.a > 0.0) c.rgb /= c.a;
-        // asleep: a sleep mask over both eyes, polka dots, a bow on one side
-        // and a closed eye stitched over each eye
-        if (u_sleep > 0.0) {
-            vec2 P = vec2(uv.x * u_tex_aspect, uv.y);
-            vec2 a = vec2((u_eye_l.x + u_eye_l.z) * 0.5 * u_tex_aspect, (u_eye_l.y + u_eye_l.w) * 0.5);
-            vec2 b = vec2((u_eye_r.x + u_eye_r.z) * 0.5 * u_tex_aspect, (u_eye_r.y + u_eye_r.w) * 0.5);
-            float eh = max(max(u_eye_l.w - u_eye_l.y, u_eye_r.w - u_eye_r.y), 0.01);
-            float ew = max(max(u_eye_l.z - u_eye_l.x, u_eye_r.z - u_eye_r.x) * u_tex_aspect, eh);
-            vec2 dir = normalize(b - a);
-            vec2 nrm = vec2(-dir.y, dir.x);
-            vec2 mid = (a + b) * 0.5;
-            float along = dot(P - mid, dir);
-            float across = dot(P - mid, nrm);
-            float half_len = length(b - a) * 0.5 + ew * 0.75;
-            float half_h = eh * 1.05;
-            // the mask itself: a soft rounded band
-            vec2 m = vec2(max(abs(along) - half_len + half_h, 0.0), across);
-            float mask = 1.0 - smoothstep(half_h - 0.003, half_h + 0.002, length(m));
-            // the elastic round the head, only over the drawn hair
-            float strap = step(abs(across + eh * 0.1), eh * 0.22) * step(abs(along), half_len + ew * 1.6) * step(0.5, c.a);
-            vec3 cloth = vec3(0.98, 0.72, 0.82);
-            // polka dots
-            vec2 g = vec2(along, across) / (eh * 0.7);
-            vec2 cell = fract(g) - 0.5;
-            float dot_ = 1.0 - smoothstep(0.16, 0.22, length(cell));
-            vec3 col = mix(cloth, vec3(1.0, 0.95, 0.97), dot_ * 0.85);
-            // a closed eye stitched over each eye
-            for (int k = 0; k < 2; k++) {
-                vec2 e = k == 0 ? a : b;
-                vec2 q = vec2(dot(P - e, dir), dot(P - e, nrm)) / vec2(ew * 0.55, eh * 0.6);
-                float curve = q.y - (0.05 - 0.45 * q.x * q.x);
-                float stitch = smoothstep(0.2, 0.08, abs(curve)) * step(abs(q.x), 0.85);
-                col = mix(col, vec3(0.45, 0.2, 0.32), stitch);
-            }
-            col = mix(col, vec3(0.86, 0.5, 0.64), smoothstep(half_h * 0.75, half_h, length(m)) * 0.6);
-            // the bow, at the outer corner of one eye
-            vec2 bow = b + dir * (ew * 0.8) - nrm * (half_h * 0.95);
-            vec2 r = vec2(dot(P - bow, dir), dot(P - bow, nrm)) / (eh * 1.25);
-            float loops = 1.0 - smoothstep(0.95, 1.05, length(vec2(abs(r.x) - 0.55, r.y * 1.5) / vec2(0.5, 0.42)));
-            loops *= step(0.08, abs(r.x));
-            float knot = 1.0 - smoothstep(0.17, 0.23, length(r));
-            float bow_a = max(loops, knot);
-            vec3 bow_col = mix(vec3(0.93, 0.38, 0.55), vec3(0.78, 0.25, 0.42), knot);
-            float on = max(mask, strap);
-            vec3 out_col = mix(c.rgb, strap > mask ? vec3(0.9, 0.55, 0.68) : col, on);
-            out_col = mix(out_col, bow_col, bow_a);
-            float alpha = max(c.a, max(mask, bow_a));
-            c = vec4(mix(c.rgb, out_col, u_sleep), mix(c.a, alpha, u_sleep));
-        }
         c.a *= u_opacity;
     } else if (u_mode == 1) {
         c = render_reze(v_uv);
@@ -1117,12 +1063,8 @@ pub struct CharacterOverlay {
     pending: Option<glow::Texture>,
     // what's drawn: the side it faces and the pose, each changed half way
     // through a short turn or squash so nothing snaps from one frame to the next
-    // where its eyes are on the calm sprite, and its skin colour: lids for sleeping
-    eyes: Option<([f32; 4], [f32; 4], [f32; 3])>,
     drawn_left: bool,
     drawn_happy: bool,
-    // eyelids, 0 open .. 1 shut
-    lids: f32,
     turn_t: f32,
     swap_t: f32,
     // where it stands among those level with it; reshuffled when it sets off
@@ -1277,10 +1219,8 @@ impl CharacterOverlay {
             last_act: Act::Idle,
             spawned: false,
             pending: None,
-            eyes: None,
             drawn_left: false,
             drawn_happy: false,
-            lids: 0.0,
             turn_t: 0.0,
             swap_t: 0.0,
             active: None,
@@ -1406,7 +1346,6 @@ impl CharacterOverlay {
             if bottom > top {
                 self.opaque = [half / w as f32, top as f32 / h as f32, bottom as f32 / h as f32];
             }
-            self.eyes = uma::find_eyes(&img).or_else(|| uma::guess_eyes(&img));
             let tex = create_texture(gl, w, h, img.as_raw(), Filter::Linear, true)?;
             self.sprite_tex = Some((tex, w, h));
 
@@ -2189,19 +2128,6 @@ impl CharacterOverlay {
                 (true, Some(h)) => h,
                 _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),
             };
-            // asleep in the calm pose: eyes shut, slowly
-            let asleep = !self.drawn_happy && self.walk.rest.is_some_and(|r| r.kind == moods::RestKind::Sleep) && self.walk.act == Act::Rest;
-            let goal = if asleep && self.eyes.is_some() { 1.0 } else { 0.0 };
-            self.lids += (goal - self.lids) * (dt * 3.0).min(1.0);
-            let lids = if self.lids < 0.02 { 0.0 } else { self.lids };
-            self.program.set_f32(gl, "u_sleep", lids);
-            if let Some((l, r, skin)) = self.eyes {
-                let aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
-                self.program.set_f32(gl, "u_tex_aspect", aspect);
-                self.program.set_vec4(gl, "u_eye_l", l);
-                self.program.set_vec4(gl, "u_eye_r", r);
-                self.program.set_vec3(gl, "u_skin", skin[0], skin[1], skin[2]);
-            }
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             self.program.set_i32(gl, "u_tex", 0);
 
@@ -2226,6 +2152,8 @@ impl CharacterOverlay {
             let n = self.extras.len() + 1;
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal));
+            // what lies under them (pillows) first
+            self.draw_carrot(gl, info, target, true);
             for i in order {
                 if i == 0 {
                     self.draw_pending(gl, target);
@@ -2234,7 +2162,7 @@ impl CharacterOverlay {
                 }
             }
             self.draw_ropes(gl, info, target);
-            self.draw_carrot(gl, info, target);
+            self.draw_carrot(gl, info, target, false);
         }
         Ok(())
     }

@@ -540,6 +540,32 @@ impl CharacterOverlay {
     }
 
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
+        // in bed: a pillow under the head and a blanket up to the chin
+        let actors = std::iter::once((&self.walk, self.hit_rect, self.visible, self.opaque)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible, e.opaque)));
+        for (k, (wk, r, seen, o)) in actors.enumerate() {
+            let h = r[3] - r[1];
+            let lying = wk.act == Act::Rest && wk.rest.is_some_and(|x| x.kind == RestKind::Sleep) && wk.rot.abs() > 1.2;
+            if h <= 0.0 || !seen || !lying {
+                continue;
+            }
+            // turned a quarter round: the head is to the left when turned anticlockwise
+            let head_left = wk.rot > 0.0;
+            let cx = (r[0] + r[2]) * 0.5;
+            let floor = r[1] + h * o[2];
+            let long = h * (o[2] - o[1]);
+            let thick = (r[2] - r[0]) * o[0] * 2.0;
+            let dir = if head_left { -1.0 } else { 1.0 };
+            let head = cx + dir * long * 0.5;
+            // the pillow, under the head
+            let (pw, ph) = (long * 0.4, thick * 0.5);
+            let px = head - dir * long * 0.14;
+            v.push((25, [px - pw * 0.5, floor - ph, px + pw * 0.5, floor + ph * 0.06], false, k));
+            // the blanket from the shoulders to past the feet, low over the body
+            let from = head - dir * long * 0.34;
+            let to = cx - dir * long * 0.55;
+            let (x0, x1) = (from.min(to), from.max(to));
+            v.push((24, [x0, floor - thick * 0.55, x1, floor + thick * 0.04], !head_left, k));
+        }
         // keepsakes: lying beside whoever's resting
         let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
         for (k, (wk, r, seen)) in actors.enumerate() {
