@@ -1203,10 +1203,14 @@ impl App {
                 ch.remove("tuning");
                 ch.remove("source");
                 ch.remove("source_happy");
+                // switched on the fly too
+                ch.remove("walk");
+                ch.remove("look_at_mouse");
             }
             v
         };
-        (self.config.character.extra != new.character.extra || self.config.character.source != new.character.source || self.config.character.tuning != new.character.tuning)
+        let c = (&self.config.character, &new.character);
+        (c.0.extra != c.1.extra || c.0.source != c.1.source || c.0.tuning != c.1.tuning || c.0.walk != c.1.walk || c.0.look_at_mouse != c.1.look_at_mouse)
             && strip(&self.config) == strip(new)
     }
 
@@ -1813,6 +1817,13 @@ impl App {
                     let source_changed = source != self.config.character.source;
                     let team_changed = extra != self.config.character.extra || source_changed;
                     crate::render::tuning::set(config.character.tuning);
+                    let (walk, look) = (config.character.walk, config.character.look_at_mouse);
+                    for oc in self.outputs.iter_mut() {
+                        let chars = [oc.front_overlay.as_mut().and_then(|f| f.character.as_mut()), oc.character.as_mut()];
+                        for ch in chars.into_iter().flatten() {
+                            ch.set_switches(walk, look);
+                        }
+                    }
                     self.config = config;
                     for oc in self.outputs.iter_mut().filter(|_| team_changed) {
                         let (w, h) = (oc.width, oc.height);

@@ -341,6 +341,7 @@ uniform float u_rot;      // turned about its centre (tumbling, planted)
 uniform float u_sink;     // pushed down into the ground
 uniform float u_aspect;   // output width / height
 uniform vec2 u_pivot;     // the point it turns about, clip offset from its centre
+uniform float u_xscale;   // narrowed while turning round
 
 void main() {
     vec2 uv = a_pos * 0.5 + 0.5;
@@ -356,6 +357,7 @@ void main() {
     p.x += height_factor * u_tilt.x * 0.055;
     p.y += height_factor * u_tilt.y * 0.025;
 
+    p.x *= u_xscale;
     vec2 d = p * u_half_size;
     d.x *= u_aspect;
     float c = cos(u_rot), s = sin(u_rot);
@@ -1056,6 +1058,12 @@ pub struct CharacterOverlay {
     active: Option<WindowRect>,
     // this frame's sprite, drawn once everyone is updated, frontmost last
     pending: Option<glow::Texture>,
+    // what's drawn: the side it faces and the pose, each changed half way
+    // through a short turn or squash so nothing snaps from one frame to the next
+    drawn_left: bool,
+    drawn_happy: bool,
+    turn_t: f32,
+    swap_t: f32,
     // where it stands among those level with it; reshuffled when it sets off
     layer: f32,
     layer_act: Act,
@@ -1207,6 +1215,10 @@ impl CharacterOverlay {
             last_act: Act::Idle,
             spawned: false,
             pending: None,
+            drawn_left: false,
+            drawn_happy: false,
+            turn_t: 0.0,
+            swap_t: 0.0,
             active: None,
             layer: actor as f32 * 0.37 % 1.0,
             layer_act: Act::Idle,
@@ -1220,6 +1232,16 @@ impl CharacterOverlay {
     }
 
     /// Swap the extra characters without touching the ones that stay.
+    /// Walk and Follow mouse, switched without reloading anyone.
+    pub fn set_switches(&mut self, walk: bool, look_at_mouse: bool) {
+        self.config.walk = walk;
+        self.config.look_at_mouse = look_at_mouse;
+        for e in &mut self.extras {
+            e.config.walk = walk;
+            e.config.look_at_mouse = look_at_mouse;
+        }
+    }
+
     pub fn update_extras(&mut self, gl: &glow::Context, extra: &[String], width: i32, height: i32) {
         // only new ones at the end: everyone keeps their place, chats and games go on
         let appended = extra.len() >= self.config.extra.len() && extra[..self.config.extra.len()] == self.config.extra[..];
@@ -1729,7 +1751,32 @@ impl CharacterOverlay {
                 e.view = view;
             }
             self.share_views(view, strip.map(|st| st.ws));
-            if self.config.walk {
+            // Walk off: everyone stays put, no wandering, chats or games
+            let still = !self.config.walk;
+            self.walk.still = still;
+            for e in &mut self.extras {
+                e.walk.still = still;
+            }
+            if still {
+                // whatever they were doing stops where they stand
+                let n = self.extras.len() + 1;
+                self.race = None;
+                for i in 0..n {
+                    let wk = self.walk_of(i);
+                    wk.social = None;
+                    wk.race = None;
+                    wk.crowd = None;
+                    wk.circle = false;
+                    if matches!(wk.act, Act::Walk | Act::Chase) {
+                        wk.act = Act::Idle;
+                        wk.target = wk.x;
+                        wk.timer = 1.0;
+                    }
+                }
+                if !self.chats.is_empty() {
+                    self.clear_chats();
+                }
+            } else {
                 self.run_race(dt, w);
                 self.run_social(dt, info.mouse);
             }
@@ -1851,7 +1898,7 @@ impl CharacterOverlay {
                 (y0 + y1) * 0.5,
             )
             ).flatten().unwrap_or_default();
-            let mirrored = self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right);
+            let mirrored = self.config.flip_x ^ (self.walk.left == self.faces_right);
             // moving to music: lean the upper body, nod the head
             let (lean, nod) = if self.walk.act == Act::Idle { (self.vibe.sway * 0.35, self.vibe.nod * -0.6) } else { (0.0, 0.0) };
             model.set_groove(lean, nod);
@@ -1871,7 +1918,7 @@ impl CharacterOverlay {
             // the anchor when the strip isn't scrolled); `view` converts to screen
             let [view, extra] = self.own_view;
             self.top_air = (1.0 - center_clip[1]) / half_clip[1] + 1.2;
-            let (walk_x, moving, jump) = if self.config.walk {
+            let (walk_x, moving, jump) = if true {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
                 // visiting a fullscreen app: only the screen itself
@@ -1956,7 +2003,7 @@ impl CharacterOverlay {
                 (0.0, false, 0.0)
             };
             // held: follow the cursor; released: fall back down
-            let walk_x = if self.config.walk || self.walk.act == Act::Held {
+            let walk_x = if true {
                 self.carry(info, dt, center_clip, half_clip);
                 self.walk.x - view
             } else {
@@ -2015,8 +2062,28 @@ impl CharacterOverlay {
                 _ => [0.0, 0.0],
             };
             self.program.set_vec2(gl, "u_pivot", pivot[0], pivot[1]);
+            // turning round: narrows to a sliver, flips, opens out again
+            const TURN: f32 = 0.16;
+            let airborne = matches!(self.walk.act, Act::Held | Act::Fall | Act::Planted | Act::Travel) || self.walk.rot.abs() > 0.05;
+            if self.walk.left != self.drawn_left && self.turn_t <= 0.0 {
+                if airborne {
+                    self.drawn_left = self.walk.left;
+                } else {
+                    self.turn_t = TURN;
+                }
+            }
+            let mut xscale = 1.0;
+            if self.turn_t > 0.0 {
+                self.turn_t -= dt;
+                if self.turn_t <= TURN * 0.5 {
+                    self.drawn_left = self.walk.left;
+                }
+                let k = (self.turn_t.max(0.0) / TURN * 2.0 - 1.0).abs();
+                xscale = 0.2 + 0.8 * k;
+            }
+            self.program.set_f32(gl, "u_xscale", xscale);
             self.program
-                .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right)));
+                .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.drawn_left == self.faces_right)));
             self.program.set_i32(gl, "u_mode", mode);
             self.program.set_i32(gl, "u_premul", i32::from(self.model.is_some()));
             self.program.set_f32(gl, "u_time", time);
@@ -2040,7 +2107,20 @@ impl CharacterOverlay {
                     || self.walk.giggle > 0.0
                     || self.walk.petted > 0.0
                     || self.walk.social.is_some_and(|s| s.happy));
-            let tex = match (happy, self.sprite_happy) {
+            // a change of pose: a quick squash, swapped at the bottom of it
+            const SWAP: f32 = 0.14;
+            if happy != self.drawn_happy && self.swap_t <= 0.0 {
+                self.swap_t = SWAP;
+            }
+            if self.swap_t > 0.0 {
+                self.swap_t -= dt;
+                if self.swap_t <= SWAP * 0.5 {
+                    self.drawn_happy = happy;
+                }
+                let k = (std::f32::consts::PI * (1.0 - self.swap_t.max(0.0) / SWAP)).sin();
+                self.program.set_f32(gl, "u_breath", breath - squash - k * 4.0);
+            }
+            let tex = match (self.drawn_happy, self.sprite_happy) {
                 (true, Some(h)) => h,
                 _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),
             };

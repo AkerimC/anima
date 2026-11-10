@@ -272,7 +272,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
+        Chat { encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
     }
 }
 
@@ -368,6 +368,8 @@ pub(super) struct Chat {
     regroup: bool,
     // after a game: who's had enough and wanders off (seconds until each goes)
     leavers: Vec<(usize, f32)>,
+    // just finished a game: the next talk decides who plays on
+    encore_due: bool,
     // and who's holding up the next game for those staying: proposer, game, seconds left
     offer: Option<(usize, Game, f32)>,
     // someone was picked up: turn-taking games wait this long at most for them
@@ -739,6 +741,132 @@ impl CharacterOverlay {
             }
         }
         self.chats = chats;
+        self.settle_states(dt, n);
+    }
+
+    /// The state machine's rules, checked for everyone every frame: what a
+    /// character is doing has to agree with what it's part of, and nothing
+    /// may hang in a state it can't leave. Whatever doesn't fit is put right
+    /// gently (back to standing, flags cleared), never by jumping it about.
+    pub(super) fn settle_states(&mut self, dt: f32, n: usize) {
+        let ids: Vec<(u32, Stage)> = self.chats.iter().chain(self.new_chats.iter()).map(|c| (c.id, c.stage)).collect();
+        let racing = self.race.is_some();
+        for i in 0..n {
+            let wk = self.walk_of(i);
+            let was = wk.act;
+            // how long in this state, and whether it's getting anywhere
+            if wk.act == wk.state_act {
+                wk.state_age += dt;
+            } else {
+                wk.state_act = wk.act;
+                wk.state_age = 0.0;
+            }
+            let mut fixed: Vec<&str> = Vec::new();
+            // part of a chat or a game that's gone
+            let stage = wk.social.and_then(|s| ids.iter().find(|c| c.0 == s.chat).map(|c| c.1));
+            if wk.social.is_some() && stage.is_none() {
+                wk.social = None;
+                fixed.push("chat gone");
+            }
+            // racing in a race that's over
+            if wk.race.is_some() && !racing {
+                wk.race = None;
+                fixed.push("race gone");
+            }
+            // only ever one thing to belong to
+            if wk.crowd.is_some() && (wk.social.is_some() || wk.race.is_some()) {
+                wk.crowd = None;
+                fixed.push("queue while busy");
+            }
+            if wk.act == Act::Rest && wk.rest.is_none() {
+                wk.act = Act::Idle;
+                fixed.push("resting without a rest");
+            } else if wk.rest.is_some() && !matches!(wk.act, Act::Rest | Act::Held | Act::Fall) {
+                wk.rest = None;
+                fixed.push("rest left over");
+            }
+            if wk.act == Act::Travel && wk.trip.is_none() {
+                wk.act = Act::Idle;
+                wk.sink = 0.0;
+                fixed.push("travelling nowhere");
+            } else if wk.trip.is_some() && matches!(wk.act, Act::Held | Act::Fall) {
+                // picked up on the way: the trip is off
+                wk.trip = None;
+                wk.sink = 0.0;
+                fixed.push("trip interrupted");
+            }
+            // states that can't last: falling while on the floor, planted for ages,
+            // a jump that never ended
+            let floored = wk.air <= 0.0 && wk.vy <= 0.0;
+            let stuck = match wk.act {
+                Act::Fall => floored && wk.state_age > 1.5,
+                Act::Planted => wk.state_age > 6.0,
+                Act::Jump => wk.state_age > 4.0,
+                Act::Pat => wk.state_age > 60.0,
+                Act::Chase => wk.state_age > 40.0,
+                _ => false,
+            };
+            if stuck {
+                wk.act = Act::Idle;
+                wk.air = 0.0;
+                wk.vx = 0.0;
+                wk.vy = 0.0;
+                wk.jump = 0.0;
+                wk.tumble = 0.0;
+                wk.timer = 1.0;
+                wk.target = wk.x;
+                fixed.push("stuck state");
+            }
+            // flags that belong to one kind of game only
+            if let Some(r) = wk.social.as_mut() {
+                let st = stage.unwrap_or(Stage::Talk);
+                let talk = matches!(st, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer);
+                if r.lean != 0.0 && st != Stage::Tug {
+                    r.lean = 0.0;
+                    fixed.push("lean");
+                }
+                if r.perched && !matches!(st, Stage::Volley | Stage::Gift) {
+                    r.perched = false;
+                    fixed.push("perched");
+                }
+                if talk && (r.no_touch || r.no_pat || r.face_lock || r.chasing) {
+                    r.no_touch = false;
+                    r.no_pat = false;
+                    r.face_lock = false;
+                    r.chasing = false;
+                    fixed.push("game flags in a chat");
+                }
+                if talk && (r.flying || r.stuck) && matches!(wk.act, Act::Idle | Act::Walk) && wk.state_age > 3.0 {
+                    r.flying = false;
+                    r.stuck = false;
+                    fixed.push("still flying in a chat");
+                }
+                if r.leaping && !r.moving && matches!(wk.act, Act::Idle | Act::Walk) {
+                    r.leaping = false;
+                }
+                if r.grabbed && matches!(wk.act, Act::Idle | Act::Walk) && wk.state_age > 2.0 {
+                    r.grabbed = false;
+                    fixed.push("grab left over");
+                }
+                // walking towards a place it can't reach (squeezed off the edge)
+                if r.moving && wk.act == Act::Walk {
+                    if (wk.x - wk.walk_from).abs() > 0.002 {
+                        wk.walk_from = wk.x;
+                        wk.walk_stall = 0.0;
+                    } else {
+                        wk.walk_stall += dt;
+                        if wk.walk_stall > 2.5 {
+                            r.moving = false;
+                            wk.walk_stall = 0.0;
+                            fixed.push("walking on the spot");
+                        }
+                    }
+                }
+            }
+            if !fixed.is_empty() {
+                log::debug!("state {i}: {was:?}, put right: {}", fixed.join(", "));
+            }
+        }
     }
 
     fn each_pair(members: &[usize]) -> Vec<(usize, usize)> {
@@ -1530,6 +1658,9 @@ impl CharacterOverlay {
         } else if size == 2 && self.race.is_none() && self.social_age >= tn().warm_small && !c.played.contains(&Game::Gift) && self.walk.rand() < tn().gift_chance {
             c.played.push(Game::Gift);
             self.start_gift(c);
+        }
+        if std::mem::take(&mut c.encore_due) && c.stage == Stage::Talk {
+            self.plan_encore(c);
         }
     }
 
@@ -4589,6 +4720,7 @@ impl CharacterOverlay {
         let mut other = Chat::new(id, right.to_vec(), Stage::Approach, 0.0);
         other.games = c.games;
         other.played = c.played.clone();
+        other.encore_due = c.encore_due;
         log::debug!("chat {}: splits, {:?} go off as chat {id}", c.id, other.members);
         for &i in &other.members {
             if let Some(r) = self.walk_of(i).social.as_mut() {
@@ -4993,6 +5125,7 @@ impl CharacterOverlay {
 
     /// A game's not over till it's been talked about.
     fn talk_it_over(&mut self, c: &mut Chat) {
+        c.encore_due = true;
         // the cheering is over
         for &i in &c.members.clone() {
             if let Some(r) = self.walk_of(i).social.as_mut() {
@@ -5014,9 +5147,6 @@ impl CharacterOverlay {
         }
         let length = tn().after_game_min + self.walk.rand() * tn().after_game_rand;
         self.start_talk(c, length);
-        if c.stage == Stage::Talk {
-            self.plan_encore(c);
-        }
     }
 
     /// After a game some have had enough and drift off; the lively and the

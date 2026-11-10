@@ -112,15 +112,12 @@ tuning! {
     }
     "Roaming", "Moving between workspaces" {
         ws_every: "Moving interval per character (s)" = 240.0, 10.0, 3600.0, 10.0, 0;
-        ws_bored: "Gets bored after (s)" = 300.0, 10.0, 3600.0, 10.0, 0;
-        ws_familiar: "Bored of familiar faces" = 1.0, 0.0, 10.0, 0.5, 1;
-        ws_floor: "Smallest share per workspace" = 0.15, 0.0, 0.5, 0.05, 2;
+        ws_floor: "Smallest share per workspace" = 0.05, 0.0, 0.5, 0.05, 2;
         ws_use_weight: "Use vs window count (1 = use)" = 0.5, 0.0, 1.0, 0.05, 2;
         ws_use_half: "Use halves every (s)" = 900.0, 30.0, 14400.0, 30.0, 0;
-        ws_balance: "Urge to leave a crowded one" = 1.0, 0.0, 10.0, 0.5, 1;
         ws_stay: "Stays at least (s)" = 120.0, 0.0, 3600.0, 10.0, 0;
         ws_gap: "Quiet after someone leaves (s)" = 45.0, 0.0, 1800.0, 5.0, 0;
-        ws_friends: "Friends who may come along, at most" = 1.0, 0.0, 6.0, 1.0, 0;
+        ws_friends: "Friends who may come along, at most" = 0.0, 0.0, 6.0, 1.0, 0;
         ws_max: "On the way at once" = 2.0, 1.0, 12.0, 1.0, 0;
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
     }

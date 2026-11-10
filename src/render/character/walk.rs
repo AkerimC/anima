@@ -126,6 +126,14 @@ pub(super) struct WalkState {
     pub(super) greet_cool: f32,
     // seconds with nothing to do and nobody around
     pub(super) bored: f32,
+    // the state machine's bookkeeping: current state, seconds in it, and
+    // whether a walk is getting anywhere
+    pub(super) state_act: Act,
+    pub(super) state_age: f32,
+    pub(super) walk_from: f32,
+    pub(super) walk_stall: f32,
+    // Walk switched off in the settings
+    pub(super) still: bool,
     // just gave up fishing: not again for a while
     pub(super) fish_cool: f32,
     // visiting a fullscreen app: gets a rod out once it's up
@@ -174,6 +182,13 @@ impl WalkState {
 
     pub(super) fn pick(&mut self, min: f32, max: f32, can_chase: bool) {
         let t = tn();
+        // told to stay put: just stands there
+        if self.still {
+            self.act = Act::Idle;
+            self.target = self.x;
+            self.timer = 1.0;
+            return;
+        }
         // in a panic: off to somewhere else at once, no standing about
         if self.fret {
             let mut to = min + self.rand() * (max - min);

@@ -54,7 +54,7 @@ impl Ui {
         }
     }
 
-    fn reload_soon(&self) {
+    pub(crate) fn reload_soon(&self) {
         if self.is_on() {
             self.reload.call(250, daemon::reload);
         }

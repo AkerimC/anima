@@ -530,7 +530,8 @@ fn settings_row(ui: &Rc<Ui>) -> gtk::Widget {
         let u = ui.clone();
         sw.connect_active_notify(move |w| {
             config::set("character", key, w.is_active());
-            u.restart_soon();
+            // applied as it runs: nobody gets reloaded
+            u.reload_soon();
         });
         sw
     };
