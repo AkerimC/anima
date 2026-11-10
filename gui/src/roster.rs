@@ -354,21 +354,51 @@ fn sprite_surface(path: &str) -> Option<(gtk::cairo::ImageSurface, image::RgbaIm
 /// drag it to move it, drag its corner or scroll to size it. Saved as it's
 /// done, and shown on the desktop at once.
 fn fit_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str) -> gtk::Widget {
+    fit_pose(r, pop, i, name, path, false)
+}
+
+fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str, happy: bool) -> gtk::Widget {
     use anima::render::character::wear;
     use std::cell::{Cell, RefCell};
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(320).build();
     b.append(&back_header(r, pop, i, name, "Fit accessories"));
+    // calm and happy are pictures of their own: each is fitted on its own
+    let poses = gtk::Box::builder().spacing(0).halign(gtk::Align::Center).build();
+    poses.add_css_class("linked");
+    let calm_b = gtk::ToggleButton::builder().label("Calm").active(!happy).build();
+    let happy_b = gtk::ToggleButton::builder().label("Happy").active(happy).group(&calm_b).build();
+    let happy_pic = wear::happy_path(path).filter(|p| std::path::Path::new(p).is_file());
+    happy_b.set_sensitive(happy_pic.is_some());
+    for (btn, want) in [(calm_b.clone(), false), (happy_b.clone(), true)] {
+        let (rr, p, n, pth) = (r.clone(), pop.clone(), name.to_string(), path.to_string());
+        btn.connect_toggled(move |t| {
+            if t.is_active() && want != happy {
+                p.set_child(Some(&fit_pose(&rr, &p, i, &n, &pth, want)));
+            }
+        });
+    }
+    poses.append(&calm_b);
+    poses.append(&happy_b);
+    b.append(&poses);
     // what it wears, plus the Santa hat
     let on: Vec<String> = wardrobe_all().get(name).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     let mut items: Vec<wear::Item> = wear::catalog().into_iter().filter(|it| on.contains(&it.id)).collect();
     items.push(wear::santa_item());
+    let calm_path = path;
+    let path = if happy { happy_pic.as_deref().unwrap_or(path) } else { path };
     let Some((surf, img)) = sprite_surface(path) else {
         b.append(&gtk::Label::new(Some("Couldn't read its picture")));
         return b.upcast();
     };
-    let Some(anchors) = anima::render::anchors::find(&img) else {
-        b.append(&gtk::Label::new(Some("Couldn't find its head on the picture")));
-        return b.upcast();
+    let calm_anchors = image::open(calm_path).ok().and_then(|i| anima::render::anchors::find(&i.to_rgba8()));
+    let found = anima::render::anchors::find(&img);
+    let anchors = match (happy, calm_anchors, found) {
+        (true, Some(c), Some(h)) => wear::happy_anchors(&c, h),
+        (_, _, Some(a)) => a,
+        _ => {
+            b.append(&gtk::Label::new(Some("Couldn't find its head on the picture")));
+            return b.upcast();
+        }
     };
     let hint = gtk::Label::builder()
         .label("Pick one, then drag its box to move it, drag the corner or scroll over it to size it.")
@@ -377,7 +407,7 @@ fn fit_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         .build();
     hint.add_css_class("dim-label");
     b.append(&hint);
-    let faces_right = path.contains("_0010.") || path.contains("_0011.");
+    let faces_right = calm_path.contains("_0010.") || calm_path.contains("_0011.");
     let fits: Rc<RefCell<wear::Fits>> = Rc::new(RefCell::new(fits_all()));
     let pick: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     let items = Rc::new(items);
@@ -390,7 +420,7 @@ fn fit_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
     };
     let fit_of = {
         let (fits, who) = (fits.clone(), who.clone());
-        move |id: &str| fits.borrow().get(&who).and_then(|m| m.get(id)).copied()
+        move |id: &str| fits.borrow().get(&who).and_then(|m| m.get(&wear::fit_key(id, happy)).or_else(|| m.get(id))).copied()
     };
     let rect_of = {
         let (items, fit_of) = (items.clone(), fit_of.clone());
@@ -448,7 +478,7 @@ fn fit_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
     let set_fit = {
         let (fits, who) = (fits.clone(), who.clone());
         move |id: &str, f: [f32; 4]| {
-            fits.borrow_mut().entry(who.clone()).or_default().insert(id.to_string(), f);
+            fits.borrow_mut().entry(who.clone()).or_default().insert(wear::fit_key(id, happy), f);
         }
     };
     let drag = gtk::GestureDrag::new();
@@ -543,7 +573,7 @@ fn fit_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
         let (pick, items, fits, who, area2, save) = (pick.clone(), items.clone(), fits.clone(), who.clone(), area.clone(), save.clone());
         reset.connect_clicked(move |_| {
             if let Some(m) = fits.borrow_mut().get_mut(&who) {
-                m.remove(&items[pick.get()].id);
+                m.remove(&wear::fit_key(&items[pick.get()].id, happy));
             }
             save();
             area2.queue_draw();

@@ -120,6 +120,39 @@ pub fn anchor_point(a: &crate::render::anchors::Anchors, anchor: Anchor, faces_r
     }
 }
 
+/// The happy pose's anchors, with what can't be seen there (eyes shut in
+/// a smile, hands out of sight) taken from the calm pose, in the same place
+/// relative to the head and the body.
+pub fn happy_anchors(calm: &crate::render::anchors::Anchors, mut happy: crate::render::anchors::Anchors) -> crate::render::anchors::Anchors {
+    let rel = |p: [f32; 2], from: &[f32; 4], to: &[f32; 4]| {
+        let (fw, fh) = ((from[2] - from[0]).max(0.01), (from[3] - from[1]).max(0.01));
+        [to[0] + (p[0] - from[0]) / fw * (to[2] - to[0]), to[1] + (p[1] - from[1]) / fh * (to[3] - to[1])]
+    };
+    if !happy.eyes_found {
+        happy.eyes = [rel(calm.eyes[0], &calm.head, &happy.head), rel(calm.eyes[1], &calm.head, &happy.head)];
+        happy.eye_size = calm.eye_size;
+    }
+    for k in 0..2 {
+        if !happy.hands_found[k] {
+            happy.hands[k] = rel(calm.hands[k], &calm.body, &happy.body);
+        }
+    }
+    happy
+}
+
+/// The key a hand-made fit is kept under: the item's id, with "@happy" for
+/// the happy pose.
+pub fn fit_key(id: &str, happy: bool) -> String {
+    if happy { format!("{id}@happy") } else { id.to_string() }
+}
+
+/// The happy pose's picture next to a calm Uma sprite.
+pub fn happy_path(calm: &str) -> Option<String> {
+    let p = std::path::Path::new(calm);
+    let name = p.file_name()?.to_str()?;
+    name.contains("_0010.").then(|| p.with_file_name(name.replace("[A]", "[B]").replace("_0010.", "_0011.")).to_string_lossy().into_owned())
+}
+
 /// Santa hat as an item, so it can be fitted like the rest.
 pub fn santa_item() -> Item {
     Item { id: "santa".into(), label: "Santa hat (Christmas)".into(), kind: 25, image: None, anchor: Anchor::Crown, size: [0.95, 0.72], pivot: [0.5, 1.0], offset: [0.0, 0.2], behind: false }
@@ -230,29 +263,13 @@ impl CharacterOverlay {
 
     /// What it has on right now: its wardrobe, and what the weather and the
     /// season put on it.
-    /// The anchors of the pose drawn now. The happy pose often has its eyes
-    /// shut in a smile and its arms elsewhere: what can't be seen there is
-    /// taken from the calm pose, in the same place relative to the head.
+    /// The anchors of the pose drawn now (see `happy_anchors`).
     fn pose_anchors(&self) -> Option<crate::render::anchors::Anchors> {
         let calm = self.anchors?;
         if !self.drawn_happy {
             return Some(calm);
         }
-        let Some(mut happy) = self.anchors_happy else { return Some(calm) };
-        let rel = |p: [f32; 2], from: &[f32; 4], to: &[f32; 4]| {
-            let (fw, fh) = ((from[2] - from[0]).max(0.01), (from[3] - from[1]).max(0.01));
-            [to[0] + (p[0] - from[0]) / fw * (to[2] - to[0]), to[1] + (p[1] - from[1]) / fh * (to[3] - to[1])]
-        };
-        if !happy.eyes_found {
-            happy.eyes = [rel(calm.eyes[0], &calm.head, &happy.head), rel(calm.eyes[1], &calm.head, &happy.head)];
-            happy.eye_size = calm.eye_size;
-        }
-        for k in 0..2 {
-            if !happy.hands_found[k] {
-                happy.hands[k] = rel(calm.hands[k], &calm.body, &happy.body);
-            }
-        }
-        Some(happy)
+        Some(self.anchors_happy.map_or(calm, |h| happy_anchors(&calm, h)))
     }
 
     pub(super) fn worn(&self) -> Vec<Worn> {
@@ -292,8 +309,10 @@ impl CharacterOverlay {
         let (wardrobe, items) = (&shared.0, &shared.1);
         let name = self.own_name();
         let fits = shared.2.get(&name);
+        let happy = self.drawn_happy;
         let fitted = |it: &Item| {
-            let [l, t, w, h] = layout(&a, it, self.faces_right, fits.and_then(|f| f.get(&it.id)).copied());
+            let fit = fits.and_then(|f| f.get(&fit_key(&it.id, happy)).or_else(|| f.get(&it.id))).copied();
+            let [l, t, w, h] = layout(&a, it, self.faces_right, fit);
             let (x0, x1) = (sx(l), sx(l + w));
             [x0.min(x1), sy(t + h), x0.max(x1), sy(t)]
         };
