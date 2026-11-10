@@ -69,8 +69,11 @@ const CRUMB_FPS: f32 = 12.0;
 /// lying on the floor till its owner comes for it.
 #[derive(Clone, Debug)]
 pub(super) struct Loose {
-    // what it was, to have it back
+    // what it was, to have it back, and whose: by name, since places in the
+    // team move when characters are added or taken off
     pub(super) id: String,
+    owner_name: String,
+    helper_name: Option<String>,
     pub(super) kind: i32,
     pub(super) owner: usize,
     // strip x and screen y of its middle, px; speed px/s
@@ -614,6 +617,7 @@ impl CharacterOverlay {
             return;
         }
         let worn = a.worn();
+        let owner_name = self.character_name(i);
         let view = a.own_view[0] * self.view_w * 0.5;
         // where it would stand: the bottom of its box on the ground, less the empty margin
         let ground = (1.0 - (pose.center[1] - pose.half[1])) * 0.5 * pose.size[1];
@@ -647,7 +651,7 @@ impl CharacterOverlay {
             let lie = size[0].min(size[1]) * 0.5;
             log::debug!("{i} loses its {id}");
             wk.lost.push(id.clone());
-            flying.push(Loose { id, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
+            flying.push(Loose { id, owner_name: owner_name.clone(), helper_name: None, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
         }
         self.moods.loose.extend(flying);
     }
@@ -657,9 +661,15 @@ impl CharacterOverlay {
     pub(super) fn run_loose(&mut self, dt: f32, n: usize) {
         let raining = super::weather::now().rain;
         let mut keep = Vec::new();
+        let names: Vec<String> = (0..n).map(|i| self.character_name(i)).collect();
         for mut l in std::mem::take(&mut self.moods.loose) {
-            if l.owner >= n {
-                continue;
+            // find its owner (and helper) again: the team may have changed
+            let Some(o) = names.iter().position(|x| x == &l.owner_name) else { continue };
+            l.owner = o;
+            l.helper = l.helper_name.as_ref().and_then(|h| names.iter().position(|x| x == h));
+            if l.helper.is_none() {
+                l.helper_name = None;
+                l.carried = false;
             }
             if l.still <= 0.0 || l.y < l.floor - 1.0 {
                 l.vy += 2600.0 * dt;
@@ -683,7 +693,6 @@ impl CharacterOverlay {
             } else {
                 l.still += dt;
             }
-            let o = l.owner;
             let wk = self.walk_ref(o);
             // not raining any more, or left too long: it's gone, and so is the loss
             if (l.id == "umbrella" && !raining && l.still > 8.0) || l.still > 120.0 {
@@ -705,6 +714,7 @@ impl CharacterOverlay {
                         l.rot = std::f32::consts::FRAC_PI_2;
                     }
                     l.helper = None;
+                    l.helper_name = None;
                     l.carried = false;
                 }
                 if l.helper.is_none() && l.still > 3.0 {
@@ -718,6 +728,7 @@ impl CharacterOverlay {
                         });
                     if let Some(h) = l.helper {
                         log::debug!("{h} goes to fetch {o}'s {}", l.id);
+                        l.helper_name = Some(names[h].clone());
                     }
                 }
                 if let Some(h) = l.helper {
@@ -755,6 +766,7 @@ impl CharacterOverlay {
             }
             if l.still > 0.6 && free {
                 l.helper = None;
+                l.helper_name = None;
                 l.carried = false;
                 let here = self.strip_px(o);
                 let reach = (self.actor_ref(o).hit_rect[3] - self.actor_ref(o).hit_rect[1]) * 0.35;

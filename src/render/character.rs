@@ -1886,32 +1886,7 @@ impl CharacterOverlay {
                 e.view = view;
             }
             self.share_views(view, strip.map(|st| st.ws));
-            // Walk off: everyone stays put, no wandering, chats or games
-            let still = !self.config.walk;
-            self.walk.still = still;
-            for e in &mut self.extras {
-                e.walk.still = still;
-            }
-            if still {
-                // whatever they were doing stops where they stand
-                let n = self.extras.len() + 1;
-                self.race = None;
-                for i in 0..n {
-                    let wk = self.walk_of(i);
-                    wk.social = None;
-                    wk.race = None;
-                    wk.crowd = None;
-                    wk.circle = false;
-                    if matches!(wk.act, Act::Walk | Act::Chase) {
-                        wk.act = Act::Idle;
-                        wk.target = wk.x;
-                        wk.timer = 1.0;
-                    }
-                }
-                if !self.chats.is_empty() {
-                    self.clear_chats();
-                }
-            } else {
+            {
                 self.run_race(dt, w);
                 self.run_social(dt, info.mouse);
             }

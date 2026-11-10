@@ -133,24 +133,26 @@ pub fn catalog() -> Vec<Item> {
     v
 }
 
-/// The wardrobe as saved, read again whenever the file changes; the catalog
-/// with it, so a picture dropped in shows up.
-fn wardrobe() -> (HashMap<String, Vec<String>>, Vec<Item>) {
-    type State = (Option<Instant>, Option<SystemTime>, HashMap<String, Vec<String>>, Vec<Item>);
-    static STATE: std::sync::LazyLock<Mutex<State>> = std::sync::LazyLock::new(|| Mutex::new((None, None, HashMap::new(), Vec::new())));
+/// The wardrobe as saved and the catalog, read again whenever the file or
+/// the accessories folder changes; shared, as it's asked for every frame.
+type Wardrobe = std::sync::Arc<(HashMap<String, Vec<String>>, Vec<Item>)>;
+
+fn wardrobe() -> Wardrobe {
+    type State = (Option<Instant>, Option<SystemTime>, Wardrobe);
+    static STATE: std::sync::LazyLock<Mutex<State>> = std::sync::LazyLock::new(|| Mutex::new((None, None, Wardrobe::default())));
     let mut s = STATE.lock().unwrap();
     if s.0.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
         s.0 = Some(Instant::now());
         let stamp = std::fs::metadata(wardrobe_path()).and_then(|m| m.modified()).ok();
         let dir_stamp = std::fs::metadata(accessories_dir()).and_then(|m| m.modified()).ok();
         let both = stamp.max(dir_stamp);
-        if both != s.1 || s.3.is_empty() {
+        if both != s.1 || s.2.1.is_empty() {
             s.1 = both;
-            s.2 = std::fs::read_to_string(wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-            s.3 = catalog();
+            let saved = std::fs::read_to_string(wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            s.2 = std::sync::Arc::new((saved, catalog()));
         }
     }
-    (s.2.clone(), s.3.clone())
+    s.2.clone()
 }
 
 /// One thing to draw this frame: prop kind, its box in sprite space
@@ -219,7 +221,8 @@ impl CharacterOverlay {
         let mut out = Vec::new();
         let wk = &self.walk;
         let asleep = wk.act == Act::Rest && wk.rest.is_some_and(|r| r.kind == super::moods::RestKind::Sleep);
-        let (wardrobe, items) = wardrobe();
+        let shared = wardrobe();
+        let (wardrobe, items) = (&shared.0, &shared.1);
         if let Some(ids) = wardrobe.get(&self.own_name()) {
             for id in ids {
                 let Some(it) = items.iter().find(|i| &i.id == id) else { continue };

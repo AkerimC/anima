@@ -691,8 +691,6 @@ fn settings_row(ui: &Rc<Ui>) -> gtk::Widget {
     let row = gtk::Box::builder().spacing(8).build();
     row.append(&gtk::Label::new(Some("Size")));
     row.append(&scale);
-    row.append(&gtk::Label::new(Some("Walk")));
-    row.append(&toggle("walk", true));
     row.append(&gtk::Label::new(Some("Follow mouse")));
     row.append(&toggle("look_at_mouse", true));
     let race = gtk::Button::with_label("Race");
