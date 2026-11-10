@@ -311,17 +311,33 @@ vec4 beast(vec2 p) {
     return vec4(col, max(max(body, arm), horn));
 }
 vec4 umbrella(vec2 p) {
-    // canopy: a half disc with scalloped rim, on a hooked handle
-    float d = length(p - vec2(0.0, -0.75));
-    float top = step(-0.75, p.y) * (1.0 - smoothstep(1.48, 1.53, d));
-    float rim = 0.12 * abs(sin((p.x + 1.0) * 3.14159 * 2.5));
-    top *= step(-0.75 + rim, p.y);
-    float stick = bar(p, vec2(-0.03, -1.0), vec2(0.03, -0.72));
-    float tip = disc(p, vec2(0.0, 0.8), 0.06);
-    float panel = step(0.0, sin(atan(p.y + 0.75, p.x) * 8.0));
-    vec3 col = mix(vec3(0.95, 0.45, 0.55), vec3(1.0, 0.85, 0.9), panel);
-    if (stick > 0.0 || tip > 0.0) col = vec3(0.35, 0.25, 0.2);
-    return vec4(col, max(max(top, stick), tip));
+    // canopy: a dome whose rim curves up between the ribs
+    vec2 q = (p - vec2(0.0, 0.05)) / vec2(0.96, 0.8);
+    float dome = step(0.0, q.y) * (1.0 - smoothstep(0.97, 1.0, length(q)));
+    float seg = fract((p.x + 0.96) / 0.48);
+    float edge = 0.05 + 0.1 * sin(3.14159 * seg);
+    dome *= smoothstep(edge - 0.02, edge + 0.01, p.y);
+    // ribs from the tip down to each point of the rim
+    float ribs = 0.0;
+    for (int k = 0; k < 5; k++) {
+        float rx = -0.96 + 0.48 * float(k);
+        vec2 a = vec2(0.0, 0.85), b = vec2(rx, 0.05);
+        vec2 ab = b - a;
+        float t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+        ribs = max(ribs, 1.0 - smoothstep(0.012, 0.03, length(p - a - ab * t)));
+    }
+    // soft shading: lighter towards the top
+    float light = clamp(q.y * 0.6 + 0.4, 0.0, 1.0);
+    vec3 cloth = mix(vec3(0.82, 0.33, 0.45), vec3(1.0, 0.62, 0.72), light);
+    vec3 col = mix(cloth, vec3(0.62, 0.2, 0.3), ribs * 0.8);
+    // the shaft, a little tip on top, and a hooked handle at the bottom
+    float shaft = bar(p, vec2(-0.025, -0.82), vec2(0.025, 0.9));
+    float tip = disc(p, vec2(0.0, 0.92), 0.04);
+    vec2 h = p - vec2(0.1, -0.82);
+    float hook = step(h.y, 0.0) * (1.0 - smoothstep(0.02, 0.04, abs(length(h) - 0.1)));
+    float stick = max(max(shaft, tip), hook);
+    col = mix(col, vec3(0.32, 0.22, 0.16), stick);
+    return vec4(col, max(dome, stick));
 }
 vec4 snowflake(vec2 p) {
     float a = atan(p.y, p.x);

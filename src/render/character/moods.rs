@@ -557,8 +557,8 @@ impl CharacterOverlay {
         let w = self.moods.weather;
         if w.rain || w.snow {
             let time = self.start.elapsed().as_secs_f32();
-            let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
-            for (k, (wk, r, seen)) in actors.enumerate() {
+            let actors = std::iter::once((&self.walk, self.hit_rect, self.visible, self.opaque)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible, e.opaque)));
+            for (k, (wk, r, seen, o)) in actors.enumerate() {
                 let h = r[3] - r[1];
                 if h <= 0.0 || !seen || matches!(wk.act, Act::Held | Act::Fall | Act::Travel | Act::Planted) {
                     continue;
@@ -568,10 +568,17 @@ impl CharacterOverlay {
                     let busy = wk.race.is_some() || (wk.social.is_some() && self.in_game(k));
                     let asleep = wk.act == Act::Rest;
                     if !busy && !asleep {
-                        let size = h * 0.95;
-                        let lean = if wk.left { -1.0 } else { 1.0 } * h * 0.04;
-                        let top = r[1] - h * 0.18;
-                        v.push((22, [cx + lean - size * 0.5, top, cx + lean + size * 0.5, top + size * 0.62], false, k));
+                        // held in the hand, the canopy just clear of the head
+                        let side = if wk.left { -1.0 } else { 1.0 };
+                        let body = (r[2] - r[0]) * o[0];
+                        let hand_x = cx + side * body * 0.55;
+                        let hand_y = r[1] + h * 0.6;
+                        let head = r[1] + h * o[1] - h * 0.04;
+                        // canopy rim at 47.5% of the box, handle bottom at 91%
+                        let tall = (hand_y - head) / 0.435;
+                        let top = head - tall * 0.475;
+                        let wide = (body * 2.8).max(tall * 0.75);
+                        v.push((22, [hand_x - wide * 0.5, top, hand_x + wide * 0.5, top + tall], false, k));
                     }
                 } else {
                     for f in 0..3 {
