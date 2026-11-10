@@ -364,8 +364,18 @@ impl CharacterOverlay {
         let tex_aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
         // an open one: the top a set size just clear of the head, the stick from
         // it down to `hold`, however far that is
+        let picture = super::rope::prop_image(22).is_some();
         let mut open = |hold: [f32; 2], behind: bool| {
             let wide = 1.3 * hw;
+            if picture {
+                // the picture's handle at the bottom: the whole umbrella from above the
+                // head down to the hand
+                let rim = crown[1] - 0.015;
+                let top = rim - wide * 0.55 * tex_aspect;
+                let (x0, x1) = (sx(hold[0] - wide * 0.5), sx(hold[0] + wide * 0.5));
+                out.push(Worn { id: "umbrella", kind: 22, rect: [x0.min(x1), sy(hold[1] + hh * 0.05), x0.max(x1), sy(top)], flip: false, behind, image: None });
+                return;
+            }
             let tall = wide * 0.5 * tex_aspect;
             let rim = crown[1] - 0.015;
             let (x0, x1) = (sx(hold[0] - wide * 0.5), sx(hold[0] + wide * 0.5));

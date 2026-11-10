@@ -4057,7 +4057,12 @@ impl CharacterOverlay {
                 let size = h * 1.25;
                 let sx = x - own[0] * self.view_w * 0.5 + (time * 7.0).sin() * size * 0.04;
                 if h > 0.0 && k > 0.0 {
-                    v.push((21, [sx - size * 0.5, floor - size * k, sx + size * 0.5, floor], false, owner));
+                    if super::rope::prop_image(21).is_some() {
+                        // a picture: full size, rising out of the ground, shown above it only
+                        v.push((21000 + (k * 1000.0) as i32, [sx - size * 0.5, floor - size * k, sx + size * 0.5, floor + size * (1.0 - k)], false, owner));
+                    } else {
+                        v.push((21, [sx - size * 0.5, floor - size * k, sx + size * 0.5, floor], false, owner));
+                    }
                 }
             }
             for a in f.anglers.iter().filter(|a| (1..=5).contains(&a.phase) && !a.blown) {

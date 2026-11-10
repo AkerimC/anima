@@ -193,6 +193,8 @@ uniform int u_kind;
 uniform int u_flip;
 uniform vec4 u_rect;
 uniform sampler2D u_img;
+uniform vec2 u_fit;      // a picture kept to its own shape inside the box
+uniform float u_reveal;  // shown from the bottom up to this share (rising out of the ground)
 uniform float u_time;
 uniform float u_saspect; // screen width / height
 float hash1(float x) { return fract(sin(x * 127.1) * 43758.5453); }
@@ -555,7 +557,11 @@ vec4 crown(vec2 p) {
     return vec4(col, a);
 }
 vec4 picture(vec2 p) {
-    return texture(u_img, vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));
+    vec2 q = p * u_fit;
+    if (abs(q.x) > 1.0 || abs(q.y) > 1.0 || p.y > -1.0 + 2.0 * u_reveal) {
+        return vec4(0.0);
+    }
+    return texture(u_img, vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5));
 }
 vec4 canopy(vec2 p) {
     // the umbrella's top on its own: a ribbed dome filling the box, rim at the bottom
@@ -663,7 +669,7 @@ pub(super) struct CarrotGl {
     #[allow(dead_code)]
     vbo: glow::Buffer,
     // accessories' pictures, loaded once (None: couldn't be read)
-    images: std::collections::HashMap<std::path::PathBuf, Option<glow::Texture>>,
+    images: std::collections::HashMap<std::path::PathBuf, Option<(glow::Texture, f32)>>,
 }
 
 impl CarrotGl {
@@ -682,6 +688,65 @@ impl CarrotGl {
             Ok(Self { program, vao, vbo, images: Default::default() })
         }
     }
+}
+
+impl CarrotGl {
+    /// A picture's texture and width / height, loaded once.
+    fn picture(&mut self, gl: &glow::Context, path: &std::path::Path) -> Option<(glow::Texture, f32)> {
+        *self.images.entry(path.to_path_buf()).or_insert_with(|| {
+            let img = image::open(path).ok()?.to_rgba8();
+            let (iw, ih) = img.dimensions();
+            let tex = crate::render::gl::create_texture(gl, iw, ih, img.as_raw(), crate::render::gl::Filter::Linear, true).ok()?;
+            Some((tex, iw as f32 / ih.max(1) as f32))
+        })
+    }
+}
+
+/// How much to stretch the box's coordinates so a picture of `aspect`
+/// (width / height) keeps its shape inside a box `w` x `h`, centred.
+fn fit(w: f32, h: f32, aspect: f32) -> [f32; 2] {
+    let box_aspect = (w / h.max(0.01)).max(0.01);
+    if box_aspect > aspect { [box_aspect / aspect, 1.0] } else { [1.0, aspect / box_aspect] }
+}
+
+/// The picture standing in for a drawn prop: a PNG named after it in
+/// `~/.local/share/anima/props/` (looked for again every few seconds).
+pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
+    use std::time::{Duration, Instant};
+    let name = match kind {
+        0 => "carrot",
+        1 => "gift",
+        2 => "balloon",
+        12 => "note",
+        15 => "star",
+        16 => "duck",
+        17 => "boot",
+        18 => "can",
+        21 => "beast",
+        22 => "umbrella",
+        42 => "umbrella_closed",
+        23 => "snowflake",
+        28 => "top_hat",
+        29 => "bow",
+        30 => "glasses",
+        31 => "sunglasses",
+        32 => "flower",
+        33 => "scarf",
+        34 => "backpack",
+        36 => "headphones",
+        37 => "crown",
+        _ => return None,
+    };
+    type Seen = (Option<Instant>, std::collections::HashSet<String>);
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<Seen>> = std::sync::LazyLock::new(|| std::sync::Mutex::new((None, std::collections::HashSet::new())));
+    let dir = crate::util::data_dir().join("props");
+    let mut s = SEEN.lock().unwrap();
+    if s.0.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+        s.0 = Some(Instant::now());
+        s.1 = std::fs::read_dir(&dir).map(|d| d.flatten().filter_map(|e| e.file_name().into_string().ok()).collect()).unwrap_or_default();
+    }
+    let file = format!("{name}.png");
+    s.1.contains(&file).then(|| dir.join(file))
 }
 
 impl CharacterOverlay {
@@ -729,23 +794,26 @@ impl CharacterOverlay {
         c.program.set_f32(gl, "c_aspect", pose.aspect);
         c.program.set_vec2(gl, "c_pivot", pose.pivot[0], pose.pivot[1]);
         c.program.set_f32(gl, "c_xscale", pose.xscale);
+        c.program.set_f32(gl, "u_reveal", 1.0);
         for w in worn.iter().filter(|w| w.behind == behind) {
-            if w.kind == 100 {
-                let Some(path) = w.image.as_ref() else { continue };
-                let tex = *c.images.entry(path.clone()).or_insert_with(|| {
-                    let img = image::open(path).ok()?.to_rgba8();
-                    let (iw, ih) = img.dimensions();
-                    crate::render::gl::create_texture(gl, iw, ih, img.as_raw(), crate::render::gl::Filter::Linear, true).ok()
-                });
-                let Some(tex) = tex else { continue };
+            // a picture: its own, or the one in the props folder for this kind
+            let picture = w.image.clone().or_else(|| prop_image(w.kind));
+            let mut kind = w.kind;
+            if let Some(path) = picture {
+                let Some((tex, aspect)) = c.picture(gl, &path) else { continue };
+                // the box in px, to keep the picture to its own shape
+                let [x0, y0, x1, y1] = w.rect;
+                let (bw, bh) = ((x1 - x0) * 0.5 * pose.half[0] * pose.size[0], (y1 - y0) * 0.5 * pose.half[1] * pose.size[1]);
+                c.program.set_vec2(gl, "u_fit", fit(bw, bh, aspect)[0], fit(bw, bh, aspect)[1]);
                 unsafe {
                     gl.active_texture(glow::TEXTURE1);
                     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 }
                 c.program.set_i32(gl, "u_img", 1);
+                kind = 100;
             }
             c.program.set_vec4(gl, "u_sub", w.rect);
-            c.program.set_i32(gl, "u_kind", w.kind);
+            c.program.set_i32(gl, "u_kind", kind);
             c.program.set_i32(gl, "u_flip", i32::from(w.flip));
             unsafe {
                 gl.enable(glow::BLEND);
@@ -754,7 +822,7 @@ impl CharacterOverlay {
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_vertex_array(None);
             }
-            if w.kind == 100 {
+            if kind == 100 {
                 unsafe {
                     gl.bind_texture(glow::TEXTURE_2D, None);
                     gl.active_texture(glow::TEXTURE0);
@@ -799,6 +867,9 @@ impl CharacterOverlay {
         c.program.set_f32(gl, "u_saspect", w / h);
         c.program.set_f32(gl, "c_aspect", w / h);
         for (kind, rect, flip, spin, zoom) in props {
+            // the creature rising out of the ground says how far it's up in its kind
+            let (kind, reveal) = if kind >= 21000 { (21, (kind - 21000) as f32 / 1000.0) } else { (kind, 1.0) };
+            let picture = prop_image(kind);
             c.program.bind(gl);
             c.program.set_f32(gl, "u_spin", spin);
             if !target.begin(gl, 0, rect) {
@@ -808,6 +879,21 @@ impl CharacterOverlay {
             c.program.bind(gl);
             c.program.set_vec4(gl, "u_rect", [x0 / w * 2.0 - 1.0, 1.0 - y1 / h * 2.0, x1 / w * 2.0 - 1.0, 1.0 - y0 / h * 2.0]);
             c.program.set_vec4(gl, "u_clip", zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform()));
+            c.program.set_f32(gl, "u_reveal", reveal);
+            let kind = match picture.and_then(|p| c.picture(gl, &p)) {
+                Some((tex, aspect)) => {
+                    let f = fit(x1 - x0, y1 - y0, aspect);
+                    c.program.set_vec2(gl, "u_fit", f[0], f[1]);
+                    unsafe {
+                        gl.active_texture(glow::TEXTURE1);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        gl.active_texture(glow::TEXTURE0);
+                    }
+                    c.program.set_i32(gl, "u_img", 1);
+                    100
+                }
+                None => kind,
+            };
             c.program.set_i32(gl, "u_kind", kind);
             c.program.set_i32(gl, "u_flip", i32::from(flip));
             unsafe {
