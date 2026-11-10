@@ -131,12 +131,16 @@ tuning! {
         ws_max: "On the way at once" = 2.0, 1.0, 12.0, 1.0, 0;
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
     }
-    "Roaming", "Sleep" {
-        sleep_after: "Untouched for (s)" = 300.0, 25.0, 3600.0, 15.0, 0;
-        night_sleep: "Go to bed at night (share)" = 0.5, 0.0, 1.0, 0.05, 2;
-        night_spread: "Going to bed one by one (s)" = 90.0, 0.0, 1800.0, 5.0, 0;
+    "Roaming", "Weather" {
+        weather_show: "Weather shown: 0 off, 1 around them, 2 whole screen" = 1.0, 0.0, 2.0, 1.0, 0;
+        drop_swing: "Swung this hard, the umbrella flies off" = 5.0, 0.5, 30.0, 0.5, 1;
         snow_settle: "Snow piles up on heads over (s)" = 45.0, 1.0, 600.0, 5.0, 0;
         snow_hop: "Hop after snowflakes (per s)" = 0.06, 0.0, 2.0, 0.01, 2;
+        night_sleep: "Go to bed at night (share)" = 0.5, 0.0, 1.0, 0.05, 2;
+        night_spread: "Going to bed one by one (s)" = 90.0, 0.0, 1800.0, 5.0, 0;
+    }
+    "Roaming", "Sleep" {
+        sleep_after: "Untouched for (s)" = 300.0, 25.0, 3600.0, 15.0, 0;
         sleep_spread: "Dozing off one by one (s)" = 15.0, 0.0, 120.0, 1.0, 0;
         sleep_sink: "Sinking while lying down" = 0.55, 0.0, 1.0, 0.05, 2;
         nap_games: "Games before a nap" = 3.0, 1.0, 20.0, 1.0, 0;

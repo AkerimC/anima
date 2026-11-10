@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::walk::Act;
 use super::CharacterOverlay;
+use crate::render::tuning::get as tn;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anchor {
@@ -222,7 +223,7 @@ impl CharacterOverlay {
         }
         // snow that has settled on its head (or hat)
         let pile = wk.snow_pile;
-        if pile >= 0.05 {
+        if pile >= 0.05 && tn().weather_show >= 0.5 {
             let (size, pivot, offset) = if hatted {
                 ([0.45 * (0.7 + 0.3 * pile), 0.1 + 0.2 * pile], [0.5, 0.8], [0.0, -0.3])
             } else {
@@ -232,8 +233,9 @@ impl CharacterOverlay {
         }
         // rain: an umbrella in the hand, unless it's busy playing or resting
         let busy = wk.race.is_some() || wk.in_game;
-        let free = !matches!(wk.act, Act::Held | Act::Fall | Act::Travel | Act::Planted | Act::Rest);
-        if weather.rain && !busy && free {
+        // held up by hand it keeps hold of it, till shaken hard
+        let free = !matches!(wk.act, Act::Travel | Act::Planted | Act::Rest);
+        if weather.rain && !busy && free && !wk.umbrella_down && tn().weather_show >= 0.5 {
             // the top a set size just clear of the head, centred over the hand;
             // the stick from it down to the hand, however far that is
             let tex_aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);

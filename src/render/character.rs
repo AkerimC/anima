@@ -1514,6 +1514,15 @@ impl CharacterOverlay {
                     })
                     .collect::<Vec<_>>()
             }))
+            // dropped things, tumbling
+            .chain(self.moods.loose.iter().filter_map(|l| {
+                let a = if l.owner == 0 { self } else { self.extras.get(l.owner - 1)? };
+                let x = l.x - a.own_view[0] * self.view_w * 0.5;
+                let r = l.size[0].max(l.size[1]) * 0.75;
+                shown([x - r, l.y - r, x + r, l.y + r], l.owner)
+            }))
+            // rain or snow over everything: all of it changes
+            .chain(self.weather_sheet().map(|_| [0.0, 0.0, self.surface[0].max(1.0) * 4.0, self.surface[1].max(1.0) * 4.0]))
             // the rope spans the gap between the two sides
             .chain(self.ropes_owned().into_iter().filter_map(|([x0, y0, x1, y1], o)| shown([x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0], o)))
             .collect()

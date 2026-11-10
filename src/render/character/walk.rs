@@ -128,6 +128,9 @@ pub(super) struct WalkState {
     pub(super) bored: f32,
     // snow settled on its head, 0..1
     pub(super) snow_pile: f32,
+    // shook its umbrella out of its hand, and how hard it's been swung (s)
+    pub(super) umbrella_down: bool,
+    pub(super) shake: f32,
     // playing a game right now (not just chatting), kept up by the main character
     pub(super) in_game: bool,
     // trained a while ago: not again for a bit

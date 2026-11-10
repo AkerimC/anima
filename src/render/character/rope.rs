@@ -129,6 +129,7 @@ uniform vec4 u_clip;
 // moves the sprite (breathing, leaning, turning, hopping)
 uniform int u_attach;
 uniform vec4 u_sub;
+uniform float u_spin;
 uniform vec2 c_center;
 uniform vec2 c_half;
 uniform vec2 c_tilt;
@@ -162,6 +163,16 @@ void main() {
         return;
     }
     vec2 p = mix(u_rect.xy, u_rect.zw, a_pos * 0.5 + 0.5);
+    // turned about its middle (something dropped, tumbling)
+    if (u_spin != 0.0) {
+        vec2 mid = (u_rect.xy + u_rect.zw) * 0.5;
+        vec2 d = p - mid;
+        d.x *= c_aspect;
+        float c = cos(u_spin), s = sin(u_spin);
+        d = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
+        d.x /= c_aspect;
+        p = mid + d;
+    }
     gl_Position = vec4(p * u_clip.xy + u_clip.zw, 0.0, 1.0);
 }
 "#;
@@ -182,6 +193,9 @@ uniform int u_kind;
 uniform int u_flip;
 uniform vec4 u_rect;
 uniform sampler2D u_img;
+uniform float u_time;
+uniform float u_saspect; // screen width / height
+float hash1(float x) { return fract(sin(x * 127.1) * 43758.5453); }
 float blade(vec2 p, float x, float lean) {
     float t = clamp((p.y - 0.25) / 0.7, 0.0, 1.0);
     float d = abs(p.x - x - lean * t) - 0.17 * (1.0 - t);
@@ -571,6 +585,39 @@ vec4 shaft(vec2 p) {
     float hook = step(h.y, 0.0) * (1.0 - smoothstep(0.75, 1.0, abs(length(h) - 1.0) * 6.0)) * step(-1.2, h.y);
     return vec4(vec3(0.32, 0.22, 0.16), max(stick, hook));
 }
+vec4 rainfall(vec2 p) {
+    // slanted streaks over the whole screen, columns falling at their own speed
+    vec2 q = vec2((p.x * 0.5 + 0.5) * u_saspect, p.y * 0.5 + 0.5);
+    q.x += q.y * 0.12;
+    float a = 0.0;
+    for (int k = 0; k < 2; k++) {
+        float scale = k == 0 ? 70.0 : 120.0;
+        float x = q.x * scale;
+        float col = floor(x);
+        float h = hash1(col + float(k) * 31.0);
+        float y = fract(q.y * (1.2 + h) + u_time * (1.1 + h * 0.8) + h * 7.0);
+        float streak = step(abs(fract(x) - 0.5), 0.05) * smoothstep(0.0, 0.015, y) * (1.0 - smoothstep(0.05, 0.07, y)) * step(0.45, h);
+        a = max(a, streak * (k == 0 ? 0.5 : 0.3));
+    }
+    return vec4(vec3(0.75, 0.82, 0.95), a);
+}
+vec4 snowfall(vec2 p) {
+    // flakes drifting down and swaying, three depths
+    vec2 q = vec2((p.x * 0.5 + 0.5) * u_saspect, p.y * 0.5 + 0.5);
+    float a = 0.0;
+    for (int k = 0; k < 3; k++) {
+        float fk = float(k);
+        float scale = 9.0 + fk * 7.0;
+        vec2 g = vec2(q.x, q.y + u_time * (0.06 + fk * 0.03)) * scale;
+        g.x += sin(u_time * 0.8 + g.y * 0.7 + fk) * 0.35;
+        vec2 cell = floor(g);
+        float h = hash1(cell.x * 13.0 + cell.y * 71.0 + fk * 5.0);
+        vec2 f = fract(g) - vec2(hash1(cell.x + cell.y * 3.0 + fk), hash1(cell.y + cell.x * 7.0 + fk));
+        float r = 0.04 + 0.05 * (1.0 - fk / 3.0);
+        a = max(a, step(0.55, h) * (1.0 - smoothstep(r * 0.6, r, length(f))) * (0.9 - fk * 0.2));
+    }
+    return vec4(vec3(1.0), a);
+}
 vec4 snowflake(vec2 p) {
     float a = atan(p.y, p.x);
     float r = length(p);
@@ -589,7 +636,7 @@ vec4 confetti(vec2 p) {
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
-    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : u_kind == 26 ? sleepmask(p) : u_kind == 27 ? partyhat(p) : u_kind == 28 ? tophat(p) : u_kind == 29 ? bigbow(p) : u_kind == 30 ? glasses(p, false) : u_kind == 31 ? glasses(p, true) : u_kind == 32 ? flower(p) : u_kind == 33 ? scarf(p) : u_kind == 34 ? backpack(p) : u_kind == 35 ? wings(p) : u_kind == 36 ? headphones(p) : u_kind == 37 ? crown(p) : u_kind == 38 ? canopy(p) : u_kind == 39 ? shaft(p) : u_kind == 100 ? picture(p) : carrot(p);
+    vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : u_kind == 26 ? sleepmask(p) : u_kind == 27 ? partyhat(p) : u_kind == 28 ? tophat(p) : u_kind == 29 ? bigbow(p) : u_kind == 30 ? glasses(p, false) : u_kind == 31 ? glasses(p, true) : u_kind == 32 ? flower(p) : u_kind == 33 ? scarf(p) : u_kind == 34 ? backpack(p) : u_kind == 35 ? wings(p) : u_kind == 36 ? headphones(p) : u_kind == 37 ? crown(p) : u_kind == 38 ? canopy(p) : u_kind == 39 ? shaft(p) : u_kind == 40 ? rainfall(p) : u_kind == 41 ? snowfall(p) : u_kind == 100 ? picture(p) : carrot(p);
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
@@ -622,6 +669,19 @@ impl CarrotGl {
 }
 
 impl CharacterOverlay {
+    /// Rain or snow over the whole screen, if that's how the weather is shown.
+    pub(super) fn weather_sheet(&self) -> Option<i32> {
+        let sky = super::weather::now();
+        let whole = crate::render::tuning::get().weather_show >= 1.5 && !super::locked();
+        if whole && sky.rain {
+            Some(40)
+        } else if whole && sky.snow {
+            Some(41)
+        } else {
+            None
+        }
+    }
+
     /// Worn and held things, drawn with the sprite's own transform: `behind`
     /// picks the ones that go behind it. Called between the sprite's
     /// target begin and end.
@@ -689,7 +749,20 @@ impl CharacterOverlay {
     }
 
     pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
-        let props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, z))).collect();
+        let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
+        // (kind, surface box, mirrored, turned by, where)
+        let mut props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, 0.0f32, z))).collect();
+        // dropped things, turning as they fall
+        for l in &self.moods.loose {
+            let Some(a) = (if l.owner == 0 { Some(&*self) } else { self.extras.get(l.owner - 1) }) else { continue };
+            let Some(z) = self.placed(l.owner) else { continue };
+            let x = l.x - a.own_view[0] * self.view_w * 0.5;
+            props.push((l.kind, [x - l.size[0] * 0.5, l.y - l.size[1] * 0.5, x + l.size[0] * 0.5, l.y + l.size[1] * 0.5], false, l.rot, z));
+        }
+        // the weather over the whole screen, under everything else
+        if let Some(kind) = self.weather_sheet() {
+            props.insert(0, (kind, [0.0, 0.0, w, h], false, 0.0, None));
+        }
         if props.is_empty() {
             return;
         }
@@ -702,9 +775,16 @@ impl CharacterOverlay {
                 }
             }
         }
-        let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
+        let time = self.start.elapsed().as_secs_f32();
         let Some(c) = self.carrot_gl.as_mut() else { return };
-        for (kind, rect, flip, zoom) in props {
+        c.program.bind(gl);
+        c.program.set_i32(gl, "u_attach", 0);
+        c.program.set_f32(gl, "u_time", time);
+        c.program.set_f32(gl, "u_saspect", w / h);
+        c.program.set_f32(gl, "c_aspect", w / h);
+        for (kind, rect, flip, spin, zoom) in props {
+            c.program.bind(gl);
+            c.program.set_f32(gl, "u_spin", spin);
             if !target.begin(gl, 0, rect) {
                 continue;
             }

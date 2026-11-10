@@ -185,7 +185,7 @@ fn holds(s: &Space, p: [f32; 2]) -> bool {
 }
 
 impl CharacterOverlay {
-    fn actor_ref(&self, i: usize) -> &CharacterOverlay {
+    pub(super) fn actor_ref(&self, i: usize) -> &CharacterOverlay {
         if i == 0 { self } else { &self.extras[i - 1] }
     }
 

@@ -65,12 +65,33 @@ pub(super) struct Crumb {
 // crumbs move in little steps, like hand-drawn frames
 const CRUMB_FPS: f32 = 12.0;
 
+/// Something that fell out of a character's hand: tumbling down, bouncing,
+/// lying on the floor till its owner comes for it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Loose {
+    pub(super) kind: i32,
+    pub(super) owner: usize,
+    // strip x and screen y of its middle, px; speed px/s
+    pub(super) x: f32,
+    pub(super) y: f32,
+    vx: f32,
+    vy: f32,
+    pub(super) rot: f32,
+    spin: f32,
+    floor: f32,
+    pub(super) size: [f32; 2],
+    // seconds lying still
+    still: f32,
+}
+
 #[derive(Default)]
 pub(super) struct Moods {
     pub(super) protests: Vec<Protest>,
     crumbs: Vec<Crumb>,
     // one-off flashes: kind, owner, strip x, screen y, size, seconds left
     pub(super) effects: Vec<(i32, usize, f32, f32, f32, f32)>,
+    // things dropped: an umbrella shaken out of the hand
+    pub(super) loose: Vec<Loose>,
     crumb_tick: f32,
     idle_t: f32,
     hot_t: f32,
@@ -398,6 +419,7 @@ impl CharacterOverlay {
             self.walk_of(i).rest_tick(dt, idle, drowsy, crowded);
         }
         self.run_weather(dt, n);
+        self.run_loose(dt, n);
 
         let load = desktop::CPU.load(Relaxed) as f32 / 1000.0;
         if self.moods.fretting {
@@ -533,6 +555,17 @@ impl CharacterOverlay {
             } else if wk.keepsake.is_some() {
                 wk.keepsake = None;
             }
+            // swung about hard in the rain: the umbrella flies out of its hand
+            let wk = self.walk_ref(i);
+            if wk.act == Act::Held && w.rain && tn().weather_show >= 0.5 && !wk.umbrella_down {
+                let swing = wk.swing_v.abs();
+                let wk = self.walk_of(i);
+                wk.shake = if swing > tn().drop_swing { wk.shake + dt } else { (wk.shake - dt).max(0.0) };
+                if wk.shake > 0.25 {
+                    wk.shake = 0.0;
+                    self.drop_umbrella(i);
+                }
+            }
             let wk = self.walk_of(i);
             // snow settles on its head while it stands about, and comes off when it jumps or runs
             let shaken = matches!(wk.act, Act::Jump | Act::Fall | Act::Held | Act::Chase | Act::Planted) || wk.rot.abs() > 0.3;
@@ -551,6 +584,89 @@ impl CharacterOverlay {
         }
     }
 
+    /// The umbrella leaves the hand where it is now, flung the way it swung.
+    fn drop_umbrella(&mut self, i: usize) {
+        let a = self.actor_ref(i);
+        let (r, pose) = (a.hit_rect, a.pose);
+        let h = r[3] - r[1];
+        if h <= 0.0 {
+            return;
+        }
+        let (cx, top) = ((r[0] + r[2]) * 0.5, r[1] + h * 0.2);
+        let x = cx + a.own_view[0] * self.view_w * 0.5;
+        // where it would stand: the bottom of its box on the ground, less the empty margin
+        let ground = (1.0 - (pose.center[1] - pose.half[1])) * 0.5 * pose.size[1];
+        let floor = ground - h * (1.0 - a.opaque[2]) - h * 0.12;
+        let wk = self.walk_of(i);
+        let dir = if wk.swing_v > 0.0 { -1.0 } else { 1.0 };
+        let (vx, spin) = (dir * (250.0 + wk.rand() * 300.0), dir * -(6.0 + wk.rand() * 6.0));
+        wk.umbrella_down = true;
+        log::debug!("{i} loses its umbrella");
+        self.moods.loose.push(Loose { kind: 22, owner: i, x, y: top, vx, vy: -350.0, rot: 0.0, spin, floor, size: [h * 0.75, h * 0.9], still: 0.0 });
+    }
+
+    /// Dropped things fall and bounce; their owner, once on its feet, goes
+    /// and picks them up again.
+    pub(super) fn run_loose(&mut self, dt: f32, n: usize) {
+        let raining = super::weather::now().rain;
+        let mut keep = Vec::new();
+        for mut l in std::mem::take(&mut self.moods.loose) {
+            if l.owner >= n {
+                continue;
+            }
+            if l.still <= 0.0 || l.y < l.floor - 1.0 {
+                l.vy += 2600.0 * dt;
+                l.x += l.vx * dt;
+                l.y += l.vy * dt;
+                l.rot += l.spin * dt;
+                if l.y >= l.floor {
+                    l.y = l.floor;
+                    l.vy = -l.vy * 0.35;
+                    l.vx *= 0.6;
+                    l.spin *= 0.5;
+                    if l.vy.abs() < 120.0 {
+                        l.vy = 0.0;
+                        l.vx = 0.0;
+                        l.spin = 0.0;
+                        // lies flat, on its side
+                        l.rot = if (l.rot.rem_euclid(std::f32::consts::TAU)) < std::f32::consts::PI { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
+                        l.still = 0.001;
+                    }
+                }
+            } else {
+                l.still += dt;
+            }
+            let o = l.owner;
+            let wk = self.walk_ref(o);
+            // not raining any more, or left too long: it's gone, and so is the loss
+            if !raining && l.still > 8.0 || l.still > 120.0 {
+                self.walk_of(o).umbrella_down = false;
+                continue;
+            }
+            let free = matches!(wk.act, Act::Idle | Act::Walk) && wk.social.is_none() && wk.race.is_none();
+            if l.still > 0.6 && free {
+                let here = self.strip_px(o);
+                let reach = (self.actor_ref(o).hit_rect[3] - self.actor_ref(o).hit_rect[1]) * 0.35;
+                if (here - l.x).abs() < reach {
+                    // got it back
+                    let wk = self.walk_of(o);
+                    wk.umbrella_down = false;
+                    wk.start_bob(tn().jump_height * 0.3);
+                    log::debug!("{o} picks its umbrella up again");
+                    continue;
+                }
+                // over to it
+                let pose = self.actor_ref(o).pose;
+                let to_clip = (l.x - self.actor_ref(o).own_view[0] * self.view_w * 0.5) * 2.0 / self.view_w.max(1.0) - 1.0;
+                let wk = self.walk_of(o);
+                wk.target = wk.x + (to_clip - pose.center[0]);
+                wk.act = Act::Walk;
+            }
+            keep.push(l);
+        }
+        self.moods.loose = keep;
+    }
+
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
         // keepsakes: lying beside whoever's resting
         let actors = std::iter::once((&self.walk, self.hit_rect, self.visible)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible)));
@@ -567,7 +683,7 @@ impl CharacterOverlay {
         }
         // rain: an umbrella over everyone not busy in a game; snow: flakes about them
         let w = self.moods.weather;
-        if w.rain || w.snow {
+        if (w.rain || w.snow) && (0.5..1.5).contains(&tn().weather_show) {
             let time = self.start.elapsed().as_secs_f32();
             let actors = std::iter::once((&self.walk, self.hit_rect, self.visible, self.opaque)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible, e.opaque)));
             for (k, (wk, r, seen, _)) in actors.enumerate() {
