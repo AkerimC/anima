@@ -150,6 +150,15 @@ impl CharacterOverlay {
         park::job_of(&self.character_name(i)).as_deref() == Some(job)
     }
 
+    /// May `i` do `job`'s work? Yes if it's its job; no if it has another
+    /// job; with no job, only while nobody has that one.
+    pub(super) fn may_work(&self, i: usize, job: &str) -> bool {
+        match park::job_of(&self.character_name(i)) {
+            Some(j) => j == job,
+            None => !park::jobs_cached().jobs.values().any(|v| v == job),
+        }
+    }
+
     /// Some of a job's work done; told when that earns it the job.
     pub(super) fn work(&mut self, i: usize, job: &str, k: f32) {
         let wk = self.walk_of(i);
@@ -252,9 +261,12 @@ impl CharacterOverlay {
         let dv = up - now;
         if dx.abs() <= 6.0 && dv.abs() <= 2.0 {
             let wk = self.walk_of(i);
-            wk.air = (up / (h * 0.5)).max(0.0);
+            // on the floor exactly, or held up there: never a sliver of air
+            // without a hold (that's a fall, and a fall ends what it's doing)
+            let up = if up < 0.5 { 0.0 } else { up };
+            wk.air = up / (h * 0.5);
             if let Some(r) = wk.social.as_mut() {
-                r.perched = up > 0.5;
+                r.perched = up > 0.0;
                 r.moving = false;
             }
             return true;
@@ -271,7 +283,8 @@ impl CharacterOverlay {
         let wk = self.walk_of(i);
         wk.air = (next / (h * 0.5)).max(0.0);
         if let Some(r) = wk.social.as_mut() {
-            r.perched = next > 0.5;
+            // held up the whole way, even the first sliver off the floor
+            r.perched = wk.air > 0.0;
         }
         false
     }
@@ -375,6 +388,10 @@ impl CharacterOverlay {
             let room = park::room(&t.kind);
             // tables are for eating; the stove is the chef's once there is one
             if room == 0 || t.place != place || t.kind == "table" || (t.kind == "chair" && t.place == "cafe") || (restaurant && t.kind == "stove" && t.place == "cafe") {
+                continue;
+            }
+            // farm work is the farmer's (if there is one); others with a job keep to theirs
+            if matches!(t.kind.as_str(), "carrots" | "wheat" | "apple_tree" | "coop" | "barn") && !self.may_work(i, "farmer") {
                 continue;
             }
             let on = chats.iter().find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == t.kind));
@@ -1496,8 +1513,9 @@ impl CharacterOverlay {
             wk.ws == farm.ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none()
         };
         let on_farm = |this: &Self, i: usize| this.place_here(i).is_some_and(|p| p.place == "farm");
-        // only someone already on the farm (a farmer first)
-        let who = (0..n).filter(|&i| free(self, i) && on_farm(self, i)).max_by_key(|&i| self.is_job(i, "farmer") as u8);
+        // only someone already on the farm who may do farm work: the farmer,
+        // or (with no farmer) someone without a job
+        let who = (0..n).filter(|&i| free(self, i) && on_farm(self, i) && self.may_work(i, "farmer")).max_by_key(|&i| self.is_job(i, "farmer") as u8);
         if let Some(i) = who {
             log::debug!("farm: {i} goes to collect from the {kind}");
             self.start_play(chats, i, k, &kind);

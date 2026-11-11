@@ -254,10 +254,12 @@ impl CharacterOverlay {
             }
         }
         // the farm piling up: its farmer (or whoever farms most) goes
-        if backlog >= 3 && self.visitors(n, FARM) == 0 {
+        // (the farmer if there is one; it's already there: nobody else)
+        let farmer_there = (0..n).any(|i| self.is_job(i, "farmer") && self.place_here(i).is_some_and(|p| p.place == "farm"));
+        if backlog >= 3 && self.visitors(n, FARM) == 0 && !farmer_there {
             let jobs = park::read_jobs();
             let points = |this: &Self, i: usize| jobs.points.get(&this.character_name(i)).and_then(|p| p.get("farmer")).copied().unwrap_or(0.0);
-            let who = free.iter().copied().max_by(|&a, &b| {
+            let who = free.iter().copied().filter(|&i| self.may_work(i, "farmer")).max_by(|&a, &b| {
                 let ka = (self.is_job(a, "farmer") as u8 as f32) * 1000.0 + points(self, a);
                 let kb = (self.is_job(b, "farmer") as u8 as f32) * 1000.0 + points(self, b);
                 ka.total_cmp(&kb)
@@ -287,7 +289,7 @@ impl CharacterOverlay {
         if self.visitors(n, FISH) + self.visitors(n, FISHING) == 0 && due(&FISH_AT, tn().visit_fish_every) {
             let jobs = park::read_jobs();
             let points = |this: &Self, i: usize| jobs.points.get(&this.character_name(i)).and_then(|p| p.get("fisher")).copied().unwrap_or(0.0);
-            let who = free.iter().copied().filter(|&i| self.walk_ref(i).fish_cool <= 0.0).max_by(|&a, &b| {
+            let who = free.iter().copied().filter(|&i| self.walk_ref(i).fish_cool <= 0.0 && self.may_work(i, "fisher")).max_by(|&a, &b| {
                 let ka = (self.is_job(a, "fisher") as u8 as f32) * 1000.0 + points(self, a);
                 let kb = (self.is_job(b, "fisher") as u8 as f32) * 1000.0 + points(self, b);
                 ka.total_cmp(&kb)
