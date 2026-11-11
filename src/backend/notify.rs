@@ -22,10 +22,18 @@ pub fn spawn() {
                 return;
             };
             let Some(out) = child.stdout.take() else { return };
+            // the first string after the call is the app's name: our own
+            // notices (orders in the park) aren't news to the characters
+            let mut call = false;
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 if line.starts_with("method call") && line.contains("member=Notify") {
-                    log::debug!("notify: notification");
-                    NOTIFICATIONS.fetch_add(1, Ordering::Relaxed);
+                    call = true;
+                } else if call && line.trim_start().starts_with("string ") {
+                    call = false;
+                    if line.trim_start() != "string \"Anima\"" {
+                        log::debug!("notify: notification");
+                        NOTIFICATIONS.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         })

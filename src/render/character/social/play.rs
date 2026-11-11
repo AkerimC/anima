@@ -592,6 +592,18 @@ impl CharacterOverlay {
     /// on the ground sends it there, on something in the park sends it to play.
     pub(super) fn right_orders(&mut self, chats: &mut Vec<Chat>, n: usize) {
         use std::sync::atomic::Ordering::Relaxed;
+        // picked but told nothing for 5 s: let go
+        let expired = {
+            let mut picked = PICKED.lock().unwrap();
+            let gone = picked.filter(|p| p.1.elapsed().as_secs_f32() > 5.0).map(|p| p.0);
+            if gone.is_some() {
+                *picked = None;
+            }
+            gone
+        };
+        if let Some(i) = expired.filter(|&i| i < n) {
+            tell(&format!("{} is no longer picked", self.character_name(i)));
+        }
         let now = crate::backend::pointer::RIGHT_DOUBLE.load(Relaxed);
         if ORDERS_SEEN.swap(now, Relaxed) == now || now == 0 {
             return;
@@ -611,10 +623,11 @@ impl CharacterOverlay {
                 wk.start_jump(tn().jump_height * 0.4);
             }
             log::debug!("orders: {i} picked");
+            tell(&format!("{} is picked: right double click where it should go", self.character_name(i)));
             return;
         }
         let Some((i, at)) = PICKED.lock().unwrap().take() else { return };
-        if at.elapsed().as_secs_f32() > 30.0 || i >= n {
+        if at.elapsed().as_secs_f32() > 5.0 || i >= n {
             return;
         }
         let a = self.actor_ref(i);
@@ -634,6 +647,7 @@ impl CharacterOverlay {
         }
         let wk = self.walk_ref(i);
         if !matches!(wk.act, Act::Idle | Act::Walk | Act::Rest) || wk.race.is_some() || wk.trip.is_some() {
+            tell(&format!("{} can't go right now", self.character_name(i)));
             return;
         }
         if wk.act == Act::Rest {
@@ -655,6 +669,8 @@ impl CharacterOverlay {
             if let Some((k, t)) = on {
                 let kind = t.kind.clone();
                 log::debug!("orders: {i} sent to the {kind}");
+                let label = park::recipe(&kind).map_or(kind.clone(), |r| r.1.to_lowercase());
+                tell(&format!("{} goes to the {label}", self.character_name(i)));
                 self.start_play(chats, i, k, &kind);
                 return;
             }
@@ -667,6 +683,7 @@ impl CharacterOverlay {
         wk.act = Act::Walk;
         wk.timer = 3.0;
         log::debug!("orders: {i} walks to {px:.0}");
+        tell(&format!("{} is on its way", self.character_name(i)));
     }
 
     /// What's drawn over the park on the character layer: the swing's ropes
@@ -741,4 +758,12 @@ impl CharacterOverlay {
 /// Both on the seesaw and going up and down.
 fn seesaw_rocking(p: &Play) -> bool {
     p.riders.len() >= 2 && p.riders[0].phase == 1 && p.riders[1].phase == 1
+}
+
+/// A short desktop notification about orders, replacing the last one.
+fn tell(text: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["-a", "Anima", "-t", "2500", "-h", "string:x-canonical-private-synchronous:anima-orders", "Anima", text])
+        .spawn()
+        .map(|mut c| std::thread::spawn(move || c.wait()));
 }
