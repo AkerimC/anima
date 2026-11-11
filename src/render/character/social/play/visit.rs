@@ -24,6 +24,8 @@ pub(super) const GAME: u8 = 8;
 pub(super) const DONE: u8 = 9;
 // came to eat and found nothing: home, and a nap
 pub(super) const NO_FOOD: u8 = 10;
+// work first: at its workplace for as long as that's on
+pub(super) const ON_SHIFT: u8 = 11;
 
 /// Mode 3 is on (and there's somewhere to visit).
 pub(super) fn visiting_mode() -> bool {
@@ -39,6 +41,11 @@ pub(super) fn meal_slot() -> Option<u32> {
     let m = super::super::super::weather::minutes_now();
     let k = if m < 11 * 60 { 0 } else if m < 17 * 60 { 1 } else { 2 };
     Some(day * 3 + k)
+}
+
+/// Where `job` is done.
+fn job_place(job: &str) -> &'static str {
+    park::JOBS.iter().find(|j| j.0 == job).map_or("park", |j| j.2)
 }
 
 fn target(reason: u8) -> &'static str {
@@ -133,7 +140,12 @@ impl CharacterOverlay {
                 continue;
             }
             // there: into the right window if it isn't in it yet
-            let place = target(reason);
+            let place = if reason == ON_SHIFT {
+                let name = self.character_name(i);
+                park::job_of(&name).or_else(|| park::part_of(&name)).map_or("park", |j| job_place(&j))
+            } else {
+                target(reason)
+            };
             let inside = self.place_here(i).is_some_and(|p| p.place == place);
             if reason != DONE && reason != NO_FOOD && free && !inside && !self.walk_ref(i).social.is_some_and(|s| s.moving) {
                 if let Some(p) = governor::place_rect(place) {
@@ -167,6 +179,8 @@ impl CharacterOverlay {
                 WORK => (!diners_waiting && t > 60.0 && free) || (t > 600.0 && free),
                 ATTEND => t > 180.0 && free,
                 GAME => t > 45.0 && free,
+                // the shift ends when work first does
+                ON_SHIFT => !working() && free,
                 _ => false,
             };
             if done {
@@ -232,6 +246,16 @@ impl CharacterOverlay {
                 }
             }
         }
+        // work first: those with a job (full or part-time) to their workplace for the shift
+        if working() {
+            for i in 0..n {
+                let name = self.character_name(i);
+                let job = park::job_of(&name).or_else(|| park::part_of(&name));
+                if let Some(job) = job.filter(|_| self.desk_free(i, windows)) {
+                    self.send_visit(i, job_place(&job), ON_SHIFT);
+                }
+            }
+        }
         // the chef and the waiters, while there are people to feed
         let diners = self.visitors(n, MEAL) + self.visitors(n, HUNGRY);
         if diners > 0 && !playing_only() {
@@ -259,8 +283,8 @@ impl CharacterOverlay {
             let jobs = park::read_jobs();
             let points = |this: &Self, i: usize| jobs.points.get(&this.character_name(i)).and_then(|p| p.get("farmer")).copied().unwrap_or(0.0);
             let who = free.iter().copied().filter(|&i| self.may_work(i, "farmer")).max_by(|&a, &b| {
-                let ka = (self.is_job(a, "farmer") as u8 as f32) * 1000.0 + points(self, a);
-                let kb = (self.is_job(b, "farmer") as u8 as f32) * 1000.0 + points(self, b);
+                let ka = (self.is_job(a, "farmer") as u8 as f32) * 1000.0 + (self.is_part(a, "farmer") as u8 as f32) * 500.0 + points(self, a);
+                let kb = (self.is_job(b, "farmer") as u8 as f32) * 1000.0 + (self.is_part(b, "farmer") as u8 as f32) * 500.0 + points(self, b);
                 ka.total_cmp(&kb)
             });
             if let Some(i) = who {
@@ -289,8 +313,8 @@ impl CharacterOverlay {
             let jobs = park::read_jobs();
             let points = |this: &Self, i: usize| jobs.points.get(&this.character_name(i)).and_then(|p| p.get("fisher")).copied().unwrap_or(0.0);
             let who = free.iter().copied().filter(|&i| self.walk_ref(i).fish_cool <= 0.0 && self.may_work(i, "fisher")).max_by(|&a, &b| {
-                let ka = (self.is_job(a, "fisher") as u8 as f32) * 1000.0 + points(self, a);
-                let kb = (self.is_job(b, "fisher") as u8 as f32) * 1000.0 + points(self, b);
+                let ka = (self.is_job(a, "fisher") as u8 as f32) * 1000.0 + (self.is_part(a, "fisher") as u8 as f32) * 500.0 + points(self, a);
+                let kb = (self.is_job(b, "fisher") as u8 as f32) * 1000.0 + (self.is_part(b, "fisher") as u8 as f32) * 500.0 + points(self, b);
                 ka.total_cmp(&kb)
             });
             if let Some(i) = who {

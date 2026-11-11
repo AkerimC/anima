@@ -691,6 +691,12 @@ fn jobs_list() -> gtk::Widget {
             l.add_css_class("dim-label");
         }
         list.append(&l);
+        let part: Vec<&String> = j.part.iter().filter(|e| e.1 == id).map(|e| e.0).collect();
+        if !part.is_empty() {
+            let p = gtk::Label::builder().label(format!("Part-time ({}/{}): {}", part.len(), park::PART_SLOTS, part.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))).xalign(0.0).wrap(true).max_width_chars(36).build();
+            p.add_css_class("caption");
+            list.append(&p);
+        }
     }
     // how hungry each one is, and its favourite dish
     list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));

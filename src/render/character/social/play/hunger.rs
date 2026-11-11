@@ -139,7 +139,7 @@ impl CharacterOverlay {
         let Some(&i) = hungry.get((self.walk.rand() * hungry.len().max(1) as f32) as usize % hungry.len().max(1)) else { return };
         let here = self.place_here(i).map(|p| p.place);
         // at work in the cafe: a quick bite in the kitchen
-        if here.as_deref() == Some("cafe") && (self.is_job(i, "chef") || self.is_job(i, "waiter")) && self.restaurant_open() {
+        if here.as_deref() == Some("cafe") && (self.on_duty("chef") == Some(i) || self.on_duty("waiter") == Some(i)) && self.restaurant_open() {
             if !self.staff_meal(i) && self.walk_ref(i).visit_for == 0 {
                 let secs = tn().hungry_nap;
                 self.walk_of(i).lie_down(secs);
@@ -208,8 +208,13 @@ impl CharacterOverlay {
             return;
         }
         *last = Some(Instant::now());
-        for name in park::read_jobs().jobs.keys() {
+        let jobs = park::read_jobs();
+        for name in jobs.jobs.keys() {
             park::earn(name, tn().wage as u32);
+        }
+        // part-time: half
+        for name in jobs.part.keys() {
+            park::earn(name, (tn().wage * 0.5).round() as u32);
         }
         log::debug!("wages paid");
     }

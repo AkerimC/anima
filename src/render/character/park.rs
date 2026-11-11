@@ -482,7 +482,13 @@ pub struct Jobs {
     // name -> job
     #[serde(default)]
     pub jobs: BTreeMap<String, String>,
+    // name -> job it helps out with part-time (its job's places were all taken)
+    #[serde(default)]
+    pub part: BTreeMap<String, String>,
 }
+
+/// How many can help out part-time in each job.
+pub const PART_SLOTS: usize = 2;
 
 pub fn jobs_path() -> PathBuf {
     crate::util::data_dir().join("jobs.json")
@@ -512,6 +518,15 @@ pub fn job_of(name: &str) -> Option<String> {
     c.as_ref().and_then(|x| x.1.jobs.get(name).cloned())
 }
 
+/// The job `name` helps out with part-time, if any.
+pub fn part_of(name: &str) -> Option<String> {
+    let mut c = JOBS_CACHE.lock().unwrap();
+    if c.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 2.0) {
+        *c = Some((std::time::Instant::now(), read_jobs()));
+    }
+    c.as_ref().and_then(|x| x.1.part.get(name).cloned())
+}
+
 pub fn job_label(id: &str) -> &'static str {
     JOBS.iter().find(|j| j.0 == id).map_or("", |j| j.1)
 }
@@ -522,14 +537,23 @@ pub fn add_work(name: &str, job: &str, k: f32) -> Option<String> {
     *j.points.entry(name.to_string()).or_default().entry(job.to_string()).or_default() += k;
     let mut earned = None;
     if !j.jobs.contains_key(name) {
-        let mine = j.points.get(name).and_then(|p| p.get(job)).copied().unwrap_or(0.0);
-        // the work it does most, and there's still room in it
-        let best = j.points.get(name).and_then(|p| p.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|e| e.0.clone()));
-        let slots = JOBS.iter().find(|x| x.0 == job).map_or(0, |x| x.3);
-        let taken = j.jobs.values().filter(|v| *v == job).count();
-        if mine >= JOB_AT && best.as_deref() == Some(job) && taken < slots {
-            j.jobs.insert(name.to_string(), job.to_string());
-            earned = Some(job.to_string());
+        let points = j.points.get(name).cloned().unwrap_or_default();
+        let room = |j: &Jobs, id: &str| j.jobs.values().filter(|v| *v == id).count() < JOBS.iter().find(|x| x.0 == id).map_or(0, |x| x.3);
+        // of the jobs with a place left, the one it does most, once it's done enough
+        let best_open = points.iter().filter(|(id, _)| room(&j, id)).max_by(|a, b| a.1.total_cmp(b.1)).map(|e| (e.0.clone(), *e.1));
+        if let Some((id, k)) = best_open.filter(|b| b.1 >= JOB_AT) {
+            let _ = k;
+            j.part.remove(name);
+            j.jobs.insert(name.to_string(), id.clone());
+            earned = Some(id);
+        } else if !j.part.contains_key(name) {
+            // all the places in what it does most are taken: it helps out part-time
+            let part_room = |j: &Jobs, id: &str| j.part.values().filter(|v| *v == id).count() < PART_SLOTS;
+            let best_full = points.iter().filter(|(id, k)| **k >= JOB_AT && !room(&j, id) && part_room(&j, id)).max_by(|a, b| a.1.total_cmp(b.1)).map(|e| e.0.clone());
+            if let Some(id) = best_full {
+                j.part.insert(name.to_string(), id.clone());
+                earned = Some(format!("part:{id}"));
+            }
         }
     }
     if let Ok(text) = serde_json::to_string_pretty(&j) {

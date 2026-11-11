@@ -3447,10 +3447,8 @@ impl CharacterOverlay {
                     a.phase = 5;
                     a.t = 0.0;
                     let (_, points, good) = if a.item >= MATERIAL { (a.item, 2.0, true) } else if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
-                    // fishing off the pier is a fisher's work
-                    if self.pier_of(a.i).is_some() {
-                        self.work(a.i, "fisher", if good { 1.5 } else { 1.0 });
-                    }
+                    // fishing (off the pier or by a window) is a fisher's work
+                    self.work(a.i, "fisher", if good { 1.5 } else { 1.0 });
                     // a fish or a carrot: into the kitchen's pantry too
                     if (FISH..CREATURE).contains(&a.item) {
                         self.bring_food(a.i, "fish", 1);

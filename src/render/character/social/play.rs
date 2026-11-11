@@ -184,12 +184,22 @@ impl CharacterOverlay {
         park::job_of(&self.character_name(i)).as_deref() == Some(job)
     }
 
-    /// May `i` do `job`'s work? Yes if it's its job; no if it has another
-    /// job; with no job, only while nobody has that one.
+    /// Helps out with `job` part-time.
+    pub(super) fn is_part(&self, i: usize, job: &str) -> bool {
+        park::part_of(&self.character_name(i)).as_deref() == Some(job)
+    }
+
+    /// May `i` do `job`'s work? Yes if it's its job or it helps out with it;
+    /// no if it has another; with neither, only while nobody has that one.
     pub(super) fn may_work(&self, i: usize, job: &str) -> bool {
-        match park::job_of(&self.character_name(i)) {
-            Some(j) => j == job,
-            None => !park::jobs_cached().jobs.values().any(|v| v == job),
+        let name = self.character_name(i);
+        match (park::job_of(&name), park::part_of(&name)) {
+            (Some(j), _) => j == job,
+            (None, Some(p)) => p == job,
+            (None, None) => {
+                let jobs = park::jobs_cached();
+                !jobs.jobs.values().any(|v| v == job) && !jobs.part.values().any(|v| v == job)
+            }
         }
     }
 
@@ -198,12 +208,20 @@ impl CharacterOverlay {
         let wk = self.walk_of(i);
         wk.hunger = (wk.hunger + 0.03 * k).min(1.0);
         let name = self.character_name(i);
-        if let Some(j) = park::add_work(&name, job, k) {
-            log::info!("{name} is now a {j}");
-            super::super::wear::kit_out(&name, &j);
-            tell(&format!("{name} is now the {}!", park::job_label(&j).to_lowercase()));
-            let wk = self.walk_of(i);
-            wk.start_jump(tn().jump_height * 1.2);
+        match park::add_work(&name, job, k) {
+            Some(e) if e.starts_with("part:") => {
+                let p = &e["part:".len()..];
+                log::info!("{name} now helps out part-time as a {p}");
+                tell(&format!("{name} now helps out part-time as a {}", park::job_label(p).to_lowercase()));
+            }
+            Some(j) => {
+                log::info!("{name} is now a {j}");
+                super::super::wear::kit_out(&name, &j);
+                tell(&format!("{name} is now the {}!", park::job_label(&j).to_lowercase()));
+                let wk = self.walk_of(i);
+                wk.start_jump(tn().jump_height * 1.2);
+            }
+            None => {}
         }
     }
 
@@ -1579,7 +1597,7 @@ impl CharacterOverlay {
         let on_farm = |this: &Self, i: usize| this.place_here(i).is_some_and(|p| p.place == "farm");
         // only someone already on the farm who may do farm work: the farmer,
         // or (with no farmer) someone without a job
-        let who = (0..n).filter(|&i| free(self, i) && on_farm(self, i) && self.may_work(i, "farmer")).max_by_key(|&i| self.is_job(i, "farmer") as u8);
+        let who = (0..n).filter(|&i| free(self, i) && on_farm(self, i) && self.may_work(i, "farmer")).max_by_key(|&i| self.is_job(i, "farmer") as u8 * 2 + self.is_part(i, "farmer") as u8);
         if let Some(i) = who {
             log::debug!("farm: {i} goes to collect from the {kind}");
             self.start_play(chats, i, k, &kind);

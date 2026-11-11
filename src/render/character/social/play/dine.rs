@@ -49,8 +49,12 @@ const EAT: f32 = 30.0;
 
 impl CharacterOverlay {
     /// Someone with that job, in the cafe and free (or doing just that).
-    fn on_duty(&self, job: &str) -> Option<usize> {
-        (0..self.extras.len() + 1).find(|&i| self.is_job(i, job) && self.place_here(i).is_some_and(|p| p.place == "cafe"))
+    /// Who's working `job` in the cafe: the one with the job, else someone
+    /// helping out with it part-time.
+    pub(super) fn on_duty(&self, job: &str) -> Option<usize> {
+        let n = self.extras.len() + 1;
+        let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe");
+        (0..n).find(|&i| self.is_job(i, job) && here(i)).or_else(|| (0..n).find(|&i| self.is_part(i, job) && here(i)))
     }
 
     /// The chef is in: the cafe works as a restaurant.
@@ -71,7 +75,8 @@ impl CharacterOverlay {
 
     /// Hungry, in the cafe with the chef in: a seat at a table with room.
     pub(super) fn maybe_dine(&mut self, chats: &mut Vec<Chat>, i: usize) -> bool {
-        if !self.restaurant_open() || self.is_job(i, "chef") || self.is_job(i, "waiter") || order_of(i).is_some() {
+        // not whoever is working there right now
+        if !self.restaurant_open() || self.on_duty("chef") == Some(i) || self.on_duty("waiter") == Some(i) || order_of(i).is_some() {
             return false;
         }
         // only the hungry (sooner at mealtimes), and only with something in the pantry
