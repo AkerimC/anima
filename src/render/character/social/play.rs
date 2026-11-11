@@ -88,6 +88,31 @@ fn dish_on(table: u64) -> Option<(String, f32)> {
     LIVE.lock().unwrap().dishes.iter().find(|d| d.0 == table).map(|d| (d.1.clone(), d.2))
 }
 
+/// What they're there for (the windows' second menu): 0 both, 1 only to
+/// play (no hunger, no farming, fishing or cooking: they tire and nap
+/// instead), 2 work first (games now and then).
+pub(super) fn activity() -> u8 {
+    tn().activity.round().clamp(0.0, 2.0) as u8
+}
+
+pub(super) fn playing_only() -> bool {
+    activity() == 1
+}
+
+pub(super) fn working() -> bool {
+    activity() == 2
+}
+
+/// The work things (farm, stove, stall, a tree's wood): none of it while only playing.
+fn work_thing(kind: &str) -> bool {
+    matches!(kind, "carrots" | "wheat" | "apple_tree" | "coop" | "barn" | "tree" | "stove" | "stall" | "counter")
+}
+
+/// The fun things in the park.
+fn fun_thing(kind: &str) -> bool {
+    matches!(kind, "slide" | "swing" | "seesaw" | "sandbox")
+}
+
 /// A thing's place's column: (x, width) on its workspace's strip.
 fn column(place: &str) -> Option<(f32, f32)> {
     governor::place_rect(place).map(|p| (p.x, p.w))
@@ -382,7 +407,7 @@ impl CharacterOverlay {
             }
         }
         // hungry in the cafe, the chef in: a seat at a table
-        if place == "cafe" && self.maybe_dine(chats, i) {
+        if place == "cafe" && !playing_only() && self.maybe_dine(chats, i) {
             return;
         }
         if self.walk_of(i).rand() >= tn().park_play || self.too_busy(chats, n) {
@@ -401,6 +426,10 @@ impl CharacterOverlay {
             }
             // farm work is the farmer's (if there is one); others with a job keep to theirs
             if matches!(t.kind.as_str(), "carrots" | "wheat" | "apple_tree" | "coop" | "barn") && !self.may_work(i, "farmer") {
+                continue;
+            }
+            // only playing: no work
+            if playing_only() && work_thing(&t.kind) {
                 continue;
             }
             let on = chats.iter().find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == t.kind));
@@ -423,6 +452,10 @@ impl CharacterOverlay {
             // eggs, milk or a crop waiting: hard to walk past
             if park::farm_state(t, &park::read_farm_cached()).1 > 0 {
                 weight *= 8.0;
+            }
+            // work first: the fun things less often
+            if working() && fun_thing(&t.kind) {
+                weight *= 0.3;
             }
             options.push((k, weight));
         }
@@ -480,6 +513,8 @@ impl CharacterOverlay {
                 _ => {}
             }
             let r = self.walk.rand();
+            // work first: game time a third as often
+            let every = if working() { every * 3.0 } else { every };
             *next = Some(Instant::now() + std::time::Duration::from_secs_f32(every * (0.6 + r * 0.8)));
             drop(next);
             if visit::visiting_mode() {
@@ -686,6 +721,11 @@ impl CharacterOverlay {
         if done && thing.place == "park" && matches!(thing.kind.as_str(), "slide" | "swing" | "seesaw" | "sandbox") {
             for &i in &c.members.clone() {
                 self.work(i, "attendant", 1.0);
+                // only playing: it tires them, and tired out they nap it off
+                if playing_only() {
+                    self.spend(i, tn().play_tire);
+                    self.walk_of(i).played += 0.5;
+                }
             }
         }
         if done && matches!(thing.kind.as_str(), "table") {
@@ -1509,6 +1549,9 @@ impl CharacterOverlay {
     /// Eggs in the coop, milk in the barn, a crop ripe: someone on the farm
     /// (a farmer first) goes to get it.
     fn farm_calls(&mut self, chats: &mut Vec<Chat>, n: usize) {
+        if playing_only() {
+            return;
+        }
         static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
         {
             let mut next = NEXT.lock().unwrap();

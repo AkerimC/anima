@@ -2727,6 +2727,10 @@ impl CharacterOverlay {
         // the farm's pier to fish; on the desktop, by the windows as always
         if let Some(farm) = crate::backend::governor::place_workspace("farm") {
             let home = crate::backend::governor::places().iter().any(|p| p.ws == self.walk_ref(i).ws);
+            // only playing: no fishing in the windows
+            if home && play::playing_only() {
+                return None;
+            }
             if home && self.walk_ref(i).ws == farm {
                 log::debug!("{i} walks to the pier to fish");
                 return Some(self.fish_alone(i, false));

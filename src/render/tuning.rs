@@ -137,6 +137,7 @@ tuning! {
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
     }
     "Roaming", "Park" {
+        activity: "In the park, cafe and farm: 0 both, 1 only play (no hunger; they tire and nap), 2 work first (fewer games)" = 0.0, 0.0, 2.0, 1.0, 0;
         park_mode: "With the park, cafe or farm open: 0 desktop, 1 only them, 2 them and out now and then, 3 the desktop, visiting them" = 3.0, 0.0, 3.0, 1.0, 0;
         visit_fish_every: "Mode 3: the fisher (and the park attendant) goes over about every (s)" = 600.0, 30.0, 7200.0, 30.0, 0;
         park_play: "Someone free in the park goes to play (chance each look)" = 0.25, 0.0, 1.0, 0.05, 2;
@@ -149,6 +150,7 @@ tuning! {
         park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
         hunger_time: "From full to starving, doing nothing (s)" = 2400.0, 60.0, 36000.0, 60.0, 0;
         hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
+        play_tire: "Only playing: a go on the slide or swing tires them by" = 0.12, 0.0, 1.0, 0.01, 2;
         hungry_nap: "Nothing to eat: a nap of (s)" = 240.0, 10.0, 3600.0, 10.0, 0;
         picnic_chance: "A meal cooked for oneself is eaten as a picnic in the park (share)" = 0.25, 0.0, 1.0, 0.05, 2;
         wage: "Coins each job pays every 20 minutes" = 5.0, 0.0, 100.0, 1.0, 0;

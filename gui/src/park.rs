@@ -13,6 +13,9 @@ use std::rc::Rc;
 
 use crate::{config, daemon};
 
+/// What they're there for: the choices, and the setting each is (activity).
+const ACTIVITIES: [(&str, f64); 3] = [("Play and work", 0.0), ("Only play", 1.0), ("Work first", 2.0)];
+
 /// The choices, and the setting each one is (park_mode).
 const MODES: [(&str, f64); 4] = [("Live on the desktop", 0.0), ("Live on the desktop, visit these", 3.0), ("Live in these windows", 1.0), ("Here, out now and then", 2.0)];
 
@@ -468,6 +471,19 @@ fn build(app: &adw::Application, place: &str) {
             daemon::reload();
         }
     });
+    // what they're there for
+    let labels: Vec<&str> = ACTIVITIES.iter().map(|m| m.0).collect();
+    let what = gtk::DropDown::from_strings(&labels);
+    what.set_tooltip_text(Some("Only play: no hunger, farming, fishing or cooking; playing tires them and they nap it off. Work first: farming, fishing and cooking come before games."));
+    let now = config::tuning_value("activity").unwrap_or(0.0).round();
+    what.set_selected(ACTIVITIES.iter().position(|m| m.1 == now).unwrap_or(0) as u32);
+    what.connect_selected_notify(|d| {
+        let v = ACTIVITIES.get(d.selected() as usize).map_or(0.0, |m| m.1);
+        config::set_tuning("activity", (v != 0.0).then_some(v));
+        if daemon::running() {
+            daemon::reload();
+        }
+    });
     let header = adw::HeaderBar::new();
     header.pack_start(&build_btn);
     if place == "cafe" {
@@ -486,6 +502,7 @@ fn build(app: &adw::Application, place: &str) {
     jpop.connect_show(move |_| j2.set_child(Some(&jobs_list())));
     header.pack_start(&jobs);
     header.pack_end(&mode);
+    header.pack_end(&what);
     let view = adw::ToolbarView::new();
     view.add_top_bar(&header);
     view.set_content(Some(&toast));

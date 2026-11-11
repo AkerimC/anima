@@ -219,7 +219,8 @@ impl CharacterOverlay {
         let free: Vec<usize> = (0..n).filter(|&i| self.desk_free(i, windows)).collect();
         let away = (0..n).filter(|&i| self.walk_ref(i).visit_for != 0).count();
         let on_desk = (0..n).filter(|&i| !windows.contains(&self.walk_ref(i).ws) && self.walk_ref(i).visit_for == 0).count();
-        let slot = meal_slot();
+        // only playing: the only visits are game time and the park attendant
+        let slot = if playing_only() { None } else { meal_slot() };
         // mealtime: most go to eat, two at a time; three stay behind
         if let Some(slot) = slot {
             // (three stay behind on the desktop)
@@ -233,7 +234,7 @@ impl CharacterOverlay {
         }
         // the chef and the waiters, while there are people to feed
         let diners = self.visitors(n, MEAL) + self.visitors(n, HUNGRY);
-        if diners > 0 {
+        if diners > 0 && !playing_only() {
             for job in ["chef", "waiter"] {
                 for i in 0..n {
                     if self.is_job(i, job) && self.desk_free(i, windows) {
@@ -245,7 +246,7 @@ impl CharacterOverlay {
         // (no limit on how many are over in the windows at once)
         let _ = away;
         // hungry: to the cafe
-        if let Some(&i) = free.iter().find(|&&i| self.hungry(i)) {
+        if let Some(&i) = free.iter().find(|&&i| !playing_only() && self.hungry(i)) {
             if governor::place_rect("cafe").is_some() {
                 self.send_visit(i, "cafe", HUNGRY);
                 return;
@@ -254,7 +255,7 @@ impl CharacterOverlay {
         // the farm piling up: its farmer (or whoever farms most) goes
         // (the farmer if there is one; it's already there: nobody else)
         let farmer_there = (0..n).any(|i| self.is_job(i, "farmer") && self.place_here(i).is_some_and(|p| p.place == "farm"));
-        if backlog >= 3 && self.visitors(n, FARM) == 0 && !farmer_there {
+        if backlog >= 3 && self.visitors(n, FARM) == 0 && !farmer_there && !playing_only() {
             let jobs = park::read_jobs();
             let points = |this: &Self, i: usize| jobs.points.get(&this.character_name(i)).and_then(|p| p.get("farmer")).copied().unwrap_or(0.0);
             let who = free.iter().copied().filter(|&i| self.may_work(i, "farmer")).max_by(|&a, &b| {
@@ -284,7 +285,7 @@ impl CharacterOverlay {
                 _ => false,
             }
         };
-        if self.visitors(n, FISH) + self.visitors(n, FISHING) == 0 && due(&FISH_AT, tn().visit_fish_every) {
+        if self.visitors(n, FISH) + self.visitors(n, FISHING) == 0 && !playing_only() && due(&FISH_AT, tn().visit_fish_every) {
             let jobs = park::read_jobs();
             let points = |this: &Self, i: usize| jobs.points.get(&this.character_name(i)).and_then(|p| p.get("fisher")).copied().unwrap_or(0.0);
             let who = free.iter().copied().filter(|&i| self.walk_ref(i).fish_cool <= 0.0 && self.may_work(i, "fisher")).max_by(|&a, &b| {

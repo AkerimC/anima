@@ -91,8 +91,8 @@ impl CharacterOverlay {
     /// the hungry go to eat, the starving sit down, and wages are paid.
     pub(super) fn hunger_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         let homes = governor::places();
-        // the desktop only: no hunger to see to
-        if homes.is_empty() || tn().park_mode < 0.5 {
+        // the desktop only, or only playing: no hunger to see to
+        if homes.is_empty() || tn().park_mode < 0.5 || playing_only() {
             return;
         }
         let visiting = visit::visiting_mode();
