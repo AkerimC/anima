@@ -7,6 +7,9 @@
 use crate::render::tuning::get as tn;
 use super::CharacterOverlay;
 use super::walk::{Act, WalkState};
+use crate::backend::governor;
+
+mod play;
 
 /// A game asked for from the settings window (`anima game <name>`).
 pub static GAME_NOW: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -97,6 +100,8 @@ enum Stage {
     RaceCall,
     // setting off a few at a time; the rest stay and chat till their turn
     RaceWait,
+    // on something built in the park
+    Play,
 }
 
 /// Volleyball: who does what, and the score.
@@ -278,7 +283,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None }
+        Chat { practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
     }
 }
 
@@ -419,6 +424,8 @@ pub(super) struct Chat {
     // samba: still walking over to join the row
     samba_new: Vec<usize>,
     gift: Option<Gift>,
+    // playing on something built in the park
+    play: Option<play::Play>,
 }
 
 /// Chance per look that someone nearby joins a chat this big: a pair is
@@ -801,7 +808,7 @@ impl CharacterOverlay {
                 }
                 for c in chats.iter_mut() {
                     let full = c.members.len() >= self.group_cap();
-                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Concert | Stage::Blind | Stage::Fishing | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part) && self.overlap_join(c, n, full) {
+                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Concert | Stage::Blind | Stage::Fishing | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part | Stage::Play) && self.overlap_join(c, n, full) {
                         continue;
                     }
                     if !full && matches!(c.stage, Stage::Talk | Stage::Stroll) {
@@ -815,6 +822,9 @@ impl CharacterOverlay {
                 if let Some(c) = self.bored_fishing(n, tn().look_every) {
                     chats.push(c);
                 }
+                self.park_play(&mut chats, n);
+                self.park_tell_unit(n);
+                self.park_tell_busy();
                 if let Some(c) = self.start_training(n, tn().look_every) {
                     chats.push(c);
                 }
@@ -921,7 +931,7 @@ impl CharacterOverlay {
                     r.lean = 0.0;
                     fixed.push("lean");
                 }
-                if r.perched && !matches!(st, Stage::Volley | Stage::Gift) {
+                if r.perched && !matches!(st, Stage::Volley | Stage::Gift | Stage::Play) {
                     r.perched = false;
                     fixed.push("perched");
                 }
@@ -1254,7 +1264,7 @@ impl CharacterOverlay {
         if !c.members.contains(&c.talker) {
             c.turn = 0.0;
         }
-        c.members.len() >= 2 || (matches!(c.stage, Stage::Fishing | Stage::Practice) && !c.members.is_empty())
+        c.members.len() >= 2 || (matches!(c.stage, Stage::Fishing | Stage::Practice | Stage::Play) && !c.members.is_empty())
     }
 
     /// Someone was picked up: the rest wait till it's back in its place.
@@ -6142,6 +6152,7 @@ impl CharacterOverlay {
             Stage::Blind => self.run_blind(c, dt),
             Stage::Fishing => self.run_fishing(c, dt),
             Stage::Practice => return self.run_practice(c, dt),
+            Stage::Play => return self.run_play(c, dt),
             Stage::Cheer => {
                 if c.timer <= 0.0 {
                     c.all_cheer = false;

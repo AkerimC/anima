@@ -76,7 +76,10 @@ impl RopeGl {
 
 impl CharacterOverlay {
     pub(super) fn draw_ropes(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
-        let ropes: Vec<([f32; 4], Option<SceneZoom>)> = self.ropes_owned().into_iter().filter_map(|(r, o)| self.placed(o).map(|z| (r, z))).collect();
+        // (ends, where, half thickness, sagging, twisted)
+        let mut ropes: Vec<([f32; 4], Option<SceneZoom>, f32, bool, bool)> = self.ropes_owned().into_iter().filter_map(|(r, o)| self.placed(o).map(|z| (r, z, 5.0, true, true))).collect();
+        // the park's swing ropes hang straight from the bar; a seesaw board is one thick plain band
+        ropes.extend(self.park_ropes().into_iter().filter_map(|(r, o, half, twisted)| self.placed(o).map(|z| (r, z, half, false, twisted))));
         if ropes.is_empty() {
             return;
         }
@@ -92,8 +95,8 @@ impl CharacterOverlay {
         let time = self.start.elapsed().as_secs_f32();
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         let Some(r) = self.rope.as_mut() else { return };
-        for ([x0, y0, x1, y1], zoom) in ropes {
-            if !target.begin(gl, 0, [x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0]) {
+        for ([x0, y0, x1, y1], zoom, half, sagging, twisted) in ropes {
+            if !target.begin(gl, 0, [x0.min(x1) - 20.0, y0.min(y1) - 40.0, x0.max(x1) + 20.0, y0.max(y1) + 40.0]) {
                 continue;
             }
             let clip = |x: f32, y: f32| [x / w * 2.0 - 1.0, 1.0 - y / h * 2.0];
@@ -102,9 +105,11 @@ impl CharacterOverlay {
             r.program.set_vec2(gl, "u_a", a[0], a[1]);
             r.program.set_vec2(gl, "u_b", b[0], b[1]);
             // pulled nearly tight, trembling a little
-            r.program.set_f32(gl, "u_sag", (12.0 + (time * 9.0).sin() * 3.0) / h * 2.0);
-            r.program.set_f32(gl, "u_half", 5.0 / h * 2.0);
-            r.program.set_f32(gl, "u_twists", (x1 - x0).abs() / 9.0);
+            let sag = if sagging { 12.0 + (time * 9.0).sin() * 3.0 } else { 0.0 };
+            r.program.set_f32(gl, "u_sag", sag / h * 2.0);
+            r.program.set_f32(gl, "u_half", half / h * 2.0);
+            let len = if sagging { (x1 - x0).abs() } else { ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt() };
+            r.program.set_f32(gl, "u_twists", if twisted { len / 9.0 } else { 0.0 });
             r.program.set_vec4(gl, "u_clip", zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform()));
             unsafe {
                 gl.enable(glow::BLEND);

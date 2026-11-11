@@ -138,6 +138,7 @@ tuning! {
     }
     "Roaming", "Park" {
         park_mode: "With the park window open: 0 desktop, 1 only the park, 2 the park and out now and then" = 2.0, 0.0, 2.0, 1.0, 0;
+        park_play: "Someone free in the park goes to play (chance each look)" = 0.25, 0.0, 1.0, 0.05, 2;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
         park_out_stay: "Stays out (s)" = 180.0, 10.0, 7200.0, 10.0, 0;
