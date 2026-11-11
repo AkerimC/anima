@@ -2305,6 +2305,8 @@ impl CharacterOverlay {
         }
         if self.actor == 0 {
             let n = self.extras.len() + 1;
+            // the park's swing ropes and seesaw board go behind everyone
+            self.draw_ropes(gl, info, target, true);
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal));
             for i in order {
@@ -2314,7 +2316,7 @@ impl CharacterOverlay {
                     self.extras[i - 1].draw_pending(gl, target);
                 }
             }
-            self.draw_ropes(gl, info, target);
+            self.draw_ropes(gl, info, target, false);
             self.draw_carrot(gl, info, target);
         }
         Ok(())

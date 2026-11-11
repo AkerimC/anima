@@ -278,10 +278,10 @@ impl CharacterOverlay {
                 1 => {
                     let climb = 0.6 + top / unit * 0.9;
                     let u = (r.t / climb).min(1.0);
-                    // rung by rung
-                    let step = (u * 6.0).floor() / 6.0 + ((u * 6.0).fract() * std::f32::consts::PI).sin() * 0.02;
+                    // smoothly up, easing in and out
+                    let up = u * u * (3.0 - 2.0 * u);
                     self.set_face(r.i, dir < 0.0);
-                    self.hold_at(r.i, ladder, top * step.min(1.0));
+                    self.hold_at(r.i, ladder, top * up);
                     if u >= 1.0 {
                         r.phase = 2;
                         r.t = 0.0;
@@ -470,10 +470,13 @@ impl CharacterOverlay {
                 }
                 continue;
             }
-            self.hold_at(i, spot, seat * 0.75);
+            // on a chair: up on the seat (seen from the side); on a bench the
+            // legs hang down in front of the plank
+            let bench = t.kind == "bench";
+            self.hold_at(i, spot, if bench { seat * 0.75 } else { seat + 0.02 * unit });
             let other = p.riders.iter().map(|r| r.i).find(|&o| o != i);
             let wk = self.walk_of(i);
-            wk.sink = tn().sit_sink;
+            wk.sink = if bench { tn().sit_sink } else { 0.0 };
             if let Some(o) = other {
                 if wk.rand() < 0.004 {
                     wk.gesture = true;
@@ -583,33 +586,38 @@ impl CharacterOverlay {
         let n = self.extras.len() + 1;
         let unit = self.park_unit(n);
         let mut out = Vec::new();
+        // (box, view offset, where the feet are drawn, the ground under them)
         let feet = |this: &Self, i: usize| {
             let rect = if i == 0 { this.hit_rect } else { this.extras[i - 1].hit_rect };
             let a = this.actor_ref(i);
-            (rect, a.own_view[0] * this.view_w * 0.5, rect[3] + a.walk.air * (rect[3] - rect[1]).max(1.0) * 0.5)
+            let h = (rect[3] - rect[1]).max(1.0);
+            let soles = rect[1] + h * a.opaque[2];
+            (rect, a.own_view[0] * this.view_w * 0.5, soles, soles + a.walk.air * h * 0.5)
         };
         for c in self.chats.iter().filter(|c| c.stage == Stage::Play) {
             let Some(p) = c.play.as_ref() else { continue };
             let Some(t) = park.things.get(p.thing) else { continue };
             if p.kind == "swing" {
                 let Some(r) = p.riders.first().filter(|r| r.phase == 1) else { continue };
-                let (rect, off, ground) = feet(self, r.i);
+                let (rect, off, soles, ground) = feet(self, r.i);
                 let h = (rect[3] - rect[1]).max(1.0);
                 let top = ground - park::SWING_TOP * unit;
                 let px = self.thing_px(t) - off;
-                let (hx, hy) = ((rect[0] + rect[2]) * 0.5, rect[1] + h * 0.6);
+                // down to a seat right under its feet
+                let (hx, hy) = ((rect[0] + rect[2]) * 0.5, soles);
+                let _ = h;
                 for side in [-1.0, 1.0] {
-                    let d = side * 0.14 * unit;
+                    let d = side * 0.18 * unit;
                     out.push(([px + d, top, hx + d, hy], r.i, 3.0, true));
                 }
+                out.push(([hx - 0.24 * unit, hy + 0.03 * unit, hx + 0.24 * unit, hy + 0.03 * unit], r.i, 0.035 * unit, false));
             } else if p.kind == "seesaw" && seesaw_rocking(p) {
                 let (a, b) = (p.riders[0].i, p.riders[1].i);
-                let (ra, offa, _) = feet(self, a);
-                let (rb, _, _) = feet(self, b);
+                let (_, offa, ya, _) = feet(self, a);
+                let (_, _, yb, _) = feet(self, b);
                 let half = park::SEESAW_HALF * unit;
                 let mid = self.thing_px(t) - offa;
                 // the board runs through both riders' feet, a little past each
-                let (ya, yb) = (ra[3], rb[3]);
                 let k = half / (half * 0.92);
                 let (y0, y1) = ((ya + yb) * 0.5 + (ya - yb) * 0.5 * k, (ya + yb) * 0.5 - (ya - yb) * 0.5 * k);
                 out.push(([mid - half, y0 + 4.0, mid + half, y1 + 4.0], a, 0.06 * unit, false));

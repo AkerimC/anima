@@ -75,11 +75,15 @@ impl RopeGl {
 }
 
 impl CharacterOverlay {
-    pub(super) fn draw_ropes(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
+    /// `behind`: the park's ropes (drawn before the characters), else the tug rope.
+    pub(super) fn draw_ropes(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget, behind: bool) {
         // (ends, where, half thickness, sagging, twisted)
-        let mut ropes: Vec<([f32; 4], Option<SceneZoom>, f32, bool, bool)> = self.ropes_owned().into_iter().filter_map(|(r, o)| self.placed(o).map(|z| (r, z, 5.0, true, true))).collect();
-        // the park's swing ropes hang straight from the bar; a seesaw board is one thick plain band
-        ropes.extend(self.park_ropes().into_iter().filter_map(|(r, o, half, twisted)| self.placed(o).map(|z| (r, z, half, false, twisted))));
+        let ropes: Vec<([f32; 4], Option<SceneZoom>, f32, bool, bool)> = if behind {
+            // the park's swing ropes hang straight from the bar; a seesaw board is one thick plain band
+            self.park_ropes().into_iter().filter_map(|(r, o, half, twisted)| self.placed(o).map(|z| (r, z, half, false, twisted))).collect()
+        } else {
+            self.ropes_owned().into_iter().filter_map(|(r, o)| self.placed(o).map(|z| (r, z, 5.0, true, true))).collect()
+        };
         if ropes.is_empty() {
             return;
         }
