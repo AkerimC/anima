@@ -412,7 +412,8 @@ impl CharacterOverlay {
     /// `i` goes to play on thing `k`, with whoever is on it already.
     fn start_play(&mut self, chats: &mut Vec<Chat>, i: usize, k: usize, kind: &str) {
         let kind = kind.to_string();
-        if let Some(c) = chats.iter_mut().find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == kind)) {
+        let own = matches!(kind.as_str(), "serve" | "order" | "down" | "meadow" | "chase");
+        if let Some(c) = chats.iter_mut().filter(|_| !own).find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == kind)) {
             self.enlist(i, c.id);
             c.members.push(i);
             log::debug!("chat {}: {i} joins in on the {kind}", c.id);
@@ -496,6 +497,9 @@ impl CharacterOverlay {
             return false;
         }
         if p.kind == "serve" {
+            if p.riders.is_empty() {
+                p.riders.push(Rider { i: c.members[0], phase: 0, t: 0.0, n: 0, want: 0 });
+            }
             let table = park.things.get(p.thing).filter(|t| t.kind == "table").cloned();
             let done = match table {
                 Some(t) => self.play_serve(c, &mut p, &t, dt),
@@ -1270,6 +1274,41 @@ impl CharacterOverlay {
         }
     }
 
+    /// A dish left on the serving counter with nobody coming for it (its
+    /// carrier was picked up, say): someone free in the cafe takes it to a
+    /// table and eats it.
+    fn leftovers(&mut self, chats: &mut Vec<Chat>, n: usize) {
+        static SEEN: Mutex<Vec<(u64, String, Instant)>> = Mutex::new(Vec::new());
+        let on_counters: Vec<(u64, String)> = {
+            let park = park_now();
+            let counters: Vec<u64> = park.things.iter().filter(|t| t.kind == "counter").map(|t| t.id).collect();
+            LIVE.lock().unwrap().dishes.iter().filter(|d| counters.contains(&d.0)).map(|d| (d.0, d.1.clone())).collect()
+        };
+        let mut seen = SEEN.lock().unwrap();
+        seen.retain(|s| on_counters.iter().any(|d| d.0 == s.0 && d.1 == s.1));
+        for d in &on_counters {
+            if !seen.iter().any(|s| s.0 == d.0 && s.1 == d.1) {
+                seen.push((d.0, d.1.clone(), Instant::now()));
+            }
+        }
+        // someone on the way for it, or a diner's order: not left over
+        let wanted = |dish: &str| {
+            chats.iter().filter_map(|c| c.play.as_ref()).any(|p| p.kind == "serve" && p.meal.as_ref().is_some_and(|m| m.dish == dish))
+                || dine::ORDERS.lock().unwrap().iter().any(|o| o.dish == dish && o.state == dine::Ask::Ready)
+        };
+        let Some(old) = seen.iter().find(|s| s.2.elapsed().as_secs_f32() > 45.0 && !wanted(&s.1)).cloned() else { return };
+        drop(seen);
+        let park = park_now();
+        let Some(counter) = park.things.iter().find(|t| t.id == old.0).cloned() else { return };
+        let table = park.things.iter().enumerate().filter(|(_, t)| t.kind == "table" && t.place == counter.place && dish_on(t.id).is_none()).map(|(k, _)| k).next();
+        let who = (0..n).find(|&i| self.walk_ref(i).at_leisure() && self.place_here(i).is_some_and(|p| p.place == counter.place));
+        if let (Some(k), Some(i)) = (table, who) {
+            log::debug!("cafe: {i} takes the left-over {} to a table", old.1);
+            SEEN.lock().unwrap().retain(|s| !(s.0 == old.0 && s.1 == old.1));
+            SERVE.lock().unwrap().push(Serve { who: i, table: k, dish: old.1, from: self.thing_px(&counter), counter: counter.id, by_cook: true, diner: None });
+        }
+    }
+
     /// Eggs in the coop, milk in the barn, a crop ripe: someone on the farm
     /// (a farmer first) goes to get it.
     fn farm_calls(&mut self, chats: &mut Vec<Chat>, n: usize) {
@@ -1647,6 +1686,7 @@ impl CharacterOverlay {
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         self.restaurant_tick(chats);
+        self.leftovers(chats, n);
         self.farm_calls(chats, n);
         // down from up the meadow, on foot
         let down: Vec<usize> = std::mem::take(&mut *DOWN.lock().unwrap());
@@ -1674,7 +1714,7 @@ impl CharacterOverlay {
                 }
             }
             self.start_play(chats, i, k, "serve");
-            if let Some(c) = chats.iter_mut().find(|c| c.members.contains(&i) && c.play.as_ref().is_some_and(|p| p.kind == "serve")) {
+            if let Some(c) = chats.iter_mut().rev().find(|c| c.members.contains(&i) && c.play.as_ref().is_some_and(|p| p.kind == "serve")) {
                 if let Some(p) = c.play.as_mut() {
                     p.meal = Some(Meal { dish, new: false, burnt: false, stuff: Vec::new() });
                     p.from = from;

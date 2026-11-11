@@ -796,10 +796,19 @@ fn draw_extras(sh: &mut Shared, cr: &gtk::cairo::Context, t: &park::Thing, x: f6
             cr.arc(bx, gy - 0.69 * u, 0.06 * u, std::f64::consts::PI, 0.0);
             cr.fill().ok();
             let waiting: Vec<String> = sh.world.dishes.iter().filter(|d| d.0 == t.id).map(|d| d.1.clone()).collect();
-            for (k, dish) in waiting.iter().enumerate() {
-                let size = 0.34 * u;
-                let dx = -0.4 * u + k as f64 * 0.38 * u;
-                draw_picture(sh, cr, &park::food_picture(dish), x + dx - size * 0.5, gy - 0.68 * u - size * 0.9, size, false);
+            // in a heap: four along the counter, three on top of them, two, one...
+            let size = 0.34 * u;
+            let (mut row, mut col, mut in_row) = (0usize, 0usize, 4usize);
+            for dish in &waiting {
+                let dx = (col as f64 - (in_row as f64 - 1.0) * 0.5) * 0.36 * u;
+                let dy = row as f64 * size * 0.62;
+                draw_picture(sh, cr, &park::food_picture(dish), x + dx - size * 0.5, gy - 0.68 * u - size * 0.9 - dy, size, false);
+                col += 1;
+                if col >= in_row {
+                    row += 1;
+                    col = 0;
+                    in_row = in_row.saturating_sub(1).max(1);
+                }
             }
         }
         "carrots" => {
