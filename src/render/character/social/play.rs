@@ -9,6 +9,7 @@ use super::*;
 use crate::render::character::park::{self, Park, Thing};
 
 mod dine;
+mod hunger;
 
 pub(super) struct Play {
     // which thing in the park list, and what it was when they started
@@ -58,12 +59,14 @@ struct Live {
     beasts: Vec<Beast>,
     stoves: Vec<(u64, String, f32)>,
     dishes: Vec<(u64, String, f32)>,
+    // picnics in the park: strip x, dish, how much is left
+    picnics: Vec<(f32, String, f32)>,
     written: Option<Instant>,
     last: Option<park::World>,
     seed: u32,
 }
 
-static LIVE: Mutex<Live> = Mutex::new(Live { beasts: Vec::new(), stoves: Vec::new(), dishes: Vec::new(), written: None, last: None, seed: 7 });
+static LIVE: Mutex<Live> = Mutex::new(Live { beasts: Vec::new(), stoves: Vec::new(), dishes: Vec::new(), picnics: Vec::new(), written: None, last: None, seed: 7 });
 
 fn live_rand(l: &mut Live) -> f32 {
     l.seed ^= l.seed << 13;
@@ -148,6 +151,8 @@ impl CharacterOverlay {
 
     /// Some of a job's work done; told when that earns it the job.
     pub(super) fn work(&mut self, i: usize, job: &str, k: f32) {
+        let wk = self.walk_of(i);
+        wk.hunger = (wk.hunger + 0.03 * k).min(1.0);
         let name = self.character_name(i);
         if let Some(j) = park::add_work(&name, job, k) {
             log::info!("{name} is now a {j}");
@@ -507,6 +512,17 @@ impl CharacterOverlay {
         let Some(mut p) = c.play.take() else { return false };
         let park = park_now();
         let thing = park.things.get(p.thing).filter(|t| t.kind == p.kind).cloned();
+        if p.kind == "picnic" {
+            let done = self.play_picnic(c, &mut p, dt);
+            if done {
+                for &i in &c.members.clone() {
+                    self.let_down(i);
+                }
+                return false;
+            }
+            c.play = Some(p);
+            return !c.members.is_empty();
+        }
         if p.kind == "meadow" {
             let done = self.play_meadow(c, &mut p, dt);
             if done {
@@ -621,6 +637,7 @@ impl CharacterOverlay {
             "stove" => self.play_stove(c, &mut p, &thing, mid, unit, dt),
             "carrots" | "wheat" | "apple_tree" | "coop" | "barn" => self.play_farm(c, &mut p, &thing, mid, unit, dt),
             "sandbox" => self.play_sandbox(c, &mut p, mid, unit, dt),
+            "stall" => self.play_stall(c, &mut p, mid, unit, dt),
             _ => true,
         };
         if done && thing.place == "park" && matches!(thing.kind.as_str(), "slide" | "swing" | "seesaw" | "sandbox") {
@@ -949,6 +966,7 @@ impl CharacterOverlay {
                     drop(l);
                     log::debug!("chat {}: the {dish} is all eaten", c.id);
                     for (a, &x) in eaters.iter().enumerate() {
+                        self.eat(x, &dish);
                         for &y in &eaters[a + 1..] {
                             self.add_bond(x, y, tn().bond_game * 1.5, 0.0);
                         }
@@ -1075,6 +1093,21 @@ impl CharacterOverlay {
                 p.t = p.stay;
                 p.meal = Some(Meal { dish: String::new(), ..m });
                 return false;
+            }
+            // now and then it's eaten as a picnic in the park
+            if !m.burnt && self.walk.rand() < tn().picnic_chance {
+                if let Some(pk) = governor::place_rect("park").filter(|pk| pk.ws == self.walk_ref(cook).ws) {
+                    let r = self.walk.rand();
+                    let x = pk.x + pk.w * (0.2 + 0.6 * r);
+                    let mut q = hunger::PICNIC.lock().unwrap();
+                    for rd in &p.riders {
+                        q.push((rd.i, x, m.dish.clone()));
+                    }
+                    log::debug!("chat {}: the {} goes out for a picnic", c.id, m.dish);
+                    p.t = p.stay;
+                    p.meal = Some(Meal { dish: String::new(), ..m });
+                    return false;
+                }
             }
             // onto the nearest table in this room, if there's a free one
             let park = park_now();
@@ -1325,6 +1358,7 @@ impl CharacterOverlay {
     /// The dish in the hands of whoever is carrying it.
     pub(super) fn serve_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
         self.dine_props(v);
+        self.snack_props(v);
         for c in self.chats.iter().filter(|c| c.stage == Stage::Play) {
             let Some(p) = c.play.as_ref().filter(|p| p.kind == "serve") else { continue };
             let Some(r) = p.riders.first().filter(|r| r.phase == 2) else { continue };
@@ -1729,15 +1763,19 @@ impl CharacterOverlay {
             .filter(|p| (p.kind == "swing" && p.riders.first().is_some_and(|r| r.phase == 1)) || (p.kind == "seesaw" && seesaw_rocking(p)))
             .map(|p| p.thing)
             .collect();
-        let mut l = LIVE.lock().unwrap();
-        if l.written.is_some_and(|t| t.elapsed().as_secs_f32() < 0.2) {
+        if LIVE.lock().unwrap().written.is_some_and(|t| t.elapsed().as_secs_f32() < 0.2) {
             return;
         }
+        let hunger = self.hunger_list();
+        let park = governor::place_rect("park");
+        let mut l = LIVE.lock().unwrap();
         let world = park::World {
             busy,
             animals: l.beasts.iter().map(|b| park::Animal { kind: b.kind.to_string(), x: b.x, y: b.y, left: b.left, hop: b.hop.max(0.0) }).collect(),
             stoves: l.stoves.clone(),
             dishes: l.dishes.clone(),
+            picnics: l.picnics.iter().filter_map(|p| park.as_ref().map(|k| ((p.0 - k.x) / k.w.max(1.0), p.1.clone(), p.2))).collect(),
+            hunger,
         };
         if l.last.as_ref() == Some(&world) {
             return;
@@ -1753,6 +1791,7 @@ impl CharacterOverlay {
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         self.restaurant_tick(chats);
+        self.hunger_tick(chats, dt, n);
         self.leftovers(chats, n);
         self.game_time(chats, n);
         self.farm_calls(chats, n);

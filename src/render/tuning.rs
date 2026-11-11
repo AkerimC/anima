@@ -140,13 +140,16 @@ tuning! {
         park_mode: "With the park window open: 0 desktop, 1 only the park, 2 the park and out now and then" = 2.0, 0.0, 2.0, 1.0, 0;
         park_play: "Someone free in the park goes to play (chance each look)" = 0.25, 0.0, 1.0, 0.05, 2;
         park_move_every: "Someone goes over to the park, cafe or farm about every (s)" = 90.0, 10.0, 3600.0, 10.0, 0;
-        dine_chance: "In the cafe with the chef in, someone comes to eat (chance each look)" = 0.3, 0.0, 1.0, 0.05, 2;
         cook_known: "A cook makes a recipe it knows instead of trying something new (share)" = 0.6, 0.0, 1.0, 0.05, 2;
         meadow_stroll: "Someone free on the farm strolls up the meadow (chance each look)" = 0.06, 0.0, 1.0, 0.01, 2;
         chase_chicken: "Someone free on the farm chases a hen (chance each look)" = 0.04, 0.0, 1.0, 0.01, 2;
         park_game_every: "Game time in the park about every (s)" = 150.0, 20.0, 3600.0, 10.0, 0;
         park_busy_most: "At most this share of them off on their own things at once" = 0.5, 0.1, 1.0, 0.05, 2;
         park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
+        hunger_time: "From full to starving, doing nothing (s)" = 2400.0, 60.0, 36000.0, 60.0, 0;
+        hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
+        picnic_chance: "A meal cooked for oneself is eaten as a picnic in the park (share)" = 0.25, 0.0, 1.0, 0.05, 2;
+        wage: "Coins each job pays every 20 minutes" = 5.0, 0.0, 100.0, 1.0, 0;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
         park_out_stay: "Stays out (s)" = 180.0, 10.0, 7200.0, 10.0, 0;

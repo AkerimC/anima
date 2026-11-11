@@ -5760,6 +5760,11 @@ impl CharacterOverlay {
     }
 
     fn end_game(&mut self, c: &mut Chat) {
+        // a game works up an appetite
+        for &i in &c.members.clone() {
+            let wk = self.walk_of(i);
+            wk.hunger = (wk.hunger + 0.06).min(1.0);
+        }
         let game = Self::game_name(c.stage);
         if !game.is_empty() && c.stage != Stage::Gift && c.stage != Stage::Concert {
             let members = c.members.clone();

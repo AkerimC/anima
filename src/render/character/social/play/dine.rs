@@ -45,9 +45,7 @@ pub(super) fn set_order(diner: usize, f: impl FnOnce(&mut Order)) {
 /// How long a dish takes to eat, slowly, talking.
 const EAT: f32 = 30.0;
 
-/// When each one last ate (by name): not hungry again for a while.
-static ATE: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
-const FULL_FOR: f32 = 600.0;
+
 
 impl CharacterOverlay {
     /// Someone with that job, in the cafe and free (or doing just that).
@@ -76,12 +74,8 @@ impl CharacterOverlay {
         if !self.restaurant_open() || self.is_job(i, "chef") || self.is_job(i, "waiter") || order_of(i).is_some() {
             return false;
         }
-        if self.walk_of(i).rand() >= tn().dine_chance {
-            return false;
-        }
-        // not straight after a meal, and only with something in the pantry
-        let name = self.character_name(i);
-        if ATE.lock().unwrap().iter().any(|a| a.0 == name && a.1.elapsed().as_secs_f32() < FULL_FOR) {
+        // only the hungry (sooner at mealtimes), and only with something in the pantry
+        if !self.hungry(i) {
             return false;
         }
         if park::read_pantry().values().filter(|&&v| v > 0).count() < 2 {
@@ -360,6 +354,7 @@ impl CharacterOverlay {
                             l.dishes.remove(k);
                         }
                         drop(l);
+                        self.eat(i, &dish);
                         // those who ate together get on better
                         for o in p.riders.iter().filter(|o| o.i != i && o.phase >= 30).map(|o| o.i).collect::<Vec<_>>() {
                             self.add_bond(i, o, tn().bond_game, 0.0);
@@ -386,7 +381,27 @@ impl CharacterOverlay {
                             (None, Some(w)) => vec![(w.as_str(), 1.0)],
                             (None, None) => Vec::new(),
                         };
-                        if !to.is_empty() && !park::pay(&name, price, &to) {
+                        // now and then a friend at the table treats it
+                        let treat = p.riders.iter().map(|o| o.i).filter(|&o| o != i && self.close(i, o)).find(|&o| park::coins(&self.character_name(o)) >= price * 2);
+                        let treated = match treat.filter(|_| !to.is_empty() && self.walk.rand() < 0.3) {
+                            Some(f) => {
+                                let fname = self.character_name(f);
+                                let ok = park::pay(&fname, price, &to);
+                                if ok {
+                                    log::debug!("cafe: {fname} treats {name}");
+                                    self.add_bond(i, f, tn().bond_game * 2.0, 0.0);
+                                }
+                                ok
+                            }
+                            None => false,
+                        };
+                        // its favourite: a tip for the chef
+                        if park::favorite(&name) == dish {
+                            if let Some(c) = &chef {
+                                park::pay(&name, 2, &[(c.as_str(), 1.0)]);
+                            }
+                        }
+                        if !treated && !to.is_empty() && !park::pay(&name, price, &to) {
                             // short: a friend at the table pays, and they get closer for it
                             let friend = p.riders.iter().map(|o| o.i).filter(|&o| o != i).find(|&o| park::coins(&self.character_name(o)) >= price);
                             if let Some(f) = friend {
@@ -396,11 +411,7 @@ impl CharacterOverlay {
                             }
                         }
                         log::debug!("cafe: {name} pays {price} for the {dish}");
-                        {
-                            let mut ate = ATE.lock().unwrap();
-                            ate.retain(|a| a.0 != name);
-                            ate.push((name.clone(), Instant::now()));
-                        }
+
                         self.walk_of(i).start_bob(tn().jump_height * 0.2);
                         r.phase = 41;
                         r.t = 0.0;

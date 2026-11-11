@@ -68,6 +68,8 @@ pub(super) struct WalkState {
     pub(super) gesture: bool,
     // social energy, see social.rs
     pub(super) energy: f32,
+    // how hungry, 0 (full) to 1 (starving): work and time make it, food mends it
+    pub(super) hunger: f32,
     // turned (radians) and sunk into the ground (half-heights)
     pub(super) rot: f32,
     // characters on the team

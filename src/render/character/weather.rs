@@ -83,7 +83,7 @@ pub(super) fn now() -> Weather {
     w
 }
 
-fn minutes_now() -> u32 {
+pub(super) fn minutes_now() -> u32 {
     let t = unsafe { libc::time(std::ptr::null_mut()) };
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&t, &mut tm) };

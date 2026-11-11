@@ -181,6 +181,25 @@ fn build(app: &adw::Application, place: &str) {
             let (grown, ready) = park::farm_state(t, &sh.farm);
             draw_extras(&mut sh, cr, t, x, gy, unit, grown, ready, time);
         }
+        if me.place == "park" {
+            for (px, dish, left) in sh.world.picnics.clone() {
+                let x = px as f64 * w;
+                let gy = h - 3.0;
+                // a checked blanket on the grass, the food in the middle
+                let (bw, bh) = (1.3 * unit, 0.07 * unit);
+                for k in 0..8 {
+                    if k % 2 == 0 {
+                        cr.set_source_rgb(0.9, 0.25, 0.25);
+                    } else {
+                        cr.set_source_rgb(0.98, 0.96, 0.92);
+                    }
+                    let a = x - bw * 0.5 + k as f64 * bw / 8.0;
+                    rect(cr, a, gy - bh, a + bw / 8.0, gy);
+                }
+                let size = 0.38 * unit * (0.35 + 0.65 * left as f64);
+                draw_picture(&mut sh, cr, &park::food_picture(&dish), x - size * 0.5, gy - bh - size * 0.9, size, false);
+            }
+        }
         if me.place == "farm" {
             // where each one is now: between where it was and where it's
             // going, at an even pace over the time between updates
@@ -458,7 +477,7 @@ fn build(app: &adw::Application, place: &str) {
         header.pack_start(&book);
     }
     // who does what
-    let jobs = gtk::MenuButton::builder().label("Jobs & coins").build();
+    let jobs = gtk::MenuButton::builder().label("People").build();
     let jpop = gtk::Popover::new();
     jobs.set_popover(Some(&jpop));
     let j2 = jpop.clone();
@@ -654,6 +673,23 @@ fn jobs_list() -> gtk::Widget {
         }
         list.append(&l);
     }
+    // how hungry each one is, and its favourite dish
+    list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let head = gtk::Label::builder().label("<b>Hunger and favourite dishes</b>").use_markup(true).xalign(0.0).build();
+    list.append(&head);
+    let world = park::read_world();
+    let mut lines: Vec<String> = world
+        .hunger
+        .iter()
+        .map(|(n, h)| {
+            let full = ((1.0 - h) * 100.0).round() as i32;
+            let mood = if *h >= 0.9 { " · starving" } else if *h >= 0.55 { " · hungry" } else { "" };
+            format!("{n}: {full}% full{mood} · ♥ {}", park::dish_label(park::favorite(n)))
+        })
+        .collect();
+    lines.sort();
+    let l = gtk::Label::builder().label(if lines.is_empty() { "Nobody in the windows yet".to_string() } else { lines.join("\n") }).xalign(0.0).wrap(true).max_width_chars(44).build();
+    list.append(&l);
     // carrot coins: earned bringing food to the pantry, spent at the cafe
     list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let row = gtk::Box::builder().spacing(8).build();
@@ -782,6 +818,28 @@ fn draw_extras(sh: &mut Shared, cr: &gtk::cairo::Context, t: &park::Thing, x: f6
             let Some((_, dish, left)) = sh.world.dishes.iter().find(|d| d.0 == t.id).cloned() else { return };
             let size = 0.4 * u * (0.35 + 0.65 * left as f64);
             draw_picture(sh, cr, &park::food_picture(&dish), x - size * 0.5, gy - 0.66 * u - size * 0.9, size, false);
+        }
+        "stall" => {
+            // a little striped stand with its snacks on show
+            rgb(cr, DARK);
+            for sx in [-0.5, 0.5] {
+                bar(cr, (x + sx * u, gy), (x + sx * u, gy - 1.1 * u), 0.05 * u);
+            }
+            rgb(cr, WOOD);
+            rect(cr, x - 0.58 * u, gy - 0.55 * u, x + 0.58 * u, gy);
+            for k in 0..6 {
+                let (a, b) = (x - 0.62 * u + k as f64 * 0.207 * u, x - 0.62 * u + (k + 1) as f64 * 0.207 * u);
+                if k % 2 == 0 {
+                    cr.set_source_rgb(0.92, 0.3, 0.32);
+                } else {
+                    cr.set_source_rgb(0.98, 0.95, 0.9);
+                }
+                rect(cr, a, gy - 1.25 * u, b, gy - 1.05 * u);
+            }
+            let size = 0.26 * u;
+            for (k, snack) in park::SNACKS.iter().enumerate() {
+                draw_picture(sh, cr, &park::food_picture(snack), x - 0.4 * u + k as f64 * 0.42 * u, gy - 0.55 * u - size * 0.9, size, false);
+            }
         }
         "counter" => {
             // the long wooden counter with a bell, and whatever is waiting on it
@@ -926,6 +984,7 @@ fn tall(t: &park::Thing) -> f64 {
         "tree" | "apple_tree" => 1.9,
         "coop" => 1.0,
         "counter" => 0.75,
+        "stall" => 1.3,
         "barn" => 1.4,
         "wheat" => 0.8,
         _ => 0.45,

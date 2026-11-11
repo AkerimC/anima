@@ -107,7 +107,7 @@ const FARM: &[&str] = &["farm"];
 const ANY: &[&str] = &["park", "cafe", "farm"];
 
 /// "slide_piece" makes a slide bigger.
-pub const RECIPES: [Recipe; 18] = [
+pub const RECIPES: [Recipe; 19] = [
     ("chair", "Chair", &[("wood", 2), ("nail", 1)], INSIDE),
     ("bench", "Bench", &[("wood", 3), ("nail", 2)], ANY),
     ("table", "Table", &[("wood", 4), ("nail", 2)], INSIDE),
@@ -121,6 +121,7 @@ pub const RECIPES: [Recipe; 18] = [
     ("tree", "Tree", &[("wood", 3)], &["park", "farm"]),
     ("lamp", "Lamp", &[("nail", 2), ("paint", 1)], ANY),
     ("sandbox", "Sandbox", &[("wood", 3), ("paint", 1)], PARK),
+    ("stall", "Snack stall", &[("wood", 4), ("nail", 2), ("paint", 2)], PARK),
     ("carrots", "Carrot bed", &[("wood", 2)], FARM),
     ("wheat", "Wheat field", &[("wood", 2), ("nail", 1)], FARM),
     ("apple_tree", "Apple tree", &[("wood", 3), ("paint", 1)], FARM),
@@ -203,6 +204,7 @@ pub fn width(t: &Thing) -> f32 {
         "coop" => 1.1,
         "barn" => 1.7,
         "counter" => 1.5,
+        "stall" => 1.2,
         _ => 0.5,
     }
 }
@@ -423,6 +425,12 @@ pub struct World {
     // table id, dish, how much is left 0..1
     #[serde(default)]
     pub dishes: Vec<(u64, String, f32)>,
+    // a picnic in the park: where (share of its width), what, how much is left
+    #[serde(default)]
+    pub picnics: Vec<(f32, String, f32)>,
+    // how hungry each one is, 0..1
+    #[serde(default)]
+    pub hunger: Vec<(String, f32)>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -584,3 +592,26 @@ pub fn pay(from: &str, k: u32, to: &[(&str, f32)]) -> bool {
     write_wallets(&w);
     true
 }
+
+// --- hunger, favourites, snacks, pay
+
+/// Each one's favourite dish: always the same one for a name.
+pub fn favorite(name: &str) -> &'static str {
+    let h = name.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
+    DISHES[h as usize % DISHES.len()].0
+}
+
+/// How much a dish fills (taken off hunger, 0..1).
+pub fn fills(dish: &str, favorite: bool) -> f32 {
+    let base = match dish {
+        "burnt" => 0.1,
+        "snack" => 0.2,
+        d => DISHES.iter().find(|x| x.0 == d).map_or(0.3, |x| 0.25 * x.2.len() as f32),
+    };
+    base + if favorite { 0.2 } else { 0.0 }
+}
+
+/// What a snack at the stall costs.
+pub const SNACK_PRICE: u32 = 3;
+/// What the stall sells: dish pictures.
+pub const SNACKS: [&str; 2] = ["ice_cream", "cookies"];
