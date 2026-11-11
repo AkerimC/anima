@@ -471,7 +471,7 @@ fn build(app: &adw::Application, place: &str) {
     win.set_content(Some(&view));
 
     let css = gtk::CssProvider::new();
-    css.load_from_string(".park-chest { padding: 12px 14px; min-width: 170px; }");
+    css.load_from_string(".park-chest { padding: 12px 14px; min-width: 170px; background-color: @window_bg_color; }");
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
