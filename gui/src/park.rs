@@ -693,6 +693,25 @@ fn draw_extras(sh: &mut Shared, cr: &gtk::cairo::Context, t: &park::Thing, x: f6
             let size = 0.4 * u * (0.35 + 0.65 * left as f64);
             draw_picture(sh, cr, &park::food_picture(&dish), x - size * 0.5, gy - 0.66 * u - size * 0.9, size, false);
         }
+        "counter" => {
+            // the long wooden counter with a bell, and whatever is waiting on it
+            rgb(cr, DARK);
+            rect(cr, x - 0.72 * u, gy - 0.62 * u, x + 0.72 * u, gy);
+            rgb(cr, WOOD);
+            rect(cr, x - 0.68 * u, gy - 0.58 * u, x + 0.68 * u, gy - 0.04 * u);
+            cr.set_source_rgb(0.85, 0.85, 0.82);
+            rect(cr, x - 0.8 * u, gy - 0.68 * u, x + 0.8 * u, gy - 0.6 * u);
+            cr.set_source_rgb(0.85, 0.7, 0.25);
+            let bx = x + if t.flip { -0.62 } else { 0.62 } * u;
+            cr.arc(bx, gy - 0.69 * u, 0.06 * u, std::f64::consts::PI, 0.0);
+            cr.fill().ok();
+            let waiting: Vec<String> = sh.world.dishes.iter().filter(|d| d.0 == t.id).map(|d| d.1.clone()).collect();
+            for (k, dish) in waiting.iter().enumerate() {
+                let size = 0.34 * u;
+                let dx = -0.4 * u + k as f64 * 0.38 * u;
+                draw_picture(sh, cr, &park::food_picture(dish), x + dx - size * 0.5, gy - 0.68 * u - size * 0.9, size, false);
+            }
+        }
         "carrots" => {
             cr.set_source_rgb(0.45, 0.3, 0.18);
             rect(cr, x - 0.5 * u, gy - 0.1 * u, x + 0.5 * u, gy);
@@ -807,6 +826,7 @@ fn tall(t: &park::Thing) -> f64 {
         "slide" => park::slide_size(t.pieces).0 as f64 + 0.35,
         "tree" | "apple_tree" => 1.9,
         "coop" => 1.0,
+        "counter" => 0.75,
         "barn" => 1.4,
         "wheat" => 0.8,
         _ => 0.45,

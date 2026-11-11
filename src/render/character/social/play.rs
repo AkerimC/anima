@@ -19,6 +19,9 @@ pub(super) struct Play {
     // at the stove: what's in the pot; carrying it: where from (strip px)
     meal: Option<Meal>,
     from: f32,
+    // carrying it off the serving counter (its id), and is it the cook doing it
+    counter: u64,
+    by_cook: bool,
 }
 
 #[derive(Clone)]
@@ -134,6 +137,7 @@ impl CharacterOverlay {
         let name = self.character_name(i);
         if let Some(j) = park::add_work(&name, job, k) {
             log::info!("{name} is now a {j}");
+            super::super::wear::kit_out(&name, &j);
             tell(&format!("{name} is now the {}!", park::job_label(&j).to_lowercase()));
             let wk = self.walk_of(i);
             wk.start_jump(tn().jump_height * 1.2);
@@ -316,7 +320,7 @@ impl CharacterOverlay {
             "seesaw" => 10.0 + self.walk.rand() * 8.0,
             _ => 0.0,
         };
-        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay, meal: None, from: 0.0 });
+        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay, meal: None, from: 0.0, counter: 0, by_cook: false });
         log::debug!("chat {id}: {i} goes to the {kind}");
         chats.push(c);
     }
@@ -389,7 +393,7 @@ impl CharacterOverlay {
         }
         if done && thing.kind == "stove" {
             if let Some(k) = p.meal.as_ref().and_then(|m| m.dish.strip_prefix("table:")).and_then(|k| k.parse::<usize>().ok()) {
-                let server = SERVE.lock().unwrap().iter().find(|s| s.1 == k).map(|s| s.0);
+                let server = SERVE.lock().unwrap().iter().find(|s| s.table == k).map(|s| s.who);
                 let mut q = PENDING.lock().unwrap();
                 for r in p.riders.iter().filter(|r| Some(r.i) != server) {
                     q.push((r.i, k));
@@ -831,9 +835,20 @@ impl CharacterOverlay {
                 let ws = self.walk_ref(cook).ws;
                 let waiter = (0..self.extras.len() + 1).find(|&j| self.is_job(j, "waiter") && self.walk_ref(j).ws == ws && self.place_here(j).is_some_and(|q| q.place == t.place) && (self.walk_ref(j).at_leisure() || p.riders.iter().any(|r| r.i == j)));
                 let helper = waiter.or_else(|| p.riders.iter().skip(1).map(|r| r.i).next());
-                match helper {
-                    Some(h) => SERVE.lock().unwrap().push((h, k, m.dish.clone(), mid)),
-                    None => LIVE.lock().unwrap().dishes.push((id, m.dish.clone(), 1.0)),
+                // a serving counter in the room: the dish goes there first
+                let counter = park
+                    .things
+                    .iter()
+                    .filter(|x| x.kind == "counter" && x.place == t.place)
+                    .min_by(|a, b| (a.x - t.x).abs().total_cmp(&(b.x - t.x).abs()))
+                    .map(|x| (x.id, self.thing_px(x)));
+                match (helper, counter) {
+                    (h, Some((cid, cx))) => {
+                        LIVE.lock().unwrap().dishes.push((cid, m.dish.clone(), 1.0));
+                        SERVE.lock().unwrap().push(Serve { who: h.unwrap_or(cook), table: k, dish: m.dish.clone(), from: cx, counter: cid, by_cook: h.is_none() });
+                    }
+                    (Some(h), None) => SERVE.lock().unwrap().push(Serve { who: h, table: k, dish: m.dish.clone(), from: mid, counter: 0, by_cook: false }),
+                    (None, None) => LIVE.lock().unwrap().dishes.push((id, m.dish.clone(), 1.0)),
                 }
                 p.meal = Some(Meal { dish: format!("table:{k}"), ..m });
             }
@@ -980,13 +995,23 @@ impl CharacterOverlay {
             1 if r.t > 0.6 => {
                 r.phase = 2;
                 self.walk_of(r.i).start_bob(tn().jump_height * 0.12);
+                // picked up off the counter
+                if p.counter != 0 {
+                    let dish = p.meal.as_ref().map(|m| m.dish.clone()).unwrap_or_default();
+                    let mut l = LIVE.lock().unwrap();
+                    if let Some(k) = l.dishes.iter().position(|d| d.0 == p.counter && d.1 == dish) {
+                        l.dishes.remove(k);
+                    }
+                }
             }
             2 => {
                 let spot = table + if p.from < table { -0.7 } else { 0.7 } * unit;
                 if go(self, spot) {
                     let dish = p.meal.as_ref().map_or_else(|| "bread".to_string(), |m| m.dish.clone());
                     LIVE.lock().unwrap().dishes.push((t.id, dish, 1.0));
-                    self.work(r.i, "waiter", 2.0);
+                    if !p.by_cook {
+                        self.work(r.i, "waiter", 2.0);
+                    }
                     self.set_happy(r.i, true);
                     PENDING.lock().unwrap().push((r.i, p.thing));
                     p.riders[0] = r;
@@ -1009,7 +1034,10 @@ impl CharacterOverlay {
             let h = (rect[3] - rect[1]).max(1.0);
             let size = h * 0.3;
             let x = (rect[0] + rect[2]) * 0.5;
-            let y = rect[1] + h * 0.42;
+            // on the tray on its head, or in its hands
+            let top = rect[1] + h * self.actor_ref(r.i).opaque[1];
+            let tray = super::super::wear::wears(&self.character_name(r.i), "custom:tray");
+            let y = if tray { top - size * 0.55 } else { rect[1] + h * 0.42 };
             v.push((super::FOOD + k as i32, [x - size * 0.5, y - size * 0.5, x + size * 0.5, y + size * 0.5], false, r.i));
         }
     }
@@ -1088,8 +1116,18 @@ impl CharacterOverlay {
 
 /// Cooks and those who waited, off to eat at a table: (who, table index).
 static PENDING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
-/// Someone to carry a dish from the stove to a table: (who, table index, dish, stove px).
-static SERVE: Mutex<Vec<(usize, usize, String, f32)>> = Mutex::new(Vec::new());
+/// Someone to carry a dish to a table.
+struct Serve {
+    who: usize,
+    table: usize,
+    dish: String,
+    // where it's picked up (strip px), off which counter (0: the stove)
+    from: f32,
+    counter: u64,
+    by_cook: bool,
+}
+
+static SERVE: Mutex<Vec<Serve>> = Mutex::new(Vec::new());
 
 /// Picked by a right double click: (who, when).
 static PICKED: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
@@ -1277,8 +1315,8 @@ impl CharacterOverlay {
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         // a dish to carry: off to the stove for it
-        let serve: Vec<(usize, usize, String, f32)> = std::mem::take(&mut *SERVE.lock().unwrap());
-        for (i, k, dish, from) in serve {
+        let serve: Vec<Serve> = std::mem::take(&mut *SERVE.lock().unwrap());
+        for Serve { who: i, table: k, dish, from, counter, by_cook } in serve {
             if i >= n {
                 continue;
             }
@@ -1295,6 +1333,8 @@ impl CharacterOverlay {
                 if let Some(p) = c.play.as_mut() {
                     p.meal = Some(Meal { dish, new: false, burnt: false, stuff: Vec::new() });
                     p.from = from;
+                    p.counter = counter;
+                    p.by_cook = by_cook;
                 }
             }
         }

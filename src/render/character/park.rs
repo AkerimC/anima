@@ -104,11 +104,12 @@ const FARM: &[&str] = &["farm"];
 const ANY: &[&str] = &["park", "cafe", "farm"];
 
 /// "slide_piece" makes a slide bigger.
-pub const RECIPES: [Recipe; 17] = [
+pub const RECIPES: [Recipe; 18] = [
     ("chair", "Chair", &[("wood", 2), ("nail", 1)], INSIDE),
     ("bench", "Bench", &[("wood", 3), ("nail", 2)], ANY),
     ("table", "Table", &[("wood", 4), ("nail", 2)], INSIDE),
     ("stove", "Stove", &[("wood", 1), ("nail", 3), ("paint", 1)], INSIDE),
+    ("counter", "Serving counter", &[("wood", 4), ("nail", 2), ("paint", 1)], &["cafe"]),
     ("swing", "Swing", &[("wood", 4), ("rope", 2), ("nail", 2)], PARK),
     ("seesaw", "Seesaw", &[("wood", 3), ("nail", 2), ("paint", 1)], PARK),
     ("slide", "Slide", &[("wood", 4), ("nail", 3), ("paint", 1)], PARK),
@@ -198,6 +199,7 @@ pub fn width(t: &Thing) -> f32 {
         "apple_tree" => 1.3,
         "coop" => 1.1,
         "barn" => 1.7,
+        "counter" => 1.5,
         _ => 0.5,
     }
 }

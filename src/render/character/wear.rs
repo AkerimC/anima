@@ -281,11 +281,44 @@ pub(super) fn give(name: &str, id: &str) {
     }
 }
 
+/// What each job comes with (accessories folder pictures), given and put on
+/// when the job is earned; changed in the wardrobe like anything else.
+pub const JOB_GEAR: [(&str, [&str; 2]); 5] = [
+    ("chef", ["custom:chef_hat", "custom:mustache"]),
+    ("waiter", ["custom:bow_tie", "custom:tray"]),
+    ("fisher", ["custom:fishing_hat", "custom:rubber_boot"]),
+    ("farmer", ["custom:straw_hat", "custom:pitchfork"]),
+    ("attendant", ["custom:staff_cap", "custom:whistle"]),
+];
+
+/// `name` got `job`: its gear is theirs, and on.
+pub(super) fn kit_out(name: &str, job: &str) {
+    let Some((_, gear)) = JOB_GEAR.iter().find(|g| g.0 == job) else { return };
+    let mut worn: HashMap<String, Vec<String>> = std::fs::read_to_string(wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let mine = worn.entry(name.to_string()).or_default();
+    for id in gear {
+        give(name, id);
+        if !mine.iter().any(|x| x == id) {
+            mine.push(id.to_string());
+        }
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&worn) {
+        let _ = crate::util::atomic_write(&wardrobe_path(), text.as_bytes());
+    }
+}
+
+/// Wears `id` right now (from the wardrobe).
+pub(super) fn wears(name: &str, id: &str) -> bool {
+    wardrobe().0.get(name).is_some_and(|v| v.iter().any(|x| x == id))
+}
+
 /// Something `name` hasn't found yet, at random (`roll` 0..1), as its place
 /// in the catalog; None once it has everything.
 pub(super) fn unfound(name: &str, roll: f32) -> Option<usize> {
     let shared = wardrobe();
-    let left: Vec<usize> = (0..shared.1.len()).filter(|&k| !owns(&shared.3, name, &shared.1[k].id) && shared.1[k].id != "sleep_mask").collect();
+    // (a job's gear comes with the job, not off the line)
+    let gear = |id: &str| JOB_GEAR.iter().any(|g| g.1.contains(&id));
+    let left: Vec<usize> = (0..shared.1.len()).filter(|&k| !owns(&shared.3, name, &shared.1[k].id) && shared.1[k].id != "sleep_mask" && !gear(&shared.1[k].id)).collect();
     (!left.is_empty()).then(|| left[(roll * left.len() as f32) as usize % left.len()])
 }
 
