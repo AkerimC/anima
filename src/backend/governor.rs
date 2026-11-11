@@ -251,6 +251,7 @@ pub struct Place {
     pub ws: u64,
     pub x: f32,
     pub w: f32,
+    pub h: f32,
 }
 
 static PLACE_WS: std::sync::Mutex<Vec<Place>> = std::sync::Mutex::new(Vec::new());
@@ -412,13 +413,14 @@ fn update_niri_strip(sock: &Path) {
                 cols.sort_by_key(|c| c.0);
                 let mut x = gap;
                 let mut at = (0.0, screen_w);
+                let height = w["layout"]["tile_size"].get(1).and_then(|v| v.as_f64()).unwrap_or(1000.0) as f32;
                 for (c, width) in &cols {
                     if Some(*c) == col {
                         at = (x, *width);
                     }
                     x += width + gap;
                 }
-                Some(Place { place: place.to_string(), ws, x: at.0, w: at.1 })
+                Some(Place { place: place.to_string(), ws, x: at.0, w: at.1, h: height })
             })
             .collect();
         *PLACE_WS.lock().unwrap() = places;

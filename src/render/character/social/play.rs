@@ -45,6 +45,8 @@ struct Beast {
     left: bool,
     wait: f32,
     hop: f32,
+    // how far up the meadow (share of the window's height)
+    y: f32,
     // running from someone: how fast, for how long still
     flee: f32,
     flee_t: f32,
@@ -184,6 +186,46 @@ impl CharacterOverlay {
             let text = format!("{{\"unit_frac\": {frac:.5}}}");
             let _ = crate::util::atomic_write(&park::view_path(), text.as_bytes());
         }
+    }
+
+    /// How high up the meadow a thing stands (strip px above the floor).
+    fn thing_up(&self, t: &Thing) -> f32 {
+        governor::place_rect(&t.place).map_or(0.0, |p| t.y * p.h)
+    }
+
+    /// Walks towards `x`, climbing (or coming down) to `up` px above the
+    /// floor on the way, as up or down a meadow. True once there.
+    fn walk_up_to(&mut self, i: usize, x: f32, up: f32, dt: f32) -> bool {
+        let here = self.strip_px(i);
+        let h = self.height_of(i);
+        let surface = self.actor_ref(i).surface[0].max(1.0);
+        let now = self.walk_ref(i).air * h * 0.5;
+        let dx = x - here;
+        let dv = up - now;
+        if dx.abs() <= 6.0 && dv.abs() <= 2.0 {
+            let wk = self.walk_of(i);
+            wk.air = (up / (h * 0.5)).max(0.0);
+            if let Some(r) = wk.social.as_mut() {
+                r.perched = up > 0.5;
+                r.moving = false;
+            }
+            return true;
+        }
+        let speed = 0.16;
+        // across at walking pace (walking as it goes), and up or down in step
+        let step = speed * surface * 0.5 * dt;
+        let unit = self.park_unit(self.extras.len() + 1);
+        let climb = if dx.abs() > 6.0 { (dv.abs() * step / dx.abs()).max(0.3 * unit * dt) } else { 0.8 * unit * dt };
+        let next = now + dv.signum() * climb.min(dv.abs());
+        if dx.abs() > 6.0 {
+            self.go_facing(i, x, speed);
+        }
+        let wk = self.walk_of(i);
+        wk.air = (next / (h * 0.5)).max(0.0);
+        if let Some(r) = wk.social.as_mut() {
+            r.perched = next > 0.5;
+        }
+        false
     }
 
     fn thing_px(&self, t: &Thing) -> f32 {
@@ -972,18 +1014,29 @@ impl CharacterOverlay {
     /// take the eggs from the coop, milk the cows.
     fn play_farm(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
         let _ = c;
+        let up = self.thing_up(t);
         for k in 0..p.riders.len() {
             let mut r = p.riders[k];
             let spot = mid + (k as f32 - 0.5) * 0.5 * unit;
+            // up the meadow to it
             if r.phase == 0 {
-                if !self.walk_ref(r.i).social.is_some_and(|s| s.moving) && (self.strip_px(r.i) - spot).abs() > 6.0 && self.arrived(r.i) {
-                    self.go(r.i, spot, 0.14);
-                } else if self.arrived(r.i) && (self.strip_px(r.i) - spot).abs() <= 6.0 {
+                if self.walk_up_to(r.i, spot, up, dt) {
                     r.phase = 1;
                     r.t = 0.0;
                     self.set_face(r.i, spot > mid);
                 }
                 p.riders[k] = r;
+                continue;
+            }
+            // done: back down to the floor
+            if r.phase == 3 {
+                if self.walk_up_to(r.i, spot + if spot > mid { 0.8 } else { -0.8 } * unit, 0.0, dt) {
+                    r.phase = 4;
+                }
+                p.riders[k] = r;
+                continue;
+            }
+            if r.phase == 4 {
                 continue;
             }
             r.t += dt;
@@ -1006,8 +1059,7 @@ impl CharacterOverlay {
                     self.work(r.i, "farmer", 2.0);
                     log::debug!("{} takes {k} {food}", r.i);
                     self.set_happy(r.i, true);
-                    let wk = self.walk_of(r.i);
-                    wk.start_jump(tn().jump_height * 0.6);
+                    self.walk_of(r.i).start_bob(tn().jump_height * 0.3);
                 } else {
                     // nothing yet: tends it, and it comes on a little faster
                     let push = match t.kind.as_str() {
@@ -1028,9 +1080,13 @@ impl CharacterOverlay {
             if r.phase == 2 && self.walk.rand() < dt * 0.6 {
                 self.walk_of(r.i).start_bob(tn().jump_height * 0.08);
             }
+            if r.phase == 2 && r.t > 5.0 {
+                r.phase = 3;
+                self.set_happy(r.i, false);
+            }
             p.riders[k] = r;
         }
-        p.t > 6.0
+        p.riders.iter().all(|r| r.phase == 4) || p.t > 60.0
     }
 
     /// Carrying a dish: to the stove for it, over to the table, down it goes.
@@ -1124,11 +1180,17 @@ impl CharacterOverlay {
             p.riders.push(Rider { i, phase: 0, t: 0.0, n: 0, want: 0 });
         }
         let unit = self.park_unit(self.extras.len() + 1);
-        let (x0, w) = column("farm").unwrap_or((0.0, self.view_w.max(1.0)));
+        let farm = governor::place_rect("farm");
+        let (x0, w, wh) = farm.map_or((0.0, self.view_w.max(1.0), 1000.0), |p| (p.x, p.w, p.h));
+        // caught (or given up): back down to the floor
+        if p.riders[0].phase == 1 {
+            let x = self.strip_px(i);
+            return self.walk_up_to(i, x + 0.6 * unit, 0.0, dt) || p.t > 25.0;
+        }
         let me = self.strip_px(i);
         let mut l = LIVE.lock().unwrap();
         let Some(b) = l.beasts.get_mut(p.thing) else { return true };
-        let at = x0 + b.x * w;
+        let (at, up) = (x0 + b.x * w, b.y * wh);
         let d = at - me;
         if d.abs() < unit * 2.2 {
             // runs off, tiring
@@ -1143,19 +1205,17 @@ impl CharacterOverlay {
             b.flee = d.signum() * 0.05;
         }
         drop(l);
-        if caught {
-            self.set_happy(i, true);
-            let wk = self.walk_of(i);
-            wk.start_jump(tn().jump_height * 1.0);
-            let secs = tn().laugh_time;
-            wk.laugh(secs);
-            log::debug!("{i} caught a hen");
-            return true;
+        if caught || p.t > 14.0 {
+            if caught {
+                self.set_happy(i, true);
+                self.walk_of(i).start_bob(tn().jump_height * 0.5);
+                log::debug!("{i} caught a hen");
+            }
+            p.riders[0].phase = 1;
+            return false;
         }
-        if self.arrived(i) || self.walk.rand() < dt * 4.0 {
-            self.run_to(i, at, 0.42);
-        }
-        p.t > 14.0
+        self.walk_up_to(i, at, up, dt);
+        false
     }
 
     /// Down in the sand, digging, moving to another corner now and then.
@@ -1283,7 +1343,8 @@ impl CharacterOverlay {
             let unit = self.park_unit(n);
             let ground = { let r = self.actor_ref(i).hit_rect; r[1] + (r[3] - r[1]) * self.actor_ref(i).opaque[2] };
             let on = park.things.iter().enumerate().filter(|(_, t)| park::room(&t.kind) > 0 && t.place == place).find(|(_, t)| {
-                (px - self.thing_px(t)).abs() <= park::width(t) * unit * 0.5 && p[1] >= ground - 2.0 * unit
+                let base = ground - self.thing_up(t);
+                (px - self.thing_px(t)).abs() <= park::width(t) * unit * 0.5 && p[1] >= base - 2.0 * unit && p[1] <= base + 0.3 * unit
             });
             if let Some((k, t)) = on {
                 let kind = t.kind.clone();
@@ -1371,7 +1432,7 @@ impl CharacterOverlay {
         }
         let world = park::World {
             busy,
-            animals: l.beasts.iter().map(|b| park::Animal { kind: b.kind.to_string(), x: b.x, left: b.left, hop: b.hop.max(0.0) }).collect(),
+            animals: l.beasts.iter().map(|b| park::Animal { kind: b.kind.to_string(), x: b.x, y: b.y, left: b.left, hop: b.hop.max(0.0) }).collect(),
             stoves: l.stoves.clone(),
             dishes: l.dishes.clone(),
         };
@@ -1429,25 +1490,31 @@ impl CharacterOverlay {
             return;
         }
         // a coop has three hens, a barn two cows
-        let homes: Vec<(u64, &'static str, usize, f32)> = park
+        let homes: Vec<(u64, &'static str, usize, f32, f32)> = park
             .things
             .iter()
             .filter(|t| t.place == "farm")
             .filter_map(|t| match t.kind.as_str() {
-                "coop" => Some((t.id, "chicken", 3, t.x)),
-                "barn" => Some((t.id, "cow", 2, t.x)),
+                "coop" => Some((t.id, "chicken", 3, t.x, t.y)),
+                "barn" => Some((t.id, "cow", 2, t.x, t.y)),
                 _ => None,
             })
             .collect();
         l.beasts.retain(|b| homes.iter().any(|h| h.0 == b.home));
-        for &(id, kind, want, x) in &homes {
+        for &(id, kind, want, x, y) in &homes {
             let have = l.beasts.iter().filter(|b| b.home == id).count();
             for _ in have..want {
                 let r = live_rand(&mut l);
-                l.beasts.push(Beast { home: id, kind, x: (x + (r - 0.5) * 0.1).clamp(0.03, park::PIER.0 - 0.05), goal: x, left: r < 0.5, wait: r * 3.0, hop: 0.0, flee: 0.0, flee_t: 0.0 });
+                l.beasts.push(Beast { home: id, kind, x: (x + (r - 0.5) * 0.1).clamp(0.03, park::PIER.0 - 0.05), goal: x, left: r < 0.5, wait: r * 3.0, hop: 0.0, y: (y + (r - 0.5) * 0.03).max(0.0), flee: 0.0, flee_t: 0.0 });
             }
         }
         let homes_x: Vec<(u64, f32)> = homes.iter().map(|h| (h.0, h.3)).collect();
+        // moved up or down the meadow with their home
+        for b in l.beasts.iter_mut() {
+            if let Some(h) = homes.iter().find(|h| h.0 == b.home) {
+                b.y += (h.4 - b.y).clamp(-0.004, 0.004);
+            }
+        }
         let (lo, hi) = (0.03, park::PIER.0 - 0.05);
         for k in 0..l.beasts.len() {
             let r1 = live_rand(&mut l);

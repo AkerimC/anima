@@ -23,7 +23,7 @@ struct Shared {
     unit_frac: Option<f32>,
     farm: park::Farm,
     // animals as drawn (eased towards where the daemon says they are)
-    shown: Vec<(String, f32, bool, f32)>,
+    shown: Vec<(String, f32, bool, f32, f32)>,
     pics: HashMap<(String, i32), Option<gdk_pixbuf::Pixbuf>>,
     started: std::time::Instant,
 }
@@ -114,6 +114,7 @@ struct Win {
     place: &'static str,
     sel: Option<usize>,
     drag_from: Option<f32>,
+    drag_y: f32,
 }
 
 fn save(sh: &Shared) {
@@ -125,7 +126,7 @@ fn build(app: &adw::Application, place: &str) {
     let title = park::place_title(place);
     let win = adw::ApplicationWindow::builder().application(app).title(title).default_width(1280).default_height(760).build();
     let sh = shared();
-    let me = Rc::new(RefCell::new(Win { place, sel: None, drag_from: None }));
+    let me = Rc::new(RefCell::new(Win { place, sel: None, drag_from: None, drag_y: 0.0 }));
     let toast = adw::ToastOverlay::new();
 
     let ground = gtk::DrawingArea::builder().hexpand(true).vexpand(true).build();
@@ -142,18 +143,23 @@ fn build(app: &adw::Application, place: &str) {
         let unit = unit_px(&sh, w);
         let time = sh.started.elapsed().as_secs_f64();
         let things: Vec<(usize, park::Thing)> = sh.park.things.iter().cloned().enumerate().filter(|(_, t)| t.place == me.place).collect();
+        // the far ones first, so the near ones stand in front
+        let mut things = things;
+        things.sort_by(|a, b| b.1.y.total_cmp(&a.1.y));
         for (k, t) in &things {
             let busy = sh.world.busy.contains(k);
             let x = t.x as f64 * w;
-            draw_thing(cr, t, x, h - 3.0, unit, busy, me.sel == Some(*k));
+            let gy = h - 3.0 - t.y as f64 * h;
+            draw_thing(cr, t, x, gy, unit, busy, me.sel == Some(*k));
             let (grown, ready) = park::farm_state(t, &sh.farm);
-            draw_extras(&mut sh, cr, t, x, h - 3.0, unit, grown, ready, time);
+            draw_extras(&mut sh, cr, t, x, gy, unit, grown, ready, time);
         }
         if me.place == "farm" {
-            let animals = sh.shown.clone();
-            for (kind, x, left, hop) in animals {
+            let mut animals = sh.shown.clone();
+            animals.sort_by(|a, b| b.4.total_cmp(&a.4));
+            for (kind, x, left, hop, up) in animals {
                 let size = if kind == "cow" { 0.95 } else { 0.42 } * unit;
-                let y = h - 3.0 - size - hop as f64 * 0.25 * unit;
+                let y = h - 3.0 - up as f64 * h - size - hop as f64 * 0.25 * unit;
                 draw_picture(&mut sh, cr, &park::animal_picture(&kind), x as f64 * w - size * 0.5, y, size, !left);
             }
         }
@@ -167,16 +173,21 @@ fn build(app: &adw::Application, place: &str) {
         let mut me = m2.borrow_mut();
         let (w, h) = (g2.width() as f64, g2.height() as f64);
         let unit = unit_px(&sh, w);
-        let hit = sh.park.things.iter().enumerate().rev().filter(|(_, t)| t.place == me.place).find(|(_, t)| {
+        // nearest first: the lowest down
+        let mut order: Vec<(usize, &park::Thing)> = sh.park.things.iter().enumerate().filter(|(_, t)| t.place == me.place).collect();
+        order.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+        let hit = order.into_iter().find(|(_, t)| {
             let half = park::width(t) as f64 * unit * 0.5;
-            (x - t.x as f64 * w).abs() <= half && y >= h - 3.0 - tall(t) * unit
+            let gy = h - 3.0 - t.y as f64 * h;
+            (x - t.x as f64 * w).abs() <= half && y >= gy - tall(t) * unit && y <= gy + 6.0
         }).map(|(k, _)| k);
         me.sel = hit;
         me.drag_from = hit.map(|k| sh.park.things[k].x);
+        me.drag_y = hit.map_or(0.0, |k| sh.park.things[k].y);
         g2.queue_draw();
     });
     let (s2, m2, g2) = (sh.clone(), me.clone(), ground.clone());
-    drag.connect_drag_update(move |_, dx, _| {
+    drag.connect_drag_update(move |_, dx, dy| {
         let mut sh = s2.borrow_mut();
         let me = m2.borrow();
         let (Some(k), Some(from)) = (me.sel, me.drag_from) else { return };
@@ -186,6 +197,11 @@ fn build(app: &adw::Application, place: &str) {
         // on the farm, not out over the pond
         let right = if me.place == "farm" { 1.0 - park::POND } else { 1.0 };
         sh.park.things[k].x = (from + (dx / w) as f32).clamp(half, (right - half).max(half));
+        // on the farm: up and down the meadow too
+        if me.place == "farm" {
+            let h = g2.height().max(1) as f64;
+            sh.park.things[k].y = (me.drag_y - (dy / h) as f32).clamp(0.0, park::MEADOW);
+        }
         g2.queue_draw();
     });
     let (s2, m2) = (sh.clone(), me.clone());
@@ -357,7 +373,7 @@ fn build(app: &adw::Application, place: &str) {
             // somewhere free near the middle (of the land, on the farm)
             let w = g2.width().max(1) as f64;
             let unit = unit_px(&sh, w);
-            let mut thing = park::Thing { kind: id.to_string(), place: place.to_string(), id: new_id(), x: 0.5, flip: false, pieces: 1 };
+            let mut thing = park::Thing { kind: id.to_string(), place: place.to_string(), id: new_id(), x: 0.5, y: 0.0, flip: false, pieces: 1 };
             let me_half = park::width(&thing) as f64 * unit * 0.5 / w;
             let right = if place == "farm" { 1.0 - park::POND as f64 } else { 1.0 };
             let middle = right * 0.5;
@@ -441,7 +457,7 @@ fn build(app: &adw::Application, place: &str) {
             redraw = true;
         }
         // animals: ease to where they are
-        let target: Vec<(String, f32, bool, f32)> = sh.world.animals.iter().map(|a| (a.kind.clone(), a.x, a.left, a.hop)).collect();
+        let target: Vec<(String, f32, bool, f32, f32)> = sh.world.animals.iter().map(|a| (a.kind.clone(), a.x, a.left, a.hop, a.y)).collect();
         if sh.shown.len() != target.len() {
             sh.shown = target.clone();
         }
@@ -453,6 +469,7 @@ fn build(app: &adw::Application, place: &str) {
                 moving = true;
             }
             s.2 = t.2;
+            s.4 += (t.4 - s.4) * 0.3;
             if (s.3 - t.3).abs() > 0.01 {
                 s.3 += (t.3 - s.3) * 0.5;
                 moving = true;
@@ -1152,6 +1169,30 @@ fn draw_cafe(cr: &gtk::cairo::Context, w: f64, h: f64) {
 /// pier running out over it.
 fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
     draw_park(cr, w, h);
+    // the meadow: green from halfway down, rolling at its top edge
+    let top = h * (1.0 - park::MEADOW as f64) - 0.12 * u;
+    let meadow = gtk::cairo::LinearGradient::new(0.0, top, 0.0, h);
+    meadow.add_color_stop_rgb(0.0, 0.5, 0.74, 0.42);
+    meadow.add_color_stop_rgb(1.0, 0.35, 0.6, 0.27);
+    let _ = cr.set_source(&meadow);
+    cr.move_to(0.0, h);
+    let steps = 48;
+    for k in 0..=steps {
+        let x = w * k as f64 / steps as f64;
+        let y = top - h * 0.025 * ((x / w * 5.0).sin() + 0.6 * (x / w * 11.0 + 2.0).sin());
+        cr.line_to(x, y);
+    }
+    cr.line_to(w, h);
+    cr.close_path();
+    cr.fill().ok();
+    // tufts scattered over it
+    cr.set_source_rgba(0.28, 0.5, 0.22, 0.6);
+    for k in 0..60 {
+        let fx = ((k as f64 * 0.618).fract()) * w;
+        let fy = top + 0.05 * h + ((k as f64 * 0.377).fract()) * (h - top - 0.08 * h);
+        bar(cr, (fx, fy), (fx + 2.0, fy - 6.0), 2.0);
+        bar(cr, (fx + 4.0, fy), (fx + 5.0, fy - 8.0), 2.0);
+    }
     let shore = w * (1.0 - park::POND as f64);
     let top = h * 0.86;
     // the pond, a little sunk into the grass

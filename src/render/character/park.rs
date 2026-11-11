@@ -51,6 +51,9 @@ pub struct Thing {
     #[serde(default)]
     pub id: u64,
     pub x: f32,
+    // how far up the meadow behind (share of the window's height; 0: the floor)
+    #[serde(default)]
+    pub y: f32,
     #[serde(default)]
     pub flip: bool,
     #[serde(default = "one")]
@@ -237,6 +240,8 @@ pub const MILK_EVERY: f64 = 240.0;
 /// The pond's share of the farm window, on the right; the pier runs out over it.
 pub const POND: f32 = 0.13;
 pub const PIER: (f32, f32) = (0.855, 0.975);
+/// How far up the meadow things can be put (share of the window's height).
+pub const MEADOW: f32 = 0.45;
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
@@ -421,6 +426,8 @@ pub struct Animal {
     pub kind: String,
     // share of the window's width, facing left, how high it hops (unit)
     pub x: f32,
+    #[serde(default)]
+    pub y: f32,
     pub left: bool,
     pub hop: f32,
 }
