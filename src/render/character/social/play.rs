@@ -600,6 +600,7 @@ impl CharacterOverlay {
                 p.riders.push(Rider { i: c.members[0], phase: 0, t: 0.0, n: 0, want: 0 });
             }
             let table = park.things.get(p.thing).filter(|t| t.kind == "table").cloned();
+            p.t += dt;
             let done = match table {
                 Some(t) => self.play_serve(c, &mut p, &t, dt),
                 None => true,
@@ -673,14 +674,13 @@ impl CharacterOverlay {
                 for r in p.riders.iter().filter(|r| Some(r.i) != server) {
                     q.push((r.i, k));
                 }
-                // and whoever else is about in the room
-                let ws = self.walk_ref(p.riders[0].i).ws;
-                let mut more = 0;
-                for j in 0..self.extras.len() + 1 {
-                    if more < 2 && !p.riders.iter().any(|r| r.i == j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure() {
-                        q.push((j, k));
-                        more += 1;
-                    }
+                // and a couple more from the same room, the hungry first
+                let mut others: Vec<usize> = (0..self.extras.len() + 1)
+                    .filter(|&j| !p.riders.iter().any(|r| r.i == j) && self.walk_ref(j).at_leisure() && self.place_here(j).is_some_and(|q| q.place == thing.place))
+                    .collect();
+                others.sort_by_key(|&j| !self.hungry(j));
+                for j in others.into_iter().take(2) {
+                    q.push((j, k));
                 }
             }
         }
@@ -1117,7 +1117,7 @@ impl CharacterOverlay {
                     let x = pk.x + pk.w * (0.2 + 0.6 * r);
                     let mut q = hunger::PICNIC.lock().unwrap();
                     for rd in &p.riders {
-                        q.push((rd.i, x, m.dish.clone()));
+                        q.push((rd.i, x, m.dish.clone(), Instant::now()));
                     }
                     log::debug!("chat {}: the {} goes out for a picnic", c.id, m.dish);
                     p.t = p.stay;
@@ -1134,6 +1134,12 @@ impl CharacterOverlay {
                 .filter(|(_, x)| x.kind == "table" && x.place == t.place && dish_on(x.id).is_none())
                 .min_by(|a, b| (a.1.x - t.x).abs().total_cmp(&(b.1.x - t.x).abs()))
                 .map(|(k, x)| (k, x.id));
+            if m.burnt || table.is_none() {
+                // burnt: a brave bite each; no table free: eaten standing round the stove
+                for r in p.riders.clone() {
+                    self.eat(r.i, &m.dish);
+                }
+            }
             if let Some((k, id)) = table.filter(|_| !m.burnt) {
                 // carried over by a waiter in the room, or one of those waiting;
                 // with nobody to carry it, the cook puts it down there itself
@@ -1423,6 +1429,42 @@ impl CharacterOverlay {
             log::debug!("cafe: {i} takes the left-over {} to a table", old.1);
             SEEN.lock().unwrap().retain(|s| !(s.0 == old.0 && s.1 == old.1));
             SERVE.lock().unwrap().push(Serve { who: i, table: k, dish: old.1, from: self.thing_px(&counter), counter: counter.id, by_cook: true, diner: None });
+        }
+    }
+
+    /// A dish on a table with nobody at it for a while: someone hungry (or
+    /// just free) in the room sits down to it; after five minutes it's cleared.
+    fn table_leftovers(&mut self, chats: &mut Vec<Chat>, n: usize) {
+        static SEEN: Mutex<Vec<(u64, Instant)>> = Mutex::new(Vec::new());
+        let park = park_now();
+        let tables: Vec<(usize, u64, String)> = park.things.iter().enumerate().filter(|(_, t)| t.kind == "table").map(|(k, t)| (k, t.id, t.place.clone())).collect();
+        let dished: Vec<u64> = LIVE.lock().unwrap().dishes.iter().map(|d| d.0).collect();
+        let mut seen = SEEN.lock().unwrap();
+        // tables with a dish and nobody eating or carrying to them
+        let alone: Vec<(usize, u64, String)> = tables
+            .into_iter()
+            .filter(|(k, id, _)| dished.contains(id) && !chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.thing == *k && matches!(p.kind.as_str(), "table" | "dine" | "serve"))))
+            .collect();
+        seen.retain(|s| alone.iter().any(|a| a.1 == s.0));
+        for a in &alone {
+            if !seen.iter().any(|s| s.0 == a.1) {
+                seen.push((a.1, Instant::now()));
+            }
+        }
+        let Some(&(id, since)) = seen.iter().find(|s| s.1.elapsed().as_secs_f32() > 30.0) else { return };
+        let Some((k, _, place)) = alone.into_iter().find(|a| a.1 == id) else { return };
+        if since.elapsed().as_secs_f32() > 300.0 {
+            LIVE.lock().unwrap().dishes.retain(|d| d.0 != id);
+            seen.retain(|s| s.0 != id);
+            return;
+        }
+        drop(seen);
+        let mut who: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).at_leisure() && self.place_here(i).is_some_and(|p| p.place == place)).collect();
+        who.sort_by_key(|&i| !self.hungry(i));
+        if let Some(&i) = who.first() {
+            log::debug!("{i} sits down to a dish left on a table");
+            self.start_play(chats, i, k, "table");
+            SEEN.lock().unwrap().retain(|s| s.0 != id);
         }
     }
 
@@ -1810,6 +1852,7 @@ impl CharacterOverlay {
         self.hunger_tick(chats, dt, n);
         self.visit_tick(chats, dt, n);
         self.leftovers(chats, n);
+        self.table_leftovers(chats, n);
         self.game_time(chats, n);
         self.farm_calls(chats, n);
         // down from up the meadow, on foot

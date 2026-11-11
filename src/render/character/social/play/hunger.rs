@@ -7,8 +7,8 @@
 
 use super::*;
 
-/// Picnics being set up: (who, where on the strip, the dish).
-pub(super) static PICNIC: Mutex<Vec<(usize, f32, String)>> = Mutex::new(Vec::new());
+/// Picnics being set up: (who, where on the strip, the dish, since when).
+pub(super) static PICNIC: Mutex<Vec<(usize, f32, String, Instant)>> = Mutex::new(Vec::new());
 
 /// Breakfast, lunch or dinner time: hungry sooner.
 pub(super) fn mealtime() -> bool {
@@ -17,17 +17,42 @@ pub(super) fn mealtime() -> bool {
 }
 
 impl CharacterOverlay {
-    /// Anything to be had: two things in the pantry to cook with, a dish
-    /// waiting on a counter or a table, or a snack it can pay for.
-    pub(super) fn food_for(&self, i: usize) -> bool {
+    /// Anything to be had: two things in the pantry to cook with, or a dish
+    /// left on a serving counter (not someone else's on a table); with
+    /// `stall`, also a snack at the stall it can pay for.
+    pub(super) fn food_for(&self, i: usize, stall: bool) -> bool {
         if park::read_pantry().values().filter(|&&v| v > 0).count() >= 2 {
             return true;
         }
-        if !LIVE.lock().unwrap().dishes.is_empty() {
+        let park = park_now();
+        let counters: Vec<u64> = park.things.iter().filter(|t| t.kind == "counter").map(|t| t.id).collect();
+        if LIVE.lock().unwrap().dishes.iter().any(|d| counters.contains(&d.0)) {
             return true;
         }
-        let park = park_now();
-        park.things.iter().any(|t| t.kind == "stall") && park::coins(&self.character_name(i)) >= park::SNACK_PRICE
+        stall && park.things.iter().any(|t| t.kind == "stall") && park::coins(&self.character_name(i)) >= park::SNACK_PRICE
+    }
+
+    /// The chef or a waiter at work and hungry: a quick bite in the kitchen,
+    /// from the pantry (they can't sit down as diners while on duty).
+    pub(super) fn staff_meal(&mut self, i: usize) -> bool {
+        let pantry = park::read_pantry();
+        let have: Vec<&str> = park::INGREDIENTS.iter().map(|x| x.0).filter(|x| pantry.get(*x).copied().unwrap_or(0) > 0).collect();
+        if have.len() < 2 {
+            return false;
+        }
+        // something it knows how to make, else just two things
+        let book = park::read_book();
+        let known = park::DISHES.iter().find(|d| book.found.contains_key(d.0) && d.2.iter().all(|x| have.contains(x)));
+        let (stuff, dish): (Vec<&str>, &str) = match known {
+            Some(d) => (d.2.to_vec(), d.0),
+            None => (have[..2].to_vec(), "snack"),
+        };
+        if !park::take_food(&stuff) {
+            return false;
+        }
+        log::debug!("{} has a quick {dish} in the kitchen", self.character_name(i));
+        self.eat(i, dish);
+        true
     }
 
     /// Hungry enough to go and eat.
@@ -103,12 +128,27 @@ impl CharacterOverlay {
         // (in mode 3 those on the desktop are sent over by the visits)
         let hungry: Vec<usize> = (0..n)
             .filter(|&i| self.walk_ref(i).at_leisure() && self.walk_ref(i).trip.is_none() && self.hungry(i))
-            .filter(|&i| !visiting || homes.iter().any(|p| p.ws == self.walk_ref(i).ws))
+            // in mode 3 only those here to eat, and the chef and waiters at work;
+            // anyone else here for something else eats once back home and sent over
+            .filter(|&i| {
+                !visiting
+                    || (homes.iter().any(|p| p.ws == self.walk_ref(i).ws)
+                        && (matches!(self.walk_ref(i).visit_for, visit::MEAL | visit::HUNGRY) || (self.walk_ref(i).visit_for == visit::WORK)))
+            })
             .collect();
         let Some(&i) = hungry.get((self.walk.rand() * hungry.len().max(1) as f32) as usize % hungry.len().max(1)) else { return };
         let here = self.place_here(i).map(|p| p.place);
+        // at work in the cafe: a quick bite in the kitchen
+        if here.as_deref() == Some("cafe") && (self.is_job(i, "chef") || self.is_job(i, "waiter")) && self.restaurant_open() {
+            if !self.staff_meal(i) && self.walk_ref(i).visit_for == 0 {
+                let secs = tn().hungry_nap;
+                self.walk_of(i).lie_down(secs);
+            }
+            return;
+        }
         // nothing to eat anywhere: off to sleep instead (once it's had a look in the cafe)
-        if !self.food_for(i) && (here.as_deref() == Some("cafe") || governor::place_rect("cafe").is_none()) {
+        let stall = here.as_deref() == Some("park");
+        if !self.food_for(i, stall) && (here.as_deref() == Some("cafe") || governor::place_rect("cafe").is_none()) {
             if self.walk_ref(i).visit_for == 0 {
                 log::debug!("{} finds nothing to eat and has a nap", self.character_name(i));
                 let secs = tn().hungry_nap;
@@ -134,9 +174,11 @@ impl CharacterOverlay {
                 if self.restaurant_open() {
                     self.maybe_dine(chats, i);
                 } else if park::read_pantry().values().filter(|&&v| v > 0).count() >= 2 {
-                    let stove = park.things.iter().enumerate().find(|(k, t)| t.kind == "stove" && t.place == "cafe" && !chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.thing == *k && p.kind == "stove")));
-                    if let Some((k, _)) = stove {
-                        log::debug!("{name} is hungry and cooks");
+                    // a free stove to cook at, or one with room to wait at (and share)
+                    let used = |k: usize| chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == "stove")).map(|c| c.members.len()).sum::<usize>();
+                    let stove = park.things.iter().enumerate().filter(|(_, t)| t.kind == "stove" && t.place == "cafe").map(|(k, _)| k).min_by_key(|&k| used(k)).filter(|&k| used(k) < park::room("stove"));
+                    if let Some(k) = stove {
+                        log::debug!("{name} is hungry and goes to the stove");
                         self.start_play(chats, i, k, "stove");
                     }
                 }
@@ -174,9 +216,13 @@ impl CharacterOverlay {
 
     /// A meal to be eaten in the park: everyone for it goes along.
     fn start_picnics(&mut self, chats: &mut Vec<Chat>) {
-        let want: Vec<(usize, f32, String)> = std::mem::take(&mut *PICNIC.lock().unwrap());
-        for (i, x, dish) in want {
+        let want: Vec<(usize, f32, String, Instant)> = std::mem::take(&mut *PICNIC.lock().unwrap());
+        for (i, x, dish, at) in want {
+            // still finishing at the stove: next time (for a while)
             if !self.walk_ref(i).at_leisure() {
+                if at.elapsed().as_secs_f32() < 15.0 {
+                    PICNIC.lock().unwrap().push((i, x, dish, at));
+                }
                 continue;
             }
             self.start_play(chats, i, usize::MAX, "picnic");
@@ -283,8 +329,7 @@ impl CharacterOverlay {
                     self.walk_of(i).start_bob(tn().jump_height * 0.06);
                 }
                 if r.t > 6.0 {
-                    let wk = self.walk_of(i);
-                    wk.hunger = (wk.hunger - park::fills("snack", false)).max(0.0);
+                    self.eat(i, "snack");
                     self.set_happy(i, true);
                     p.riders[0] = r;
                     return true;

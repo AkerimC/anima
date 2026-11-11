@@ -106,8 +106,14 @@ impl CharacterOverlay {
                 o.state = Ask::Waiting;
             }
         }
-        let orders = ORDERS.lock().unwrap().clone();
         let busy = |chats: &Vec<Chat>, kind: &str| chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.kind == kind));
+        // nobody to take orders: they go straight to the chef
+        if self.on_duty("waiter").is_none() {
+            for o in ORDERS.lock().unwrap().iter_mut().filter(|o| o.state == Ask::Asked) {
+                o.state = Ask::Waiting;
+            }
+        }
+        let orders = ORDERS.lock().unwrap().clone();
         // the waiter goes over to whoever has sat down
         if let Some(o) = orders.iter().find(|o| o.state == Ask::Asked) {
             if !busy(chats, "order") {

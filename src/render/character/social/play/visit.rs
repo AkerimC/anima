@@ -143,7 +143,7 @@ impl CharacterOverlay {
                 }
             }
             // came to eat: had a look round the cafe and there's nothing
-            if matches!(reason, MEAL | HUNGRY) && inside && free && t > 6.0 && !self.food_for(i) && !self.restaurant_open() {
+            if matches!(reason, MEAL | HUNGRY) && inside && free && t > 6.0 && !self.food_for(i, false) {
                 log::debug!("visit: {i} finds nothing to eat");
                 let wk = self.walk_of(i);
                 wk.visit_for = NO_FOOD;
@@ -218,12 +218,12 @@ impl CharacterOverlay {
         let _ = chats;
         let free: Vec<usize> = (0..n).filter(|&i| self.desk_free(i, windows)).collect();
         let away = (0..n).filter(|&i| self.walk_ref(i).visit_for != 0).count();
-        let on_desk = (0..n).filter(|&i| !windows.contains(&self.walk_ref(i).ws)).count();
+        let on_desk = (0..n).filter(|&i| !windows.contains(&self.walk_ref(i).ws) && self.walk_ref(i).visit_for == 0).count();
         let slot = meal_slot();
         // mealtime: most go to eat, two at a time; three stay behind
         if let Some(slot) = slot {
             if governor::place_rect("cafe").is_some() && on_desk > 3 {
-                let go: Vec<usize> = free.iter().copied().filter(|&i| self.walk_ref(i).fed_meal != slot).take(2).collect();
+                let go: Vec<usize> = free.iter().copied().filter(|&i| self.walk_ref(i).fed_meal != slot).take(2.min(on_desk - 3)).collect();
                 for i in go {
                     self.walk_of(i).fed_meal = slot;
                     self.send_visit(i, "cafe", MEAL);
@@ -309,7 +309,7 @@ impl CharacterOverlay {
     pub(super) fn game_volunteers(&mut self, n: usize) -> usize {
         let windows: Vec<u64> = governor::places().into_iter().map(|p| p.ws).collect();
         let free: Vec<usize> = (0..n).filter(|&i| self.desk_free(i, &windows) && self.walk_ref(i).energy >= tn().energy_game_need && !self.hungry(i)).collect();
-        let on_desk = (0..n).filter(|&i| !windows.contains(&self.walk_ref(i).ws)).count();
+        let on_desk = (0..n).filter(|&i| !windows.contains(&self.walk_ref(i).ws) && self.walk_ref(i).visit_for == 0).count();
         let k = free.len().min(4).min(on_desk.saturating_sub(3));
         for &i in free.iter().take(k) {
             self.send_visit(i, "park", GAME);
