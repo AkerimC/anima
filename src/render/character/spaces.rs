@@ -496,10 +496,12 @@ impl CharacterOverlay {
             self.park_roam(n, &homes);
             return;
         }
-        // workspaces with windows on them; the one in use only if it has some too
-        let mut hosts: Vec<u64> = self.spaces.list.iter().filter(|s| s.has_windows).map(|s| s.id).collect();
+        // workspaces with windows on them; the one in use only if it has some too.
+        // Not the park's (cafe's, farm's): they're only visited, for a reason
+        let windows = place_windows();
+        let mut hosts: Vec<u64> = self.spaces.list.iter().filter(|s| s.has_windows && !windows.contains(&s.id)).map(|s| s.id).collect();
         if hosts.is_empty() {
-            hosts = self.spaces.list.iter().filter(|s| s.active).map(|s| s.id).collect();
+            hosts = self.spaces.list.iter().filter(|s| s.active && !windows.contains(&s.id)).map(|s| s.id).collect();
         }
         if hosts.is_empty() {
             return;
@@ -525,7 +527,7 @@ impl CharacterOverlay {
         let Some(to) = (0..hosts.len()).max_by(|&a, &b| short(self, a).total_cmp(&short(self, b))) else { return };
         let empty_spot = (0..n).find(|&i| {
             let wk = self.walk_ref(i);
-            wk.at_leisure() && wk.trip.is_none() && !hosts.contains(&wk.ws) && !wk.visiting && !wk.backstage
+            wk.at_leisure() && wk.trip.is_none() && !hosts.contains(&wk.ws) && !wk.visiting && !wk.backstage && wk.visit_for == 0 && !windows.contains(&wk.ws)
         });
         // on an empty workspace: off to where the work is, no waiting about
         let leaver = if let Some(i) = empty_spot.filter(|&i| self.walk_ref(i).here_t >= 20.0) {
@@ -542,7 +544,7 @@ impl CharacterOverlay {
             let pool: Vec<usize> = (0..n)
                 .filter(|&i| {
                     let wk = self.walk_ref(i);
-                    wk.ws == hosts[from] && wk.at_leisure() && wk.trip.is_none() && wk.here_t >= tn().ws_stay && !wk.visiting && !wk.backstage
+                    wk.ws == hosts[from] && wk.at_leisure() && wk.trip.is_none() && wk.here_t >= tn().ws_stay && !wk.visiting && !wk.backstage && wk.visit_for == 0
                 })
                 .collect();
             if pool.is_empty() || self.walk.rand() >= 1.0 / tn().ws_every.max(1.0) * pool.len() as f32 * 4.0 {
@@ -569,10 +571,39 @@ impl CharacterOverlay {
     }
 }
 
+/// The workspaces of the park, cafe and farm windows, when the characters
+/// only visit them (modes 0 and 3): not somewhere to roam to.
+fn place_windows() -> Vec<u64> {
+    if (0.5..2.5).contains(&tn().park_mode) {
+        return Vec::new();
+    }
+    governor::places().into_iter().map(|p| p.ws).collect()
+}
+
+impl CharacterOverlay {
+    /// Back to the desktop after a visit: where it came from if that's still
+    /// there, else the busiest workspace with windows. None: nowhere else.
+    pub(super) fn desktop_home(&self, from: u64) -> Option<u64> {
+        let windows: Vec<u64> = governor::places().into_iter().map(|p| p.ws).collect();
+        let ok = |id: u64| self.spaces.list.iter().any(|s| s.id == id) && !windows.contains(&id);
+        if ok(from) {
+            return Some(from);
+        }
+        self.spaces
+            .list
+            .iter()
+            .filter(|s| s.has_windows && !windows.contains(&s.id))
+            .max_by_key(|s| governor::window_count(s.id))
+            .map(|s| s.id)
+            .or_else(|| self.spaces.list.iter().find(|s| s.active && !windows.contains(&s.id)).map(|s| s.id))
+    }
+}
+
 /// The workspaces of the open park, cafe and farm windows, when the
 /// characters should live there.
 fn place_homes() -> Vec<u64> {
-    if tn().park_mode < 0.5 {
+    // 0: the desktop only; 3: the desktop, visiting the windows (play.rs)
+    if tn().park_mode < 0.5 || tn().park_mode > 2.5 {
         return Vec::new();
     }
     let mut v: Vec<u64> = governor::places().into_iter().map(|p| p.ws).collect();

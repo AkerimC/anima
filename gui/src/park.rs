@@ -13,7 +13,8 @@ use std::rc::Rc;
 
 use crate::{config, daemon};
 
-const MODES: [&str; 3] = ["Live on the desktop", "Live in these windows", "Here, out now and then"];
+/// The choices, and the setting each one is (park_mode).
+const MODES: [(&str, f64); 4] = [("Live on the desktop", 0.0), ("Live on the desktop, visit these", 3.0), ("Live in these windows", 1.0), ("Here, out now and then", 2.0)];
 
 /// What every window shares: what's built, and what's going on.
 struct Shared {
@@ -455,13 +456,14 @@ fn build(app: &adw::Application, place: &str) {
     }
 
     // where they live
-    let mode = gtk::DropDown::from_strings(&MODES);
+    let labels: Vec<&str> = MODES.iter().map(|m| m.0).collect();
+    let mode = gtk::DropDown::from_strings(&labels);
     mode.set_tooltip_text(Some("Where the characters live while the park, cafe or farm is open"));
-    let now = config::tuning_value("park_mode").unwrap_or(2.0).round().clamp(0.0, 2.0) as u32;
-    mode.set_selected(now);
+    let now = config::tuning_value("park_mode").unwrap_or(3.0).round();
+    mode.set_selected(MODES.iter().position(|m| m.1 == now).unwrap_or(1) as u32);
     mode.connect_selected_notify(|d| {
-        let v = d.selected() as f64;
-        config::set_tuning("park_mode", (v != 2.0).then_some(v));
+        let v = MODES.get(d.selected() as usize).map_or(3.0, |m| m.1);
+        config::set_tuning("park_mode", (v != 3.0).then_some(v));
         if daemon::running() {
             daemon::reload();
         }

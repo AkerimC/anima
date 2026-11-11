@@ -137,7 +137,8 @@ tuning! {
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
     }
     "Roaming", "Park" {
-        park_mode: "With the park window open: 0 desktop, 1 only the park, 2 the park and out now and then" = 2.0, 0.0, 2.0, 1.0, 0;
+        park_mode: "With the park, cafe or farm open: 0 desktop, 1 only them, 2 them and out now and then, 3 the desktop, visiting them" = 3.0, 0.0, 3.0, 1.0, 0;
+        visit_fish_every: "Mode 3: the fisher (and the park attendant) goes over about every (s)" = 600.0, 30.0, 7200.0, 30.0, 0;
         park_play: "Someone free in the park goes to play (chance each look)" = 0.25, 0.0, 1.0, 0.05, 2;
         park_move_every: "Someone goes over to the park, cafe or farm about every (s)" = 90.0, 10.0, 3600.0, 10.0, 0;
         cook_known: "A cook makes a recipe it knows instead of trying something new (share)" = 0.6, 0.0, 1.0, 0.05, 2;

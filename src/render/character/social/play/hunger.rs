@@ -19,6 +19,10 @@ pub(super) fn mealtime() -> bool {
 impl CharacterOverlay {
     /// Hungry enough to go and eat.
     pub(super) fn hungry(&self, i: usize) -> bool {
+        // come to the cafe for a meal: eats whatever its hunger
+        if self.walk_ref(i).visit_for == visit::MEAL {
+            return true;
+        }
         let h = self.walk_ref(i).hunger;
         h >= tn().hunger_eat || (mealtime() && h >= tn().hunger_eat * 0.55)
     }
@@ -31,6 +35,11 @@ impl CharacterOverlay {
         let wk = self.walk_of(i);
         wk.hunger = (wk.hunger - k).max(0.0);
         wk.energy = (wk.energy + k * 0.5).min(1.0);
+        // came over to eat: that's done
+        if matches!(wk.visit_for, visit::MEAL | visit::HUNGRY) {
+            wk.visit_for = visit::DONE;
+            wk.visit_t = 0.0;
+        }
         if fav {
             log::debug!("{name} had its favourite, {dish}");
             wk.start_bob(tn().jump_height * 0.35);
@@ -44,14 +53,17 @@ impl CharacterOverlay {
     /// the hungry go to eat, the starving sit down, and wages are paid.
     pub(super) fn hunger_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         let homes = governor::places();
-        if homes.is_empty() {
+        // the desktop only: no hunger to see to
+        if homes.is_empty() || tn().park_mode < 0.5 {
             return;
         }
+        let visiting = visit::visiting_mode();
         let rate = dt / tn().hunger_time.max(60.0);
         for i in 0..n {
             let starving = {
                 let wk = self.walk_of(i);
-                if !homes.iter().any(|p| p.ws == wk.ws) {
+                // living on the desktop, they get hungry there too
+                if !visiting && !homes.iter().any(|p| p.ws == wk.ws) {
                     continue;
                 }
                 wk.hunger = (wk.hunger + rate).min(1.0);
@@ -75,7 +87,11 @@ impl CharacterOverlay {
         self.pay_wages();
         self.start_picnics(chats);
         // one hungry one at a time goes to eat
-        let hungry: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).at_leisure() && self.walk_ref(i).trip.is_none() && self.hungry(i)).collect();
+        // (in mode 3 those on the desktop are sent over by the visits)
+        let hungry: Vec<usize> = (0..n)
+            .filter(|&i| self.walk_ref(i).at_leisure() && self.walk_ref(i).trip.is_none() && self.hungry(i))
+            .filter(|&i| !visiting || homes.iter().any(|p| p.ws == self.walk_ref(i).ws))
+            .collect();
         let Some(&i) = hungry.get((self.walk.rand() * hungry.len().max(1) as f32) as usize % hungry.len().max(1)) else { return };
         let here = self.place_here(i).map(|p| p.place);
         let park = park_now();

@@ -10,6 +10,7 @@ use crate::render::character::park::{self, Park, Thing};
 
 mod dine;
 mod hunger;
+mod visit;
 
 pub(super) struct Play {
     // which thing in the park list, and what it was when they started
@@ -430,7 +431,18 @@ impl CharacterOverlay {
     /// get together for one of the usual games.
     fn game_time(&mut self, chats: &mut Vec<Chat>, n: usize) {
         static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
-        {
+        // volunteers on their way from the desktop: the game once they're there
+        static GATHER: Mutex<Option<Instant>> = Mutex::new(None);
+        let gather_now = {
+            let mut g = GATHER.lock().unwrap();
+            if g.is_some_and(|t| Instant::now() >= t) {
+                *g = None;
+                true
+            } else {
+                false
+            }
+        };
+        if !gather_now {
             let mut next = NEXT.lock().unwrap();
             let every = tn().park_game_every.max(10.0);
             match *next {
@@ -443,6 +455,13 @@ impl CharacterOverlay {
             }
             let r = self.walk.rand();
             *next = Some(Instant::now() + std::time::Duration::from_secs_f32(every * (0.6 + r * 0.8)));
+            drop(next);
+            if visit::visiting_mode() {
+                if self.game_volunteers(n) > 0 {
+                    *GATHER.lock().unwrap() = Some(Instant::now() + std::time::Duration::from_secs(25));
+                }
+                return;
+            }
         }
         let Some(park) = governor::place_rect("park") else { return };
         if self.race.is_some() {
@@ -472,9 +491,6 @@ impl CharacterOverlay {
             self.enlist(i, id);
         }
         log::debug!("chat {id}: game time in the park, {game:?} with {members:?}");
-        if let Some(&first) = members.first() {
-            tell(&format!("Game time in the park! {} calls the others", self.character_name(first)));
-        }
         let mut c = Chat::new(id, members, Stage::Approach, 0.0);
         c.forced = Some(game);
         self.arrange(&c);
@@ -1792,6 +1808,7 @@ impl CharacterOverlay {
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         self.restaurant_tick(chats);
         self.hunger_tick(chats, dt, n);
+        self.visit_tick(chats, dt, n);
         self.leftovers(chats, n);
         self.game_time(chats, n);
         self.farm_calls(chats, n);
