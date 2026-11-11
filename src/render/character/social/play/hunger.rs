@@ -17,6 +17,19 @@ pub(super) fn mealtime() -> bool {
 }
 
 impl CharacterOverlay {
+    /// Anything to be had: two things in the pantry to cook with, a dish
+    /// waiting on a counter or a table, or a snack it can pay for.
+    pub(super) fn food_for(&self, i: usize) -> bool {
+        if park::read_pantry().values().filter(|&&v| v > 0).count() >= 2 {
+            return true;
+        }
+        if !LIVE.lock().unwrap().dishes.is_empty() {
+            return true;
+        }
+        let park = park_now();
+        park.things.iter().any(|t| t.kind == "stall") && park::coins(&self.character_name(i)) >= park::SNACK_PRICE
+    }
+
     /// Hungry enough to go and eat.
     pub(super) fn hungry(&self, i: usize) -> bool {
         // come to the cafe for a meal: eats whatever its hunger
@@ -94,6 +107,15 @@ impl CharacterOverlay {
             .collect();
         let Some(&i) = hungry.get((self.walk.rand() * hungry.len().max(1) as f32) as usize % hungry.len().max(1)) else { return };
         let here = self.place_here(i).map(|p| p.place);
+        // nothing to eat anywhere: off to sleep instead (once it's had a look in the cafe)
+        if !self.food_for(i) && (here.as_deref() == Some("cafe") || governor::place_rect("cafe").is_none()) {
+            if self.walk_ref(i).visit_for == 0 {
+                log::debug!("{} finds nothing to eat and has a nap", self.character_name(i));
+                let secs = tn().hungry_nap;
+                self.walk_of(i).lie_down(secs);
+            }
+            return;
+        }
         let park = park_now();
         let name = self.character_name(i);
         // a snack at the stall, if it's in the park with some coins

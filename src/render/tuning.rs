@@ -149,6 +149,7 @@ tuning! {
         park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
         hunger_time: "From full to starving, doing nothing (s)" = 2400.0, 60.0, 36000.0, 60.0, 0;
         hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
+        hungry_nap: "Nothing to eat: a nap of (s)" = 240.0, 10.0, 3600.0, 10.0, 0;
         picnic_chance: "A meal cooked for oneself is eaten as a picnic in the park (share)" = 0.25, 0.0, 1.0, 0.05, 2;
         wage: "Coins each job pays every 20 minutes" = 5.0, 0.0, 100.0, 1.0, 0;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;

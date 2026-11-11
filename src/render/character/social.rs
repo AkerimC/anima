@@ -772,6 +772,13 @@ impl CharacterOverlay {
                 let c = self.fish_alone(i, true);
                 self.new_chats.push(c);
             }
+            let wk = self.walk_ref(i);
+            if wk.nap_on_arrival && wk.act == Act::Idle && wk.trip.is_none() && wk.social.is_none() {
+                let wk = self.walk_of(i);
+                wk.nap_on_arrival = false;
+                let secs = tn().hungry_nap;
+                wk.lie_down(secs);
+            }
         }
         self.run_spaces(dt, n);
         self.grow_bonds(dt);

@@ -22,6 +22,8 @@ pub(super) const WORK: u8 = 6;
 pub(super) const ATTEND: u8 = 7;
 pub(super) const GAME: u8 = 8;
 pub(super) const DONE: u8 = 9;
+// came to eat and found nothing: home, and a nap
+pub(super) const NO_FOOD: u8 = 10;
 
 /// Mode 3 is on (and there's somewhere to visit).
 pub(super) fn visiting_mode() -> bool {
@@ -133,12 +135,20 @@ impl CharacterOverlay {
             // there: into the right window if it isn't in it yet
             let place = target(reason);
             let inside = self.place_here(i).is_some_and(|p| p.place == place);
-            if reason != DONE && free && !inside && !self.walk_ref(i).social.is_some_and(|s| s.moving) {
+            if reason != DONE && reason != NO_FOOD && free && !inside && !self.walk_ref(i).social.is_some_and(|s| s.moving) {
                 if let Some(p) = governor::place_rect(place) {
                     if self.walk_ref(i).act == Act::Idle {
                         self.walk_into(i, &p);
                     }
                 }
+            }
+            // came to eat: had a look round the cafe and there's nothing
+            if matches!(reason, MEAL | HUNGRY) && inside && free && t > 6.0 && !self.food_for(i) && !self.restaurant_open() {
+                log::debug!("visit: {i} finds nothing to eat");
+                let wk = self.walk_of(i);
+                wk.visit_for = NO_FOOD;
+                wk.visit_t = 0.0;
+                continue;
             }
             let done = match reason {
                 // fed (eat() marks it), or nothing to be had
@@ -163,6 +173,23 @@ impl CharacterOverlay {
                 let wk = self.walk_of(i);
                 wk.visit_for = DONE;
                 wk.visit_t = 0.0;
+            }
+            // nothing to eat: straight home for a nap (right here if there's nowhere else)
+            if reason == NO_FOOD && free && t > 2.0 {
+                let from = self.walk_ref(i).visit_from;
+                let wk = self.walk_of(i);
+                wk.visit_for = 0;
+                match self.desktop_home(from) {
+                    Some(home) if home != ws => {
+                        self.walk_of(i).nap_on_arrival = true;
+                        self.send_to(i, home);
+                    }
+                    _ => {
+                        let secs = tn().hungry_nap;
+                        self.walk_of(i).lie_down(secs);
+                    }
+                }
+                continue;
             }
             // done: a little while longer, then home
             if reason == DONE && free && t > 25.0 {

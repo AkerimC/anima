@@ -171,6 +171,8 @@ pub(super) struct WalkState {
     pub(super) fish_cool: f32,
     // visiting a fullscreen app: gets a rod out once it's up
     pub(super) fish_on_arrival: bool,
+    // went to eat and found nothing: a nap once it's back home
+    pub(super) nap_on_arrival: bool,
     // petted while busy: a happy moment that doesn't stop what it's doing
     pub(super) petted: f32,
     // waiting for its turn to be petted
