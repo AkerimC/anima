@@ -479,7 +479,7 @@ fn keepsake_name(kind: i32) -> String {
         16 => "a rubber duck".into(),
         0 => "a carrot".into(),
         // sea creatures are rare enough to keep
-        k if k >= CREATURE => super::rope::sea_name(k).map(|n| format!("a {n}")).unwrap_or_default(),
+        k if (CREATURE..MATERIAL).contains(&k) => super::rope::sea_name(k).map(|n| format!("a {n}")).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -529,6 +529,8 @@ pub(super) const FOUND: i32 = 30000;
 /// A fish (props/fish) or a sea creature (props/creatures): this plus its place there.
 pub(super) const FISH: i32 = 40000;
 pub(super) const CREATURE: i32 = 41000;
+/// Something for the park chest: this plus its place in park::MATERIALS.
+pub(super) const MATERIAL: i32 = 42000;
 
 fn grounded(wk: &WalkState) -> bool {
     matches!(wk.act, Act::Idle | Act::Walk)
@@ -3332,6 +3334,11 @@ impl CharacterOverlay {
                                 a.item = base + (self.walk.rand() * count as f32) as i32 % count as i32;
                             }
                         }
+                        // now and then something for the park chest instead
+                        if self.walk.rand() < tn().fish_material {
+                            let n = super::park::MATERIALS.len();
+                            a.item = MATERIAL + (self.walk.rand() * n as f32) as i32 % n as i32;
+                        }
                         // now and then something to wear it hasn't got yet
                         if self.walk.rand() < tn().fish_find {
                             let name = self.character_name(a.i);
@@ -3355,7 +3362,13 @@ impl CharacterOverlay {
                 4 if a.t > tn().fish_reel => {
                     a.phase = 5;
                     a.t = 0.0;
-                    let (_, points, good) = if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
+                    let (_, points, good) = if a.item >= MATERIAL { (a.item, 2.0, true) } else if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
+                    // something for the park: into the chest
+                    if let Some(&(id, label)) = (a.item >= MATERIAL).then(|| super::park::MATERIALS.get((a.item - MATERIAL) as usize)).flatten() {
+                        let name = self.character_name(a.i);
+                        super::park::add(&name, id);
+                        log::debug!("chat {}: {} found {label} for the chest", c.id, a.i);
+                    }
                     // found something to wear: it's in its things now
                     if let Some((id, label, _, _)) = (FOUND..FISH).contains(&a.item).then(|| super::wear::catalog_entry((a.item - FOUND) as usize)).flatten() {
                         let name = self.character_name(a.i);

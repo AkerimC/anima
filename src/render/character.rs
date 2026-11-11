@@ -29,6 +29,7 @@ use crate::pkg::decode_tex;
 mod interact;
 mod moods;
 mod pat;
+pub mod park;
 mod race;
 mod rope;
 mod social;

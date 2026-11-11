@@ -238,6 +238,11 @@ impl CharacterOverlay {
         if !list.is_empty() && !locked {
             for i in 0..n {
                 if !list.iter().any(|s| s.id == self.walk_ref(i).ws) {
+                    // the park is home while it's open
+                    if let Some(park) = park_home().filter(|p| list.iter().any(|s| s.id == *p)) {
+                        self.walk_of(i).ws = park;
+                        continue;
+                    }
                     // back where it was last time, or with its team
                     if let Some(ws) = self.home_for(i, &list, n) {
                         self.walk_of(i).ws = ws;
@@ -484,6 +489,10 @@ impl CharacterOverlay {
         for i in 0..n {
             self.walk_of(i).here_t += 1.0;
         }
+        if let Some(park) = park_home().filter(|p| self.spaces.list.iter().any(|s| s.id == *p)) {
+            self.park_roam(n, park);
+            return;
+        }
         // workspaces with windows on them; the one in use only if it has some too
         let mut hosts: Vec<u64> = self.spaces.list.iter().filter(|s| s.has_windows).map(|s| s.id).collect();
         if hosts.is_empty() {
@@ -554,6 +563,57 @@ impl CharacterOverlay {
             log::debug!("workspaces: {j} goes along with {i}");
             self.send_to(j, hosts[to]);
         }
+    }
+}
+
+/// The park window's workspace, when the characters should live there.
+fn park_home() -> Option<u64> {
+    if tn().park_mode < 0.5 {
+        return None;
+    }
+    governor::park_workspace()
+}
+
+impl CharacterOverlay {
+    /// The park is open and home: everyone gathers there; in mode 2 a few go
+    /// out to the other workspaces now and then and come back after a while.
+    fn park_roam(&mut self, n: usize, park: u64) {
+        let moving = (0..n).filter(|&i| self.walk_ref(i).trip.is_some()).count();
+        if moving >= tn().ws_max as usize {
+            return;
+        }
+        let free = |this: &Self, i: usize| {
+            let wk = this.walk_ref(i);
+            wk.at_leisure() && wk.trip.is_none() && !wk.visiting && !wk.backstage
+        };
+        let only = tn().park_mode < 1.5;
+        // out long enough (or not allowed out at all): back to the park
+        let back = (0..n).find(|&i| free(self, i) && self.walk_ref(i).ws != park && (only || self.walk_ref(i).here_t >= tn().park_out_stay));
+        if let Some(i) = back {
+            log::debug!("park: {i} goes back to the park");
+            self.send_to(i, park);
+            return;
+        }
+        if only {
+            return;
+        }
+        let out = (0..n).filter(|&i| self.walk_ref(i).ws != park || self.heading_to(i).is_some_and(|t| t != park)).count();
+        if out as f32 >= tn().park_out || self.walk.rand() >= 1.0 / tn().park_out_every.max(1.0) {
+            return;
+        }
+        // somewhere with windows, or the workspace in view
+        let away: Vec<u64> = self.spaces.list.iter().filter(|s| s.id != park && (s.has_windows || s.active)).map(|s| s.id).collect();
+        if away.is_empty() {
+            return;
+        }
+        let pool: Vec<usize> = (0..n).filter(|&i| free(self, i) && self.walk_ref(i).ws == park && self.walk_ref(i).here_t >= 30.0).collect();
+        if pool.is_empty() {
+            return;
+        }
+        let i = pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()];
+        let to = away[(self.walk.rand() * away.len() as f32) as usize % away.len()];
+        log::debug!("park: {i} goes out to workspace {to}");
+        self.send_to(i, to);
     }
 }
 

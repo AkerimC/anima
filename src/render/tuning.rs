@@ -46,6 +46,7 @@ tuning! {
         fish_most: "Most fishing together" = 5.0, 1.0, 12.0, 1.0, 0;
         fish_real: "A good catch is a real fish (share)" = 0.75, 0.0, 1.0, 0.05, 2;
         fish_creature: "Of those, a rare sea creature (share)" = 0.15, 0.0, 1.0, 0.05, 2;
+        fish_material: "Something for the park chest (share of catches)" = 0.25, 0.0, 1.0, 0.05, 2;
         fish_find: "Something to wear on the line (share of catches)" = 0.12, 0.0, 1.0, 0.01, 2;
         fish_boom: "Confetti goes off with a bang" = 0.25, 0.0, 1.0, 0.05, 2;
         fish_boom_reach: "Explosion reach (widths)" = 3.0, 0.5, 15.0, 0.5, 1;
@@ -134,6 +135,12 @@ tuning! {
         ws_friends: "Friends who may come along, at most" = 0.0, 0.0, 6.0, 1.0, 0;
         ws_max: "On the way at once" = 2.0, 1.0, 12.0, 1.0, 0;
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
+    }
+    "Roaming", "Park" {
+        park_mode: "With the park window open: 0 desktop, 1 only the park, 2 the park and out now and then" = 2.0, 0.0, 2.0, 1.0, 0;
+        park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
+        park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
+        park_out_stay: "Stays out (s)" = 180.0, 10.0, 7200.0, 10.0, 0;
     }
     "Roaming", "Weather" {
         carry_keepsake: "Carries its favourite keepsake on its back (share of the time)" = 0.4, 0.0, 1.0, 0.05, 2;

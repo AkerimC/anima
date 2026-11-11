@@ -243,6 +243,13 @@ pub fn focused_app() -> Option<String> {
 static WORKSPACES: std::sync::Mutex<Option<Vec<Space>>> = std::sync::Mutex::new(None);
 static WINDOW_COUNTS: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+static PARK_WS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The workspace the park window is on, if it's open.
+pub fn park_workspace() -> Option<u64> {
+    Some(PARK_WS.load(std::sync::atomic::Ordering::Relaxed)).filter(|&w| w != 0)
+}
+
 /// How many windows a workspace has.
 pub fn window_count(id: u64) -> usize {
     WINDOW_COUNTS.lock().unwrap().iter().find(|c| c.0 == id).map_or(0, |c| c.1)
@@ -349,6 +356,8 @@ fn update_niri_strip(sock: &Path) {
             }
         }
         *WINDOW_COUNTS.lock().unwrap() = counts;
+        let park = windows.iter().find(|w| w.get("app_id").and_then(|a| a.as_str()) == Some(crate::render::character::park::APP_ID));
+        PARK_WS.store(park.and_then(|w| w.get("workspace_id")?.as_u64()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
     let screen_w = niri_output_rect(sock).map(|r| r.2).unwrap_or(1920.0);
     let gap = niri_gaps();

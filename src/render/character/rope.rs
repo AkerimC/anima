@@ -788,6 +788,10 @@ pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
     use std::time::{Duration, Instant};
     // something to wear, found on a fishing line: its own picture, or the
     // props folder's for its drawn kind
+    if kind >= super::social::MATERIAL {
+        let (id, _) = super::park::MATERIALS.get((kind - super::social::MATERIAL) as usize)?;
+        return Some(super::park::picture(id)).filter(|p| p.exists());
+    }
     if kind >= super::social::FISH {
         return sea_picture(kind);
     }
