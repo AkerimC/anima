@@ -167,6 +167,15 @@ impl CharacterOverlay {
         }
     }
 
+    /// Where `i` holds something in its hands (its middle, not its face), surface px.
+    pub(super) fn hands_y(&self, i: usize) -> f32 {
+        let rect = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
+        let h = (rect[3] - rect[1]).max(1.0);
+        let o = self.actor_ref(i).opaque;
+        let (top, bottom) = (rect[1] + h * o[1], rect[1] + h * o[2]);
+        top + (bottom - top) * 0.62
+    }
+
     /// The farm's pier, if the farm is on `i`'s workspace (it can walk there).
     pub(super) fn pier_near(&self, i: usize) -> Option<(f32, f32)> {
         governor::place_rect("farm").filter(|p| p.ws == self.walk_ref(i).ws).map(|p| (p.x + park::PIER.0 * p.w, p.x + park::PIER.1 * p.w))
@@ -231,15 +240,30 @@ impl CharacterOverlay {
         let farm = governor::place_rect("farm").filter(|p| p.ws == self.walk_ref(i).ws)?;
         let size = self.width_of(i);
         let gap = size * 1.05;
-        let mut slots: Vec<(f32, f32)> = Vec::new();
+        // the pier's places, and two on each jetty (by the shore and at its end)
+        let mut pier: Vec<(f32, f32)> = Vec::new();
         let (a, b) = (farm.x + park::PIER.0 * farm.w + size * 0.5, farm.x + park::PIER.1 * farm.w - size * 0.5);
         let mut x = a;
         while x <= b {
-            slots.push((x, 0.0));
+            pier.push((x, 0.0));
             x += gap;
         }
+        let mut jetties: Vec<(f32, f32)> = Vec::new();
+        let (ja, jb) = (farm.x + park::JETTY.0 * farm.w, farm.x + park::JETTY.1 * farm.w);
         for y in park::JETTIES {
-            slots.push((farm.x + (park::JETTY.0 + park::JETTY.1) * 0.5 * farm.w, y * farm.h));
+            jetties.push((ja + size * 0.35, y * farm.h));
+            jetties.push(((jb - size * 0.35).max(ja + size * 0.35 + gap), y * farm.h));
+        }
+        // spread out: a place on the pier, one up a jetty, the pier again...
+        let mut slots: Vec<(f32, f32)> = Vec::new();
+        let (mut p, mut j) = (pier.into_iter(), jetties.into_iter());
+        loop {
+            let (a, b) = (p.next(), j.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            slots.extend(a);
+            slots.extend(b);
         }
         let mut spots = SPOTS.lock().unwrap();
         spots.retain(|s| s.3.elapsed().as_secs_f32() < 2.0 && s.0 != i);
@@ -376,6 +400,35 @@ impl CharacterOverlay {
             r.perched = wk.air > 0.0;
         }
         false
+    }
+
+    /// To a chair (or off one): down to the floor first, along the floor,
+    /// then up onto the seat; never gliding through the air. True once there.
+    pub(super) fn seat_walk(&mut self, i: usize, x: f32, up: f32, dt: f32) -> bool {
+        let dx = x - self.strip_px(i);
+        let h = self.height_of(i);
+        let now = self.walk_ref(i).air * h * 0.5;
+        if dx.abs() > 6.0 && now > 0.5 {
+            // off the seat, straight down
+            let unit = self.park_unit(self.extras.len() + 1);
+            let next = (now - 1.6 * unit * dt).max(0.0);
+            let wk = self.walk_of(i);
+            wk.air = next / (h * 0.5);
+            if let Some(r) = wk.social.as_mut() {
+                r.perched = wk.air > 0.0;
+                r.moving = false;
+            }
+            return false;
+        }
+        if dx.abs() > 6.0 {
+            // along the floor
+            if !self.walk_ref(i).social.is_some_and(|s| s.moving) && self.arrived(i) {
+                self.go_facing(i, x, 0.15);
+            }
+            return false;
+        }
+        // there: up onto it (or down to the floor)
+        self.walk_up_to(i, x, up, dt)
     }
 
     fn thing_px(&self, t: &Thing) -> f32 {
@@ -1094,12 +1147,12 @@ impl CharacterOverlay {
             let i = p.riders[k].i;
             let (x, up) = seats[k.min(seats.len() - 1)];
             if p.riders[k].phase == 0 {
-                if self.walk_up_to(i, x, up, dt) {
+                if self.seat_walk(i, x, up, dt) {
                     p.riders[k].phase = 1;
                     self.set_face(i, x > mid);
                 }
             } else if up > 0.0 {
-                self.walk_up_to(i, x, up, dt);
+                self.seat_walk(i, x, up, dt);
             }
         }
         if let Some((dish, left)) = dish_on(t.id) {
@@ -1196,12 +1249,7 @@ impl CharacterOverlay {
             if self.walk.rand() < dt * 0.8 {
                 self.walk_of(cook).start_bob(tn().jump_height * 0.08);
             }
-            // the others can smell it
-            for r in p.riders.clone().iter().skip(1) {
-                if self.walk.rand() < dt * 0.3 {
-                    self.walk_of(r.i).start_bob(tn().jump_height * 0.1);
-                }
-            }
+            // the others just wait (no hopping about: it looked like a fault)
             return false;
         }
         if p.riders[0].phase == 1 && p.riders[0].n == 0 {
@@ -1257,6 +1305,7 @@ impl CharacterOverlay {
             // a diner's order: to them, or burnt and made again
             if p.diner != usize::MAX {
                 let dish = (!m.burnt).then(|| m.dish.clone());
+                dine::set_order(p.diner, |o| o.cook = Some(cook));
                 self.order_cooked(p.diner, dish, mid);
                 p.t = p.stay;
                 p.meal = Some(Meal { dish: String::new(), ..m });
@@ -1565,10 +1614,11 @@ impl CharacterOverlay {
             let h = (rect[3] - rect[1]).max(1.0);
             let size = h * 0.3;
             let x = (rect[0] + rect[2]) * 0.5;
-            // on the tray on its head, or in its hands
+            // the waiter: on the tray on its head; anyone else: in its hands, at its middle
             let top = rect[1] + h * self.actor_ref(r.i).opaque[1];
-            let tray = super::super::wear::wears(&self.character_name(r.i), "custom:tray");
-            let y = if tray { top - size * 0.55 } else { rect[1] + h * 0.42 };
+            let waiter = self.is_job(r.i, "waiter") || self.is_part(r.i, "waiter");
+            let tray = waiter && super::super::wear::wears(&self.character_name(r.i), "custom:tray");
+            let y = if tray { top - size * 0.55 } else { self.hands_y(r.i) };
             v.push((super::FOOD + k as i32, [x - size * 0.5, y - size * 0.5, x + size * 0.5, y + size * 0.5], false, r.i));
         }
     }

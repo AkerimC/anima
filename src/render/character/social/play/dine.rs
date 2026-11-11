@@ -28,9 +28,14 @@ pub(super) struct Order {
     pub(super) state: Ask,
     pub(super) dish: String,
     pub(super) waiter: Option<usize>,
+    // who cooked it (gets the cook's share)
+    pub(super) cook: Option<usize>,
 }
 
 pub(super) static ORDERS: Mutex<Vec<Order>> = Mutex::new(Vec::new());
+
+/// Orders the chef has cooked in a row (a helper takes a turn after two).
+static IN_A_ROW: Mutex<u32> = Mutex::new(0);
 
 /// A stove's "diner" when the chef cooks for the counter, not for an order.
 pub(super) const PREP: usize = usize::MAX - 1;
@@ -53,11 +58,34 @@ const EAT: f32 = 30.0;
 impl CharacterOverlay {
     /// Someone with that job, in the cafe and free (or doing just that).
     /// Who's working `job` in the cafe: the one with the job, else someone
-    /// helping out with it part-time.
+    /// helping out with it part-time. With no waiter about, a cook helping
+    /// out part-time waits on the tables (not the one at the stove).
     pub(super) fn on_duty(&self, job: &str) -> Option<usize> {
         let n = self.extras.len() + 1;
         let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe");
-        (0..n).find(|&i| self.is_job(i, job) && here(i)).or_else(|| (0..n).find(|&i| self.is_part(i, job) && here(i)))
+        let found = (0..n).find(|&i| self.is_job(i, job) && here(i)).or_else(|| (0..n).find(|&i| self.is_part(i, job) && here(i)));
+        if found.is_some() || job != "waiter" {
+            return found;
+        }
+        let chef = self.on_duty("chef");
+        (0..n).find(|&i| self.is_part(i, "chef") && here(i) && Some(i) != chef)
+    }
+
+    /// Who cooks the next order: the chef, but after two in a row a cook
+    /// helping out part-time takes a turn (and does whenever the chef is
+    /// busy, eating say).
+    fn next_cook(&self) -> Option<usize> {
+        let n = self.extras.len() + 1;
+        let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe");
+        let free = |i: usize| self.walk_ref(i).at_leisure() && self.walk_ref(i).act == Act::Idle;
+        let chef = (0..n).find(|&i| self.is_job(i, "chef") && here(i));
+        let helper = (0..n).find(|&i| self.is_part(i, "chef") && here(i) && free(i));
+        let turns = *IN_A_ROW.lock().unwrap();
+        match (chef, helper) {
+            (Some(c), Some(h)) if turns >= 2 || !free(c) => Some(h),
+            (Some(c), _) => Some(c),
+            (None, h) => h.or_else(|| self.on_duty("chef")),
+        }
     }
 
     /// The chef is in: the cafe works as a restaurant.
@@ -143,7 +171,12 @@ impl CharacterOverlay {
         if let Some(o) = orders.iter().find(|o| o.state == Ask::Waiting) {
             let cooking = chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.kind == "stove" && p.diner != usize::MAX));
             if !cooking {
-                if let Some(chef) = self.on_duty("chef") {
+                if let Some(chef) = self.next_cook() {
+                    // whose turn: the chef's count goes up, a helper's turn resets it
+                    {
+                        let mut row = IN_A_ROW.lock().unwrap();
+                        *row = if self.is_job(chef, "chef") { *row + 1 } else { 0 };
+                    }
                     // the chef stops whatever else it's doing in the cafe
                     if !self.walk_ref(chef).at_leisure() {
                         let mut in_stove = false;
@@ -318,9 +351,9 @@ impl CharacterOverlay {
                 }
                 // sit and wait for the waiter
                 10 => {
-                    if self.walk_up_to(i, seat, seat_up, dt) {
+                    if self.seat_walk(i, seat, seat_up, dt) {
                         self.set_face(i, seat > mid);
-                        ORDERS.lock().unwrap().push(Order { diner: i, table: p.thing, by_waiter: true, state: Ask::Asked, dish: String::new(), waiter: None });
+                        ORDERS.lock().unwrap().push(Order { diner: i, table: p.thing, by_waiter: true, state: Ask::Asked, dish: String::new(), waiter: None, cook: None });
                         r.phase = 11;
                         r.t = 0.0;
                     }
@@ -347,7 +380,7 @@ impl CharacterOverlay {
                     let spot = at + side * (0.8 + 0.5 * place as f32) * unit;
                     let there = go(self, spot, 0.14);
                     if there && order_of(i).is_none() {
-                        ORDERS.lock().unwrap().push(Order { diner: i, table: p.thing, by_waiter: false, state: Ask::Waiting, dish: String::new(), waiter: None });
+                        ORDERS.lock().unwrap().push(Order { diner: i, table: p.thing, by_waiter: false, state: Ask::Waiting, dish: String::new(), waiter: None, cook: None });
                     }
                     if there {
                         self.set_face(i, side > 0.0);
@@ -373,7 +406,7 @@ impl CharacterOverlay {
                 }
                 // carrying it to the table
                 21 => {
-                    if self.walk_up_to(i, seat, seat_up, dt) {
+                    if self.seat_walk(i, seat, seat_up, dt) {
                         let dish = order_of(i).map(|o| o.dish).unwrap_or_default();
                         LIVE.lock().unwrap().dishes.push((t.id, dish, 1.0));
                         set_order(i, |o| o.state = Ask::Served);
@@ -384,7 +417,7 @@ impl CharacterOverlay {
                 }
                 // eating, slowly
                 30 => {
-                    if self.walk_up_to(i, seat, seat_up, dt) {
+                    if self.seat_walk(i, seat, seat_up, dt) {
                         self.set_face(i, seat > mid);
                     }
                     let dish = order_of(i).map(|o| o.dish).unwrap_or_default();
@@ -420,12 +453,13 @@ impl CharacterOverlay {
                 40 => {
                     let at = pickup.map_or(mid, |p| p.0) + if seat < mid { -0.6 } else { 0.6 } * unit;
                     // down off the chair, over to pay
-                    if self.walk_up_to(i, at, 0.0, dt) || r.t > 20.0 {
+                    if self.seat_walk(i, at, 0.0, dt) || r.t > 20.0 {
                         let name = self.character_name(i);
                         let o = order_of(i);
                         let dish = o.as_ref().map(|o| o.dish.clone()).unwrap_or_default();
                         let price = park::dish_price(&dish);
-                        let chef = self.on_duty("chef").map(|c| self.character_name(c));
+                        // the cook's share to whoever cooked it
+                        let chef = order_of(i).and_then(|o| o.cook).or_else(|| self.on_duty("chef")).map(|c| self.character_name(c));
                         let waiter = o.and_then(|o| o.waiter).map(|w| self.character_name(w));
                         let to: Vec<(&str, f32)> = match (&chef, &waiter) {
                             (Some(c), Some(w)) => vec![(c.as_str(), 0.6), (w.as_str(), 0.4)],
@@ -503,7 +537,7 @@ impl CharacterOverlay {
                 };
                 let Some(kind) = kind else { continue };
                 let size = h * if kind == super::super::COIN { 0.2 } else { 0.3 };
-                let y = if kind == super::super::COIN { rect[1] + h * self.actor_ref(r.i).opaque[1] - size * (1.0 + r.t * 0.4) } else { rect[1] + h * 0.42 };
+                let y = if kind == super::super::COIN { rect[1] + h * self.actor_ref(r.i).opaque[1] - size * (1.0 + r.t * 0.4) } else { self.hands_y(r.i) };
                 v.push((kind, [x - size * 0.5, y - size * 0.5, x + size * 0.5, y + size * 0.5], false, r.i));
             }
         }

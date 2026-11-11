@@ -2761,7 +2761,9 @@ impl CharacterOverlay {
         self.enlist(i, id);
         let size = self.width_of(i);
         // on the farm's workspace and not told to stay put: out on the pier
-        let pier = if here { self.pier_of(i) } else { self.pier_near(i) };
+        // the farm on this workspace: always at its pond, never where it stands
+        let _ = here;
+        let pier = self.pier_near(i);
         let x = if let Some((lo, hi)) = pier {
             let r = self.walk.rand();
             lo + size * 0.4 + r * (hi - lo - size * 0.8).max(0.0)
@@ -3328,7 +3330,14 @@ impl CharacterOverlay {
                     f.anglers[k] = a;
                     continue;
                 }
-                a.at = free_fishing_spot(&f, a.i, x, lo, hi, size);
+                // at the farm's pond: a free place on the pier or a jetty again
+                match self.pier_near(a.i).and_then(|_| self.farm_spot(a.i)) {
+                    Some((at, up)) => {
+                        a.at = at;
+                        a.up = up;
+                    }
+                    None => a.at = free_fishing_spot(&f, a.i, x, lo, hi, size),
+                }
                 self.go(a.i, a.at, 0.16);
             }
             // blown off its spot: lands, laughs, walks back, casts again
@@ -5374,8 +5383,13 @@ impl CharacterOverlay {
     /// and join when it's over.
     fn try_watch(&mut self, c: &mut Chat, n: usize) {
         let fishing = c.stage == Stage::Fishing;
-        // not before the anglers are in their places
-        if fishing && c.step == 9 {
+        // not before the anglers are in their places; and nobody stands about
+        // watching them in the park, cafe or farm (they've things to do there)
+        if fishing && (c.step == 9 || c.members.iter().any(|&m| self.place_here(m).is_some())) {
+            // any already watching there go off about their business
+            for w in std::mem::take(&mut c.watchers) {
+                self.leave(w, c.id);
+            }
             return;
         }
         for &w in &c.watchers.clone() {

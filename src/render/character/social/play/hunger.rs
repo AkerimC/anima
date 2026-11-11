@@ -356,7 +356,8 @@ impl CharacterOverlay {
             let size = h * 0.24 * (1.0 - r.t / 8.0).max(0.3);
             let side = if self.walk_ref(r.i).left { -1.0 } else { 1.0 };
             let x = (rect[0] + rect[2]) * 0.5 + side * h * 0.18;
-            let y = rect[1] + h * 0.5;
+            let y = self.hands_y(r.i);
+            let _ = h;
             v.push((super::super::FOOD + k as i32, [x - size * 0.5, y - size * 0.5, x + size * 0.5, y + size * 0.5], false, r.i));
         }
     }
