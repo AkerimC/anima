@@ -248,7 +248,7 @@ impl CharacterOverlay {
     /// Diners at one table: sit (or queue first), wait, eat slowly talking
     /// to each other, pay, go.
     pub(super) fn play_dine(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
-        let seats = [mid - 0.85 * unit, mid + 0.85 * unit, mid - 1.3 * unit, mid + 1.3 * unit];
+        let seats = self.table_seats(t, mid, unit);
         let mut off = Vec::new();
         let waiter = self.on_duty("waiter").is_some();
         let pickup = self.pickup();
@@ -257,7 +257,7 @@ impl CharacterOverlay {
         for k in 0..p.riders.len() {
             let mut r = p.riders[k];
             let i = r.i;
-            let seat = seats[k.min(3)];
+            let (seat, seat_up) = seats[k.min(seats.len() - 1)];
             r.t += dt;
             let go = |this: &mut Self, x: f32, speed: f32| {
                 if !this.walk_ref(i).social.is_some_and(|s| s.moving) && (this.strip_px(i) - x).abs() > 8.0 && this.arrived(i) {
@@ -272,7 +272,7 @@ impl CharacterOverlay {
                 }
                 // sit and wait for the waiter
                 10 => {
-                    if go(self, seat, 0.14) {
+                    if self.walk_up_to(i, seat, seat_up, dt) {
                         self.set_face(i, seat > mid);
                         ORDERS.lock().unwrap().push(Order { diner: i, table: p.thing, by_waiter: true, state: Ask::Asked, dish: String::new(), waiter: None });
                         r.phase = 11;
@@ -327,7 +327,7 @@ impl CharacterOverlay {
                 }
                 // carrying it to the table
                 21 => {
-                    if go(self, seat, 0.16) {
+                    if self.walk_up_to(i, seat, seat_up, dt) {
                         let dish = order_of(i).map(|o| o.dish).unwrap_or_default();
                         LIVE.lock().unwrap().dishes.push((t.id, dish, 1.0));
                         set_order(i, |o| o.state = Ask::Served);
@@ -338,7 +338,7 @@ impl CharacterOverlay {
                 }
                 // eating, slowly
                 30 => {
-                    if go(self, seat, 0.14) {
+                    if self.walk_up_to(i, seat, seat_up, dt) {
                         self.set_face(i, seat > mid);
                     }
                     let dish = order_of(i).map(|o| o.dish).unwrap_or_default();
@@ -372,7 +372,8 @@ impl CharacterOverlay {
                 // to the counter to pay
                 40 => {
                     let at = pickup.map_or(mid, |p| p.0) + if seat < mid { -0.6 } else { 0.6 } * unit;
-                    if go(self, at, 0.16) || r.t > 20.0 {
+                    // down off the chair, over to pay
+                    if self.walk_up_to(i, at, 0.0, dt) || r.t > 20.0 {
                         let name = self.character_name(i);
                         let o = order_of(i);
                         let dish = o.as_ref().map(|o| o.dish.clone()).unwrap_or_default();
@@ -418,6 +419,7 @@ impl CharacterOverlay {
         for i in off {
             set_order(i, |o| o.state = Ask::Failed);
             self.get_off(c, p, i);
+            self.push_down(i);
         }
         c.members.is_empty()
     }

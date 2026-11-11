@@ -368,7 +368,7 @@ impl CharacterOverlay {
         for (k, t) in park.things.iter().enumerate() {
             let room = park::room(&t.kind);
             // tables are for eating; the stove is the chef's once there is one
-            if room == 0 || t.place != place || t.kind == "table" || (restaurant && t.kind == "stove" && t.place == "cafe") {
+            if room == 0 || t.place != place || t.kind == "table" || (t.kind == "chair" && t.place == "cafe") || (restaurant && t.kind == "stove" && t.place == "cafe") {
                 continue;
             }
             let on = chats.iter().find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == t.kind));
@@ -388,6 +388,10 @@ impl CharacterOverlay {
                 (j, "stove") if j != Some("chef") && chef_here => 0.3,
                 _ => 1.0,
             };
+            // eggs, milk or a crop waiting: hard to walk past
+            if park::farm_state(t, &park::read_farm_cached()).1 > 0 {
+                weight *= 8.0;
+            }
             options.push((k, weight));
         }
         let total: f32 = options.iter().map(|o| o.1).sum();
@@ -551,6 +555,11 @@ impl CharacterOverlay {
         if done && thing.place == "park" && matches!(thing.kind.as_str(), "slide" | "swing" | "seesaw" | "sandbox") {
             for &i in &c.members.clone() {
                 self.work(i, "attendant", 1.0);
+            }
+        }
+        if done && matches!(thing.kind.as_str(), "table") {
+            for &i in &c.members.clone() {
+                self.push_down(i);
             }
         }
         if done && thing.kind == "stove" {
@@ -838,17 +847,17 @@ impl CharacterOverlay {
     /// Round the table, chatting; alone it waits a while for company. With
     /// a dish on it, they eat it together and get closer.
     fn play_table(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
-        let spots = [mid - 0.85 * unit, mid + 0.85 * unit, mid - 1.3 * unit, mid + 1.3 * unit];
+        let seats = self.table_seats(t, mid, unit);
         for k in 0..p.riders.len().min(4) {
             let i = p.riders[k].i;
+            let (x, up) = seats[k.min(seats.len() - 1)];
             if p.riders[k].phase == 0 {
-                let spot = spots[k];
-                if !self.walk_ref(i).social.is_some_and(|s| s.moving) && (self.strip_px(i) - spot).abs() > 6.0 && self.arrived(i) {
-                    self.go(i, spot, 0.14);
-                } else if self.arrived(i) && (self.strip_px(i) - spot).abs() <= 6.0 {
+                if self.walk_up_to(i, x, up, dt) {
                     p.riders[k].phase = 1;
-                    self.set_face(i, spot > mid);
+                    self.set_face(i, x > mid);
                 }
+            } else if up > 0.0 {
+                self.walk_up_to(i, x, up, dt);
             }
         }
         if let Some((dish, left)) = dish_on(t.id) {
@@ -1162,6 +1171,24 @@ impl CharacterOverlay {
         p.riders.iter().all(|r| r.phase == 4) || p.t > 60.0
     }
 
+    /// Where those at a table sit: on the chairs beside it (x, height to sit
+    /// at), then standing places round it.
+    pub(super) fn table_seats(&self, t: &Thing, mid: f32, unit: f32) -> Vec<(f32, f32)> {
+        let park = park_now();
+        let mut chairs: Vec<f32> = park.things.iter().filter(|c| c.kind == "chair" && c.place == t.place && (c.y - t.y).abs() < 0.02).map(|c| self.thing_px(c)).filter(|x| (x - mid).abs() < 1.3 * unit).collect();
+        chairs.sort_by(|a, b| (a - mid).abs().total_cmp(&(b - mid).abs()));
+        let mut seats: Vec<(f32, f32)> = chairs.into_iter().take(4).map(|x| (x, park::SEAT * unit + 0.02 * unit)).collect();
+        for x in [mid - 0.85 * unit, mid + 0.85 * unit, mid - 1.3 * unit, mid + 1.3 * unit] {
+            if seats.len() >= 4 {
+                break;
+            }
+            if !seats.iter().any(|s| (s.0 - x).abs() < 0.4 * unit) {
+                seats.push((x, 0.0));
+            }
+        }
+        seats
+    }
+
     /// Carrying a dish: to the stove for it, over to the table, down it goes.
     fn play_serve(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, dt: f32) -> bool {
         let _ = c;
@@ -1240,6 +1267,42 @@ impl CharacterOverlay {
             let tray = super::super::wear::wears(&self.character_name(r.i), "custom:tray");
             let y = if tray { top - size * 0.55 } else { rect[1] + h * 0.42 };
             v.push((super::FOOD + k as i32, [x - size * 0.5, y - size * 0.5, x + size * 0.5, y + size * 0.5], false, r.i));
+        }
+    }
+
+    /// Eggs in the coop, milk in the barn, a crop ripe: someone on the farm
+    /// (a farmer first) goes to get it.
+    fn farm_calls(&mut self, chats: &mut Vec<Chat>, n: usize) {
+        static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+        {
+            let mut next = NEXT.lock().unwrap();
+            if next.is_some_and(|t| t.elapsed().as_secs_f32() < 3.0) {
+                return;
+            }
+            *next = Some(Instant::now());
+        }
+        let Some(farm) = governor::place_rect("farm") else { return };
+        let park = park_now();
+        let state = park::read_farm_cached();
+        let waiting: Vec<(usize, String)> = park
+            .things
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.place == "farm" && park::farm_state(t, &state).1 > 0)
+            .filter(|(k, t)| !chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.thing == *k && p.kind == t.kind)))
+            .map(|(k, t)| (k, t.kind.clone()))
+            .collect();
+        let Some((k, kind)) = waiting.first().cloned() else { return };
+        let free = |this: &Self, i: usize| {
+            let wk = this.walk_ref(i);
+            wk.ws == farm.ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none()
+        };
+        let on_farm = |this: &Self, i: usize| this.place_here(i).is_some_and(|p| p.place == "farm");
+        // only someone already on the farm (a farmer first)
+        let who = (0..n).filter(|&i| free(self, i) && on_farm(self, i)).max_by_key(|&i| self.is_job(i, "farmer") as u8);
+        if let Some(i) = who {
+            log::debug!("farm: {i} goes to collect from the {kind}");
+            self.start_play(chats, i, k, &kind);
         }
     }
 
@@ -1584,6 +1647,7 @@ impl CharacterOverlay {
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         self.restaurant_tick(chats);
+        self.farm_calls(chats, n);
         // down from up the meadow, on foot
         let down: Vec<usize> = std::mem::take(&mut *DOWN.lock().unwrap());
         for i in down.into_iter().filter(|&i| i < n) {
