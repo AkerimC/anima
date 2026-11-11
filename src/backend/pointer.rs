@@ -24,6 +24,7 @@ const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const BTN_TOUCH: u16 = 0x14a;
 const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
 const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
 const EV_SYN: u16 = 0x00;
 
@@ -40,6 +41,9 @@ pub static DOUBLE_CLICK: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// Left button held down (for picking characters up).
 pub static BUTTON_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Counts right-button double clicks (the characters take orders from them).
+pub static RIGHT_DOUBLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_RIGHT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
 /// A character is being carried; the real cursor is pinned to the estimate
 /// so the two can't drift apart.
@@ -380,6 +384,15 @@ fn read_device(mut file: File, touchpad: bool, s: &Shared) {
                     BUTTON_DOWN.store(value != 0, std::sync::atomic::Ordering::Relaxed);
                     if value == 1 {
                         s.click();
+                    }
+                }
+                (EV_KEY, BTN_RIGHT) if value == 1 => {
+                    let mut last = LAST_RIGHT.lock().unwrap();
+                    if last.is_some_and(|t| t.elapsed() < Duration::from_millis(400)) {
+                        RIGHT_DOUBLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        *last = None;
+                    } else {
+                        *last = Some(Instant::now());
                     }
                 }
                 (EV_KEY, BTN_TOUCH) if value == 1 => {

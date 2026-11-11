@@ -172,6 +172,12 @@ impl CharacterOverlay {
             return;
         };
         let kind = park.things[k].kind.clone();
+        self.start_play(chats, i, k, &kind);
+    }
+
+    /// `i` goes to play on thing `k`, with whoever is on it already.
+    fn start_play(&mut self, chats: &mut Vec<Chat>, i: usize, k: usize, kind: &str) {
+        let kind = kind.to_string();
         if let Some(c) = chats.iter_mut().find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == kind)) {
             self.enlist(i, c.id);
             c.members.push(i);
@@ -577,7 +583,92 @@ impl CharacterOverlay {
     }
 }
 
+/// Picked by a right double click: (who, when).
+static PICKED: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
+static ORDERS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl CharacterOverlay {
+    /// Right double click on a character picks it; then a right double click
+    /// on the ground sends it there, on something in the park sends it to play.
+    pub(super) fn right_orders(&mut self, chats: &mut Vec<Chat>, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = crate::backend::pointer::RIGHT_DOUBLE.load(Relaxed);
+        if ORDERS_SEEN.swap(now, Relaxed) == now || now == 0 {
+            return;
+        }
+        let m = self.screen_mouse;
+        // on a character: that one listens
+        let hit = (0..n).find(|&i| {
+            let a = self.actor_ref(i);
+            let r = a.body_box();
+            let r = a.zoom.map_or(r, |z| z.to_screen(r));
+            a.visible && m[0] >= r[0] && m[0] <= r[2] && m[1] >= r[1] && m[1] <= r[3]
+        });
+        if let Some(i) = hit {
+            *PICKED.lock().unwrap() = Some((i, Instant::now()));
+            let wk = self.walk_of(i);
+            if matches!(wk.act, Act::Idle | Act::Walk) && wk.air <= 0.0 {
+                wk.start_jump(tn().jump_height * 0.4);
+            }
+            log::debug!("orders: {i} picked");
+            return;
+        }
+        let Some((i, at)) = PICKED.lock().unwrap().take() else { return };
+        if at.elapsed().as_secs_f32() > 30.0 || i >= n {
+            return;
+        }
+        let a = self.actor_ref(i);
+        if !a.visible {
+            return;
+        }
+        let p = a.zoom.map_or(m, |z| z.to_scene(m));
+        let px = p[0] + a.own_view[0] * self.view_w * 0.5;
+        // out of whatever it was doing
+        for c in chats.iter_mut() {
+            if c.members.contains(&i) || c.watchers.contains(&i) {
+                c.members.retain(|&x| x != i);
+                c.watchers.retain(|&x| x != i);
+                self.let_down(i);
+                self.leave(i, c.id);
+            }
+        }
+        let wk = self.walk_ref(i);
+        if !matches!(wk.act, Act::Idle | Act::Walk | Act::Rest) || wk.race.is_some() || wk.trip.is_some() {
+            return;
+        }
+        if wk.act == Act::Rest {
+            let wk = self.walk_of(i);
+            wk.rest = None;
+            wk.act = Act::Idle;
+            wk.sink = 0.0;
+            wk.rot = 0.0;
+        }
+        // something in the park under the click: play on it
+        let park_ws = governor::park_workspace();
+        if park_ws.is_some() && park_ws == Some(self.walk_ref(i).ws) {
+            let park = park_now();
+            let unit = self.park_unit(n);
+            let ground = { let r = self.actor_ref(i).hit_rect; r[1] + (r[3] - r[1]) * self.actor_ref(i).opaque[2] };
+            let on = park.things.iter().enumerate().filter(|(_, t)| park::room(&t.kind) > 0).find(|(_, t)| {
+                (px - self.thing_px(t)).abs() <= park::width(t) * unit * 0.5 && p[1] >= ground - 2.0 * unit
+            });
+            if let Some((k, t)) = on {
+                let kind = t.kind.clone();
+                log::debug!("orders: {i} sent to the {kind}");
+                self.start_play(chats, i, k, &kind);
+                return;
+            }
+        }
+        // just there
+        let here = self.strip_px(i);
+        let surface = self.actor_ref(i).surface[0].max(1.0);
+        let wk = self.walk_of(i);
+        wk.target = wk.x + (px - here) * 2.0 / surface;
+        wk.act = Act::Walk;
+        wk.timer = 3.0;
+        log::debug!("orders: {i} walks to {px:.0}");
+    }
+
     /// What's drawn over the park on the character layer: the swing's ropes
     /// from the bar to the hands of whoever swings, and the seesaw's board
     /// under its two riders. (surface px, owner, half thickness px, twisted)

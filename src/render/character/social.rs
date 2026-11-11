@@ -798,6 +798,7 @@ impl CharacterOverlay {
         });
 
         chats.append(&mut self.new_chats);
+        self.right_orders(&mut chats, n);
 
         self.social_tick -= dt;
         if self.social_tick <= 0.0 {
@@ -824,7 +825,6 @@ impl CharacterOverlay {
                 }
                 self.park_play(&mut chats, n);
                 self.park_tell_unit(n);
-                self.park_tell_busy();
                 if let Some(c) = self.start_training(n, tn().look_every) {
                     chats.push(c);
                 }
@@ -840,6 +840,7 @@ impl CharacterOverlay {
             }
         }
         self.chats = chats;
+        self.park_tell_busy();
         self.settle_states(dt, n);
     }
 
