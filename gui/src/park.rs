@@ -86,12 +86,22 @@ pub fn run() -> glib::ExitCode {
         if want.is_empty() {
             want.push("park");
         }
-        for place in want {
+        // one after another, so each finds the ones before it and goes beside them
+        // (the first right away: an open window keeps the program running)
+        let open = |app: &adw::Application, place: &str| {
             let title = park::place_title(place);
             match app.windows().into_iter().find(|w| w.title().is_some_and(|t| t == title)) {
                 Some(w) => w.present(),
                 None => build(app, place),
             }
+        };
+        for (k, place) in want.into_iter().enumerate() {
+            if k == 0 {
+                open(app, place);
+                continue;
+            }
+            let app = app.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500 * k as u64), move || open(&app, place));
         }
         0.into()
     });
@@ -390,6 +400,13 @@ fn build(app: &adw::Application, place: &str) {
         pop.connect_show(move |_| p2.set_child(Some(&recipe_book())));
         header.pack_start(&book);
     }
+    // who does what
+    let jobs = gtk::MenuButton::builder().label("Jobs").build();
+    let jpop = gtk::Popover::new();
+    jobs.set_popover(Some(&jpop));
+    let j2 = jpop.clone();
+    jpop.connect_show(move |_| j2.set_child(Some(&jobs_list())));
+    header.pack_start(&jobs);
     header.pack_end(&mode);
     let view = adw::ToolbarView::new();
     view.add_top_bar(&header);
@@ -538,6 +555,43 @@ fn pantry_card() -> gtk::Box {
         glib::ControlFlow::Continue
     });
     card
+}
+
+/// The jobs: who has each, and who's closest to getting one.
+fn jobs_list() -> gtk::Widget {
+    let j = park::read_jobs();
+    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
+    let note = gtk::Label::builder().label("Earned by doing the work; not everyone gets one").xalign(0.0).build();
+    note.add_css_class("dim-label");
+    note.add_css_class("caption");
+    list.append(&note);
+    for (id, label, place, slots) in park::JOBS {
+        let holders: Vec<&String> = j.jobs.iter().filter(|e| e.1 == id).map(|e| e.0).collect();
+        let head = gtk::Label::builder()
+            .label(format!("<b>{label}</b> <small>({}, {}/{slots})</small>", park::place_title(place), holders.len()))
+            .use_markup(true)
+            .xalign(0.0)
+            .build();
+        list.append(&head);
+        let text = if holders.is_empty() {
+            // the closest ones without a job
+            let mut near: Vec<(&String, f32)> = j.points.iter().filter(|(n, _)| !j.jobs.contains_key(*n)).filter_map(|(n, p)| p.get(id).map(|v| (n, *v))).collect();
+            near.sort_by(|a, b| b.1.total_cmp(&a.1));
+            if near.is_empty() {
+                "Nobody yet".to_string()
+            } else {
+                near.iter().take(2).map(|(n, v)| format!("{n} {:.0}/{:.0}", v.min(park::JOB_AT), park::JOB_AT)).collect::<Vec<_>>().join(", ")
+            }
+        } else {
+            holders.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        };
+        let l = gtk::Label::builder().label(text).xalign(0.0).wrap(true).max_width_chars(36).build();
+        if holders.is_empty() {
+            l.add_css_class("dim-label");
+        }
+        list.append(&l);
+    }
+    list.upcast()
 }
 
 /// Every dish: what's been found (who by, how often made), the rest a "???".
@@ -1109,7 +1163,8 @@ fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
     }
 }
 
-/// Moves a window (by title) onto an empty workspace when it opened among others.
+/// Puts a window (by title) beside the other park, cafe or farm windows, or
+/// onto an empty workspace of its own when it's the first and opened among others.
 fn own_workspace(title: &str) {
     let json = |args: &[&str]| -> Option<serde_json::Value> {
         let out = std::process::Command::new("niri").args(["msg", "--json"]).args(args).output().ok()?;
@@ -1126,11 +1181,26 @@ fn own_workspace(title: &str) {
         }
     }
     let Some((Some(id), Some(ws), list)) = me else { return };
+    let Some(spaces) = json(&["workspaces"]) else { return };
+    let spaces = spaces.as_array().cloned().unwrap_or_default();
+    // the others already open: in beside them, side by side on their workspace
+    let sibling = list
+        .iter()
+        .find(|w| w["app_id"].as_str() == Some(park::APP_ID) && w["title"].as_str() != Some(title))
+        .and_then(|w| w["workspace_id"].as_u64());
+    if let Some(other) = sibling {
+        if other != ws {
+            if let Some(idx) = spaces.iter().find(|s| s["id"].as_u64() == Some(other)).and_then(|s| s["idx"].as_u64()) {
+                let _ = std::process::Command::new("niri")
+                    .args(["msg", "action", "move-window-to-workspace", "--window-id", &id.to_string(), "--focus", "true", &idx.to_string()])
+                    .status();
+            }
+        }
+        return;
+    }
     if list.iter().filter(|w| w["workspace_id"].as_u64() == Some(ws)).count() <= 1 {
         return;
     }
-    let Some(spaces) = json(&["workspaces"]) else { return };
-    let spaces = spaces.as_array().cloned().unwrap_or_default();
     let output = spaces.iter().find(|s| s["id"].as_u64() == Some(ws)).and_then(|s| s["output"].as_str().map(String::from));
     // niri always keeps an empty one at the end
     let empty = spaces

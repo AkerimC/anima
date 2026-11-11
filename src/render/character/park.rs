@@ -431,3 +431,77 @@ pub fn world_path() -> PathBuf {
 pub fn read_world() -> World {
     std::fs::read_to_string(world_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
+
+// --- jobs: earned over time by doing the work, not everyone gets one
+
+/// id, label, where it's done, how many can have it.
+pub const JOBS: [(&str, &str, &str, usize); 5] = [
+    ("attendant", "Park attendant", "park", 1),
+    ("chef", "Chef", "cafe", 1),
+    ("waiter", "Waiter", "cafe", 2),
+    ("farmer", "Farmer", "farm", 2),
+    ("fisher", "Fisher", "farm", 2),
+];
+
+/// Work done to earn a job.
+pub const JOB_AT: f32 = 20.0;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct Jobs {
+    // name -> job -> work done
+    #[serde(default)]
+    pub points: BTreeMap<String, BTreeMap<String, f32>>,
+    // name -> job
+    #[serde(default)]
+    pub jobs: BTreeMap<String, String>,
+}
+
+pub fn jobs_path() -> PathBuf {
+    crate::util::data_dir().join("jobs.json")
+}
+
+pub fn read_jobs() -> Jobs {
+    std::fs::read_to_string(jobs_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+static JOBS_CACHE: std::sync::Mutex<Option<(std::time::Instant, Jobs)>> = std::sync::Mutex::new(None);
+
+/// `read_jobs`, at most once every two seconds.
+pub fn jobs_cached() -> Jobs {
+    let mut c = JOBS_CACHE.lock().unwrap();
+    if c.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 2.0) {
+        *c = Some((std::time::Instant::now(), read_jobs()));
+    }
+    c.as_ref().map(|x| x.1.clone()).unwrap_or_default()
+}
+
+pub fn job_of(name: &str) -> Option<String> {
+    jobs_cached().jobs.get(name).cloned()
+}
+
+pub fn job_label(id: &str) -> &'static str {
+    JOBS.iter().find(|j| j.0 == id).map_or("", |j| j.1)
+}
+
+/// `name` did some of `job`'s work. Returns the job if that just earned it.
+pub fn add_work(name: &str, job: &str, k: f32) -> Option<String> {
+    let mut j = read_jobs();
+    *j.points.entry(name.to_string()).or_default().entry(job.to_string()).or_default() += k;
+    let mut earned = None;
+    if !j.jobs.contains_key(name) {
+        let mine = j.points.get(name).and_then(|p| p.get(job)).copied().unwrap_or(0.0);
+        // the work it does most, and there's still room in it
+        let best = j.points.get(name).and_then(|p| p.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|e| e.0.clone()));
+        let slots = JOBS.iter().find(|x| x.0 == job).map_or(0, |x| x.3);
+        let taken = j.jobs.values().filter(|v| *v == job).count();
+        if mine >= JOB_AT && best.as_deref() == Some(job) && taken < slots {
+            j.jobs.insert(name.to_string(), job.to_string());
+            earned = Some(job.to_string());
+        }
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&j) {
+        let _ = crate::util::atomic_write(&jobs_path(), text.as_bytes());
+    }
+    *JOBS_CACHE.lock().unwrap() = Some((std::time::Instant::now(), j));
+    earned
+}

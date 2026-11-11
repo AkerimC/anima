@@ -538,6 +538,8 @@ pub(super) const FISH: i32 = 40000;
 pub(super) const CREATURE: i32 = 41000;
 /// Something for the park chest: this plus its place in park::MATERIALS.
 pub(super) const MATERIAL: i32 = 42000;
+/// A dish being carried: this plus its place in park::DISHES.
+pub(super) const FOOD: i32 = 44000;
 
 fn grounded(wk: &WalkState) -> bool {
     matches!(wk.act, Act::Idle | Act::Walk)
@@ -2702,15 +2704,23 @@ impl CharacterOverlay {
         }
         let i = (0..n).find(|&i| {
             let wk = self.walk_ref(i);
-            wk.bored >= tn().fish_bored && wk.fish_cool <= 0.0 && wk.act == Act::Idle && self.on_screen(i)
+            // a fisher by trade doesn't need to be as bored
+            let keen = if self.is_job(i, "fisher") { 0.4 } else { 1.0 };
+            wk.bored >= tn().fish_bored * keen && wk.fish_cool <= 0.0 && wk.act == Act::Idle && self.on_screen(i)
         })?;
         if self.walk_of(i).rand() >= every / tn().fish_bored_every.max(1.0) {
             return None;
         }
         self.walk_of(i).bored = 0.0;
-        // the farm is open: mostly off to its pier to fish there
+        // living in the park, cafe or farm (not out on the desktop): off to
+        // the farm's pier to fish; on the desktop, by the windows as always
         if let Some(farm) = crate::backend::governor::place_workspace("farm") {
-            if self.walk_ref(i).ws != farm && self.walk_of(i).rand() < tn().fish_at_pier && self.send_to(i, farm) {
+            let home = crate::backend::governor::places().iter().any(|p| p.ws == self.walk_ref(i).ws);
+            if home && self.walk_ref(i).ws == farm {
+                log::debug!("{i} walks to the pier to fish");
+                return Some(self.fish_alone(i, false));
+            }
+            if home && self.send_to(i, farm) {
                 self.walk_of(i).fish_on_arrival = true;
                 log::debug!("{i} goes to the farm to fish");
                 return None;
@@ -2726,7 +2736,8 @@ impl CharacterOverlay {
         let id = self.chat_id;
         self.enlist(i, id);
         let size = self.width_of(i);
-        let pier = self.pier_of(i);
+        // on the farm's workspace and not told to stay put: out on the pier
+        let pier = if here { self.pier_of(i) } else { self.pier_near(i) };
         let x = if let Some((lo, hi)) = pier {
             let r = self.walk.rand();
             lo + size * 0.4 + r * (hi - lo - size * 0.8).max(0.0)
@@ -2753,7 +2764,7 @@ impl CharacterOverlay {
     /// The stretch of floor `i` is fishing on: its window, or the screen
     /// around it when that window isn't known.
     fn fishing_window(&self, i: usize, at: f32) -> (f32, f32) {
-        if let Some(pier) = self.pier_of(i) {
+        if let Some(pier) = self.pier_near(i).filter(|p| at >= p.0 - 40.0 && at <= p.1 + 40.0) {
             return pier;
         }
         let active = self.spaces.active;
@@ -3200,7 +3211,7 @@ impl CharacterOverlay {
     /// bite, reel in whatever it is.
     fn start_fishing(&mut self, c: &mut Chat) {
         let (x, cw) = self.big_window();
-        let (lo, hi) = match self.pier_of(c.members[0]) {
+        let (lo, hi) = match self.pier_near(c.members[0]) {
             // on the farm: everyone out on the pier, close together
             Some((a, b)) => (a + 20.0, b - 20.0),
             None => (x + 80.0, x + cw - 80.0),
@@ -3394,6 +3405,10 @@ impl CharacterOverlay {
                     a.phase = 5;
                     a.t = 0.0;
                     let (_, points, good) = if a.item >= MATERIAL { (a.item, 2.0, true) } else if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
+                    // fishing off the pier is a fisher's work
+                    if self.pier_of(a.i).is_some() {
+                        self.work(a.i, "fisher", if good { 1.5 } else { 1.0 });
+                    }
                     // a fish or a carrot: into the kitchen's pantry too
                     if (FISH..CREATURE).contains(&a.item) {
                         super::park::add_food("fish", 1);
@@ -4390,6 +4405,7 @@ impl CharacterOverlay {
             v.push((0, [x - size * 0.5, top, x + size * 0.5, top + size], false, b.giver));
         }
         self.mood_props(&mut v);
+        self.serve_props(&mut v);
         // a picture in place of a drawn thing fills the box's width at its own shape
         for p in &mut v {
             if (21000..FOUND).contains(&p.0) || p.0 >= FISH {
