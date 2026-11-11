@@ -72,6 +72,14 @@ impl RopeGl {
             Ok(Self { program, vao, vbo })
         }
     }
+
+    pub(super) fn destroy(&self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_vertex_array(self.vao);
+            gl.delete_buffer(self.vbo);
+        }
+        self.program.destroy(gl);
+    }
 }
 
 impl CharacterOverlay {
@@ -348,6 +356,14 @@ impl CarrotGl {
             gl.bind_vertex_array(None);
             Ok(Self { program, vao, vbo })
         }
+    }
+
+    pub(super) fn destroy(&self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_vertex_array(self.vao);
+            gl.delete_buffer(self.vbo);
+        }
+        self.program.destroy(gl);
     }
 }
 

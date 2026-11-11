@@ -22,6 +22,7 @@ use glow::HasContext;
 use serde::{Deserialize, Serialize};
 
 use super::FrameInfo;
+use super::Renderer;
 use super::gl::{Filter, Program, create_texture};
 use super::image::ImageRenderer;
 use crate::pkg::decode_tex;
@@ -225,7 +226,7 @@ impl SceneZoom {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CharacterConfig {
     /// Enabled flag.
@@ -1247,20 +1248,59 @@ impl CharacterOverlay {
         }
     }
 
-    pub fn reload_source(&mut self, gl: &glow::Context, _width: i32, _height: i32) -> Result<()> {
-        if let Some((old, _, _)) = self.sprite_tex.take() {
-            unsafe { gl.delete_texture(old) };
+    /// Delete the sprite/model GL resources owned by this character, leaving
+    /// its overlay program and quad intact.  Called before reloading a source
+    /// or destroying the overlay.
+    fn release_art(&mut self, gl: &glow::Context) {
+        // `sprite_tex` aliases the model's offscreen colour texture when a 3D
+        // model is loaded, so destroy the model first and skip that handle.
+        let model_color = self.model.as_ref().map(|m| m.color());
+        if let Some(mut model) = self.model.take() {
+            model.destroy(gl);
         }
-        self.sprite_tex = None;
-        self.sprite_happy = None;
-        self.sprite_renderer = None;
+        if let Some((tex, _, _)) = self.sprite_tex.take() {
+            if Some(tex) != model_color {
+                unsafe { gl.delete_texture(tex) };
+            }
+        }
+        if let Some(tex) = self.sprite_happy.take() {
+            unsafe { gl.delete_texture(tex) };
+        }
+        // `pending` only borrows one of the handles above; never delete it.
+        self.pending = None;
+        if let Some(mut renderer) = self.sprite_renderer.take() {
+            renderer.destroy(gl);
+        }
+        if let Some(rope) = self.rope.take() {
+            rope.destroy(gl);
+        }
+        if let Some(carrot) = self.carrot_gl.take() {
+            carrot.destroy(gl);
+        }
+        for mut extra in self.extras.drain(..) {
+            extra.destroy(gl);
+        }
         self.faces_right = false;
-        self.model = None;
+    }
+
+    /// Delete every GL object owned by this character and its team.  Requires
+    /// a current context; call before dropping the overlay.
+    pub fn destroy(&mut self, gl: &glow::Context) {
+        self.release_art(gl);
+        unsafe {
+            gl.delete_texture(self.dummy_tex);
+            gl.delete_vertex_array(self.vao);
+            gl.delete_buffer(self.vbo);
+        }
+        self.program.destroy(gl);
+    }
+
+    pub fn reload_source(&mut self, gl: &glow::Context, _width: i32, _height: i32) -> Result<()> {
+        self.release_art(gl);
 
         if self.actor == 0 {
             self.chats.clear();
             self.walk.social = None;
-            self.extras.clear();
             for src in &self.config.extra {
                 let mut cfg = self.config.clone();
                 cfg.source = src.clone();

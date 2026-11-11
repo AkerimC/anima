@@ -456,16 +456,31 @@ impl App {
 
     /// Synchronize the front overlay `Layer::Overlay` surface for output `idx`
     /// based on whether the character is enabled and needs a front overlay.
-    fn sync_character_surfaces(&mut self, idx: usize) {
+    fn sync_character_surfaces(&mut self, idx: usize, force: bool) {
         if idx >= self.outputs.len() {
             return;
         }
         let ch_cfg = self.config.character.clone();
         let needs_front = ch_cfg.enabled && ch_cfg.effective_placement().needs_overlay_surface();
+        // A wallpaper switch must not reload the character's GLB: only rebuild
+        // when the character configuration actually changed (or on request).
+        let unchanged = |current: Option<&CharacterOverlay>| {
+            !force && current.is_some_and(|c| c.config == ch_cfg)
+        };
 
         if needs_front {
             // Remove background-layer character so it isn't drawn twice.
-            self.outputs[idx].character = None;
+            if let Some(mut old) = self.outputs[idx].character.take() {
+                if let (Some(ctx), Some(surf)) = (
+                    self.outputs[idx].gl_context.as_ref(),
+                    self.outputs[idx].gl_surface.as_ref(),
+                ) {
+                    let _ = ctx.make_current(surf);
+                }
+                if let Some(gl) = self.outputs[idx].gl.as_ref() {
+                    old.destroy(gl);
+                }
+            }
 
             if self.outputs[idx].front_overlay.is_none() {
                 let windowed = ch_cfg.windows
@@ -518,10 +533,16 @@ impl App {
             } else {
                 let (w, h) = (self.outputs[idx].width, self.outputs[idx].height);
                 if let Some(fo) = self.outputs[idx].front_overlay.as_mut() {
-                    if let (Some(ctx), Some(surf), Some(gl)) =
-                        (&fo.gl_context, &fo.gl_surface, &fo.gl)
-                    {
+                    if unchanged(fo.character.as_ref()) {
+                        return;
+                    }
+                    if let (Some(ctx), Some(surf)) = (&fo.gl_context, &fo.gl_surface) {
                         let _ = ctx.make_current(surf);
+                    }
+                    if let Some(gl) = fo.gl.as_ref() {
+                        if let Some(mut old) = fo.character.take() {
+                            old.destroy(gl);
+                        }
                         fo.character = CharacterOverlay::new(gl, ch_cfg, w, h).ok();
                     }
                 }
@@ -532,23 +553,40 @@ impl App {
                 if let (Some(ctx), Some(surf)) = (&fo.gl_context, &fo.gl_surface) {
                     let _ = ctx.make_current(surf);
                 }
-                fo.character = None;
+                if let Some(mut ch) = fo.character.take() {
+                    if let Some(gl) = fo.gl.as_ref() {
+                        ch.destroy(gl);
+                    }
+                }
                 fo.gl = None;
                 drop(fo.gl_surface.take());
                 drop(fo.gl_context.take());
             }
 
             // Build character in the background wallpaper GL context.
+            if !ch_cfg.enabled {
+                return;
+            }
+            if unchanged(self.outputs[idx].character.as_ref()) {
+                return;
+            }
             if let (Some(ctx), Some(surf)) = (
                 self.outputs[idx].gl_context.as_ref(),
                 self.outputs[idx].gl_surface.as_ref(),
             ) {
                 let _ = ctx.make_current(surf);
             }
-            if let Some(gl) = self.outputs[idx].gl.as_ref() {
-                let (w, h) = (self.outputs[idx].width, self.outputs[idx].height);
-                self.outputs[idx].character = CharacterOverlay::new(gl, ch_cfg, w, h).ok();
+            if let Some(mut old) = self.outputs[idx].character.take() {
+                if let Some(gl) = self.outputs[idx].gl.as_ref() {
+                    old.destroy(gl);
+                }
             }
+            let (w, h) = (self.outputs[idx].width, self.outputs[idx].height);
+            let fresh = self.outputs[idx]
+                .gl
+                .as_ref()
+                .map(|gl| CharacterOverlay::new(gl, ch_cfg, w, h).ok());
+            self.outputs[idx].character = fresh.flatten();
         }
     }
 
@@ -610,6 +648,9 @@ impl App {
                 })
             };
             let _ = fo.layer.wl_surface().set_buffer_scale(scale);
+            if let Some(mut old) = fo.character.take() {
+                old.destroy(&gl);
+            }
             fo.character = CharacterOverlay::new(&gl, ch_cfg, width, height).ok();
             fo.gl_surface = Some(gl_surface);
             fo.gl_context = Some(gl_context);
@@ -765,7 +806,7 @@ impl App {
             }
         }
         oc.last_render = Instant::now() - Duration::from_secs(1);
-        self.sync_character_surfaces(idx);
+        self.sync_character_surfaces(idx, false);
         self.update_audio_state();
 
         if self.outputs[idx].configured {
@@ -1802,7 +1843,7 @@ impl App {
 
                 let new_cfg = self.config.character.clone();
                 for idx in 0..self.outputs.len() {
-                    self.sync_character_surfaces(idx);
+                    self.sync_character_surfaces(idx, true);
                     self.outputs[idx].animating = true;
                     self.schedule_render(idx);
                 }
@@ -2138,7 +2179,11 @@ impl App {
             if let (Some(c), Some(s)) = (&fo.gl_context, &fo.gl_surface) {
                 let _ = c.make_current(s);
             }
-            fo.character = None;
+            if let Some(mut ch) = fo.character.take() {
+                if let Some(gl) = fo.gl.as_ref() {
+                    ch.destroy(gl);
+                }
+            }
             fo.gl = None;
             // Same ordering rule as below: the EGL surface must be destroyed
             // while its Wayland surface is alive.
@@ -2153,7 +2198,11 @@ impl App {
                 old.destroy(gl);
             }
         }
-        ctx.character = None;
+        if let Some(mut ch) = ctx.character.take() {
+            if let Some(gl) = ctx.gl.as_ref() {
+                ch.destroy(gl);
+            }
+        }
         ctx.gl = None;
         drop(ctx.gl_surface.take());
         drop(ctx.gl_context.take());
