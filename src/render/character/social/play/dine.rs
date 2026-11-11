@@ -32,6 +32,9 @@ pub(super) struct Order {
 
 pub(super) static ORDERS: Mutex<Vec<Order>> = Mutex::new(Vec::new());
 
+/// A stove's "diner" when the chef cooks for the counter, not for an order.
+pub(super) const PREP: usize = usize::MAX - 1;
+
 fn order_of(diner: usize) -> Option<Order> {
     ORDERS.lock().unwrap().iter().find(|o| o.diner == diner).cloned()
 }
@@ -64,7 +67,7 @@ impl CharacterOverlay {
 
     /// Where dishes are fetched and paid for: the serving counter, or the
     /// stove nearest the middle of the cafe. (strip px, counter id or 0)
-    fn pickup(&self) -> Option<(f32, u64)> {
+    pub(super) fn pickup(&self) -> Option<(f32, u64)> {
         let park = park_now();
         let things: Vec<&Thing> = park.things.iter().filter(|t| t.place == "cafe").collect();
         if let Some(c) = things.iter().find(|t| t.kind == "counter") {
@@ -106,6 +109,7 @@ impl CharacterOverlay {
         // an order nobody is working on any more (the chef or waiter was
         // picked up, say): back to the chef
         let handled: Vec<usize> = chats.iter().filter_map(|c| c.play.as_ref()).filter(|p| matches!(p.kind.as_str(), "stove" | "serve")).map(|p| p.diner).collect();
+        let _ = PREP;
         let queued: Vec<usize> = SERVE.lock().unwrap().iter().filter_map(|s| s.diner).collect();
         for o in ORDERS.lock().unwrap().iter_mut() {
             if o.state == Ask::Cooking && !handled.contains(&o.diner) && !queued.contains(&o.diner) {
@@ -130,6 +134,10 @@ impl CharacterOverlay {
                     }
                 }
             }
+        }
+        // nothing ordered: the chef cooks something for the counter (a few at most)
+        if !orders.iter().any(|o| o.state == Ask::Waiting) {
+            self.prep_for_counter(chats);
         }
         // the chef cooks the next order
         if let Some(o) = orders.iter().find(|o| o.state == Ask::Waiting) {
@@ -178,6 +186,31 @@ impl CharacterOverlay {
                         None => set_order(o.diner, |o| o.state = Ask::Failed),
                     }
                 }
+            }
+        }
+    }
+
+    /// The chef with nothing on: something for the serving counter, for
+    /// whoever's hungry later (at most three waiting there).
+    fn prep_for_counter(&mut self, chats: &mut Vec<Chat>) {
+        if playing_only() {
+            return;
+        }
+        let Some(chef) = self.on_duty("chef").filter(|&c| self.walk_ref(c).at_leisure() && self.walk_ref(c).act == Act::Idle) else { return };
+        let Some((_, counter)) = self.pickup().filter(|p| p.1 != 0) else { return };
+        if LIVE.lock().unwrap().dishes.iter().filter(|d| d.0 == counter).count() >= 3 {
+            return;
+        }
+        if park::read_pantry().values().filter(|&&v| v > 0).count() < 2 {
+            return;
+        }
+        let park = park_now();
+        let stove = park.things.iter().enumerate().find(|(k, t)| t.kind == "stove" && t.place == "cafe" && !chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.kind == "stove" && p.thing == *k)));
+        if let Some((k, _)) = stove {
+            log::debug!("cafe: the chef {chef} cooks for the counter");
+            self.start_play(chats, chef, k, "stove");
+            if let Some(p) = chats.iter_mut().rev().find_map(|c| c.play.as_mut().filter(|p| p.kind == "stove" && c.members.first() == Some(&chef))) {
+                p.diner = PREP;
             }
         }
     }

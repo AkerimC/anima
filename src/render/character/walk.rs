@@ -76,6 +76,8 @@ pub(super) struct WalkState {
     pub(super) visit_t: f32,
     pub(super) visit_from: u64,
     pub(super) fed_meal: u32,
+    // standing about doing nothing in the park, cafe or farm (s)
+    pub(super) idle_t: f32,
     // turned (radians) and sunk into the ground (half-heights)
     pub(super) rot: f32,
     // characters on the team

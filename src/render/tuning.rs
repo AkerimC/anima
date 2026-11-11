@@ -151,6 +151,7 @@ tuning! {
         hunger_time: "From full to starving, doing nothing (s)" = 2400.0, 60.0, 36000.0, 60.0, 0;
         hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
         play_tire: "Only playing: a go on the slide or swing tires them by" = 0.12, 0.0, 1.0, 0.01, 2;
+        idle_nudge: "Standing about in the park, cafe or farm for (s), then off to do something" = 20.0, 3.0, 600.0, 1.0, 0;
         hungry_nap: "Nothing to eat: a nap of (s)" = 240.0, 10.0, 3600.0, 10.0, 0;
         picnic_chance: "A meal cooked for oneself is eaten as a picnic in the park (share)" = 0.25, 0.0, 1.0, 0.05, 2;
         wage: "Coins each job pays every 20 minutes" = 5.0, 0.0, 100.0, 1.0, 0;
