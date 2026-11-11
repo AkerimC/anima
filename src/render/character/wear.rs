@@ -288,7 +288,7 @@ pub const JOB_GEAR: [(&str, [&str; 2]); 5] = [
     ("waiter", ["custom:bow_tie", "custom:tray"]),
     ("fisher", ["custom:fishing_hat", "custom:rubber_boot"]),
     ("farmer", ["custom:straw_hat", "custom:pitchfork"]),
-    ("attendant", ["custom:staff_cap", "custom:whistle"]),
+    ("attendant", ["custom:staff_cap", "custom:megaphone"]),
 ];
 
 /// `name` got `job`: its gear is theirs, and on.
