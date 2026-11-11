@@ -41,6 +41,7 @@ tuning! {
         fish_time: "Longest time (s)" = 1500.0, 10.0, 7200.0, 5.0, 0;
         fish_bored: "Bored enough to fish alone after (s)" = 90.0, 5.0, 1800.0, 5.0, 0;
         fish_bored_every: "Then goes fishing within about (s)" = 60.0, 1.0, 1800.0, 5.0, 0;
+        fish_glee: "Anglers have a happy moment while waiting (per s)" = 0.06, 0.0, 1.0, 0.01, 2;
         fish_join: "Passers-by join in (per s)" = 0.08, 0.0, 2.0, 0.01, 2;
         fish_most: "Most fishing together" = 5.0, 1.0, 12.0, 1.0, 0;
         fish_real: "A good catch is a real fish (share)" = 0.75, 0.0, 1.0, 0.05, 2;

@@ -209,6 +209,8 @@ struct Angler {
     blown: bool,
     // picked up: decides on landing whether it comes back
     thrown: bool,
+    // seconds left of a happy moment while it waits for a bite
+    glee: f32,
 }
 
 /// Fishing: everyone along the floor of the widest window.
@@ -218,6 +220,8 @@ struct Fishing {
     beast: Option<(f32, f32, f32)>,
     // no second one straight after
     beast_cool: f32,
+    // those watching: who, seconds till it does something else, who it's chatting with
+    idle: Vec<(usize, f32, Option<usize>)>,
 }
 
 /// What can come up on the line: prop kind, points, whether it's a good one.
@@ -2713,7 +2717,7 @@ impl CharacterOverlay {
         self.go(i, x, 0.14);
         log::debug!("chat {id}: {i} goes fishing");
         let mut c = Chat::new(id, vec![i], Stage::Fishing, 0.0);
-        c.fishing = Some(Fishing { anglers: vec![Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: x, blown: false, thrown: false }], beast: None, beast_cool: 8.0 });
+        c.fishing = Some(Fishing { anglers: vec![Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: x, blown: false, thrown: false, glee: 0.0 }], beast: None, beast_cool: 8.0, idle: Vec::new() });
         c.scores = vec![(i, 0.0)];
         c.step = 9;
         c.timer = 30.0;
@@ -2934,7 +2938,7 @@ impl CharacterOverlay {
 
     /// Now and then something comes up beside the anglers: they drop
     /// everything and run, and it sinks back after 2-3 seconds.
-    fn run_beast(&mut self, f: &mut Fishing, first: usize, dt: f32) {
+    fn run_beast(&mut self, f: &mut Fishing, first: usize, watchers: &[usize], dt: f32) {
         if let Some(b) = f.beast.as_mut() {
             b.1 += dt;
             if b.1 >= b.2 {
@@ -2971,6 +2975,108 @@ impl CharacterOverlay {
             let dir = if (at - x).abs() < 1.0 { -side } else { (at - x).signum() };
             let far = reach * (1.0 + self.walk.rand() * 0.5);
             self.go(a.i, (x + dir * far).clamp(0.0, width), 0.42);
+        }
+        // those watching run off too
+        for &w in watchers {
+            let at = self.strip_px(w);
+            if (at - x).abs() > reach * 1.3 {
+                continue;
+            }
+            let dir = if (at - x).abs() < 1.0 { -side } else { (at - x).signum() };
+            let far = reach * (1.2 + self.walk.rand() * 0.5);
+            if let Some(r) = self.walk_of(w).social.as_mut() {
+                r.happy = false;
+            }
+            self.go(w, (x + dir * far).clamp(0.0, width), 0.42);
+            if let Some(d) = f.idle.iter_mut().find(|d| d.0 == w) {
+                // looks back for a bit once it's safe
+                d.1 = 1.5 + self.walk.rand();
+                d.2 = None;
+            }
+        }
+    }
+
+    /// Those watching the anglers: stroll about the bank, stop to look, or
+    /// have a word with someone next to them.
+    fn fish_watchers(&mut self, c: &Chat, f: &mut Fishing, dt: f32) {
+        f.idle.retain(|d| c.watchers.contains(&d.0));
+        for &w in &c.watchers {
+            if !f.idle.iter().any(|d| d.0 == w) {
+                f.idle.push((w, 1.0 + self.walk.rand() * 2.0, None));
+            }
+        }
+        if f.beast.is_some() || f.anglers.is_empty() {
+            return;
+        }
+        let xs: Vec<f32> = f.anglers.iter().map(|a| a.at).collect();
+        let (lo, hi) = (xs.iter().copied().fold(f32::MAX, f32::min), xs.iter().copied().fold(f32::MIN, f32::max));
+        for k in 0..f.idle.len() {
+            let (w, mut t, mut with) = f.idle[k];
+            if !self.arrived(w) {
+                continue;
+            }
+            t -= dt;
+            if let Some(o) = with {
+                // talking: faces the other one and nods along now and then
+                self.face(w, o);
+                if self.walk.rand() < dt * 0.9 {
+                    self.walk_of(w).start_bob(tn().jump_height * 0.07);
+                }
+                if self.walk.rand() < dt * 0.25 {
+                    self.walk_of(w).gesture = true;
+                }
+            }
+            if t > 0.0 {
+                f.idle[k] = (w, t, with);
+                continue;
+            }
+            if with.take().is_some() {
+                if let Some(r) = self.walk_of(w).social.as_mut() {
+                    r.happy = false;
+                }
+            }
+            let size = self.width_of(w);
+            let width = self.strip_width_of(w);
+            let x = self.strip_px(w);
+            let roll = self.walk.rand();
+            // someone near to talk to: another watcher or an angler waiting for a bite
+            let near = c.watchers.iter().copied().filter(|&o| o != w && self.arrived(o))
+                .chain(f.anglers.iter().filter(|a| a.phase == 2 && !a.blown).map(|a| a.i))
+                .filter(|&o| (self.strip_px(o) - x).abs() < size * 2.5)
+                .min_by(|&a, &b| (self.strip_px(a) - x).abs().total_cmp(&(self.strip_px(b) - x).abs()));
+            if roll < 0.35 && near.is_some() {
+                let o = near.unwrap_or(w);
+                with = Some(o);
+                self.face(w, o);
+                let wk = self.walk_of(w);
+                if let Some(r) = wk.social.as_mut() {
+                    r.happy = true;
+                }
+                wk.gesture = true;
+                t = 2.5 + self.walk.rand() * 2.5;
+            } else if roll < 0.8 {
+                // a stroll along the bank, never right on top of an angler
+                let (a, b) = ((lo - size * 3.0).max(size), (hi + size * 3.0).min((width - size).max(size)));
+                let mut goal = x;
+                for _ in 0..6 {
+                    let g = a + self.walk.rand() * (b - a).max(1.0);
+                    if xs.iter().all(|&ax| (ax - g).abs() > size * 0.8) {
+                        goal = g;
+                        break;
+                    }
+                }
+                let pace = 0.1 + self.walk.rand() * 0.05;
+                self.go(w, goal, pace);
+                t = 1.5 + self.walk.rand() * 2.0;
+            } else {
+                // stops to look at the nearest rod
+                if let Some(a) = f.anglers.iter().min_by(|p, q| (self.strip_px(p.i) - x).abs().total_cmp(&(self.strip_px(q.i) - x).abs())) {
+                    let i = a.i;
+                    self.face(w, i);
+                }
+                t = 2.0 + self.walk.rand() * 2.0;
+            }
+            f.idle[k] = (w, t, with);
         }
     }
 
@@ -3056,7 +3162,7 @@ impl CharacterOverlay {
         c.scores.push((j, 0.0));
         self.go(j, spot, 0.14);
         if let Some(f) = c.fishing.as_mut() {
-            f.anglers.push(Angler { i: j, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: spot, blown: false, thrown: false });
+            f.anglers.push(Angler { i: j, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: spot, blown: false, thrown: false, glee: 0.0 });
         }
         log::debug!("chat {}: {j} sees them fishing and joins", c.id);
     }
@@ -3071,10 +3177,10 @@ impl CharacterOverlay {
         for (k, &i) in c.members.clone().iter().enumerate() {
             let at = lo + (k as f32 + 0.5) * slot;
             self.go(i, at, 0.16);
-            anglers.push(Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at, blown: false, thrown: false });
+            anglers.push(Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at, blown: false, thrown: false, glee: 0.0 });
         }
         log::debug!("chat {}: fishing, {} rods", c.id, anglers.len());
-        c.fishing = Some(Fishing { anglers, beast: None, beast_cool: 8.0 });
+        c.fishing = Some(Fishing { anglers, beast: None, beast_cool: 8.0, idle: Vec::new() });
         c.scores = c.members.iter().map(|&i| (i, 0.0)).collect();
         c.step = 9;
         c.timer = 40.0;
@@ -3107,7 +3213,9 @@ impl CharacterOverlay {
             c.fishing = Some(f);
             return;
         }
-        self.run_beast(&mut f, c.members[0], dt);
+        let watchers = c.watchers.clone();
+        self.run_beast(&mut f, c.members[0], &watchers, dt);
+        self.fish_watchers(c, &mut f, dt);
         let mut bored_off = Vec::new();
         for k in 0..f.anglers.len() {
             let mut a = f.anglers[k];
@@ -3182,6 +3290,29 @@ impl CharacterOverlay {
                 2 if a.t > a.wait => {
                     a.phase = 3;
                     a.t = 0.0;
+                    if a.glee > 0.0 {
+                        a.glee = 0.0;
+                        if let Some(r) = self.walk_of(a.i).social.as_mut() {
+                            r.happy = false;
+                        }
+                    }
+                }
+                2 => {
+                    if a.glee > 0.0 {
+                        a.glee -= dt;
+                        if a.glee <= 0.0 {
+                            if let Some(r) = self.walk_of(a.i).social.as_mut() {
+                                r.happy = false;
+                            }
+                        }
+                    } else if self.walk.rand() < dt * tn().fish_glee {
+                        a.glee = 1.2 + self.walk.rand();
+                        let wk = self.walk_of(a.i);
+                        if let Some(r) = wk.social.as_mut() {
+                            r.happy = true;
+                        }
+                        wk.start_bob(tn().jump_height * 0.08);
+                    }
                 }
                 3 if a.t > 0.9 => {
                     // quick enough? the more practice, the likelier
@@ -5116,8 +5247,13 @@ impl CharacterOverlay {
     /// Someone around sees a game going on: they come and stand by to watch,
     /// and join when it's over.
     fn try_watch(&mut self, c: &mut Chat, n: usize) {
+        let fishing = c.stage == Stage::Fishing;
+        // not before the anglers are in their places
+        if fishing && c.step == 9 {
+            return;
+        }
         for &w in &c.watchers.clone() {
-            if Some(w) != c.cheater && self.arrived(w) {
+            if !fishing && Some(w) != c.cheater && self.arrived(w) {
                 self.face(w, c.talker);
                 if self.walk.rand() < 0.12 {
                     self.walk_of(w).start_bob(tn().jump_height * 0.1);
