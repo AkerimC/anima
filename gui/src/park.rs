@@ -401,7 +401,7 @@ fn build(app: &adw::Application, place: &str) {
         header.pack_start(&book);
     }
     // who does what
-    let jobs = gtk::MenuButton::builder().label("Jobs").build();
+    let jobs = gtk::MenuButton::builder().label("Jobs & coins").build();
     let jpop = gtk::Popover::new();
     jobs.set_popover(Some(&jpop));
     let j2 = jpop.clone();
@@ -591,7 +591,21 @@ fn jobs_list() -> gtk::Widget {
         }
         list.append(&l);
     }
-    list.upcast()
+    // carrot coins: earned bringing food to the pantry, spent at the cafe
+    list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let row = gtk::Box::builder().spacing(8).build();
+    let pic = gtk::Image::from_file(park::food_picture("coin"));
+    pic.set_pixel_size(22);
+    row.append(&pic);
+    let head = gtk::Label::builder().label("<b>Carrot coins</b>").use_markup(true).xalign(0.0).build();
+    row.append(&head);
+    list.append(&row);
+    let mut w: Vec<(String, u32)> = park::read_wallets().into_iter().filter(|e| e.1 > 0).collect();
+    w.sort_by(|a, b| b.1.cmp(&a.1));
+    let text = if w.is_empty() { "Nobody has any yet: they earn them bringing food to the pantry".to_string() } else { w.iter().map(|(n, k)| format!("{n}: {k}")).collect::<Vec<_>>().join("\n") };
+    let l = gtk::Label::builder().label(text).xalign(0.0).wrap(true).max_width_chars(36).build();
+    list.append(&l);
+    gtk::ScrolledWindow::builder().child(&list).propagate_natural_height(true).max_content_height(640).min_content_width(300).build().upcast()
 }
 
 /// Every dish: what's been found (who by, how often made), the rest a "???".

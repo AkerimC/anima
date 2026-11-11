@@ -540,6 +540,8 @@ pub(super) const CREATURE: i32 = 41000;
 pub(super) const MATERIAL: i32 = 42000;
 /// A dish being carried: this plus its place in park::DISHES.
 pub(super) const FOOD: i32 = 44000;
+/// A carrot coin changing hands.
+pub(super) const COIN: i32 = 45000;
 
 fn grounded(wk: &WalkState) -> bool {
     matches!(wk.act, Act::Idle | Act::Walk)
@@ -3411,9 +3413,9 @@ impl CharacterOverlay {
                     }
                     // a fish or a carrot: into the kitchen's pantry too
                     if (FISH..CREATURE).contains(&a.item) {
-                        super::park::add_food("fish", 1);
+                        self.bring_food(a.i, "fish", 1);
                     } else if a.item == 0 {
-                        super::park::add_food("carrot", 1);
+                        self.bring_food(a.i, "carrot", 1);
                     }
                     // something for the park: into the chest
                     if let Some(&(id, label)) = (a.item >= MATERIAL).then(|| super::park::MATERIALS.get((a.item - MATERIAL) as usize)).flatten() {

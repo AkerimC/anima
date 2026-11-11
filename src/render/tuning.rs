@@ -140,6 +140,7 @@ tuning! {
         park_mode: "With the park window open: 0 desktop, 1 only the park, 2 the park and out now and then" = 2.0, 0.0, 2.0, 1.0, 0;
         park_play: "Someone free in the park goes to play (chance each look)" = 0.25, 0.0, 1.0, 0.05, 2;
         park_move_every: "Someone goes over to the park, cafe or farm about every (s)" = 90.0, 10.0, 3600.0, 10.0, 0;
+        dine_chance: "In the cafe with the chef in, someone comes to eat (chance each look)" = 0.3, 0.0, 1.0, 0.05, 2;
         cook_known: "A cook makes a recipe it knows instead of trying something new (share)" = 0.6, 0.0, 1.0, 0.05, 2;
         chase_chicken: "Someone free on the farm chases a hen (chance each look)" = 0.04, 0.0, 1.0, 0.01, 2;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;

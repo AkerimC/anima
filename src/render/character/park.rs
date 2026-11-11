@@ -507,3 +507,64 @@ pub fn add_work(name: &str, job: &str, k: f32) -> Option<String> {
     *JOBS_CACHE.lock().unwrap() = Some((std::time::Instant::now(), j));
     earned
 }
+
+// --- carrot coins: earned by bringing food to the pantry, spent at the cafe
+
+/// What bringing one of these to the pantry earns.
+pub fn food_worth(id: &str) -> u32 {
+    match id {
+        "fish" => 3,
+        "egg" | "milk" => 2,
+        _ => 1,
+    }
+}
+
+/// What a dish costs at the cafe (once it has a chef).
+pub fn dish_price(id: &str) -> u32 {
+    DISHES.iter().find(|d| d.0 == id).map_or(5, |d| 3 * d.2.len() as u32 + 2)
+}
+
+pub type Wallets = BTreeMap<String, u32>;
+
+pub fn wallets_path() -> PathBuf {
+    crate::util::data_dir().join("wallets.json")
+}
+
+pub fn read_wallets() -> Wallets {
+    std::fs::read_to_string(wallets_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn write_wallets(w: &Wallets) {
+    if let Ok(text) = serde_json::to_string_pretty(w) {
+        let _ = crate::util::atomic_write(&wallets_path(), text.as_bytes());
+    }
+}
+
+pub fn coins(name: &str) -> u32 {
+    read_wallets().get(name).copied().unwrap_or(0)
+}
+
+pub fn earn(name: &str, k: u32) {
+    let mut w = read_wallets();
+    *w.entry(name.to_string()).or_default() += k;
+    write_wallets(&w);
+}
+
+/// `from` pays `k`, shared out to `to` (who gets what share); false if it
+/// hasn't got that much.
+pub fn pay(from: &str, k: u32, to: &[(&str, f32)]) -> bool {
+    let mut w = read_wallets();
+    let have = w.get(from).copied().unwrap_or(0);
+    if have < k {
+        return false;
+    }
+    w.insert(from.to_string(), have - k);
+    let mut left = k;
+    for (n, (name, share)) in to.iter().enumerate() {
+        let part = if n + 1 == to.len() { left } else { ((k as f32 * share).round() as u32).min(left) };
+        left -= part;
+        *w.entry(name.to_string()).or_default() += part;
+    }
+    write_wallets(&w);
+    true
+}

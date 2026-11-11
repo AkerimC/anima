@@ -8,6 +8,8 @@ use std::time::{Instant, SystemTime};
 use super::*;
 use crate::render::character::park::{self, Park, Thing};
 
+mod dine;
+
 pub(super) struct Play {
     // which thing in the park list, and what it was when they started
     thing: usize,
@@ -22,6 +24,8 @@ pub(super) struct Play {
     // carrying it off the serving counter (its id), and is it the cook doing it
     counter: u64,
     by_cook: bool,
+    // cooking for / taking the order of this diner (usize::MAX: nobody)
+    diner: usize,
 }
 
 #[derive(Clone)]
@@ -125,6 +129,13 @@ impl CharacterOverlay {
     /// The farm's pier, if the farm is on `i`'s workspace (it can walk there).
     pub(super) fn pier_near(&self, i: usize) -> Option<(f32, f32)> {
         governor::place_rect("farm").filter(|p| p.ws == self.walk_ref(i).ws).map(|p| (p.x + park::PIER.0 * p.w, p.x + park::PIER.1 * p.w))
+    }
+
+    /// `i` brings `k` of `id` to the pantry, and is paid for it in carrot coins.
+    pub(super) fn bring_food(&mut self, i: usize, id: &str, k: u32) {
+        park::add_food(id, k);
+        let name = self.character_name(i);
+        park::earn(&name, park::food_worth(id) * k);
     }
 
     /// `i` has this job.
@@ -253,16 +264,22 @@ impl CharacterOverlay {
                 return;
             }
         }
+        // hungry in the cafe, the chef in: a seat at a table
+        if place == "cafe" && self.maybe_dine(chats, i) {
+            return;
+        }
         if self.walk_of(i).rand() >= tn().park_play {
             return;
         }
+        let restaurant = self.restaurant_open();
         // something with room; somewhere a friend is waiting counts for more
         let job = park::job_of(&self.character_name(i));
         let chef_here = (0..n).any(|j| j != i && self.is_job(j, "chef") && self.place_here(j).is_some_and(|p| p.place == place));
         let mut options: Vec<(usize, f32)> = Vec::new();
         for (k, t) in park.things.iter().enumerate() {
             let room = park::room(&t.kind);
-            if room == 0 || t.place != place {
+            // tables are for eating; the stove is the chef's once there is one
+            if room == 0 || t.place != place || t.kind == "table" || (restaurant && t.kind == "stove" && t.place == "cafe") {
                 continue;
             }
             let on = chats.iter().find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == t.kind));
@@ -274,8 +291,8 @@ impl CharacterOverlay {
             let mut weight = if waiting { 3.0 } else { 1.0 };
             // what its job is about draws it more; the chef's stove is the chef's
             weight *= match (job.as_deref(), t.kind.as_str()) {
-                (Some("attendant"), "slide" | "swing" | "seesaw" | "sandbox") => 4.0,
                 (Some("attendant"), "swing") if used == 1 => 6.0,
+                (Some("attendant"), "slide" | "swing" | "seesaw" | "sandbox") => 4.0,
                 (Some("chef"), "stove") => 6.0,
                 (Some("farmer"), "carrots" | "wheat" | "apple_tree" | "coop" | "barn") => 4.0,
                 (Some("waiter"), "table") => 2.0,
@@ -320,7 +337,7 @@ impl CharacterOverlay {
             "seesaw" => 10.0 + self.walk.rand() * 8.0,
             _ => 0.0,
         };
-        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay, meal: None, from: 0.0, counter: 0, by_cook: false });
+        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay, meal: None, from: 0.0, counter: 0, by_cook: false, diner: usize::MAX });
         log::debug!("chat {id}: {i} goes to the {kind}");
         chats.push(c);
     }
@@ -329,6 +346,36 @@ impl CharacterOverlay {
         let Some(mut p) = c.play.take() else { return false };
         let park = park_now();
         let thing = park.things.get(p.thing).filter(|t| t.kind == p.kind).cloned();
+        if p.kind == "order" {
+            let done = self.play_order(c, &mut p, dt);
+            if done {
+                return false;
+            }
+            c.play = Some(p);
+            return !c.members.is_empty();
+        }
+        if p.kind == "dine" {
+            let table = park.things.get(p.thing).filter(|t| t.kind == "table").cloned();
+            if let Some(t) = table {
+                p.riders.retain(|r| c.members.contains(&r.i));
+                for &i in &c.members {
+                    if !p.riders.iter().any(|r| r.i == i) {
+                        p.riders.push(Rider { i, phase: 0, t: 0.0, n: 0, want: 0 });
+                    }
+                }
+                p.t += dt;
+                let unit = self.park_unit(self.extras.len() + 1);
+                let mid = self.thing_px(&t);
+                if !self.play_dine(c, &mut p, &t, mid, unit, dt) {
+                    c.play = Some(p);
+                    return !c.members.is_empty();
+                }
+            }
+            for &i in &c.members.clone() {
+                self.let_down(i);
+            }
+            return false;
+        }
         if p.kind == "serve" {
             let table = park.things.get(p.thing).filter(|t| t.kind == "table").cloned();
             let done = match table {
@@ -756,7 +803,13 @@ impl CharacterOverlay {
         }
         // decide what to make, once there
         if p.meal.is_none() {
-            match self.choose_meal(cook) {
+            let choice = self.choose_meal(cook);
+            if choice.is_none() && p.diner != usize::MAX {
+                // nothing to cook it with
+                self.order_failed(p.diner);
+                return true;
+            }
+            match choice {
                 Some(m) => {
                     log::debug!("chat {}: {cook} cooks {:?} -> {}", c.id, m.stuff, m.dish);
                     p.meal = Some(m);
@@ -820,6 +873,14 @@ impl CharacterOverlay {
                 let secs = tn().laugh_time;
                 wk.laugh(secs);
             }
+            // a diner's order: to them, or burnt and made again
+            if p.diner != usize::MAX {
+                let dish = (!m.burnt).then(|| m.dish.clone());
+                self.order_cooked(p.diner, dish, mid);
+                p.t = p.stay;
+                p.meal = Some(Meal { dish: String::new(), ..m });
+                return false;
+            }
             // onto the nearest table in this room, if there's a free one
             let park = park_now();
             let table = park
@@ -845,9 +906,9 @@ impl CharacterOverlay {
                 match (helper, counter) {
                     (h, Some((cid, cx))) => {
                         LIVE.lock().unwrap().dishes.push((cid, m.dish.clone(), 1.0));
-                        SERVE.lock().unwrap().push(Serve { who: h.unwrap_or(cook), table: k, dish: m.dish.clone(), from: cx, counter: cid, by_cook: h.is_none() });
+                        SERVE.lock().unwrap().push(Serve { who: h.unwrap_or(cook), table: k, dish: m.dish.clone(), from: cx, counter: cid, by_cook: h.is_none(), diner: None });
                     }
-                    (Some(h), None) => SERVE.lock().unwrap().push(Serve { who: h, table: k, dish: m.dish.clone(), from: mid, counter: 0, by_cook: false }),
+                    (Some(h), None) => SERVE.lock().unwrap().push(Serve { who: h, table: k, dish: m.dish.clone(), from: mid, counter: 0, by_cook: false, diner: None }),
                     (None, None) => LIVE.lock().unwrap().dishes.push((id, m.dish.clone(), 1.0)),
                 }
                 p.meal = Some(Meal { dish: format!("table:{k}"), ..m });
@@ -939,7 +1000,7 @@ impl CharacterOverlay {
                         "coop" => ("egg", ready),
                         _ => ("milk", ready),
                     };
-                    park::add_food(food, k);
+                    self.bring_food(r.i, food, k);
                     farm.insert(key, park::now());
                     park::write_farm(&farm);
                     self.work(r.i, "farmer", 2.0);
@@ -1009,6 +1070,16 @@ impl CharacterOverlay {
                 if go(self, spot) {
                     let dish = p.meal.as_ref().map_or_else(|| "bread".to_string(), |m| m.dish.clone());
                     LIVE.lock().unwrap().dishes.push((t.id, dish, 1.0));
+                    if p.diner != usize::MAX {
+                        let w = r.i;
+                        dine::set_order(p.diner, |o| {
+                            o.state = dine::Ask::Served;
+                            o.waiter = Some(w);
+                        });
+                        p.riders[0] = r;
+                        self.work(r.i, "waiter", 2.0);
+                        return true;
+                    }
                     if !p.by_cook {
                         self.work(r.i, "waiter", 2.0);
                     }
@@ -1026,6 +1097,7 @@ impl CharacterOverlay {
 
     /// The dish in the hands of whoever is carrying it.
     pub(super) fn serve_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
+        self.dine_props(v);
         for c in self.chats.iter().filter(|c| c.stage == Stage::Play) {
             let Some(p) = c.play.as_ref().filter(|p| p.kind == "serve") else { continue };
             let Some(r) = p.riders.first().filter(|r| r.phase == 2) else { continue };
@@ -1125,6 +1197,8 @@ struct Serve {
     from: f32,
     counter: u64,
     by_cook: bool,
+    // a diner's order, when it's one
+    diner: Option<usize>,
 }
 
 static SERVE: Mutex<Vec<Serve>> = Mutex::new(Vec::new());
@@ -1314,9 +1388,10 @@ impl CharacterOverlay {
     /// Every frame: the hens and cows potter about (and run from whoever is
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
+        self.restaurant_tick(chats);
         // a dish to carry: off to the stove for it
         let serve: Vec<Serve> = std::mem::take(&mut *SERVE.lock().unwrap());
-        for Serve { who: i, table: k, dish, from, counter, by_cook } in serve {
+        for Serve { who: i, table: k, dish, from, counter, by_cook, diner } in serve {
             if i >= n {
                 continue;
             }
@@ -1335,6 +1410,7 @@ impl CharacterOverlay {
                     p.from = from;
                     p.counter = counter;
                     p.by_cook = by_cook;
+                    p.diner = diner.unwrap_or(usize::MAX);
                 }
             }
         }
