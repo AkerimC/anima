@@ -255,17 +255,26 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
     try_group.add(&tries);
     page.add(&try_group);
     // the park: a window of its own they can live in
-    let park_group = adw::PreferencesGroup::builder().title("Park").description("A window of its own on an empty workspace. The characters live there while it's open (you pick how in its top bar), and what they find while fishing goes into its chest.").build();
-    let open = gtk::Button::builder().label("Open the park").valign(gtk::Align::Center).build();
-    open.add_css_class("suggested-action");
-    open.connect_clicked(|_| {
-        if let Ok(me) = std::env::current_exe() {
-            let _ = std::process::Command::new(me).arg("--park").spawn();
+    let park_group = adw::PreferencesGroup::builder().title("Park, cafe and farm").description("Windows of their own, each on an empty workspace. The characters live in them while they're open (you pick how in their top bar), going from one to another. What they find while fishing goes into the chest; the farm's pond is where they fish, its beds, hens and cows fill the pantry, and the cafe cooks it.").build();
+    for (arg, title, sub) in [
+        ("--world", "All three", "Park, cafe and farm at once"),
+        ("--park", "Anima Park", "Slide, swings, seesaw, sandbox"),
+        ("--cafe", "Anima Cafe", "Stove and tables: cooking, finding recipes, eating together"),
+        ("--farm", "Anima Farm", "A pond with a pier for fishing, beds, hens and cows"),
+    ] {
+        let open = gtk::Button::builder().label("Open").valign(gtk::Align::Center).build();
+        if arg == "--world" {
+            open.add_css_class("suggested-action");
         }
-    });
-    let row = adw::ActionRow::builder().title("Anima Park").subtitle("Sky, grass and the chest").build();
-    row.add_suffix(&open);
-    park_group.add(&row);
+        open.connect_clicked(move |_| {
+            if let Ok(me) = std::env::current_exe() {
+                let _ = std::process::Command::new(me).arg(arg).spawn();
+            }
+        });
+        let row = adw::ActionRow::builder().title(title).subtitle(sub).build();
+        row.add_suffix(&open);
+        park_group.add(&row);
+    }
     page.add(&park_group);
     page.upcast()
 }

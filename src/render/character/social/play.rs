@@ -16,7 +16,68 @@ pub(super) struct Play {
     t: f32,
     // how long this go lasts
     stay: f32,
+    // at the stove: what's in the pot
+    meal: Option<Meal>,
 }
+
+#[derive(Clone)]
+struct Meal {
+    dish: String,
+    new: bool,
+    burnt: bool,
+    stuff: Vec<String>,
+}
+
+/// A hen or a cow on the farm, belonging to a coop or barn (by id).
+struct Beast {
+    home: u64,
+    kind: &'static str,
+    x: f32,
+    goal: f32,
+    left: bool,
+    wait: f32,
+    hop: f32,
+    // running from someone: how fast, for how long still
+    flee: f32,
+    flee_t: f32,
+}
+
+/// Animals, what's on the stoves and tables: kept here, drawn by the windows.
+struct Live {
+    beasts: Vec<Beast>,
+    stoves: Vec<(u64, String, f32)>,
+    dishes: Vec<(u64, String, f32)>,
+    written: Option<Instant>,
+    last: Option<park::World>,
+    seed: u32,
+}
+
+static LIVE: Mutex<Live> = Mutex::new(Live { beasts: Vec::new(), stoves: Vec::new(), dishes: Vec::new(), written: None, last: None, seed: 7 });
+
+fn live_rand(l: &mut Live) -> f32 {
+    l.seed ^= l.seed << 13;
+    l.seed ^= l.seed >> 17;
+    l.seed ^= l.seed << 5;
+    (l.seed % 10000) as f32 / 10000.0
+}
+
+fn set_stove(id: u64, state: &str, k: f32) {
+    let mut l = LIVE.lock().unwrap();
+    l.stoves.retain(|s| s.0 != id);
+    if !state.is_empty() {
+        l.stoves.push((id, state.to_string(), k));
+    }
+}
+
+fn dish_on(table: u64) -> Option<(String, f32)> {
+    LIVE.lock().unwrap().dishes.iter().find(|d| d.0 == table).map(|d| (d.1.clone(), d.2))
+}
+
+/// The place of the workspace `ws`, if it's the park, cafe or farm.
+fn place_of(ws: u64) -> Option<String> {
+    governor::place_on(ws)
+}
+
 
 #[derive(Clone, Copy)]
 struct Rider {
@@ -52,6 +113,11 @@ fn park_now() -> Park {
 }
 
 impl CharacterOverlay {
+    /// On the farm: the pier's stretch of floor (strip px), where they fish.
+    pub(super) fn pier_of(&self, i: usize) -> Option<(f32, f32)> {
+        (place_of(self.walk_ref(i).ws).as_deref() == Some("farm")).then(|| (park::PIER.0 * self.view_w, park::PIER.1 * self.view_w))
+    }
+
     fn height_of(&self, i: usize) -> f32 {
         let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
         (r[3] - r[1]).max(1.0)
@@ -65,7 +131,7 @@ impl CharacterOverlay {
 
     /// Tells the park window how big a character is, so it draws things to fit.
     pub(super) fn park_tell_unit(&mut self, n: usize) {
-        if governor::park_workspace().is_none() || self.view_w < 1.0 {
+        if governor::places().is_empty() || self.view_w < 1.0 {
             return;
         }
         let frac = self.park_unit(n) / self.view_w;
@@ -127,21 +193,31 @@ impl CharacterOverlay {
     /// Once in a while someone free in the park goes to play on something
     /// there, or joins whoever is on it already.
     pub(super) fn park_play(&mut self, chats: &mut Vec<Chat>, n: usize) {
-        let Some(ws) = governor::park_workspace() else { return };
-        let park = park_now();
-        if park.things.is_empty() {
+        let homes = governor::places();
+        if homes.is_empty() {
             return;
         }
+        let park = park_now();
         let who: Vec<usize> = (0..n)
             .filter(|&i| {
                 let wk = self.walk_ref(i);
-                wk.ws == ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none() && chat_cool(wk) <= tn().overlap_cool && wk.energy >= tn().energy_watch_need
+                homes.iter().any(|h| h.1 == wk.ws) && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none() && chat_cool(wk) <= tn().overlap_cool && wk.energy >= tn().energy_watch_need
             })
             .collect();
         if who.is_empty() {
             return;
         }
         let i = who[(self.walk.rand() * who.len() as f32) as usize % who.len()];
+        let place = place_of(self.walk_ref(i).ws).unwrap_or_default();
+        // on the farm: now and then after a hen instead
+        if place == "farm" && self.walk_of(i).rand() < tn().chase_chicken {
+            let hens: Vec<usize> = LIVE.lock().unwrap().beasts.iter().enumerate().filter(|b| b.1.kind == "chicken" && b.1.flee_t <= 0.0).map(|b| b.0).collect();
+            let taken: Vec<usize> = chats.iter().filter_map(|c| c.play.as_ref()).filter(|p| p.kind == "chase").map(|p| p.thing).collect();
+            if let Some(&k) = hens.iter().find(|k| !taken.contains(k)) {
+                self.start_play(chats, i, k, "chase");
+                return;
+            }
+        }
         if self.walk_of(i).rand() >= tn().park_play {
             return;
         }
@@ -149,7 +225,7 @@ impl CharacterOverlay {
         let mut options: Vec<(usize, f32)> = Vec::new();
         for (k, t) in park.things.iter().enumerate() {
             let room = park::room(&t.kind);
-            if room == 0 {
+            if room == 0 || t.place != place {
                 continue;
             }
             let on = chats.iter().find(|c| c.stage == Stage::Play && c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == t.kind));
@@ -196,7 +272,7 @@ impl CharacterOverlay {
             "seesaw" => 10.0 + self.walk.rand() * 8.0,
             _ => 0.0,
         };
-        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay });
+        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay, meal: None });
         log::debug!("chat {id}: {i} goes to the {kind}");
         chats.push(c);
     }
@@ -205,7 +281,18 @@ impl CharacterOverlay {
         let Some(mut p) = c.play.take() else { return false };
         let park = park_now();
         let thing = park.things.get(p.thing).filter(|t| t.kind == p.kind).cloned();
-        let Some(thing) = thing.filter(|_| governor::park_workspace().is_some()) else {
+        if p.kind == "chase" {
+            let done = self.play_chase(c, &mut p, dt);
+            if done {
+                for &i in &c.members.clone() {
+                    self.let_down(i);
+                }
+                return false;
+            }
+            c.play = Some(p);
+            return !c.members.is_empty();
+        }
+        let Some(thing) = thing.filter(|t| governor::place_workspace(&t.place).is_some()) else {
             // taken down, or the park closed: off they get
             for &i in &c.members.clone() {
                 self.let_down(i);
@@ -225,20 +312,43 @@ impl CharacterOverlay {
         p.t += dt;
         let unit = self.park_unit(self.extras.len() + 1);
         let mid = self.thing_px(&thing);
-        let done = match thing.kind.as_str() {
+        let mut done = match thing.kind.as_str() {
             "slide" => self.play_slide(c, &mut p, &thing, mid, unit, dt),
             "swing" => self.play_swing(c, &mut p, mid, unit, dt),
             "seesaw" => self.play_seesaw(c, &mut p, mid, unit, dt),
             "chair" | "bench" => self.play_sit(c, &mut p, &thing, mid, unit),
-            "table" => self.play_table(c, &mut p, mid, unit, dt),
-            "stove" => self.play_stove(c, &mut p, mid, unit, dt),
+            "table" => self.play_table(c, &mut p, &thing, mid, unit, dt),
+            "stove" => self.play_stove(c, &mut p, &thing, mid, unit, dt),
+            "carrots" | "wheat" | "apple_tree" | "coop" | "barn" => self.play_farm(c, &mut p, &thing, mid, unit, dt),
             "sandbox" => self.play_sandbox(c, &mut p, mid, unit, dt),
             _ => true,
         };
+        if done && thing.kind == "stove" {
+            if let Some(k) = p.meal.as_ref().and_then(|m| m.dish.strip_prefix("table:")).and_then(|k| k.parse::<usize>().ok()) {
+                let mut q = PENDING.lock().unwrap();
+                for r in &p.riders {
+                    q.push((r.i, k));
+                }
+                // and whoever else is about in the room
+                let ws = self.walk_ref(p.riders[0].i).ws;
+                let mut more = 0;
+                for j in 0..self.extras.len() + 1 {
+                    if more < 2 && !p.riders.iter().any(|r| r.i == j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure() {
+                        q.push((j, k));
+                        more += 1;
+                    }
+                }
+            }
+        }
         if done {
             for &i in &c.members.clone() {
                 self.let_down(i);
+                self.leave(i, c.id);
             }
+            c.members.clear();
+            done = true;
+        }
+        if done {
             return false;
         }
         c.play = Some(p);
@@ -494,8 +604,9 @@ impl CharacterOverlay {
         p.t > p.stay
     }
 
-    /// Round the table, chatting; alone it waits a while for company.
-    fn play_table(&mut self, c: &mut Chat, p: &mut Play, mid: f32, unit: f32, dt: f32) -> bool {
+    /// Round the table, chatting; alone it waits a while for company. With
+    /// a dish on it, they eat it together and get closer.
+    fn play_table(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
         let spots = [mid - 0.85 * unit, mid + 0.85 * unit, mid - 1.3 * unit, mid + 1.3 * unit];
         for k in 0..p.riders.len().min(4) {
             let i = p.riders[k].i;
@@ -509,17 +620,52 @@ impl CharacterOverlay {
                 }
             }
         }
+        if let Some((dish, left)) = dish_on(t.id) {
+            let eaters: Vec<usize> = p.riders.iter().filter(|r| r.phase == 1).map(|r| r.i).collect();
+            if !eaters.is_empty() {
+                // a bite now and then, happy about it
+                for &i in &eaters {
+                    if self.walk.rand() < dt * 0.9 {
+                        self.walk_of(i).start_bob(tn().jump_height * 0.07);
+                    }
+                    let glad = dish != "burnt" || self.walk.rand() < 0.5;
+                    self.set_happy(i, glad);
+                }
+                let left = left - dt * 0.018 * eaters.len() as f32;
+                let mut l = LIVE.lock().unwrap();
+                if left <= 0.0 {
+                    l.dishes.retain(|d| d.0 != t.id);
+                    drop(l);
+                    log::debug!("chat {}: the {dish} is all eaten", c.id);
+                    for (a, &x) in eaters.iter().enumerate() {
+                        for &y in &eaters[a + 1..] {
+                            self.add_bond(x, y, tn().bond_game * 1.5, 0.0);
+                        }
+                        let wk = self.walk_of(x);
+                        wk.start_jump(tn().jump_height * 0.6);
+                    }
+                    p.stay = p.t + 3.0;
+                } else if let Some(d) = l.dishes.iter_mut().find(|d| d.0 == t.id) {
+                    d.2 = left;
+                }
+                return false;
+            }
+            // food waiting: nobody leaves before it's eaten
+            p.stay = p.stay.max(p.t + 5.0);
+        }
         if c.members.len() >= 2 {
             self.chatter(c, dt);
-        } else if p.t > 15.0 {
+        } else if p.t > 15.0 && dish_on(t.id).is_none() {
             return true;
         }
         p.t > p.stay
     }
 
-    /// Cooking: busy hands and little hops, then a happy jump when it's ready;
-    /// whoever came to wait cheers.
-    fn play_stove(&mut self, c: &mut Chat, p: &mut Play, mid: f32, unit: f32, dt: f32) -> bool {
+    /// At the stove: the cook takes what's in the pantry and cooks, a recipe
+    /// it knows or something new; others come and wait. Little hops while it
+    /// cooks; a new recipe found, a happy jump; burnt, a hop back and the
+    /// others laugh. What's made goes on the nearest table to be eaten.
+    fn play_stove(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
         for k in 0..p.riders.len() {
             let i = p.riders[k].i;
             let spot = if k == 0 { mid } else { mid + (if k % 2 == 1 { 1.0 } else { -1.0 }) * (0.8 + 0.4 * (k / 2) as f32) * unit };
@@ -531,28 +677,250 @@ impl CharacterOverlay {
                 }
                 continue;
             }
-            if k == 0 {
-                if self.walk.rand() < dt * 1.2 {
-                    self.walk_of(i).gesture = true;
-                }
-                if self.walk.rand() < dt * 0.8 {
-                    self.walk_of(i).start_bob(tn().jump_height * 0.08);
-                }
-            } else {
+            if k > 0 {
                 self.face(i, p.riders[0].i);
             }
         }
-        if p.t > p.stay && p.riders[0].phase == 1 {
-            for r in p.riders.clone() {
-                let wk = self.walk_of(r.i);
-                wk.start_jump(tn().jump_height * 0.7);
+        let cook = p.riders[0].i;
+        if p.riders[0].phase != 1 {
+            return false;
+        }
+        // decide what to make, once there
+        if p.meal.is_none() {
+            match self.choose_meal(cook) {
+                Some(m) => {
+                    log::debug!("chat {}: {cook} cooks {:?} -> {}", c.id, m.stuff, m.dish);
+                    p.meal = Some(m);
+                    p.stay = 8.0 + self.walk.rand() * 6.0;
+                    p.t = 0.0;
+                }
+                // nothing in the pantry: a look round and off
+                None => return p.t > 4.0,
+            }
+        }
+        let Some(m) = p.meal.clone() else { return true };
+        if p.t < p.stay {
+            set_stove(t.id, "cooking", p.t / p.stay);
+            if self.walk.rand() < dt * 0.8 {
+                self.walk_of(cook).start_bob(tn().jump_height * 0.08);
+            }
+            // the others can smell it
+            for r in p.riders.clone().iter().skip(1) {
+                if self.walk.rand() < dt * 0.3 {
+                    self.walk_of(r.i).start_bob(tn().jump_height * 0.1);
+                }
+            }
+            return false;
+        }
+        if p.riders[0].phase == 1 && p.riders[0].n == 0 {
+            p.riders[0].n = 1;
+            self.practice(&[cook], "cooking");
+            let name = self.character_name(cook);
+            let mut book = park::read_book();
+            if m.burnt {
+                set_stove(t.id, "burnt", 1.0);
+                if !m.new && park::dish_of(m.stuff.iter().map(|x| x.as_str()).collect()).is_none() {
+                    let mut stuff = m.stuff.clone();
+                    stuff.sort();
+                    if !book.failed.contains(&stuff) {
+                        book.failed.push(stuff);
+                    }
+                }
+                park::write_book(&book);
+                let wk = self.walk_of(cook);
+                wk.start_jump(tn().jump_height * 0.35);
+                for r in p.riders.clone().iter().skip(1) {
+                    self.set_happy(r.i, true);
+                    let wk = self.walk_of(r.i);
+                    wk.start_jump(tn().jump_height * 0.4);
+                    let secs = tn().laugh_time * 0.6;
+                    wk.laugh(secs);
+                }
+            } else {
+                set_stove(t.id, "done", 1.0);
+                let e = book.found.entry(m.dish.clone()).or_insert(park::Found { by: name.clone(), times: 0 });
+                e.times += 1;
+                park::write_book(&book);
+                if m.new {
+                    tell(&format!("{name} found a new recipe: {}!", park::dish_label(&m.dish)));
+                }
+                self.set_happy(cook, true);
+                let wk = self.walk_of(cook);
+                wk.start_jump(tn().jump_height * if m.new { 1.2 } else { 0.7 });
                 let secs = tn().laugh_time;
                 wk.laugh(secs);
             }
+            // onto the nearest table in this room, if there's a free one
+            let park = park_now();
+            let table = park
+                .things
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| x.kind == "table" && x.place == t.place && dish_on(x.id).is_none())
+                .min_by(|a, b| (a.1.x - t.x).abs().total_cmp(&(b.1.x - t.x).abs()))
+                .map(|(k, x)| (k, x.id));
+            if let Some((k, id)) = table.filter(|_| !m.burnt) {
+                LIVE.lock().unwrap().dishes.push((id, m.dish.clone(), 1.0));
+                p.meal = Some(Meal { dish: format!("table:{k}"), ..m });
+            }
+            p.t = p.stay;
+        }
+        // a moment to see it, then off to eat
+        if p.t > p.stay + 2.5 {
+            set_stove(t.id, "", 0.0);
             return true;
         }
-        let _ = c;
         false
+    }
+
+    /// What the cook makes: a known recipe it has the things for, or a new
+    /// mix (never one that went wrong before). None with too little in the pantry.
+    fn choose_meal(&mut self, cook: usize) -> Option<Meal> {
+        let pantry = park::read_pantry();
+        let have: Vec<&str> = park::INGREDIENTS.iter().map(|x| x.0).filter(|x| pantry.get(*x).copied().unwrap_or(0) > 0).collect();
+        if have.len() < 2 {
+            return None;
+        }
+        let book = park::read_book();
+        let known: Vec<&(&str, &str, &[&str])> = park::DISHES.iter().filter(|d| book.found.contains_key(d.0) && d.2.iter().all(|x| have.contains(x))).collect();
+        let stuff: Vec<&str> = if !known.is_empty() && self.walk.rand() < tn().cook_known {
+            known[(self.walk.rand() * known.len() as f32) as usize % known.len()].2.to_vec()
+        } else {
+            // something new: two or three things it hasn't tried together
+            let mut pick = Vec::new();
+            for _ in 0..8 {
+                let mut pool = have.clone();
+                let want = if pool.len() >= 3 && self.walk.rand() < 0.4 { 3 } else { 2 };
+                let mut mix = Vec::new();
+                for _ in 0..want {
+                    let k = (self.walk.rand() * pool.len() as f32) as usize % pool.len();
+                    mix.push(pool.swap_remove(k));
+                }
+                let mut sorted: Vec<String> = mix.iter().map(|x| x.to_string()).collect();
+                sorted.sort();
+                pick = mix;
+                if !book.failed.contains(&sorted) {
+                    break;
+                }
+            }
+            pick
+        };
+        if !park::take_food(&stuff) {
+            return None;
+        }
+        let dish = park::dish_of(stuff.clone());
+        let skill = self.skill(cook, "cooking");
+        // beginners burn things now and then, even what they know
+        let burnt = dish.is_none() || self.walk.rand() < 0.03 + 0.22 * (1.0 - skill);
+        let id = dish.unwrap_or("burnt").to_string();
+        let new = dish.is_some() && !burnt && !book.found.contains_key(&id);
+        Some(Meal { dish: if burnt { "burnt".into() } else { id }, new, burnt, stuff: stuff.iter().map(|x| x.to_string()).collect() })
+    }
+
+    /// On the farm: dig up what's ripe (or water it so it grows faster),
+    /// take the eggs from the coop, milk the cows.
+    fn play_farm(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
+        let _ = c;
+        for k in 0..p.riders.len() {
+            let mut r = p.riders[k];
+            let spot = mid + (k as f32 - 0.5) * 0.5 * unit;
+            if r.phase == 0 {
+                if !self.walk_ref(r.i).social.is_some_and(|s| s.moving) && (self.strip_px(r.i) - spot).abs() > 6.0 && self.arrived(r.i) {
+                    self.go(r.i, spot, 0.14);
+                } else if self.arrived(r.i) && (self.strip_px(r.i) - spot).abs() <= 6.0 {
+                    r.phase = 1;
+                    r.t = 0.0;
+                    self.set_face(r.i, spot > mid);
+                }
+                p.riders[k] = r;
+                continue;
+            }
+            r.t += dt;
+            if r.phase == 1 && r.t > 1.5 {
+                r.phase = 2;
+                let mut farm = park::read_farm();
+                let (_, ready) = park::farm_state(t, &farm);
+                let key = t.id.to_string();
+                if ready > 0 {
+                    let (food, k) = match t.kind.as_str() {
+                        "carrots" => ("carrot", 2),
+                        "wheat" => ("wheat", 2),
+                        "apple_tree" => ("apple", ready),
+                        "coop" => ("egg", ready),
+                        _ => ("milk", ready),
+                    };
+                    park::add_food(food, k);
+                    farm.insert(key, park::now());
+                    park::write_farm(&farm);
+                    log::debug!("{} takes {k} {food}", r.i);
+                    self.set_happy(r.i, true);
+                    let wk = self.walk_of(r.i);
+                    wk.start_jump(tn().jump_height * 0.6);
+                } else {
+                    // nothing yet: tends it, and it comes on a little faster
+                    let push = match t.kind.as_str() {
+                        "carrots" | "wheat" => park::CROP_GROW * 0.12,
+                        "apple_tree" => park::APPLE_GROW * 0.1,
+                        _ => 0.0,
+                    };
+                    if push > 0.0 {
+                        let since = farm.get(&key).copied().unwrap_or_else(park::now);
+                        farm.insert(key, since - push);
+                        park::write_farm(&farm);
+                    }
+                    self.walk_of(r.i).start_bob(tn().jump_height * 0.12);
+                }
+            }
+            if r.phase == 2 && self.walk.rand() < dt * 0.6 {
+                self.walk_of(r.i).start_bob(tn().jump_height * 0.08);
+            }
+            p.riders[k] = r;
+        }
+        p.t > 6.0
+    }
+
+    /// After a hen: it runs off, slower and slower, and once caught it hops
+    /// and the chaser jumps for joy.
+    fn play_chase(&mut self, c: &mut Chat, p: &mut Play, dt: f32) -> bool {
+        let _ = c;
+        p.t += dt;
+        let i = p.riders.first().map_or(c.members[0], |r| r.i);
+        if p.riders.is_empty() {
+            p.riders.push(Rider { i, phase: 0, t: 0.0, n: 0, want: 0 });
+        }
+        let unit = self.park_unit(self.extras.len() + 1);
+        let w = self.view_w.max(1.0);
+        let me = self.strip_px(i);
+        let mut l = LIVE.lock().unwrap();
+        let Some(b) = l.beasts.get_mut(p.thing) else { return true };
+        let at = b.x * w;
+        let d = at - me;
+        if d.abs() < unit * 2.2 {
+            // runs off, tiring
+            let tired = (1.0 - p.t / 9.0).max(0.15);
+            b.flee = d.signum() * 0.09 * tired;
+            b.flee_t = 0.3;
+        }
+        let caught = d.abs() < unit * 0.45 && p.t > 2.5;
+        if caught {
+            b.hop = 1.0;
+            b.flee_t = 1.5;
+            b.flee = d.signum() * 0.05;
+        }
+        drop(l);
+        if caught {
+            self.set_happy(i, true);
+            let wk = self.walk_of(i);
+            wk.start_jump(tn().jump_height * 1.0);
+            let secs = tn().laugh_time;
+            wk.laugh(secs);
+            log::debug!("{i} caught a hen");
+            return true;
+        }
+        if self.arrived(i) || self.walk.rand() < dt * 4.0 {
+            self.run_to(i, at, 0.42);
+        }
+        p.t > 14.0
     }
 
     /// Down in the sand, digging, moving to another corner now and then.
@@ -582,6 +950,9 @@ impl CharacterOverlay {
         p.t > p.stay
     }
 }
+
+/// Cooks and those who waited, off to eat at a table: (who, table index).
+static PENDING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Picked by a right double click: (who, when).
 static PICKED: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
@@ -658,12 +1029,11 @@ impl CharacterOverlay {
             wk.rot = 0.0;
         }
         // something in the park under the click: play on it
-        let park_ws = governor::park_workspace();
-        if park_ws.is_some() && park_ws == Some(self.walk_ref(i).ws) {
+        if let Some(place) = place_of(self.walk_ref(i).ws) {
             let park = park_now();
             let unit = self.park_unit(n);
             let ground = { let r = self.actor_ref(i).hit_rect; r[1] + (r[3] - r[1]) * self.actor_ref(i).opaque[2] };
-            let on = park.things.iter().enumerate().filter(|(_, t)| park::room(&t.kind) > 0).find(|(_, t)| {
+            let on = park.things.iter().enumerate().filter(|(_, t)| park::room(&t.kind) > 0 && t.place == place).find(|(_, t)| {
                 (px - self.thing_px(t)).abs() <= park::width(t) * unit * 0.5 && p[1] >= ground - 2.0 * unit
             });
             if let Some((k, t)) = on {
@@ -734,9 +1104,10 @@ impl CharacterOverlay {
         out
     }
 
-    /// Which swings and seesaws are in use, for the park window (it hides
-    /// their resting ropes and board then). Written when that changes.
-    pub(super) fn park_tell_busy(&self) {
+    /// The windows' picture of what's going on: swings and seesaws in use,
+    /// the animals, the stoves and the dishes. Written when it changes, at
+    /// most five times a second (in the runtime dir, not on disk).
+    pub(super) fn park_tell_world(&self) {
         let busy: Vec<usize> = self
             .chats
             .iter()
@@ -745,12 +1116,113 @@ impl CharacterOverlay {
             .filter(|p| (p.kind == "swing" && p.riders.first().is_some_and(|r| r.phase == 1)) || (p.kind == "seesaw" && seesaw_rocking(p)))
             .map(|p| p.thing)
             .collect();
-        static LAST: Mutex<Option<Vec<usize>>> = Mutex::new(None);
-        let mut last = LAST.lock().unwrap();
-        if last.as_ref() != Some(&busy) {
-            let text = serde_json::json!({ "busy": busy }).to_string();
-            let _ = crate::util::atomic_write(&park::live_path(), text.as_bytes());
-            *last = Some(busy);
+        let mut l = LIVE.lock().unwrap();
+        if l.written.is_some_and(|t| t.elapsed().as_secs_f32() < 0.2) {
+            return;
+        }
+        let world = park::World {
+            busy,
+            animals: l.beasts.iter().map(|b| park::Animal { kind: b.kind.to_string(), x: b.x, left: b.left, hop: b.hop.max(0.0) }).collect(),
+            stoves: l.stoves.clone(),
+            dishes: l.dishes.clone(),
+        };
+        if l.last.as_ref() == Some(&world) {
+            return;
+        }
+        if let Ok(text) = serde_json::to_string(&world) {
+            let _ = crate::util::atomic_write(&park::world_path(), text.as_bytes());
+        }
+        l.written = Some(Instant::now());
+        l.last = Some(world);
+    }
+
+    /// Every frame: the hens and cows potter about (and run from whoever is
+    /// after them), new beds start growing, and those who've cooked go to eat.
+    pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
+        // off to the table where the food is, with a friend or two
+        let eat: Vec<(usize, usize)> = std::mem::take(&mut *PENDING.lock().unwrap());
+        for (i, k) in eat {
+            if i < n && self.walk_ref(i).at_leisure() {
+                self.start_play(chats, i, k, "table");
+            }
+        }
+        let farm_open = governor::place_workspace("farm").is_some();
+        let park = park_now();
+        let mut l = LIVE.lock().unwrap();
+        if !farm_open {
+            l.beasts.clear();
+            return;
+        }
+        // a coop has three hens, a barn two cows
+        let homes: Vec<(u64, &'static str, usize, f32)> = park
+            .things
+            .iter()
+            .filter(|t| t.place == "farm")
+            .filter_map(|t| match t.kind.as_str() {
+                "coop" => Some((t.id, "chicken", 3, t.x)),
+                "barn" => Some((t.id, "cow", 2, t.x)),
+                _ => None,
+            })
+            .collect();
+        l.beasts.retain(|b| homes.iter().any(|h| h.0 == b.home));
+        for &(id, kind, want, x) in &homes {
+            let have = l.beasts.iter().filter(|b| b.home == id).count();
+            for _ in have..want {
+                let r = live_rand(&mut l);
+                l.beasts.push(Beast { home: id, kind, x: (x + (r - 0.5) * 0.1).clamp(0.03, park::PIER.0 - 0.05), goal: x, left: r < 0.5, wait: r * 3.0, hop: 0.0, flee: 0.0, flee_t: 0.0 });
+            }
+        }
+        let homes_x: Vec<(u64, f32)> = homes.iter().map(|h| (h.0, h.3)).collect();
+        let (lo, hi) = (0.03, park::PIER.0 - 0.05);
+        for k in 0..l.beasts.len() {
+            let r1 = live_rand(&mut l);
+            let r2 = live_rand(&mut l);
+            let b = &mut l.beasts[k];
+            b.hop = (b.hop - dt * 2.5).max(0.0);
+            if b.flee_t > 0.0 {
+                b.flee_t -= dt;
+                b.x = (b.x + b.flee * dt).clamp(lo, hi);
+                b.left = b.flee < 0.0;
+                // hops as it runs
+                if b.hop <= 0.0 {
+                    b.hop = 0.6;
+                }
+                continue;
+            }
+            if b.wait > 0.0 {
+                b.wait -= dt;
+                // a peck at the ground now and then
+                if b.kind == "chicken" && r1 < dt * 0.5 {
+                    b.hop = 0.35;
+                }
+                continue;
+            }
+            let speed = if b.kind == "chicken" { 0.025 } else { 0.007 };
+            let d = b.goal - b.x;
+            if d.abs() <= speed * dt {
+                b.x = b.goal;
+                b.wait = 1.0 + r1 * 5.0;
+                let home = homes_x.iter().find(|h| h.0 == b.home).map_or(b.x, |h| h.1);
+                let roam = if b.kind == "chicken" { 0.14 } else { 0.18 };
+                b.goal = (home + (r2 - 0.5) * 2.0 * roam).clamp(lo, hi);
+            } else {
+                b.x += d.signum() * speed * dt;
+                b.left = d < 0.0;
+            }
+        }
+        drop(l);
+        // anything newly built on the farm starts growing now
+        let mut farm = park::read_farm_cached();
+        let mut changed = false;
+        for t in park.things.iter().filter(|t| t.place == "farm" && matches!(t.kind.as_str(), "carrots" | "wheat" | "apple_tree" | "coop" | "barn")) {
+            let key = t.id.to_string();
+            if t.id != 0 && !farm.contains_key(&key) {
+                farm.insert(key, park::now());
+                changed = true;
+            }
+        }
+        if changed {
+            park::write_farm(&farm);
         }
     }
 }

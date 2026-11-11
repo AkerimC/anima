@@ -799,6 +799,7 @@ impl CharacterOverlay {
 
         chats.append(&mut self.new_chats);
         self.right_orders(&mut chats, n);
+        self.farm_tick(&mut chats, dt, n);
 
         self.social_tick -= dt;
         if self.social_tick <= 0.0 {
@@ -840,7 +841,7 @@ impl CharacterOverlay {
             }
         }
         self.chats = chats;
-        self.park_tell_busy();
+        self.park_tell_world();
         self.settle_states(dt, n);
     }
 
@@ -2707,6 +2708,14 @@ impl CharacterOverlay {
             return None;
         }
         self.walk_of(i).bored = 0.0;
+        // the farm is open: mostly off to its pier to fish there
+        if let Some(farm) = crate::backend::governor::place_workspace("farm") {
+            if self.walk_ref(i).ws != farm && self.walk_of(i).rand() < tn().fish_at_pier && self.send_to(i, farm) {
+                self.walk_of(i).fish_on_arrival = true;
+                log::debug!("{i} goes to the farm to fish");
+                return None;
+            }
+        }
         Some(self.fish_alone(i, false))
     }
 
@@ -2717,7 +2726,11 @@ impl CharacterOverlay {
         let id = self.chat_id;
         self.enlist(i, id);
         let size = self.width_of(i);
-        let x = if here {
+        let pier = self.pier_of(i);
+        let x = if let Some((lo, hi)) = pier {
+            let r = self.walk.rand();
+            lo + size * 0.4 + r * (hi - lo - size * 0.8).max(0.0)
+        } else if here {
             self.strip_px(i)
         } else {
             let view = self.view[0] * self.view_w * 0.5;
@@ -2740,6 +2753,9 @@ impl CharacterOverlay {
     /// The stretch of floor `i` is fishing on: its window, or the screen
     /// around it when that window isn't known.
     fn fishing_window(&self, i: usize, at: f32) -> (f32, f32) {
+        if let Some(pier) = self.pier_of(i) {
+            return pier;
+        }
         let active = self.spaces.active;
         let here = active == 0 || self.walk_ref(i).ws == active;
         let cols = if here { crate::backend::governor::niri_columns() } else { Vec::new() };
@@ -3184,7 +3200,11 @@ impl CharacterOverlay {
     /// bite, reel in whatever it is.
     fn start_fishing(&mut self, c: &mut Chat) {
         let (x, cw) = self.big_window();
-        let (lo, hi) = (x + 80.0, x + cw - 80.0);
+        let (lo, hi) = match self.pier_of(c.members[0]) {
+            // on the farm: everyone out on the pier, close together
+            Some((a, b)) => (a + 20.0, b - 20.0),
+            None => (x + 80.0, x + cw - 80.0),
+        };
         let slot = (hi - lo).max(1.0) / c.members.len() as f32;
         let mut anglers = Vec::new();
         for (k, &i) in c.members.clone().iter().enumerate() {
@@ -3374,6 +3394,12 @@ impl CharacterOverlay {
                     a.phase = 5;
                     a.t = 0.0;
                     let (_, points, good) = if a.item >= MATERIAL { (a.item, 2.0, true) } else if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
+                    // a fish or a carrot: into the kitchen's pantry too
+                    if (FISH..CREATURE).contains(&a.item) {
+                        super::park::add_food("fish", 1);
+                    } else if a.item == 0 {
+                        super::park::add_food("carrot", 1);
+                    }
                     // something for the park: into the chest
                     if let Some(&(id, label)) = (a.item >= MATERIAL).then(|| super::park::MATERIALS.get((a.item - MATERIAL) as usize)).flatten() {
                         let name = self.character_name(a.i);

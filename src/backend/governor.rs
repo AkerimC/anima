@@ -243,11 +243,26 @@ pub fn focused_app() -> Option<String> {
 static WORKSPACES: std::sync::Mutex<Option<Vec<Space>>> = std::sync::Mutex::new(None);
 static WINDOW_COUNTS: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
-static PARK_WS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PLACE_WS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// The workspace the park window is on, if it's open.
 pub fn park_workspace() -> Option<u64> {
-    Some(PARK_WS.load(std::sync::atomic::Ordering::Relaxed)).filter(|&w| w != 0)
+    place_workspace("park")
+}
+
+/// Where the park, cafe or farm window is, if it's open.
+pub fn place_workspace(place: &str) -> Option<u64> {
+    PLACE_WS.lock().unwrap().iter().find(|p| p.0 == place).map(|p| p.1)
+}
+
+/// Which of them is on workspace `ws`.
+pub fn place_on(ws: u64) -> Option<String> {
+    PLACE_WS.lock().unwrap().iter().find(|p| p.1 == ws).map(|p| p.0.clone())
+}
+
+/// All the open ones: (place, workspace).
+pub fn places() -> Vec<(String, u64)> {
+    PLACE_WS.lock().unwrap().clone()
 }
 
 /// How many windows a workspace has.
@@ -356,8 +371,17 @@ fn update_niri_strip(sock: &Path) {
             }
         }
         *WINDOW_COUNTS.lock().unwrap() = counts;
-        let park = windows.iter().find(|w| w.get("app_id").and_then(|a| a.as_str()) == Some(crate::render::character::park::APP_ID));
-        PARK_WS.store(park.and_then(|w| w.get("workspace_id")?.as_u64()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        // the park, cafe and farm windows, told apart by their titles
+        let places: Vec<(String, u64)> = windows
+            .iter()
+            .filter(|w| w.get("app_id").and_then(|a| a.as_str()) == Some(crate::render::character::park::APP_ID))
+            .filter_map(|w| {
+                let title = w.get("title")?.as_str()?;
+                let place = crate::render::character::park::PLACES.iter().find(|p| p.1 == title)?.0;
+                Some((place.to_string(), w.get("workspace_id")?.as_u64()?))
+            })
+            .collect();
+        *PLACE_WS.lock().unwrap() = places;
     }
     let screen_w = niri_output_rect(sock).map(|r| r.2).unwrap_or(1920.0);
     let gap = niri_gaps();

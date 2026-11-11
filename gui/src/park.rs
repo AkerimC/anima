@@ -1,93 +1,464 @@
-//! The park window: sky and grass for the characters to live on, the chest
-//! with what they've found, and where they should live.
+//! The park, cafe and farm windows: somewhere for the characters to live,
+//! with what they've built and found. One program, a window for each, all
+//! sharing what's built (park.json); the daemon says what's going on right
+//! now (animals, the stoves, the dishes) in a small file it keeps updating.
 
 use adw::prelude::*;
 use anima::render::character::park;
-use gtk::glib;
+use gtk::gdk::prelude::GdkCairoContextExt;
+use gtk::{gdk_pixbuf, gio, glib};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::{config, daemon};
 
-const MODES: [&str; 3] = ["Live on the desktop", "Live in the park", "The park, out now and then"];
+const MODES: [&str; 3] = ["Live on the desktop", "Live in these windows", "Here, out now and then"];
 
-pub fn run() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id(park::APP_ID).build();
-    app.connect_activate(|app| {
-        if let Some(win) = app.active_window() {
-            win.present();
-            return;
-        }
-        build(app);
-    });
-    app.run_with_args::<&str>(&[])
+/// What every window shares: what's built, and what's going on.
+struct Shared {
+    park: park::Park,
+    world: park::World,
+    world_mtime: Option<std::time::SystemTime>,
+    unit_frac: Option<f32>,
+    farm: park::Farm,
+    // animals as drawn (eased towards where the daemon says they are)
+    shown: Vec<(String, f32, bool, f32)>,
+    pics: HashMap<(String, i32), Option<gdk_pixbuf::Pixbuf>>,
+    started: std::time::Instant,
 }
 
-struct St {
-    park: park::Park,
+thread_local! {
+    static SHARED: RefCell<Option<Rc<RefCell<Shared>>>> = const { RefCell::new(None) };
+}
+
+fn shared() -> Rc<RefCell<Shared>> {
+    SHARED.with(|s| {
+        s.borrow_mut()
+            .get_or_insert_with(|| {
+                let mut park = park::read_park();
+                // things from before they had numbers of their own
+                let mut changed = false;
+                for (k, t) in park.things.iter_mut().enumerate() {
+                    if t.id == 0 {
+                        t.id = new_id() + k as u64;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    park::write_park(&park);
+                }
+                Rc::new(RefCell::new(Shared {
+                    park,
+                    world: park::read_world(),
+                    world_mtime: None,
+                    unit_frac: park::read_unit_frac(),
+                    farm: park::read_farm(),
+                    shown: Vec::new(),
+                    pics: HashMap::new(),
+                    started: std::time::Instant::now(),
+                }))
+            })
+            .clone()
+    })
+}
+
+fn new_id() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_micros() as u64)
+}
+
+/// `anima-gui --park`, `--cafe`, `--farm` or `--world` (all three): the
+/// first one started opens the windows asked for by the later ones too.
+pub fn run() -> glib::ExitCode {
+    let app = adw::Application::builder().application_id(park::APP_ID).flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE).build();
+    app.connect_command_line(|app, cmd| {
+        let args: Vec<String> = cmd.arguments().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let mut want: Vec<&str> = Vec::new();
+        for a in &args {
+            match a.as_str() {
+                "--park" => want.push("park"),
+                "--cafe" => want.push("cafe"),
+                "--farm" => want.push("farm"),
+                "--world" => want.extend(["park", "cafe", "farm"]),
+                _ => {}
+            }
+        }
+        if want.is_empty() {
+            want.push("park");
+        }
+        for place in want {
+            let title = park::place_title(place);
+            match app.windows().into_iter().find(|w| w.title().is_some_and(|t| t == title)) {
+                Some(w) => w.present(),
+                None => build(app, place),
+            }
+        }
+        0.into()
+    });
+    app.connect_activate(|_| {});
+    app.run()
+}
+
+/// One window's own: what's picked and being dragged.
+struct Win {
+    place: &'static str,
     sel: Option<usize>,
     drag_from: Option<f32>,
-    busy: Vec<usize>,
-    unit_frac: Option<f32>,
 }
 
-fn save(st: &St) {
-    park::write_park(&st.park);
+fn save(sh: &Shared) {
+    park::write_park(&sh.park);
 }
 
-fn build(app: &adw::Application) {
-    let win = adw::ApplicationWindow::builder().application(app).title("Anima Park").default_width(1280).default_height(760).build();
-    let st = Rc::new(RefCell::new(St { park: park::read_park(), sel: None, drag_from: None, busy: park::read_busy(), unit_frac: park::read_unit_frac() }));
+fn build(app: &adw::Application, place: &str) {
+    let place: &'static str = park::PLACES.iter().find(|p| p.0 == place).map_or("park", |p| p.0);
+    let title = park::place_title(place);
+    let win = adw::ApplicationWindow::builder().application(app).title(title).default_width(1280).default_height(760).build();
+    let sh = shared();
+    let me = Rc::new(RefCell::new(Win { place, sel: None, drag_from: None }));
     let toast = adw::ToastOverlay::new();
 
     let ground = gtk::DrawingArea::builder().hexpand(true).vexpand(true).build();
-    let s2 = st.clone();
+    let (s2, m2) = (sh.clone(), me.clone());
     ground.set_draw_func(move |_, cr, w, h| {
         let (w, h) = (w as f64, h as f64);
-        draw_park(cr, w, h);
-        let st = s2.borrow();
-        let unit = unit_px(&st, w);
-        for (k, t) in st.park.things.iter().enumerate() {
-            draw_thing(cr, t, t.x as f64 * w, h - 3.0, unit, st.busy.contains(&k), st.sel == Some(k));
+        let mut sh = s2.borrow_mut();
+        let me = m2.borrow();
+        match me.place {
+            "cafe" => draw_cafe(cr, w, h),
+            "farm" => draw_farm(cr, w, h, sh.started.elapsed().as_secs_f64(), unit_px(&sh, w)),
+            _ => draw_park(cr, w, h),
+        }
+        let unit = unit_px(&sh, w);
+        let time = sh.started.elapsed().as_secs_f64();
+        let things: Vec<(usize, park::Thing)> = sh.park.things.iter().cloned().enumerate().filter(|(_, t)| t.place == me.place).collect();
+        for (k, t) in &things {
+            let busy = sh.world.busy.contains(k);
+            let x = t.x as f64 * w;
+            draw_thing(cr, t, x, h - 3.0, unit, busy, me.sel == Some(*k));
+            let (grown, ready) = park::farm_state(t, &sh.farm);
+            draw_extras(&mut sh, cr, t, x, h - 3.0, unit, grown, ready, time);
+        }
+        if me.place == "farm" {
+            let animals = sh.shown.clone();
+            for (kind, x, left, hop) in animals {
+                let size = if kind == "cow" { 0.95 } else { 0.42 } * unit;
+                let y = h - 3.0 - size - hop as f64 * 0.25 * unit;
+                draw_picture(&mut sh, cr, &park::animal_picture(&kind), x as f64 * w - size * 0.5, y, size, !left);
+            }
         }
     });
 
-    // drag things along the grass; a click picks one
+    // drag things along the floor; a click picks one
     let drag = gtk::GestureDrag::new();
-    let (s2, g2) = (st.clone(), ground.clone());
+    let (s2, m2, g2) = (sh.clone(), me.clone(), ground.clone());
     drag.connect_drag_begin(move |_, x, y| {
-        let mut st = s2.borrow_mut();
+        let sh = s2.borrow();
+        let mut me = m2.borrow_mut();
         let (w, h) = (g2.width() as f64, g2.height() as f64);
-        let unit = unit_px(&st, w);
-        let hit = st.park.things.iter().enumerate().rev().find(|(_, t)| {
+        let unit = unit_px(&sh, w);
+        let hit = sh.park.things.iter().enumerate().rev().filter(|(_, t)| t.place == me.place).find(|(_, t)| {
             let half = park::width(t) as f64 * unit * 0.5;
             (x - t.x as f64 * w).abs() <= half && y >= h - 3.0 - tall(t) * unit
         }).map(|(k, _)| k);
-        st.sel = hit;
-        st.drag_from = hit.map(|k| st.park.things[k].x);
+        me.sel = hit;
+        me.drag_from = hit.map(|k| sh.park.things[k].x);
         g2.queue_draw();
     });
-    let (s2, g2) = (st.clone(), ground.clone());
+    let (s2, m2, g2) = (sh.clone(), me.clone(), ground.clone());
     drag.connect_drag_update(move |_, dx, _| {
-        let mut st = s2.borrow_mut();
-        let (Some(k), Some(from)) = (st.sel, st.drag_from) else { return };
+        let mut sh = s2.borrow_mut();
+        let me = m2.borrow();
+        let (Some(k), Some(from)) = (me.sel, me.drag_from) else { return };
         let w = g2.width().max(1) as f64;
-        let unit = unit_px(&st, w);
-        let half = (park::width(&st.park.things[k]) as f64 * unit * 0.5 / w) as f32;
-        st.park.things[k].x = (from + (dx / w) as f32).clamp(half, (1.0 - half).max(half));
+        let unit = unit_px(&sh, w);
+        let half = (park::width(&sh.park.things[k]) as f64 * unit * 0.5 / w) as f32;
+        // on the farm, not out over the pond
+        let right = if me.place == "farm" { 1.0 - park::POND } else { 1.0 };
+        sh.park.things[k].x = (from + (dx / w) as f32).clamp(half, (right - half).max(half));
         g2.queue_draw();
     });
-    let s2 = st.clone();
+    let (s2, m2) = (sh.clone(), me.clone());
     drag.connect_drag_end(move |_, _, _| {
-        let mut st = s2.borrow_mut();
-        if st.drag_from.take().is_some() {
-            save(&st);
+        if m2.borrow_mut().drag_from.take().is_some() {
+            save(&s2.borrow());
         }
     });
     ground.add_controller(drag);
 
-    // the chest, top left
-    let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).halign(gtk::Align::Start).valign(gtk::Align::Start).margin_start(18).margin_top(18).build();
+    // top left: the chest (park, farm) and the pantry (cafe, farm)
+    let cards = gtk::Box::builder().spacing(12).halign(gtk::Align::Start).valign(gtk::Align::Start).margin_start(18).margin_top(18).build();
+    if place != "cafe" {
+        cards.append(&chest_card());
+    }
+    if place != "park" {
+        cards.append(&pantry_card());
+    }
+
+    // what's picked: turn it round, make a slide bigger, take it down
+    let bar = gtk::Box::builder().spacing(8).halign(gtk::Align::Center).valign(gtk::Align::Start).margin_top(18).visible(false).build();
+    bar.add_css_class("card");
+    bar.add_css_class("park-chest");
+    let name = gtk::Label::builder().build();
+    name.add_css_class("heading");
+    let turn = gtk::Button::builder().icon_name("object-flip-horizontal-symbolic").tooltip_text("Turn round").build();
+    let bigger = gtk::Button::builder().label("Add a piece").tooltip_text("2 wood, 1 nail").build();
+    let remove = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Take down (materials go back in the chest)").build();
+    remove.add_css_class("destructive-action");
+    let done = gtk::Button::builder().icon_name("object-select-symbolic").tooltip_text("Done").build();
+    for w in [name.upcast_ref::<gtk::Widget>(), turn.upcast_ref(), bigger.upcast_ref(), remove.upcast_ref(), done.upcast_ref()] {
+        bar.append(w);
+    }
+    let sync_bar = {
+        let (sh, me, bar, name, bigger) = (sh.clone(), me.clone(), bar.clone(), name.clone(), bigger.clone());
+        Rc::new(move || {
+            let sh = sh.borrow();
+            let me = me.borrow();
+            match me.sel.and_then(|k| sh.park.things.get(k)) {
+                Some(t) => {
+                    let label = park::recipe(&t.kind).map_or(t.kind.as_str(), |r| r.1);
+                    name.set_label(&if t.kind == "slide" { format!("{label} ({} pieces)", t.pieces) } else { label.to_string() });
+                    bigger.set_visible(t.kind == "slide" && t.pieces < 5);
+                    bar.set_visible(true);
+                }
+                None => bar.set_visible(false),
+            }
+        })
+    };
+    {
+        let sb = sync_bar.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_released(move |_, _, _, _| sb());
+        ground.add_controller(click);
+    }
+    let (s2, m2, g2, sb) = (sh.clone(), me.clone(), ground.clone(), sync_bar.clone());
+    turn.connect_clicked(move |_| {
+        if let Some(k) = m2.borrow().sel {
+            let mut sh = s2.borrow_mut();
+            sh.park.things[k].flip = !sh.park.things[k].flip;
+            save(&sh);
+        }
+        g2.queue_draw();
+        sb();
+    });
+    let (s2, m2, g2, sb, t2) = (sh.clone(), me.clone(), ground.clone(), sync_bar.clone(), toast.clone());
+    bigger.connect_clicked(move |_| {
+        let Some(k) = m2.borrow().sel else { return };
+        let mut sh = s2.borrow_mut();
+        let cost = park::recipe("slide_piece").map_or(&[][..], |r| r.2);
+        if !sh.park.free && !park::spend(cost) {
+            t2.add_toast(adw::Toast::new("Not enough in the chest for a piece"));
+            return;
+        }
+        sh.park.things[k].pieces = (sh.park.things[k].pieces + 1).min(5);
+        save(&sh);
+        drop(sh);
+        g2.queue_draw();
+        sb();
+    });
+    let (s2, m2, g2, sb) = (sh.clone(), me.clone(), ground.clone(), sync_bar.clone());
+    remove.connect_clicked(move |_| {
+        let Some(k) = m2.borrow_mut().sel.take() else { return };
+        let mut sh = s2.borrow_mut();
+        let t = sh.park.things.remove(k);
+        if !sh.park.free {
+            if let Some(r) = park::recipe(&t.kind) {
+                park::refund(r.2);
+            }
+            if let Some(r) = park::recipe("slide_piece") {
+                for _ in 1..t.pieces {
+                    park::refund(r.2);
+                }
+            }
+        }
+        save(&sh);
+        drop(sh);
+        g2.queue_draw();
+        sb();
+    });
+    let (m2, g2, sb) = (me.clone(), ground.clone(), sync_bar.clone());
+    done.connect_clicked(move |_| {
+        m2.borrow_mut().sel = None;
+        g2.queue_draw();
+        sb();
+    });
+
+    let overlay = gtk::Overlay::builder().child(&ground).build();
+    overlay.add_overlay(&cards);
+    overlay.add_overlay(&bar);
+    toast.set_child(Some(&overlay));
+
+    // building: what can be made here and what it takes
+    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
+    let mut buttons = Vec::new();
+    for &(id, label, cost, places) in park::RECIPES.iter().filter(|r| r.0 != "slide_piece" && r.3.contains(&place)) {
+        let row = gtk::Box::builder().spacing(10).build();
+        let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).build();
+        text.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+        let need: Vec<String> = cost.iter().map(|(m, k)| format!("{k} {}", park::MATERIALS.iter().find(|x| x.0 == *m).map_or(*m, |x| x.1).to_lowercase())).collect();
+        let sub = gtk::Label::builder().label(need.join(", ")).xalign(0.0).build();
+        sub.add_css_class("dim-label");
+        sub.add_css_class("caption");
+        text.append(&sub);
+        row.append(&text);
+        let b = gtk::Button::builder().label("Build").valign(gtk::Align::Center).build();
+        row.append(&b);
+        list.append(&row);
+        buttons.push((b, id, cost));
+        let _ = places;
+    }
+    let free = gtk::CheckButton::builder().label("Free building (trying out)").active(sh.borrow().park.free).margin_top(6).build();
+    list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    list.append(&free);
+    let scroll = gtk::ScrolledWindow::builder().child(&list).propagate_natural_height(true).max_content_height(620).hscrollbar_policy(gtk::PolicyType::Never).build();
+    let pop = gtk::Popover::builder().child(&scroll).build();
+    let build_btn = gtk::MenuButton::builder().label("Build").popover(&pop).build();
+    build_btn.add_css_class("suggested-action");
+    let s2 = sh.clone();
+    free.connect_toggled(move |c| {
+        let mut sh = s2.borrow_mut();
+        sh.park.free = c.is_active();
+        save(&sh);
+    });
+    let sync_build = {
+        let (sh, buttons) = (sh.clone(), buttons.iter().map(|(b, _, c)| (b.clone(), *c)).collect::<Vec<_>>());
+        Rc::new(move || {
+            let chest = park::read_chest();
+            let free = sh.borrow().park.free;
+            for (b, cost) in &buttons {
+                b.set_sensitive(free || park::affordable(&chest, cost));
+            }
+        })
+    };
+    {
+        let sb = sync_build.clone();
+        pop.connect_show(move |_| sb());
+        let sb = sync_build.clone();
+        free.connect_toggled(move |_| sb());
+    }
+    for (b, id, cost) in buttons {
+        let (s2, m2, g2, sb, sbar, t2, pop) = (sh.clone(), me.clone(), ground.clone(), sync_build.clone(), sync_bar.clone(), toast.clone(), pop.clone());
+        b.connect_clicked(move |_| {
+            let mut sh = s2.borrow_mut();
+            if !sh.park.free && !park::spend(cost) {
+                t2.add_toast(adw::Toast::new("Not enough in the chest"));
+                return;
+            }
+            // somewhere free near the middle (of the land, on the farm)
+            let w = g2.width().max(1) as f64;
+            let unit = unit_px(&sh, w);
+            let mut thing = park::Thing { kind: id.to_string(), place: place.to_string(), id: new_id(), x: 0.5, flip: false, pieces: 1 };
+            let me_half = park::width(&thing) as f64 * unit * 0.5 / w;
+            let right = if place == "farm" { 1.0 - park::POND as f64 } else { 1.0 };
+            let middle = right * 0.5;
+            let clear = |x: f64, sh: &Shared| sh.park.things.iter().filter(|t| t.place == place).all(|t| (t.x as f64 - x).abs() > me_half + park::width(t) as f64 * unit * 0.5 / w);
+            let spots = (0..60).map(|j| middle + (if j % 2 == 0 { 1.0 } else { -1.0 }) * (j / 2) as f64 * 0.02);
+            if let Some(x) = spots.filter(|x| *x > me_half && *x < right - me_half).find(|&x| clear(x, &sh)) {
+                thing.x = x as f32;
+            }
+            sh.park.things.push(thing);
+            let k = sh.park.things.len() - 1;
+            save(&sh);
+            drop(sh);
+            m2.borrow_mut().sel = Some(k);
+            pop.popdown();
+            g2.queue_draw();
+            sb();
+            sbar();
+        });
+    }
+
+    // where they live
+    let mode = gtk::DropDown::from_strings(&MODES);
+    mode.set_tooltip_text(Some("Where the characters live while the park, cafe or farm is open"));
+    let now = config::tuning_value("park_mode").unwrap_or(2.0).round().clamp(0.0, 2.0) as u32;
+    mode.set_selected(now);
+    mode.connect_selected_notify(|d| {
+        let v = d.selected() as f64;
+        config::set_tuning("park_mode", (v != 2.0).then_some(v));
+        if daemon::running() {
+            daemon::reload();
+        }
+    });
+    let header = adw::HeaderBar::new();
+    header.pack_start(&build_btn);
+    if place == "cafe" {
+        let book = gtk::MenuButton::builder().label("Recipes").build();
+        let pop = gtk::Popover::new();
+        book.set_popover(Some(&pop));
+        let p2 = pop.clone();
+        pop.connect_show(move |_| p2.set_child(Some(&recipe_book())));
+        header.pack_start(&book);
+    }
+    header.pack_end(&mode);
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&header);
+    view.set_content(Some(&toast));
+    win.set_content(Some(&view));
+
+    let css = gtk::CssProvider::new();
+    css.load_from_string(".park-chest { padding: 12px 14px; min-width: 170px; }");
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
+    // keeping up with the daemon: animals ease along, steam rises
+    let (s2, g2, w2) = (sh.clone(), ground.clone(), win.clone());
+    let mut last_slow = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        if !w2.is_visible() && w2.application().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let mut sh = s2.borrow_mut();
+        let m = std::fs::metadata(park::world_path()).and_then(|m| m.modified()).ok();
+        let mut redraw = false;
+        if m != sh.world_mtime {
+            sh.world_mtime = m;
+            sh.world = park::read_world();
+            redraw = true;
+        }
+        if last_slow.elapsed().as_secs_f32() > 2.0 {
+            last_slow = std::time::Instant::now();
+            sh.unit_frac = park::read_unit_frac();
+            sh.farm = park::read_farm();
+            redraw = true;
+        }
+        // animals: ease to where they are
+        let target: Vec<(String, f32, bool, f32)> = sh.world.animals.iter().map(|a| (a.kind.clone(), a.x, a.left, a.hop)).collect();
+        if sh.shown.len() != target.len() {
+            sh.shown = target.clone();
+        }
+        let mut moving = false;
+        for (s, t) in sh.shown.iter_mut().zip(&target) {
+            let d = t.1 - s.1;
+            if d.abs() > 0.0005 {
+                s.1 += d * 0.35;
+                moving = true;
+            }
+            s.2 = t.2;
+            if (s.3 - t.3).abs() > 0.01 {
+                s.3 += (t.3 - s.3) * 0.5;
+                moving = true;
+            }
+        }
+        let steaming = !sh.world.stoves.is_empty();
+        drop(sh);
+        if redraw || moving || steaming {
+            g2.queue_draw();
+        }
+        glib::ControlFlow::Continue
+    });
+
+    win.maximize();
+    win.present();
+    // a workspace of its own, so it doesn't sit among other windows
+    let t = title.to_string();
+    std::thread::spawn(move || own_workspace(&t));
+}
+
+/// The chest: building materials found while fishing.
+fn chest_card() -> gtk::Box {
+    let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).valign(gtk::Align::Start).build();
     card.add_css_class("card");
     card.add_css_class("park-chest");
     let title = gtk::Label::builder().label("Chest").xalign(0.0).build();
@@ -106,7 +477,7 @@ fn build(app: &adw::Application) {
         card.append(&row);
         counts.push((id, n));
     }
-    let who = gtk::Label::builder().xalign(0.0).wrap(true).max_width_chars(26).build();
+    let who = gtk::Label::builder().xalign(0.0).wrap(true).max_width_chars(24).build();
     who.add_css_class("dim-label");
     who.add_css_class("caption");
     card.append(&who);
@@ -115,7 +486,6 @@ fn build(app: &adw::Application) {
         for (id, n) in &counts {
             n.set_label(&park::count(&chest, id).to_string());
         }
-        // who has brought the most
         let mut by: std::collections::BTreeMap<String, u32> = Default::default();
         for m in chest.values() {
             for (name, k) in m {
@@ -128,231 +498,247 @@ fn build(app: &adw::Application) {
         who.set_label(&best.map_or("Nothing yet: they find things while fishing".into(), |(n, k)| format!("Most found: {n} ({k})")));
     };
     refresh();
-    let (s2, g2) = (st.clone(), ground.clone());
-    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+    glib::timeout_add_seconds_local(2, move || {
         refresh();
-        let mut st = s2.borrow_mut();
-        let (busy, unit) = (park::read_busy(), park::read_unit_frac());
-        if busy != st.busy || unit != st.unit_frac {
-            st.busy = busy;
-            st.unit_frac = unit;
-            g2.queue_draw();
-        }
         glib::ControlFlow::Continue
     });
+    card
+}
 
-    // what's picked: turn it round, make a slide bigger, take it down
-    let bar = gtk::Box::builder().spacing(8).halign(gtk::Align::Center).valign(gtk::Align::Start).margin_top(18).visible(false).build();
-    bar.add_css_class("card");
-    bar.add_css_class("park-chest");
-    let name = gtk::Label::builder().build();
-    name.add_css_class("heading");
-    let turn = gtk::Button::builder().icon_name("object-flip-horizontal-symbolic").tooltip_text("Turn round").build();
-    let bigger = gtk::Button::builder().label("Add a piece").tooltip_text("2 wood, 1 nail").build();
-    let remove = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Take down (materials go back in the chest)").build();
-    remove.add_css_class("destructive-action");
-    let done = gtk::Button::builder().icon_name("object-select-symbolic").tooltip_text("Done").build();
-    for w in [name.upcast_ref::<gtk::Widget>(), turn.upcast_ref(), bigger.upcast_ref(), remove.upcast_ref(), done.upcast_ref()] {
-        bar.append(w);
+/// The pantry: what the kitchen has to cook with.
+fn pantry_card() -> gtk::Box {
+    let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).valign(gtk::Align::Start).build();
+    card.add_css_class("card");
+    card.add_css_class("park-chest");
+    let title = gtk::Label::builder().label("Pantry").xalign(0.0).build();
+    title.add_css_class("heading");
+    card.append(&title);
+    let mut counts = Vec::new();
+    for (id, label) in park::INGREDIENTS {
+        let row = gtk::Box::builder().spacing(8).build();
+        let pic = gtk::Image::from_file(park::food_picture(id));
+        pic.set_pixel_size(26);
+        row.append(&pic);
+        row.append(&gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build());
+        let n = gtk::Label::builder().label("0").xalign(1.0).build();
+        n.add_css_class("numeric");
+        row.append(&n);
+        card.append(&row);
+        counts.push((id, n));
     }
-    let sync_bar = {
-        let (st, bar, name, bigger) = (st.clone(), bar.clone(), name.clone(), bigger.clone());
-        move || {
-            let st = st.borrow();
-            match st.sel.and_then(|k| st.park.things.get(k)) {
-                Some(t) => {
-                    let label = park::recipe(&t.kind).map_or(t.kind.as_str(), |r| r.1);
-                    name.set_label(&if t.kind == "slide" { format!("{label} ({} pieces)", t.pieces) } else { label.to_string() });
-                    bigger.set_visible(t.kind == "slide" && t.pieces < 5);
-                    bar.set_visible(true);
-                }
-                None => bar.set_visible(false),
-            }
+    let refresh = move || {
+        let p = park::read_pantry();
+        for (id, n) in &counts {
+            n.set_label(&p.get(*id).copied().unwrap_or(0).to_string());
         }
     };
-    let sync_bar = Rc::new(sync_bar);
-    {
-        let sb = sync_bar.clone();
-        let click = gtk::GestureClick::new();
-        click.connect_released(move |_, _, _, _| sb());
-        ground.add_controller(click);
-        let sb = sync_bar.clone();
-        let g = ground.clone();
-        let tick = gtk::EventControllerMotion::new();
-        tick.connect_leave(move |_| sb());
-        g.add_controller(tick);
-    }
-    let (s2, g2, sb) = (st.clone(), ground.clone(), sync_bar.clone());
-    turn.connect_clicked(move |_| {
-        let mut st = s2.borrow_mut();
-        if let Some(k) = st.sel {
-            st.park.things[k].flip = !st.park.things[k].flip;
-            save(&st);
-        }
-        drop(st);
-        g2.queue_draw();
-        sb();
+    refresh();
+    glib::timeout_add_seconds_local(2, move || {
+        refresh();
+        glib::ControlFlow::Continue
     });
-    let (s2, g2, sb, t2) = (st.clone(), ground.clone(), sync_bar.clone(), toast.clone());
-    bigger.connect_clicked(move |_| {
-        let mut st = s2.borrow_mut();
-        let Some(k) = st.sel else { return };
-        let cost = park::recipe("slide_piece").map_or(&[][..], |r| r.2);
-        if !st.park.free && !park::spend(cost) {
-            t2.add_toast(adw::Toast::new("Not enough in the chest for a piece"));
-            return;
-        }
-        st.park.things[k].pieces = (st.park.things[k].pieces + 1).min(5);
-        save(&st);
-        drop(st);
-        g2.queue_draw();
-        sb();
-    });
-    let (s2, g2, sb) = (st.clone(), ground.clone(), sync_bar.clone());
-    remove.connect_clicked(move |_| {
-        let mut st = s2.borrow_mut();
-        let Some(k) = st.sel.take() else { return };
-        let t = st.park.things.remove(k);
-        if !st.park.free {
-            if let Some(r) = park::recipe(&t.kind) {
-                park::refund(r.2);
+    card
+}
+
+/// Every dish: what's been found (who by, how often made), the rest a "???".
+fn recipe_book() -> gtk::Widget {
+    let book = park::read_book();
+    let grid = gtk::Grid::builder().row_spacing(8).column_spacing(10).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
+    let found = book.found.len();
+    let head = gtk::Label::builder().label(format!("{found} of {} found", park::DISHES.len())).xalign(0.0).build();
+    head.add_css_class("heading");
+    grid.attach(&head, 0, 0, 2, 1);
+    for (k, (id, label, stuff)) in park::DISHES.iter().enumerate() {
+        let row = k as i32 + 1;
+        match book.found.get(*id) {
+            Some(f) => {
+                let pic = gtk::Image::from_file(park::food_picture(id));
+                pic.set_pixel_size(32);
+                grid.attach(&pic, 0, row, 1, 1);
+                let names: Vec<&str> = stuff.iter().map(|s| park::INGREDIENTS.iter().find(|i| i.0 == *s).map_or(*s, |i| i.1)).collect();
+                let text = gtk::Label::builder()
+                    .label(format!("<b>{label}</b>\n<small>{} · found by {} · made {}×</small>", names.join(" + "), glib::markup_escape_text(&f.by), f.times))
+                    .use_markup(true)
+                    .xalign(0.0)
+                    .build();
+                grid.attach(&text, 1, row, 1, 1);
             }
-            if let Some(r) = park::recipe("slide_piece") {
-                for _ in 1..t.pieces {
-                    park::refund(r.2);
+            None => {
+                let pic = gtk::Label::builder().label("?").width_chars(3).build();
+                pic.add_css_class("title-2");
+                pic.add_css_class("dim-label");
+                grid.attach(&pic, 0, row, 1, 1);
+                let text = gtk::Label::builder().label("???").xalign(0.0).build();
+                text.add_css_class("dim-label");
+                grid.attach(&text, 1, row, 1, 1);
+            }
+        }
+    }
+    gtk::ScrolledWindow::builder().child(&grid).propagate_natural_height(true).max_content_height(600).min_content_width(320).build().upcast()
+}
+
+/// A PNG (cached at that size), mirrored if asked.
+fn draw_picture(sh: &mut Shared, cr: &gtk::cairo::Context, path: &std::path::Path, x: f64, y: f64, size: f64, mirror: bool) {
+    let px = size.round().max(4.0) as i32;
+    let key = (path.to_string_lossy().into_owned(), px);
+    let pb = sh.pics.entry(key).or_insert_with(|| gdk_pixbuf::Pixbuf::from_file_at_scale(path, px, px, true).ok()).clone();
+    let Some(pb) = pb else { return };
+    let (pw, ph) = (pb.width() as f64, pb.height() as f64);
+    cr.save().ok();
+    cr.translate(x + (size - pw) * 0.5, y + (size - ph));
+    if mirror {
+        cr.translate(pw, 0.0);
+        cr.scale(-1.0, 1.0);
+    }
+    cr.set_source_pixbuf(&pb, 0.0, 0.0);
+    cr.paint().ok();
+    cr.restore().ok();
+}
+
+/// What goes with a thing right now: crops as they grow, eggs and milk,
+/// steam over a cooking pot, a dish on a table.
+#[allow(clippy::too_many_arguments)]
+fn draw_extras(sh: &mut Shared, cr: &gtk::cairo::Context, t: &park::Thing, x: f64, gy: f64, u: f64, grown: f32, ready: u32, time: f64) {
+    let g = grown as f64;
+    match t.kind.as_str() {
+        "stove" => {
+            let Some((_, state, _)) = sh.world.stoves.iter().find(|s| s.0 == t.id).cloned() else { return };
+            let dir = if t.flip { -1.0 } else { 1.0 };
+            let pot = (x - dir * 0.2 * u, gy - 0.82 * u);
+            match state.as_str() {
+                "cooking" => {
+                    for k in 0..4 {
+                        let f = ((time * 0.6 + k as f64 * 0.25) % 1.0) as f64;
+                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.55 * (1.0 - f));
+                        cr.arc(pot.0 + (f * 9.0 + k as f64).sin() * 0.06 * u, pot.1 - f * 0.6 * u, (0.05 + f * 0.08) * u, 0.0, std::f64::consts::TAU);
+                        cr.fill().ok();
+                    }
+                }
+                "burnt" => {
+                    for k in 0..6 {
+                        let f = ((time * 0.8 + k as f64 / 6.0) % 1.0) as f64;
+                        cr.set_source_rgba(0.2, 0.2, 0.22, 0.7 * (1.0 - f));
+                        cr.arc(pot.0 + (f * 7.0 + k as f64).sin() * 0.1 * u, pot.1 - f * 0.9 * u, (0.07 + f * 0.14) * u, 0.0, std::f64::consts::TAU);
+                        cr.fill().ok();
+                    }
+                }
+                _ => {
+                    // ready: little stars over the pot
+                    cr.set_source_rgba(1.0, 0.85, 0.2, 0.9);
+                    for k in 0..5 {
+                        let a = time * 2.0 + k as f64 * 1.26;
+                        let (sx, sy) = (pot.0 + a.cos() * 0.25 * u, pot.1 - 0.25 * u + a.sin() * 0.12 * u);
+                        cr.arc(sx, sy, 0.03 * u, 0.0, std::f64::consts::TAU);
+                        cr.fill().ok();
+                    }
                 }
             }
         }
-        save(&st);
-        drop(st);
-        g2.queue_draw();
-        sb();
-    });
-    let (s2, g2, sb) = (st.clone(), ground.clone(), sync_bar.clone());
-    done.connect_clicked(move |_| {
-        s2.borrow_mut().sel = None;
-        g2.queue_draw();
-        sb();
-    });
-
-    let overlay = gtk::Overlay::builder().child(&ground).build();
-    overlay.add_overlay(&card);
-    overlay.add_overlay(&bar);
-    toast.set_child(Some(&overlay));
-
-    // building: what can be made and what it takes
-    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
-    let mut buttons = Vec::new();
-    for &(id, label, cost) in park::RECIPES.iter().filter(|r| r.0 != "slide_piece") {
-        let row = gtk::Box::builder().spacing(10).build();
-        let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).build();
-        text.append(&gtk::Label::builder().label(label).xalign(0.0).build());
-        let need: Vec<String> = cost.iter().map(|(m, k)| format!("{k} {}", park::MATERIALS.iter().find(|x| x.0 == *m).map_or(*m, |x| x.1).to_lowercase())).collect();
-        let sub = gtk::Label::builder().label(need.join(", ")).xalign(0.0).build();
-        sub.add_css_class("dim-label");
-        sub.add_css_class("caption");
-        text.append(&sub);
-        row.append(&text);
-        let b = gtk::Button::builder().label("Build").valign(gtk::Align::Center).build();
-        row.append(&b);
-        list.append(&row);
-        buttons.push((b, cost));
-        let _ = id;
-    }
-    let free = gtk::CheckButton::builder().label("Free building (trying out)").active(st.borrow().park.free).margin_top(6).build();
-    list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    list.append(&free);
-    let pop = gtk::Popover::builder().child(&list).build();
-    let build_btn = gtk::MenuButton::builder().label("Build").popover(&pop).build();
-    build_btn.add_css_class("suggested-action");
-    let s2 = st.clone();
-    free.connect_toggled(move |c| {
-        let mut st = s2.borrow_mut();
-        st.park.free = c.is_active();
-        save(&st);
-    });
-    // greyed out when the chest hasn't enough
-    let sync_build = {
-        let (st, buttons) = (st.clone(), buttons.iter().map(|(b, c)| (b.clone(), *c)).collect::<Vec<_>>());
-        move || {
-            let chest = park::read_chest();
-            let free = st.borrow().park.free;
-            for (b, cost) in &buttons {
-                b.set_sensitive(free || park::affordable(&chest, cost));
+        "table" => {
+            let Some((_, dish, left)) = sh.world.dishes.iter().find(|d| d.0 == t.id).cloned() else { return };
+            let size = 0.4 * u * (0.35 + 0.65 * left as f64);
+            draw_picture(sh, cr, &park::food_picture(&dish), x - size * 0.5, gy - 0.66 * u - size * 0.9, size, false);
+        }
+        "carrots" => {
+            cr.set_source_rgb(0.45, 0.3, 0.18);
+            rect(cr, x - 0.5 * u, gy - 0.1 * u, x + 0.5 * u, gy);
+            for k in 0..5 {
+                let px = x - 0.4 * u + k as f64 * 0.2 * u;
+                if ready > 0 {
+                    cr.set_source_rgb(0.95, 0.5, 0.12);
+                    rect(cr, px - 0.035 * u, gy - 0.16 * u, px + 0.035 * u, gy - 0.08 * u);
+                }
+                cr.set_source_rgb(0.3, 0.62, 0.25);
+                let tall = (0.06 + 0.22 * g) * u;
+                for d in [-0.04, 0.0, 0.04] {
+                    bar(cr, (px, gy - 0.1 * u), (px + d * u * 1.5, gy - 0.1 * u - tall), 0.02 * u);
+                }
             }
         }
-    };
-    let sync_build = Rc::new(sync_build);
-    {
-        let sb = sync_build.clone();
-        pop.connect_show(move |_| sb());
-        let sb = sync_build.clone();
-        free.connect_toggled(move |_| sb());
-    }
-    for (k, (b, cost)) in buttons.into_iter().enumerate() {
-        let id = park::RECIPES.iter().filter(|r| r.0 != "slide_piece").nth(k).map(|r| r.0).unwrap_or("chair");
-        let (s2, g2, sb, sbar, t2, pop) = (st.clone(), ground.clone(), sync_build.clone(), sync_bar.clone(), toast.clone(), pop.clone());
-        b.connect_clicked(move |_| {
-            let mut st = s2.borrow_mut();
-            if !st.park.free && !park::spend(cost) {
-                t2.add_toast(adw::Toast::new("Not enough in the chest"));
-                return;
+        "wheat" => {
+            cr.set_source_rgb(0.45, 0.3, 0.18);
+            rect(cr, x - 0.6 * u, gy - 0.06 * u, x + 0.6 * u, gy);
+            let (r, gr, b) = (0.35 + 0.55 * g, 0.62 + 0.15 * g, 0.25 - 0.1 * g);
+            for k in 0..9 {
+                let px = x - 0.52 * u + k as f64 * 0.13 * u;
+                let tall = (0.12 + 0.62 * g) * u;
+                let sway = (time * 1.3 + k as f64).sin() * 0.02 * u;
+                cr.set_source_rgb(r, gr, b);
+                bar(cr, (px, gy - 0.05 * u), (px + sway, gy - 0.05 * u - tall), 0.018 * u);
+                if g > 0.6 {
+                    cr.set_source_rgb(0.93, 0.78, 0.3);
+                    bar(cr, (px + sway, gy - 0.05 * u - tall), (px + sway, gy - 0.05 * u - tall + 0.12 * u), 0.045 * u);
+                }
             }
-            // somewhere free near the middle
-            let w = g2.width().max(1) as f64;
-            let unit = unit_px(&st, w);
-            let mut thing = park::Thing { kind: id.to_string(), x: 0.5, flip: false, pieces: 1 };
-            let me = park::width(&thing) as f64 * unit * 0.5 / w;
-            let clear = |x: f64, st: &St| st.park.things.iter().all(|t| (t.x as f64 - x).abs() > me + park::width(t) as f64 * unit * 0.5 / w);
-            let spots = (0..40).map(|j| 0.5 + (if j % 2 == 0 { 1.0 } else { -1.0 }) * (j / 2) as f64 * 0.025);
-            if let Some(x) = spots.filter(|x| *x > me && *x < 1.0 - me).find(|&x| clear(x, &st)) {
-                thing.x = x as f32;
-            }
-            st.park.things.push(thing);
-            st.sel = Some(st.park.things.len() - 1);
-            save(&st);
-            drop(st);
-            pop.popdown();
-            g2.queue_draw();
-            sb();
-            sbar();
-        });
-    }
-
-    // where they live
-    let mode = gtk::DropDown::from_strings(&MODES);
-    mode.set_tooltip_text(Some("Where the characters live while this window is open"));
-    let now = config::tuning_value("park_mode").unwrap_or(2.0).round().clamp(0.0, 2.0) as u32;
-    mode.set_selected(now);
-    mode.connect_selected_notify(|d| {
-        let v = d.selected() as f64;
-        config::set_tuning("park_mode", (v != 2.0).then_some(v));
-        if daemon::running() {
-            daemon::reload();
         }
-    });
-    let header = adw::HeaderBar::new();
-    header.pack_start(&build_btn);
-    header.pack_end(&mode);
-    let view = adw::ToolbarView::new();
-    view.add_top_bar(&header);
-    view.set_content(Some(&toast));
-    win.set_content(Some(&view));
-
-    let css = gtk::CssProvider::new();
-    css.load_from_string(".park-chest { padding: 12px 14px; min-width: 190px; }");
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        "apple_tree" => {
+            rgb(cr, DARK);
+            rect(cr, x - 0.09 * u, gy - 0.95 * u, x + 0.09 * u, gy);
+            cr.set_source_rgb(0.32, 0.62, 0.3);
+            for (dx, dy, r) in [(0.0, 1.4, 0.45), (-0.35, 1.1, 0.35), (0.35, 1.1, 0.35), (0.0, 1.0, 0.38)] {
+                cr.arc(x + dx * u, gy - dy * u, r * u, 0.0, std::f64::consts::TAU);
+                cr.fill().ok();
+            }
+            let n = if ready > 0 { 5 } else { (g * 4.0) as usize };
+            for (k, (dx, dy)) in [(-0.3, 1.15), (0.25, 1.3), (0.05, 0.98), (0.38, 1.05), (-0.12, 1.5)].iter().enumerate().take(n) {
+                if ready > 0 {
+                    cr.set_source_rgb(0.9, 0.15, 0.15);
+                } else {
+                    cr.set_source_rgb(0.55, 0.75, 0.25);
+                }
+                let _ = k;
+                cr.arc(x + dx * u, gy - dy * u, if ready > 0 { 0.06 } else { 0.035 } * u, 0.0, std::f64::consts::TAU);
+                cr.fill().ok();
+            }
+        }
+        "coop" => {
+            cr.set_source_rgb(0.85, 0.75, 0.55);
+            rect(cr, x - 0.45 * u, gy - 0.6 * u, x + 0.45 * u, gy);
+            cr.set_source_rgb(0.75, 0.22, 0.2);
+            cr.move_to(x - 0.55 * u, gy - 0.58 * u);
+            cr.line_to(x, gy - 0.95 * u);
+            cr.line_to(x + 0.55 * u, gy - 0.58 * u);
+            cr.close_path();
+            cr.fill().ok();
+            cr.set_source_rgb(0.3, 0.2, 0.12);
+            rect(cr, x - 0.12 * u, gy - 0.32 * u, x + 0.12 * u, gy);
+            cr.set_source_rgb(0.98, 0.96, 0.9);
+            for k in 0..ready {
+                let ex = x + 0.25 * u + k as f64 * 0.11 * u;
+                cr.save().ok();
+                cr.translate(ex, gy - 0.05 * u);
+                cr.scale(0.045 * u, 0.06 * u);
+                cr.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
+                cr.restore().ok();
+                cr.fill().ok();
+            }
+        }
+        "barn" => {
+            cr.set_source_rgb(0.72, 0.18, 0.15);
+            rect(cr, x - 0.75 * u, gy - 0.95 * u, x + 0.75 * u, gy);
+            cr.move_to(x - 0.85 * u, gy - 0.93 * u);
+            cr.line_to(x, gy - 1.35 * u);
+            cr.line_to(x + 0.85 * u, gy - 0.93 * u);
+            cr.close_path();
+            cr.set_source_rgb(0.4, 0.15, 0.12);
+            cr.fill().ok();
+            cr.set_source_rgb(0.97, 0.95, 0.9);
+            rect(cr, x - 0.3 * u, gy - 0.6 * u, x + 0.3 * u, gy);
+            cr.set_source_rgb(0.72, 0.18, 0.15);
+            bar(cr, (x - 0.27 * u, gy - 0.57 * u), (x + 0.27 * u, gy - 0.03 * u), 0.05 * u);
+            bar(cr, (x + 0.27 * u, gy - 0.57 * u), (x - 0.27 * u, gy - 0.03 * u), 0.05 * u);
+            if ready > 0 {
+                let size = 0.32 * u;
+                draw_picture(sh, cr, &park::food_picture("milk"), x + 0.85 * u, gy - size, size, false);
+            }
+        }
+        _ => {}
     }
-    win.maximize();
-    win.present();
-    // a workspace of its own, so it doesn't sit among other windows
-    std::thread::spawn(own_workspace);
 }
 
 /// A character's height in window pixels.
-fn unit_px(st: &St, w: f64) -> f64 {
-    st.unit_frac.map_or(110.0, |f| f as f64 * w).max(30.0)
+fn unit_px(sh: &Shared, w: f64) -> f64 {
+    sh.unit_frac.map_or(110.0, |f| f as f64 * w).max(30.0)
 }
 
 /// How tall a thing is (character heights), for picking it.
@@ -365,7 +751,10 @@ fn tall(t: &park::Thing) -> f64 {
         "swing" | "lamp" => 1.65,
         "seesaw" => 0.6,
         "slide" => park::slide_size(t.pieces).0 as f64 + 0.35,
-        "tree" => 1.9,
+        "tree" | "apple_tree" => 1.9,
+        "coop" => 1.0,
+        "barn" => 1.4,
+        "wheat" => 0.8,
         _ => 0.45,
     }
 }
@@ -620,8 +1009,108 @@ fn draw_park(cr: &gtk::cairo::Context, w: f64, h: f64) {
     }
 }
 
-/// Moves the park onto an empty workspace when it opened among other windows.
-fn own_workspace() {
+/// The cafe: a warm wall with windows, wood panelling, a wooden floor.
+fn draw_cafe(cr: &gtk::cairo::Context, w: f64, h: f64) {
+    let wall = gtk::cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
+    wall.add_color_stop_rgb(0.0, 0.98, 0.9, 0.78);
+    wall.add_color_stop_rgb(1.0, 0.95, 0.84, 0.7);
+    let _ = cr.set_source(&wall);
+    cr.paint().ok();
+    // windows with a bit of sky
+    let (wy, wh) = (h * 0.14, h * 0.32);
+    for k in 0..3 {
+        let wx = w * (0.22 + 0.28 * k as f64);
+        let ww = w * 0.13;
+        cr.set_source_rgb(0.55, 0.38, 0.22);
+        rect(cr, wx - 6.0, wy - 6.0, wx + ww + 6.0, wy + wh + 6.0);
+        let sky = gtk::cairo::LinearGradient::new(0.0, wy, 0.0, wy + wh);
+        sky.add_color_stop_rgb(0.0, 0.55, 0.78, 0.97);
+        sky.add_color_stop_rgb(1.0, 0.82, 0.93, 1.0);
+        let _ = cr.set_source(&sky);
+        cr.rectangle(wx, wy, ww, wh);
+        cr.fill().ok();
+        cr.set_source_rgb(0.55, 0.38, 0.22);
+        rect(cr, wx + ww * 0.5 - 3.0, wy, wx + ww * 0.5 + 3.0, wy + wh);
+        rect(cr, wx, wy + wh * 0.5 - 3.0, wx + ww, wy + wh * 0.5 + 3.0);
+    }
+    // lamps hanging from the ceiling
+    for k in 0..4 {
+        let lx = w * (0.12 + 0.26 * k as f64);
+        cr.set_source_rgb(0.3, 0.25, 0.2);
+        bar(cr, (lx, 0.0), (lx, h * 0.08), 2.0);
+        cr.set_source_rgb(0.95, 0.75, 0.35);
+        cr.arc(lx, h * 0.095, h * 0.022, std::f64::consts::PI, 0.0);
+        cr.fill().ok();
+        cr.set_source_rgba(1.0, 0.9, 0.6, 0.25);
+        cr.arc(lx, h * 0.11, h * 0.05, 0.0, std::f64::consts::TAU);
+        cr.fill().ok();
+    }
+    // panelling and floor
+    let panel = h * 0.68;
+    cr.set_source_rgb(0.7, 0.5, 0.32);
+    rect(cr, 0.0, panel, w, h);
+    cr.set_source_rgb(0.6, 0.42, 0.26);
+    rect(cr, 0.0, panel - 6.0, w, panel + 4.0);
+    let mut x = 0.0;
+    while x < w {
+        rect(cr, x, panel + 4.0, x + 3.0, h * 0.92);
+        x += w / 24.0;
+    }
+    cr.set_source_rgb(0.5, 0.34, 0.2);
+    rect(cr, 0.0, h * 0.92, w, h);
+}
+
+/// The farm: sky and grass like the park, with a pond on the right and a
+/// pier running out over it.
+fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
+    draw_park(cr, w, h);
+    let shore = w * (1.0 - park::POND as f64);
+    let top = h * 0.86;
+    // the pond, a little sunk into the grass
+    let water = gtk::cairo::LinearGradient::new(0.0, top, 0.0, h);
+    water.add_color_stop_rgb(0.0, 0.35, 0.62, 0.85);
+    water.add_color_stop_rgb(1.0, 0.18, 0.4, 0.68);
+    let _ = cr.set_source(&water);
+    cr.move_to(shore - w * 0.02, top);
+    cr.curve_to(shore + w * 0.01, top - 4.0, w, top - 6.0, w, top);
+    cr.line_to(w, h);
+    cr.line_to(shore - w * 0.01, h);
+    cr.close_path();
+    cr.fill().ok();
+    // ripples
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+    for k in 0..6 {
+        let y = top + (h - top) * (0.18 + 0.13 * k as f64);
+        let x0 = shore + ((time * 0.3 + k as f64 * 0.37).sin() * 0.5 + 0.5) * (w - shore) * 0.6;
+        bar(cr, (x0, y), (x0 + w * 0.025, y), 2.0);
+    }
+    // reeds at the edge
+    cr.set_source_rgb(0.3, 0.5, 0.25);
+    for k in 0..5 {
+        let rx = shore - w * 0.025 + k as f64 * 6.0;
+        bar(cr, (rx, h), (rx + (time + k as f64).sin() * 2.0, h - 0.35 * u - k as f64 * 3.0), 2.5);
+    }
+    // the pier: planks at the characters' feet, posts down into the water
+    let (a, b) = (w * park::PIER.0 as f64, w * park::PIER.1 as f64);
+    let deck = h - 3.0;
+    cr.set_source_rgb(0.42, 0.28, 0.16);
+    let mut px = a + 8.0;
+    while px < b {
+        rect(cr, px - 4.0, deck - 0.12 * u, px + 4.0, h);
+        px += 0.45 * u;
+    }
+    cr.set_source_rgb(0.62, 0.44, 0.27);
+    rect(cr, a, deck - 0.03 * u, b, deck + 3.0);
+    cr.set_source_rgb(0.5, 0.34, 0.2);
+    let mut px = a;
+    while px < b {
+        bar(cr, (px, deck - 0.03 * u), (px, deck + 3.0), 1.0);
+        px += 0.16 * u;
+    }
+}
+
+/// Moves a window (by title) onto an empty workspace when it opened among others.
+fn own_workspace(title: &str) {
     let json = |args: &[&str]| -> Option<serde_json::Value> {
         let out = std::process::Command::new("niri").args(["msg", "--json"]).args(args).output().ok()?;
         serde_json::from_slice(&out.stdout).ok()
@@ -631,7 +1120,7 @@ fn own_workspace() {
         std::thread::sleep(std::time::Duration::from_millis(150));
         let Some(wins) = json(&["windows"]) else { return };
         let list = wins.as_array().cloned().unwrap_or_default();
-        if let Some(w) = list.iter().find(|w| w["app_id"].as_str() == Some(park::APP_ID)) {
+        if let Some(w) = list.iter().find(|w| w["app_id"].as_str() == Some(park::APP_ID) && w["title"].as_str() == Some(title)) {
             me = Some((w["id"].as_u64(), w["workspace_id"].as_u64(), list));
             break;
         }

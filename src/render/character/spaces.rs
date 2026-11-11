@@ -238,9 +238,11 @@ impl CharacterOverlay {
         if !list.is_empty() && !locked {
             for i in 0..n {
                 if !list.iter().any(|s| s.id == self.walk_ref(i).ws) {
-                    // the park is home while it's open
-                    if let Some(park) = park_home().filter(|p| list.iter().any(|s| s.id == *p)) {
-                        self.walk_of(i).ws = park;
+                    // the park (cafe, farm) is home while it's open
+                    let homes: Vec<u64> = place_homes().into_iter().filter(|p| list.iter().any(|s| s.id == *p)).collect();
+                    if !homes.is_empty() {
+                        let k = (self.walk_of(i).rand() * homes.len() as f32) as usize % homes.len();
+                        self.walk_of(i).ws = homes[k];
                         continue;
                     }
                     // back where it was last time, or with its team
@@ -489,8 +491,9 @@ impl CharacterOverlay {
         for i in 0..n {
             self.walk_of(i).here_t += 1.0;
         }
-        if let Some(park) = park_home().filter(|p| self.spaces.list.iter().any(|s| s.id == *p)) {
-            self.park_roam(n, park);
+        let homes: Vec<u64> = place_homes().into_iter().filter(|p| self.spaces.list.iter().any(|s| s.id == *p)).collect();
+        if !homes.is_empty() {
+            self.park_roam(n, &homes);
             return;
         }
         // workspaces with windows on them; the one in use only if it has some too
@@ -566,18 +569,20 @@ impl CharacterOverlay {
     }
 }
 
-/// The park window's workspace, when the characters should live there.
-fn park_home() -> Option<u64> {
+/// The workspaces of the open park, cafe and farm windows, when the
+/// characters should live there.
+fn place_homes() -> Vec<u64> {
     if tn().park_mode < 0.5 {
-        return None;
+        return Vec::new();
     }
-    governor::park_workspace()
+    governor::places().into_iter().map(|p| p.1).collect()
 }
 
 impl CharacterOverlay {
-    /// The park is open and home: everyone gathers there; in mode 2 a few go
-    /// out to the other workspaces now and then and come back after a while.
-    fn park_roam(&mut self, n: usize, park: u64) {
+    /// The park (cafe, farm) is open and home: everyone lives there, going
+    /// from one to another now and then; in mode 2 a few go out to the other
+    /// workspaces and come back after a while.
+    fn park_roam(&mut self, n: usize, homes: &[u64]) {
         let moving = (0..n).filter(|&i| self.walk_ref(i).trip.is_some()).count();
         if moving >= tn().ws_max as usize {
             return;
@@ -586,27 +591,48 @@ impl CharacterOverlay {
             let wk = this.walk_ref(i);
             wk.at_leisure() && wk.trip.is_none() && !wk.visiting && !wk.backstage
         };
+        let count = |this: &Self, ws: u64| (0..n).filter(|&i| this.walk_ref(i).ws == ws || this.heading_to(i) == Some(ws)).count();
+        let emptiest = |this: &Self| homes.iter().copied().min_by_key(|&h| count(this, h)).unwrap_or(homes[0]);
         let only = tn().park_mode < 1.5;
-        // out long enough (or not allowed out at all): back to the park
-        let back = (0..n).find(|&i| free(self, i) && self.walk_ref(i).ws != park && (only || self.walk_ref(i).here_t >= tn().park_out_stay));
+        // out long enough (or not allowed out at all): back to the least crowded place
+        let back = (0..n).find(|&i| free(self, i) && !homes.contains(&self.walk_ref(i).ws) && (only || self.walk_ref(i).here_t >= tn().park_out_stay));
         if let Some(i) = back {
-            log::debug!("park: {i} goes back to the park");
-            self.send_to(i, park);
+            let to = emptiest(self);
+            log::debug!("park: {i} goes back to {to}");
+            self.send_to(i, to);
             return;
+        }
+        // from one place to another: an empty one gets someone soon
+        if homes.len() >= 2 {
+            let lonely = homes.iter().any(|&h| count(self, h) == 0);
+            let every = if lonely { 15.0 } else { tn().park_move_every.max(1.0) };
+            if self.walk.rand() < 1.0 / every {
+                let to = if lonely { emptiest(self) } else { homes[(self.walk.rand() * homes.len() as f32) as usize % homes.len()] };
+                let pool: Vec<usize> = (0..n)
+                    .filter(|&i| free(self, i) && homes.contains(&self.walk_ref(i).ws) && self.walk_ref(i).ws != to && self.walk_ref(i).here_t >= 45.0)
+                    .filter(|&i| count(self, self.walk_ref(i).ws) >= 2)
+                    .collect();
+                if !pool.is_empty() {
+                    let i = pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()];
+                    log::debug!("park: {i} goes over to {to}");
+                    self.send_to(i, to);
+                    return;
+                }
+            }
         }
         if only {
             return;
         }
-        let out = (0..n).filter(|&i| self.walk_ref(i).ws != park || self.heading_to(i).is_some_and(|t| t != park)).count();
+        let out = (0..n).filter(|&i| !homes.contains(&self.walk_ref(i).ws) || self.heading_to(i).is_some_and(|t| !homes.contains(&t))).count();
         if out as f32 >= tn().park_out || self.walk.rand() >= 1.0 / tn().park_out_every.max(1.0) {
             return;
         }
         // somewhere with windows, or the workspace in view
-        let away: Vec<u64> = self.spaces.list.iter().filter(|s| s.id != park && (s.has_windows || s.active)).map(|s| s.id).collect();
+        let away: Vec<u64> = self.spaces.list.iter().filter(|s| !homes.contains(&s.id) && (s.has_windows || s.active)).map(|s| s.id).collect();
         if away.is_empty() {
             return;
         }
-        let pool: Vec<usize> = (0..n).filter(|&i| free(self, i) && self.walk_ref(i).ws == park && self.walk_ref(i).here_t >= 30.0).collect();
+        let pool: Vec<usize> = (0..n).filter(|&i| free(self, i) && homes.contains(&self.walk_ref(i).ws) && self.walk_ref(i).here_t >= 30.0).collect();
         if pool.is_empty() {
             return;
         }

@@ -45,6 +45,11 @@ pub fn picture(id: &str) -> PathBuf {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct Thing {
     pub kind: String,
+    // which window it's in ("park", "cafe", "farm"), and a number of its own
+    #[serde(default = "park_place")]
+    pub place: String,
+    #[serde(default)]
+    pub id: u64,
     pub x: f32,
     #[serde(default)]
     pub flip: bool,
@@ -54,6 +59,17 @@ pub struct Thing {
 
 fn one() -> u32 {
     1
+}
+
+fn park_place() -> String {
+    "park".into()
+}
+
+/// The windows the characters can live in: id, window title.
+pub const PLACES: [(&str, &str); 3] = [("park", "Anima Park"), ("cafe", "Anima Cafe"), ("farm", "Anima Farm")];
+
+pub fn place_title(place: &str) -> &'static str {
+    PLACES.iter().find(|p| p.0 == place).map_or("Anima Park", |p| p.1)
 }
 
 /// The park as saved: what's built, and whether building is free (trying out).
@@ -79,23 +95,36 @@ pub fn write_park(p: &Park) {
     }
 }
 
-/// What can be built: id, label, cost. "slide_piece" makes a slide bigger.
-pub const RECIPES: [(&str, &str, &[(&str, u32)]); 12] = [
-    ("chair", "Chair", &[("wood", 2), ("nail", 1)]),
-    ("bench", "Bench", &[("wood", 3), ("nail", 2)]),
-    ("table", "Table", &[("wood", 4), ("nail", 2)]),
-    ("stove", "Stove", &[("wood", 1), ("nail", 3), ("paint", 1)]),
-    ("swing", "Swing", &[("wood", 4), ("rope", 2), ("nail", 2)]),
-    ("seesaw", "Seesaw", &[("wood", 3), ("nail", 2), ("paint", 1)]),
-    ("slide", "Slide", &[("wood", 4), ("nail", 3), ("paint", 1)]),
-    ("slide_piece", "Slide piece", &[("wood", 2), ("nail", 1)]),
-    ("flowers", "Flower bed", &[("wood", 1), ("paint", 1)]),
-    ("tree", "Tree", &[("wood", 3)]),
-    ("lamp", "Lamp", &[("nail", 2), ("paint", 1)]),
-    ("sandbox", "Sandbox", &[("wood", 3), ("paint", 1)]),
+/// What can be built: id, label, cost, where.
+pub type Recipe = (&'static str, &'static str, &'static [(&'static str, u32)], &'static [&'static str]);
+
+const PARK: &[&str] = &["park"];
+const INSIDE: &[&str] = &["park", "cafe"];
+const FARM: &[&str] = &["farm"];
+const ANY: &[&str] = &["park", "cafe", "farm"];
+
+/// "slide_piece" makes a slide bigger.
+pub const RECIPES: [Recipe; 17] = [
+    ("chair", "Chair", &[("wood", 2), ("nail", 1)], INSIDE),
+    ("bench", "Bench", &[("wood", 3), ("nail", 2)], ANY),
+    ("table", "Table", &[("wood", 4), ("nail", 2)], INSIDE),
+    ("stove", "Stove", &[("wood", 1), ("nail", 3), ("paint", 1)], INSIDE),
+    ("swing", "Swing", &[("wood", 4), ("rope", 2), ("nail", 2)], PARK),
+    ("seesaw", "Seesaw", &[("wood", 3), ("nail", 2), ("paint", 1)], PARK),
+    ("slide", "Slide", &[("wood", 4), ("nail", 3), ("paint", 1)], PARK),
+    ("slide_piece", "Slide piece", &[("wood", 2), ("nail", 1)], PARK),
+    ("flowers", "Flower bed", &[("wood", 1), ("paint", 1)], ANY),
+    ("tree", "Tree", &[("wood", 3)], &["park", "farm"]),
+    ("lamp", "Lamp", &[("nail", 2), ("paint", 1)], ANY),
+    ("sandbox", "Sandbox", &[("wood", 3), ("paint", 1)], PARK),
+    ("carrots", "Carrot bed", &[("wood", 2)], FARM),
+    ("wheat", "Wheat field", &[("wood", 2), ("nail", 1)], FARM),
+    ("apple_tree", "Apple tree", &[("wood", 3), ("paint", 1)], FARM),
+    ("coop", "Chicken coop", &[("wood", 5), ("nail", 3), ("paint", 1)], FARM),
+    ("barn", "Cow barn", &[("wood", 6), ("nail", 4), ("paint", 2)], FARM),
 ];
 
-pub fn recipe(id: &str) -> Option<&'static (&'static str, &'static str, &'static [(&'static str, u32)])> {
+pub fn recipe(id: &str) -> Option<&'static Recipe> {
     RECIPES.iter().find(|r| r.0 == id)
 }
 
@@ -164,6 +193,11 @@ pub fn width(t: &Thing) -> f32 {
         "tree" => 1.2,
         "lamp" => 0.3,
         "sandbox" => 1.4,
+        "carrots" => 1.0,
+        "wheat" => 1.2,
+        "apple_tree" => 1.3,
+        "coop" => 1.1,
+        "barn" => 1.7,
         _ => 0.5,
     }
 }
@@ -175,6 +209,7 @@ pub fn room(kind: &str) -> usize {
         "bench" | "swing" | "seesaw" => 2,
         "stove" => 3,
         "table" | "slide" | "sandbox" => 4,
+        "carrots" | "wheat" | "apple_tree" | "coop" | "barn" => 2,
         _ => 0,
     }
 }
@@ -189,11 +224,210 @@ pub fn read_unit_frac() -> Option<f32> {
     std::fs::read_to_string(view_path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| v["unit_frac"].as_f64()).map(|u| u as f32)
 }
 
-/// Which things are in use right now (swings swinging).
-pub fn live_path() -> PathBuf {
-    crate::util::data_dir().join("park-live.json")
+
+
+// --- the farm: crops grow, hens lay, cows give milk (seconds)
+
+pub const CROP_GROW: f64 = 360.0;
+pub const APPLE_GROW: f64 = 480.0;
+pub const EGG_EVERY: f64 = 180.0;
+pub const MILK_EVERY: f64 = 240.0;
+/// The pond's share of the farm window, on the right; the pier runs out over it.
+pub const POND: f32 = 0.13;
+pub const PIER: (f32, f32) = (0.855, 0.975);
+
+pub fn now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
-pub fn read_busy() -> Vec<usize> {
-    std::fs::read_to_string(live_path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| serde_json::from_value(v["busy"].clone()).ok()).unwrap_or_default()
+/// For each farm thing (by id): when it was planted or last emptied.
+pub type Farm = BTreeMap<String, f64>;
+
+pub fn farm_path() -> PathBuf {
+    crate::util::data_dir().join("farm.json")
+}
+
+pub fn read_farm() -> Farm {
+    std::fs::read_to_string(farm_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// `read_farm`, at most once every two seconds (it's asked every frame).
+pub fn read_farm_cached() -> Farm {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Farm)>> = std::sync::Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    if c.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 2.0) {
+        *c = Some((std::time::Instant::now(), read_farm()));
+    }
+    c.as_ref().map(|x| x.1.clone()).unwrap_or_default()
+}
+
+pub fn write_farm(f: &Farm) {
+    if let Ok(text) = serde_json::to_string_pretty(f) {
+        let _ = crate::util::atomic_write(&farm_path(), text.as_bytes());
+    }
+}
+
+/// How far along a farm thing is, 0..1 (1: ripe / something to collect),
+/// and how many there are to take (eggs, milk).
+pub fn farm_state(t: &Thing, farm: &Farm) -> (f32, u32) {
+    let since = farm.get(&t.id.to_string()).copied().unwrap_or(0.0);
+    let gone = (now() - since).max(0.0);
+    match t.kind.as_str() {
+        "carrots" | "wheat" => ((gone / CROP_GROW).min(1.0) as f32, u32::from(gone >= CROP_GROW)),
+        "apple_tree" => ((gone / APPLE_GROW).min(1.0) as f32, if gone >= APPLE_GROW { 3 } else { 0 }),
+        "coop" => {
+            let k = ((gone / EGG_EVERY) as u32).min(3);
+            (k as f32 / 3.0, k)
+        }
+        "barn" => {
+            let k = ((gone / MILK_EVERY) as u32).min(2);
+            (k as f32 / 2.0, k)
+        }
+        _ => (0.0, 0),
+    }
+}
+
+// --- the kitchen
+
+/// What goes in the pot: id, label. Pictures are props/food/<id>.png.
+pub const INGREDIENTS: [(&str, &str); 6] = [("fish", "Fish"), ("carrot", "Carrot"), ("wheat", "Wheat"), ("apple", "Apple"), ("egg", "Egg"), ("milk", "Milk")];
+
+/// What can come out: id, label, what goes in (sorted as in INGREDIENTS).
+pub const DISHES: [(&str, &str, &[&str]); 12] = [
+    ("fish_soup", "Fish soup", &["fish", "carrot"]),
+    ("pancakes", "Pancakes", &["wheat", "egg", "milk"]),
+    ("apple_pie", "Apple pie", &["wheat", "apple"]),
+    ("custard", "Custard", &["egg", "milk"]),
+    ("bread", "Bread", &["wheat", "milk"]),
+    ("fried_fish", "Fried fish", &["fish", "wheat"]),
+    ("sushi", "Sushi", &["fish", "egg"]),
+    ("salad", "Salad", &["carrot", "apple"]),
+    ("carrot_cake", "Carrot cake", &["carrot", "wheat", "egg"]),
+    ("cookies", "Cookies", &["wheat", "egg"]),
+    ("ice_cream", "Ice cream", &["apple", "milk"]),
+    ("stew", "Stew", &["fish", "carrot", "egg"]),
+];
+
+pub fn food_picture(id: &str) -> PathBuf {
+    crate::util::data_dir().join("props").join("food").join(format!("{id}.png"))
+}
+
+pub fn animal_picture(kind: &str) -> PathBuf {
+    crate::util::data_dir().join("props").join("animals").join(format!("{kind}.png"))
+}
+
+pub fn dish_label(id: &str) -> &'static str {
+    if id == "burnt" {
+        return "Something burnt";
+    }
+    DISHES.iter().find(|d| d.0 == id).map_or("Something", |d| d.1)
+}
+
+/// The dish these make, if any (order doesn't matter).
+pub fn dish_of(mut stuff: Vec<&str>) -> Option<&'static str> {
+    let rank = |x: &&str| INGREDIENTS.iter().position(|i| i.0 == *x).unwrap_or(99);
+    stuff.sort_by_key(rank);
+    DISHES.iter().find(|d| d.2 == stuff.as_slice()).map(|d| d.0)
+}
+
+pub type Pantry = BTreeMap<String, u32>;
+
+pub fn pantry_path() -> PathBuf {
+    crate::util::data_dir().join("pantry.json")
+}
+
+pub fn read_pantry() -> Pantry {
+    std::fs::read_to_string(pantry_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn write_pantry(p: &Pantry) {
+    if let Ok(text) = serde_json::to_string_pretty(p) {
+        let _ = crate::util::atomic_write(&pantry_path(), text.as_bytes());
+    }
+}
+
+pub fn add_food(id: &str, k: u32) {
+    let mut p = read_pantry();
+    *p.entry(id.to_string()).or_default() += k;
+    write_pantry(&p);
+}
+
+/// Takes one of each; false (and nothing taken) if one is missing.
+pub fn take_food(ids: &[&str]) -> bool {
+    let mut p = read_pantry();
+    if !ids.iter().all(|i| p.get(*i).copied().unwrap_or(0) >= 1) {
+        return false;
+    }
+    for i in ids {
+        if let Some(v) = p.get_mut(*i) {
+            *v -= 1;
+        }
+    }
+    p.retain(|_, v| *v > 0);
+    write_pantry(&p);
+    true
+}
+
+/// Recipes found so far, and mixes that went wrong.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct Book {
+    #[serde(default)]
+    pub found: BTreeMap<String, Found>,
+    #[serde(default)]
+    pub failed: Vec<Vec<String>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct Found {
+    pub by: String,
+    pub times: u32,
+}
+
+pub fn book_path() -> PathBuf {
+    crate::util::data_dir().join("recipes.json")
+}
+
+pub fn read_book() -> Book {
+    std::fs::read_to_string(book_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+pub fn write_book(b: &Book) {
+    if let Ok(text) = serde_json::to_string_pretty(b) {
+        let _ = crate::util::atomic_write(&book_path(), text.as_bytes());
+    }
+}
+
+// --- what's going on right now, for the windows to draw (in the runtime dir)
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct World {
+    // swings swinging, seesaws rocking (thing indexes)
+    #[serde(default)]
+    pub busy: Vec<usize>,
+    #[serde(default)]
+    pub animals: Vec<Animal>,
+    // stove id, "cooking" / "burnt" / "done", how far along 0..1
+    #[serde(default)]
+    pub stoves: Vec<(u64, String, f32)>,
+    // table id, dish, how much is left 0..1
+    #[serde(default)]
+    pub dishes: Vec<(u64, String, f32)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Animal {
+    pub kind: String,
+    // share of the window's width, facing left, how high it hops (unit)
+    pub x: f32,
+    pub left: bool,
+    pub hop: f32,
+}
+
+pub fn world_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    dir.join("anima-world.json")
+}
+
+pub fn read_world() -> World {
+    std::fs::read_to_string(world_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
