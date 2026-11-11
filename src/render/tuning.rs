@@ -142,6 +142,7 @@ tuning! {
         park_move_every: "Someone goes over to the park, cafe or farm about every (s)" = 90.0, 10.0, 3600.0, 10.0, 0;
         dine_chance: "In the cafe with the chef in, someone comes to eat (chance each look)" = 0.3, 0.0, 1.0, 0.05, 2;
         cook_known: "A cook makes a recipe it knows instead of trying something new (share)" = 0.6, 0.0, 1.0, 0.05, 2;
+        meadow_stroll: "Someone free on the farm strolls up the meadow (chance each look)" = 0.06, 0.0, 1.0, 0.01, 2;
         chase_chicken: "Someone free on the farm chases a hen (chance each look)" = 0.04, 0.0, 1.0, 0.01, 2;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;

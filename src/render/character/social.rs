@@ -216,6 +216,8 @@ struct Angler {
     thrown: bool,
     // seconds left of a happy moment while it waits for a bite
     glee: f32,
+    // on a jetty up the farm pond's shore: how high (strip px)
+    up: f32,
 }
 
 /// Fishing: everyone along the floor of the widest window.
@@ -2753,10 +2755,11 @@ impl CharacterOverlay {
             };
             wx + size + self.walk.rand() * (ww - size * 2.0).max(0.0)
         };
+        let (x, up) = if pier.is_some() { self.farm_spot(i).unwrap_or((x, 0.0)) } else { (x, 0.0) };
         self.go(i, x, 0.14);
         log::debug!("chat {id}: {i} goes fishing");
         let mut c = Chat::new(id, vec![i], Stage::Fishing, 0.0);
-        c.fishing = Some(Fishing { anglers: vec![Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: x, blown: false, thrown: false, glee: 0.0 }], beast: None, beast_cool: 8.0, idle: Vec::new() });
+        c.fishing = Some(Fishing { anglers: vec![Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: x, blown: false, thrown: false, glee: 0.0, up }], beast: None, beast_cool: 8.0, idle: Vec::new() });
         c.scores = vec![(i, 0.0)];
         c.step = 9;
         c.timer = 30.0;
@@ -2994,7 +2997,7 @@ impl CharacterOverlay {
         if f.beast_cool > 0.0 || self.walk.rand() >= dt * tn().fish_beast {
             return;
         }
-        let ready: Vec<usize> = (0..f.anglers.len()).filter(|&k| (1..=5).contains(&f.anglers[k].phase) && !f.anglers[k].blown).collect();
+        let ready: Vec<usize> = (0..f.anglers.len()).filter(|&k| (1..=5).contains(&f.anglers[k].phase) && !f.anglers[k].blown && f.anglers[k].up <= 0.0).collect();
         if ready.is_empty() {
             return;
         }
@@ -3010,7 +3013,7 @@ impl CharacterOverlay {
         let reach = size * tn().fish_beast_reach;
         for a in &mut f.anglers {
             let at = self.strip_px(a.i);
-            if (at - x).abs() > reach {
+            if (at - x).abs() > reach || a.up > 0.0 {
                 continue;
             }
             a.blown = true;
@@ -3199,12 +3202,16 @@ impl CharacterOverlay {
         // the nearer end of the row, one place along
         let spot = if (x - lo).abs() < (x - hi).abs() { lo - size * 1.1 } else { hi + size * 1.1 };
         let spot = spot.clamp(size, (width - size).max(size));
+        let (spot, up) = match self.pier_near(j).and_then(|_| self.farm_spot(j)) {
+            Some(s) => s,
+            None => (spot, 0.0),
+        };
         self.enlist(j, c.id);
         c.members.push(j);
         c.scores.push((j, 0.0));
         self.go(j, spot, 0.14);
         if let Some(f) = c.fishing.as_mut() {
-            f.anglers.push(Angler { i: j, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: spot, blown: false, thrown: false, glee: 0.0 });
+            f.anglers.push(Angler { i: j, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: spot, blown: false, thrown: false, glee: 0.0, up });
         }
         log::debug!("chat {}: {j} sees them fishing and joins", c.id);
     }
@@ -3220,10 +3227,13 @@ impl CharacterOverlay {
         };
         let slot = (hi - lo).max(1.0) / c.members.len() as f32;
         let mut anglers = Vec::new();
+        let farm = self.pier_near(c.members[0]).is_some();
         for (k, &i) in c.members.clone().iter().enumerate() {
             let at = lo + (k as f32 + 0.5) * slot;
+            // on the farm: the pier first, then the jetties up the shore
+            let (at, up) = if farm { self.farm_spot(i).unwrap_or((at, 0.0)) } else { (at, 0.0) };
             self.go(i, at, 0.16);
-            anglers.push(Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at, blown: false, thrown: false, glee: 0.0 });
+            anglers.push(Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at, blown: false, thrown: false, glee: 0.0, up });
         }
         log::debug!("chat {}: fishing, {} rods", c.id, anglers.len());
         c.fishing = Some(Fishing { anglers, beast: None, beast_cool: 8.0, idle: Vec::new() });
@@ -3241,18 +3251,32 @@ impl CharacterOverlay {
             self.end_game(c);
             return;
         }
+        // keeping their places on the pier and the jetties
+        for a in &f.anglers {
+            if a.up > 0.0 || self.pier_of(a.i).is_some() {
+                self.hold_spot(a.i, a.at, a.up);
+            }
+        }
         if c.step == 9 {
-            if self.all_arrived(c) {
+            // up the shore to the jetties first
+            let mut up_there = true;
+            for a in f.anglers.clone() {
+                if a.up > 0.0 && !self.walk_up_to(a.i, a.at, a.up, dt) {
+                    up_there = false;
+                }
+            }
+            if up_there && self.all_arrived(c) {
                 c.step = 0;
                 c.timer = tn().fish_time;
                 for a in &mut f.anglers {
                     a.phase = 1;
                     a.t = 0.0;
                 }
-                // half look one way, half the other
+                // half look one way, half the other; at the pond, all at the water
+                let pond = self.pier_near(c.members[0]).is_some();
                 for (k, a) in f.anglers.iter().enumerate() {
                     if let Some(r) = self.walk_of(a.i).social.as_mut() {
-                        r.face_left = k % 2 == 1;
+                        r.face_left = !pond && k % 2 == 1;
                     }
                 }
             }
@@ -3268,6 +3292,7 @@ impl CharacterOverlay {
             if self.walk_ref(a.i).act == Act::Held {
                 a.blown = true;
                 a.thrown = true;
+                a.up = 0.0;
             }
             // thrown a long way: that's the end of fishing for this one
             if a.thrown && grounded(self.walk_ref(a.i)) {
@@ -3304,11 +3329,12 @@ impl CharacterOverlay {
             }
             a.t += dt;
             // came along later: rod out once it's in place, facing the way the others do
-            if a.phase == 0 && self.arrived(a.i) {
+            let there = if a.up > 0.0 { self.walk_up_to(a.i, a.at, a.up, dt) } else { self.arrived(a.i) };
+            if a.phase == 0 && there {
                 a.phase = 1;
                 a.t = 0.0;
                 let first = f.anglers[0].i;
-                let left = if first != a.i { self.walk_ref(first).social.map(|s| s.face_left) } else { None };
+                let left = if a.up > 0.0 || self.pier_of(a.i).is_some() { Some(false) } else if first != a.i { self.walk_ref(first).social.map(|s| s.face_left) } else { None };
                 if let Some(r) = self.walk_of(a.i).social.as_mut() {
                     r.face_left = left.unwrap_or_else(|| r.face_left);
                 }
@@ -3494,6 +3520,7 @@ impl CharacterOverlay {
                 c.members.retain(|&m| m != i);
                 c.scores.retain(|s| s.0 != i);
                 self.leave(i, c.id);
+                self.push_down(i);
             }
             let wk = self.walk_of(i);
             wk.fish_cool = tn().fish_again;
@@ -3501,6 +3528,9 @@ impl CharacterOverlay {
         }
         if last {
             log::debug!("chat {}: fishing over", c.id);
+            for a in &f.anglers {
+                self.push_down(a.i);
+            }
             self.end_game(c);
             return;
         }

@@ -45,8 +45,9 @@ struct Beast {
     left: bool,
     wait: f32,
     hop: f32,
-    // how far up the meadow (share of the window's height)
+    // how far up the meadow (share of the window's height), and where it's going
     y: f32,
+    goal_y: f32,
     // running from someone: how fast, for how long still
     flee: f32,
     flee_t: f32,
@@ -157,6 +158,47 @@ impl CharacterOverlay {
         }
     }
 
+    /// A free place to fish at the farm's pond: along the pier first, then the
+    /// jetties up the shore. (strip x, height px) Kept for `i` from now on.
+    pub(super) fn farm_spot(&mut self, i: usize) -> Option<(f32, f32)> {
+        let farm = governor::place_rect("farm").filter(|p| p.ws == self.walk_ref(i).ws)?;
+        let size = self.width_of(i);
+        let gap = size * 1.05;
+        let mut slots: Vec<(f32, f32)> = Vec::new();
+        let (a, b) = (farm.x + park::PIER.0 * farm.w + size * 0.5, farm.x + park::PIER.1 * farm.w - size * 0.5);
+        let mut x = a;
+        while x <= b {
+            slots.push((x, 0.0));
+            x += gap;
+        }
+        for y in park::JETTIES {
+            slots.push((farm.x + (park::JETTY.0 + park::JETTY.1) * 0.5 * farm.w, y * farm.h));
+        }
+        let mut spots = SPOTS.lock().unwrap();
+        spots.retain(|s| s.3.elapsed().as_secs_f32() < 2.0 && s.0 != i);
+        let free = slots.into_iter().find(|&(x, up)| !spots.iter().any(|s| (s.1 - x).abs() < gap * 0.9 && (s.2 - up).abs() < 8.0))?;
+        spots.push((i, free.0, free.1, Instant::now()));
+        Some(free)
+    }
+
+    /// Still fishing at its place: keeps it.
+    pub(super) fn hold_spot(&mut self, i: usize, x: f32, up: f32) {
+        let mut spots = SPOTS.lock().unwrap();
+        spots.retain(|s| s.0 != i);
+        spots.push((i, x, up, Instant::now()));
+    }
+
+    /// Off a jetty (or anywhere up the meadow): walks back down to the floor.
+    pub(super) fn push_down(&mut self, i: usize) {
+        if self.walk_ref(i).air > 0.05 {
+            // held up until its walk down starts
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.perched = true;
+            }
+            DOWN.lock().unwrap().push(i);
+        }
+    }
+
     /// The park, cafe or farm window `i` is standing in, if any.
     pub(super) fn place_here(&self, i: usize) -> Option<governor::Place> {
         governor::place_at(self.walk_ref(i).ws, self.strip_px(i))
@@ -195,7 +237,7 @@ impl CharacterOverlay {
 
     /// Walks towards `x`, climbing (or coming down) to `up` px above the
     /// floor on the way, as up or down a meadow. True once there.
-    fn walk_up_to(&mut self, i: usize, x: f32, up: f32, dt: f32) -> bool {
+    pub(super) fn walk_up_to(&mut self, i: usize, x: f32, up: f32, dt: f32) -> bool {
         let here = self.strip_px(i);
         let h = self.height_of(i);
         let surface = self.actor_ref(i).surface[0].max(1.0);
@@ -297,6 +339,11 @@ impl CharacterOverlay {
         }
         let i = who[(self.walk.rand() * who.len() as f32) as usize % who.len()];
         let Some(place) = self.place_here(i).map(|p| p.place) else { return };
+        // on the farm: now and then a stroll up the meadow
+        if place == "farm" && self.walk_of(i).rand() < tn().meadow_stroll {
+            self.start_play(chats, i, usize::MAX, "meadow");
+            return;
+        }
         // on the farm: now and then after a hen instead
         if place == "farm" && self.walk_of(i).rand() < tn().chase_chicken {
             let hens: Vec<usize> = LIVE.lock().unwrap().beasts.iter().enumerate().filter(|b| b.1.kind == "chicken" && b.1.flee_t <= 0.0).map(|b| b.0).collect();
@@ -388,6 +435,32 @@ impl CharacterOverlay {
         let Some(mut p) = c.play.take() else { return false };
         let park = park_now();
         let thing = park.things.get(p.thing).filter(|t| t.kind == p.kind).cloned();
+        if p.kind == "meadow" {
+            let done = self.play_meadow(c, &mut p, dt);
+            if done {
+                self.let_down(c.members[0]);
+                return false;
+            }
+            c.play = Some(p);
+            return true;
+        }
+        if p.kind == "down" {
+            let i = c.members[0];
+            let unit = self.park_unit(self.extras.len() + 1);
+            if p.riders.is_empty() {
+                let side = if self.walk.rand() < 0.5 { -1.0 } else { 1.0 };
+                p.from = self.strip_px(i) + side * 0.7 * unit;
+                p.riders.push(Rider { i, phase: 0, t: 0.0, n: 0, want: 0 });
+            }
+            p.t += dt;
+            let x = p.from;
+            if self.walk_up_to(i, x, 0.0, dt) || p.t > 20.0 {
+                self.let_down(i);
+                return false;
+            }
+            c.play = Some(p);
+            return true;
+        }
         if p.kind == "order" {
             let done = self.play_order(c, &mut p, dt);
             if done {
@@ -1170,6 +1243,62 @@ impl CharacterOverlay {
         }
     }
 
+    /// A stroll up the meadow: a spot or two somewhere on it, a look round,
+    /// then back down to the floor.
+    fn play_meadow(&mut self, c: &mut Chat, p: &mut Play, dt: f32) -> bool {
+        let i = c.members[0];
+        let Some(farm) = governor::place_rect("farm") else { return true };
+        let unit = self.park_unit(self.extras.len() + 1);
+        if p.riders.is_empty() {
+            p.riders.push(Rider { i, phase: 0, t: 0.0, n: 0, want: 1 + (self.walk.rand() * 2.5) as u8 });
+            p.meal = None;
+        }
+        p.t += dt;
+        let mut r = p.riders[0];
+        r.t += dt;
+        let land = (farm.x + unit, farm.x + (1.0 - park::POND) * farm.w - unit);
+        match r.phase {
+            // pick somewhere up there
+            0 => {
+                let (a, b) = (self.walk.rand(), self.walk.rand());
+                p.from = land.0 + a * (land.1 - land.0).max(0.0);
+                p.stay = (0.05 + b * 0.9) * park::MEADOW * farm.h;
+                r.phase = 1;
+            }
+            1 => {
+                if self.walk_up_to(i, p.from, p.stay, dt) {
+                    r.phase = 2;
+                    r.t = 0.0;
+                    r.n += 1;
+                }
+            }
+            // a look round; then another spot, or home
+            2 => {
+                if self.walk.rand() < dt * 0.3 {
+                    let wk = self.walk_of(i);
+                    let left = wk.left;
+                    if let Some(s) = wk.social.as_mut() {
+                        s.face_left = !left;
+                    }
+                }
+                if r.t > 4.0 + (r.n as f32) * 2.0 {
+                    r.phase = if r.n >= r.want { 3 } else { 0 };
+                    if r.phase == 3 {
+                        let x = self.strip_px(i);
+                        p.from = (x + if self.walk.rand() < 0.5 { -1.0 } else { 1.0 } * unit).clamp(land.0, land.1);
+                    }
+                }
+            }
+            _ => {
+                if self.walk_up_to(i, p.from, 0.0, dt) {
+                    return true;
+                }
+            }
+        }
+        p.riders[0] = r;
+        p.t > 90.0
+    }
+
     /// After a hen: it runs off, slower and slower, and once caught it hops
     /// and the chaser jumps for joy.
     fn play_chase(&mut self, c: &mut Chat, p: &mut Play, dt: f32) -> bool {
@@ -1262,6 +1391,11 @@ struct Serve {
 }
 
 static SERVE: Mutex<Vec<Serve>> = Mutex::new(Vec::new());
+
+/// Places taken at the farm's pond (who, x, up, when last seen there).
+static SPOTS: Mutex<Vec<(usize, f32, f32, Instant)>> = Mutex::new(Vec::new());
+/// Up the meadow with nothing left to do there: to walk back down.
+static DOWN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Picked by a right double click: (who, when).
 static PICKED: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
@@ -1450,6 +1584,17 @@ impl CharacterOverlay {
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         self.restaurant_tick(chats);
+        // down from up the meadow, on foot
+        let down: Vec<usize> = std::mem::take(&mut *DOWN.lock().unwrap());
+        for i in down.into_iter().filter(|&i| i < n) {
+            if self.walk_ref(i).social.is_some() || self.walk_ref(i).air <= 0.05 {
+                continue;
+            }
+            self.start_play(chats, i, usize::MAX, "down");
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.perched = true;
+            }
+        }
         // a dish to carry: off to the stove for it
         let serve: Vec<Serve> = std::mem::take(&mut *SERVE.lock().unwrap());
         for Serve { who: i, table: k, dish, from, counter, by_cook, diner } in serve {
@@ -1505,16 +1650,11 @@ impl CharacterOverlay {
             let have = l.beasts.iter().filter(|b| b.home == id).count();
             for _ in have..want {
                 let r = live_rand(&mut l);
-                l.beasts.push(Beast { home: id, kind, x: (x + (r - 0.5) * 0.1).clamp(0.03, park::PIER.0 - 0.05), goal: x, left: r < 0.5, wait: r * 3.0, hop: 0.0, y: (y + (r - 0.5) * 0.03).max(0.0), flee: 0.0, flee_t: 0.0 });
+                l.beasts.push(Beast { home: id, kind, x: (x + (r - 0.5) * 0.1).clamp(0.03, park::PIER.0 - 0.05), goal: x, left: r < 0.5, wait: r * 3.0, hop: 0.0, y: (y + (r - 0.5) * 0.03).max(0.0), goal_y: y, flee: 0.0, flee_t: 0.0 });
             }
         }
         let homes_x: Vec<(u64, f32)> = homes.iter().map(|h| (h.0, h.3)).collect();
-        // moved up or down the meadow with their home
-        for b in l.beasts.iter_mut() {
-            if let Some(h) = homes.iter().find(|h| h.0 == b.home) {
-                b.y += (h.4 - b.y).clamp(-0.004, 0.004);
-            }
-        }
+
         let (lo, hi) = (0.03, park::PIER.0 - 0.05);
         for k in 0..l.beasts.len() {
             let r1 = live_rand(&mut l);
@@ -1539,19 +1679,31 @@ impl CharacterOverlay {
                 }
                 continue;
             }
+            // free over the whole meadow: across and up and down it
             let speed = if b.kind == "chicken" { 0.025 } else { 0.007 };
-            let d = b.goal - b.x;
-            if d.abs() <= speed * dt {
+            let (dx, dy) = (b.goal - b.x, (b.goal_y - b.y) * 1.8);
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= speed * dt {
                 b.x = b.goal;
+                b.y = b.goal_y;
                 b.wait = 1.0 + r1 * 5.0;
-                let home = homes_x.iter().find(|h| h.0 == b.home).map_or(b.x, |h| h.1);
-                let roam = if b.kind == "chicken" { 0.14 } else { 0.18 };
-                b.goal = (home + (r2 - 0.5) * 2.0 * roam).clamp(lo, hi);
+                let r3 = live_rand(&mut l);
+                let r4 = live_rand(&mut l);
+                let b = &mut l.beasts[k];
+                // mostly a short walk; now and then off across the meadow
+                let far = r3 < 0.3;
+                let (rx, ry) = if far { (0.5, 0.5) } else if b.kind == "chicken" { (0.12, 0.1) } else { (0.15, 0.08) };
+                b.goal = (if far { lo + r2 * (hi - lo) } else { b.x + (r2 - 0.5) * 2.0 * rx }).clamp(lo, hi);
+                b.goal_y = (if far { r4 * park::MEADOW * 0.95 } else { b.y + (r4 - 0.5) * 2.0 * ry }).clamp(0.0, park::MEADOW * 0.95);
             } else {
-                b.x += d.signum() * speed * dt;
-                b.left = d < 0.0;
+                b.x += dx / dist * speed * dt;
+                b.y += dy / dist * speed * dt / 1.8;
+                if dx.abs() > 0.001 {
+                    b.left = dx < 0.0;
+                }
             }
         }
+        let _ = &homes_x;
         drop(l);
         // anything newly built on the farm starts growing now
         let mut farm = park::read_farm_cached();

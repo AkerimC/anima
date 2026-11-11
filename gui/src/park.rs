@@ -1194,24 +1194,43 @@ fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
         bar(cr, (fx + 4.0, fy), (fx + 5.0, fy - 8.0), 2.0);
     }
     let shore = w * (1.0 - park::POND as f64);
-    let top = h * 0.86;
+    // all the way up the meadow
+    let top = h * (1.0 - park::MEADOW as f64) - 0.1 * u;
     // the pond, a little sunk into the grass
     let water = gtk::cairo::LinearGradient::new(0.0, top, 0.0, h);
     water.add_color_stop_rgb(0.0, 0.35, 0.62, 0.85);
     water.add_color_stop_rgb(1.0, 0.18, 0.4, 0.68);
     let _ = cr.set_source(&water);
-    cr.move_to(shore - w * 0.02, top);
-    cr.curve_to(shore + w * 0.01, top - 4.0, w, top - 6.0, w, top);
+    // a wavy shore from the top of the meadow down to the floor
+    cr.move_to(shore + w * 0.02, top);
+    let steps = 20;
+    for k in 0..=steps {
+        let f = k as f64 / steps as f64;
+        let y = top + (h - top) * f;
+        let x = shore + w * (0.02 - 0.03 * f) + (f * 9.0).sin() * w * 0.006;
+        cr.line_to(x, y);
+    }
     cr.line_to(w, h);
-    cr.line_to(shore - w * 0.01, h);
+    cr.line_to(w, top);
     cr.close_path();
     cr.fill().ok();
-    // ripples
+    // ripples all over it
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-    for k in 0..6 {
-        let y = top + (h - top) * (0.18 + 0.13 * k as f64);
-        let x0 = shore + ((time * 0.3 + k as f64 * 0.37).sin() * 0.5 + 0.5) * (w - shore) * 0.6;
-        bar(cr, (x0, y), (x0 + w * 0.025, y), 2.0);
+    for k in 0..14 {
+        let y = top + (h - top) * (0.06 + 0.067 * k as f64);
+        let x0 = shore + w * 0.03 + ((time * 0.3 + k as f64 * 0.37).sin() * 0.5 + 0.5) * (w - shore) * 0.55;
+        bar(cr, (x0, y), (x0 + w * 0.02, y), 2.0);
+    }
+    // little jetties up the shore, for more anglers
+    let (ja, jb) = (w * park::JETTY.0 as f64, w * park::JETTY.1 as f64);
+    for y in park::JETTIES {
+        let jy = h - 3.0 - y as f64 * h;
+        cr.set_source_rgb(0.42, 0.28, 0.16);
+        for px in [ja + 0.25 * (jb - ja), jb - 6.0] {
+            rect(cr, px - 3.0, jy - 0.1 * u, px + 3.0, jy + 0.12 * u);
+        }
+        cr.set_source_rgb(0.62, 0.44, 0.27);
+        rect(cr, ja, jy - 0.03 * u, jb, jy + 3.0);
     }
     // reeds at the edge
     cr.set_source_rgb(0.3, 0.5, 0.25);

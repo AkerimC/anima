@@ -240,6 +240,10 @@ pub const MILK_EVERY: f64 = 240.0;
 /// The pond's share of the farm window, on the right; the pier runs out over it.
 pub const POND: f32 = 0.13;
 pub const PIER: (f32, f32) = (0.855, 0.975);
+/// Little jetties up the pond's shore, for more anglers: their heights
+/// (share of the window's height) and how far they reach into the water.
+pub const JETTIES: [f32; 4] = [0.1, 0.19, 0.28, 0.37];
+pub const JETTY: (f32, f32) = (1.0 - POND - 0.01, 1.0 - POND + 0.06);
 /// How far up the meadow things can be put (share of the window's height).
 pub const MEADOW: f32 = 0.45;
 
