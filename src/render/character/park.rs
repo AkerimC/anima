@@ -488,8 +488,13 @@ pub fn jobs_cached() -> Jobs {
     c.as_ref().map(|x| x.1.clone()).unwrap_or_default()
 }
 
+/// Asked many times a frame: looked up in the cache without copying it.
 pub fn job_of(name: &str) -> Option<String> {
-    jobs_cached().jobs.get(name).cloned()
+    let mut c = JOBS_CACHE.lock().unwrap();
+    if c.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 2.0) {
+        *c = Some((std::time::Instant::now(), read_jobs()));
+    }
+    c.as_ref().and_then(|x| x.1.jobs.get(name).cloned())
 }
 
 pub fn job_label(id: &str) -> &'static str {

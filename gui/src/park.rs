@@ -24,7 +24,13 @@ struct Shared {
     farm: park::Farm,
     // animals as drawn (eased towards where the daemon says they are)
     shown: Vec<(String, f32, bool, f32, f32)>,
-    pics: HashMap<(String, i32), Option<gdk_pixbuf::Pixbuf>>,
+    pics: HashMap<(String, i32), Option<gtk::cairo::ImageSurface>>,
+    // each window's background, drawn once for its size (place, w, h, unit)
+    backs: HashMap<(&'static str, i32, i32, i32), gtk::cairo::ImageSurface>,
+    // animals: where they were and are going, since when, how often news comes
+    anim_from: Vec<(f32, f32, f32)>,
+    anim_t0: std::time::Instant,
+    anim_gap: f32,
     started: std::time::Instant,
 }
 
@@ -56,6 +62,10 @@ fn shared() -> Rc<RefCell<Shared>> {
                     farm: park::read_farm(),
                     shown: Vec::new(),
                     pics: HashMap::new(),
+                    backs: HashMap::new(),
+                    anim_from: Vec::new(),
+                    anim_t0: std::time::Instant::now(),
+                    anim_gap: 0.2,
                     started: std::time::Instant::now(),
                 }))
             })
@@ -135,13 +145,30 @@ fn build(app: &adw::Application, place: &str) {
         let (w, h) = (w as f64, h as f64);
         let mut sh = s2.borrow_mut();
         let me = m2.borrow();
-        match me.place {
-            "cafe" => draw_cafe(cr, w, h),
-            "farm" => draw_farm(cr, w, h, sh.started.elapsed().as_secs_f64(), unit_px(&sh, w)),
-            _ => draw_park(cr, w, h),
-        }
         let unit = unit_px(&sh, w);
         let time = sh.started.elapsed().as_secs_f64();
+        let key = (me.place, w as i32, h as i32, unit as i32);
+        if !sh.backs.contains_key(&key) {
+            sh.backs.retain(|k, _| k.0 != me.place);
+            if let Ok(surface) = gtk::cairo::ImageSurface::create(gtk::cairo::Format::Rgb24, w as i32, h as i32) {
+                if let Ok(c) = gtk::cairo::Context::new(&surface) {
+                    match me.place {
+                        "cafe" => draw_cafe(&c, w, h),
+                        "farm" => draw_farm(&c, w, h, unit),
+                        _ => draw_park(&c, w, h),
+                    }
+                }
+                surface.flush();
+                sh.backs.insert(key, surface);
+            }
+        }
+        if let Some(back) = sh.backs.get(&key) {
+            cr.set_source_surface(back, 0.0, 0.0).ok();
+            cr.paint().ok();
+        }
+        if me.place == "farm" {
+            draw_farm_live(cr, w, h, time, unit);
+        }
         let things: Vec<(usize, park::Thing)> = sh.park.things.iter().cloned().enumerate().filter(|(_, t)| t.place == me.place).collect();
         // the far ones first, so the near ones stand in front
         let mut things = things;
@@ -155,6 +182,20 @@ fn build(app: &adw::Application, place: &str) {
             draw_extras(&mut sh, cr, t, x, gy, unit, grown, ready, time);
         }
         if me.place == "farm" {
+            // where each one is now: between where it was and where it's
+            // going, at an even pace over the time between updates
+            let k = (sh.anim_t0.elapsed().as_secs_f32() / sh.anim_gap).min(1.0);
+            let animals_now: Vec<(String, f32, bool, f32, f32)> = sh
+                .world
+                .animals
+                .iter()
+                .enumerate()
+                .map(|(n, a)| {
+                    let from = sh.anim_from.get(n).copied().unwrap_or((a.x, a.y, a.hop));
+                    (a.kind.clone(), from.0 + (a.x - from.0) * k, a.left, from.2 + (a.hop - from.2) * k, from.1 + (a.y - from.1) * k)
+                })
+                .collect();
+            sh.shown = animals_now;
             let mut animals = sh.shown.clone();
             animals.sort_by(|a, b| b.4.total_cmp(&a.4));
             for (kind, x, left, hop, up) in animals {
@@ -435,10 +476,10 @@ fn build(app: &adw::Application, place: &str) {
         gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 
-    // keeping up with the daemon: animals ease along, steam rises
+    // keeping up with the daemon: news ten times a second
     let (s2, g2, w2) = (sh.clone(), ground.clone(), win.clone());
     let mut last_slow = std::time::Instant::now() - std::time::Duration::from_secs(5);
-    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         if !w2.is_visible() && w2.application().is_none() {
             return glib::ControlFlow::Break;
         }
@@ -447,7 +488,13 @@ fn build(app: &adw::Application, place: &str) {
         let mut redraw = false;
         if m != sh.world_mtime {
             sh.world_mtime = m;
+            // the animals carry on from where they're drawn now
+            let from: Vec<(f32, f32, f32)> = sh.shown.iter().map(|a| (a.1, a.4, a.3)).collect();
+            let gap = sh.anim_t0.elapsed().as_secs_f32().clamp(0.1, 0.6);
+            sh.anim_gap = sh.anim_gap * 0.7 + gap * 0.3;
+            sh.anim_t0 = std::time::Instant::now();
             sh.world = park::read_world();
+            sh.anim_from = if from.len() == sh.world.animals.len() { from } else { sh.world.animals.iter().map(|a| (a.x, a.y, a.hop)).collect() };
             redraw = true;
         }
         if last_slow.elapsed().as_secs_f32() > 2.0 {
@@ -456,29 +503,28 @@ fn build(app: &adw::Application, place: &str) {
             sh.farm = park::read_farm();
             redraw = true;
         }
-        // animals: ease to where they are
-        let target: Vec<(String, f32, bool, f32, f32)> = sh.world.animals.iter().map(|a| (a.kind.clone(), a.x, a.left, a.hop, a.y)).collect();
-        if sh.shown.len() != target.len() {
-            sh.shown = target.clone();
-        }
-        let mut moving = false;
-        for (s, t) in sh.shown.iter_mut().zip(&target) {
-            let d = t.1 - s.1;
-            if d.abs() > 0.0005 {
-                s.1 += d * 0.35;
-                moving = true;
-            }
-            s.2 = t.2;
-            s.4 += (t.4 - s.4) * 0.3;
-            if (s.3 - t.3).abs() > 0.01 {
-                s.3 += (t.3 - s.3) * 0.5;
-                moving = true;
-            }
-        }
-        let steaming = !sh.world.stoves.is_empty();
         drop(sh);
-        if redraw || moving || steaming {
+        if redraw {
             g2.queue_draw();
+        }
+        glib::ControlFlow::Continue
+    });
+    // every frame while something moves (only while the window is shown):
+    // animals on the farm, steam and smoke over a pot
+    let (s2, m2) = (sh.clone(), me.clone());
+    let last = std::cell::Cell::new(std::time::Instant::now());
+    ground.add_tick_callback(move |g, _| {
+        let sh = s2.borrow();
+        let place = m2.borrow().place;
+        let animals = place == "farm" && !sh.world.animals.is_empty();
+        let steam = place != "farm" && !sh.world.stoves.is_empty();
+        drop(sh);
+        // animals at 30 a second, the pond's ripples and steam at 20: smooth
+        // enough, and each frame repaints the whole window
+        let every = if animals { 0.033 } else { 0.05 };
+        if (animals || steam || place == "farm") && last.get().elapsed().as_secs_f32() >= every {
+            last.set(std::time::Instant::now());
+            g.queue_draw();
         }
         glib::ControlFlow::Continue
     });
@@ -666,16 +712,29 @@ fn recipe_book() -> gtk::Widget {
 fn draw_picture(sh: &mut Shared, cr: &gtk::cairo::Context, path: &std::path::Path, x: f64, y: f64, size: f64, mirror: bool) {
     let px = size.round().max(4.0) as i32;
     let key = (path.to_string_lossy().into_owned(), px);
-    let pb = sh.pics.entry(key).or_insert_with(|| gdk_pixbuf::Pixbuf::from_file_at_scale(path, px, px, true).ok()).clone();
-    let Some(pb) = pb else { return };
-    let (pw, ph) = (pb.width() as f64, pb.height() as f64);
+    let pic = sh
+        .pics
+        .entry(key)
+        .or_insert_with(|| {
+            let pb = gdk_pixbuf::Pixbuf::from_file_at_scale(path, px, px, true).ok()?;
+            let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, pb.width(), pb.height()).ok()?;
+            let c = gtk::cairo::Context::new(&surface).ok()?;
+            c.set_source_pixbuf(&pb, 0.0, 0.0);
+            c.paint().ok()?;
+            drop(c);
+            surface.flush();
+            Some(surface)
+        })
+        .clone();
+    let Some(pic) = pic else { return };
+    let (pw, ph) = (pic.width() as f64, pic.height() as f64);
     cr.save().ok();
     cr.translate(x + (size - pw) * 0.5, y + (size - ph));
     if mirror {
         cr.translate(pw, 0.0);
         cr.scale(-1.0, 1.0);
     }
-    cr.set_source_pixbuf(&pb, 0.0, 0.0);
+    cr.set_source_surface(&pic, 0.0, 0.0).ok();
     cr.paint().ok();
     cr.restore().ok();
 }
@@ -1167,7 +1226,7 @@ fn draw_cafe(cr: &gtk::cairo::Context, w: f64, h: f64) {
 
 /// The farm: sky and grass like the park, with a pond on the right and a
 /// pier running out over it.
-fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
+fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, u: f64) {
     draw_park(cr, w, h);
     // the meadow: green from halfway down, rolling at its top edge
     let top = h * (1.0 - park::MEADOW as f64) - 0.12 * u;
@@ -1214,13 +1273,6 @@ fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
     cr.line_to(w, top);
     cr.close_path();
     cr.fill().ok();
-    // ripples all over it
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-    for k in 0..14 {
-        let y = top + (h - top) * (0.06 + 0.067 * k as f64);
-        let x0 = shore + w * 0.03 + ((time * 0.3 + k as f64 * 0.37).sin() * 0.5 + 0.5) * (w - shore) * 0.55;
-        bar(cr, (x0, y), (x0 + w * 0.02, y), 2.0);
-    }
     // little jetties up the shore, for more anglers
     let (ja, jb) = (w * park::JETTY.0 as f64, w * park::JETTY.1 as f64);
     for y in park::JETTIES {
@@ -1231,12 +1283,6 @@ fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
         }
         cr.set_source_rgb(0.62, 0.44, 0.27);
         rect(cr, ja, jy - 0.03 * u, jb, jy + 3.0);
-    }
-    // reeds at the edge
-    cr.set_source_rgb(0.3, 0.5, 0.25);
-    for k in 0..5 {
-        let rx = shore - w * 0.025 + k as f64 * 6.0;
-        bar(cr, (rx, h), (rx + (time + k as f64).sin() * 2.0, h - 0.35 * u - k as f64 * 3.0), 2.5);
     }
     // the pier: planks at the characters' feet, posts down into the water
     let (a, b) = (w * park::PIER.0 as f64, w * park::PIER.1 as f64);
@@ -1254,6 +1300,25 @@ fn draw_farm(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
     while px < b {
         bar(cr, (px, deck - 0.03 * u), (px, deck + 3.0), 1.0);
         px += 0.16 * u;
+    }
+}
+
+/// What moves on the farm's background: ripples on the pond, the reeds.
+fn draw_farm_live(cr: &gtk::cairo::Context, w: f64, h: f64, time: f64, u: f64) {
+    let shore = w * (1.0 - park::POND as f64);
+    let top = h * (1.0 - park::MEADOW as f64) - 0.1 * u;
+    // ripples all over it
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+    for k in 0..14 {
+        let y = top + (h - top) * (0.06 + 0.067 * k as f64);
+        let x0 = shore + w * 0.03 + ((time * 0.3 + k as f64 * 0.37).sin() * 0.5 + 0.5) * (w - shore) * 0.55;
+        bar(cr, (x0, y), (x0 + w * 0.02, y), 2.0);
+    }
+    // reeds at the edge
+    cr.set_source_rgb(0.3, 0.5, 0.25);
+    for k in 0..5 {
+        let rx = shore - w * 0.025 + k as f64 * 6.0;
+        bar(cr, (rx, h), (rx + (time + k as f64).sin() * 2.0, h - 0.35 * u - k as f64 * 3.0), 2.5);
     }
 }
 
