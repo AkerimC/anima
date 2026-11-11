@@ -161,31 +161,72 @@ fn card(r: &Rc<Roster>, i: usize, m: &team::Member) -> gtk::Widget {
     }
     frame.append(&col);
 
-    // right-click: a small menu, each choice opening its own little view;
-    // opened in the middle of the window, near the top, so it never runs
-    // off the bottom (a card low down used to push it out of sight)
-    let menu = gtk::Popover::builder().has_arrow(false).position(gtk::PositionType::Bottom).build();
+    // right-click: the small menu on the card where it was clicked; what it
+    // opens comes up in the middle of the window
+    let menu = gtk::Popover::new();
+    menu.set_parent(&frame);
     let click = gtk::GestureClick::builder().button(3).build();
     let (rr, path, card) = (r.clone(), m.path.clone(), frame.clone());
     click.connect_pressed(move |_, _, x, y| {
-        let host: gtk::Widget = card.root().and_then(|root| root.downcast::<gtk::Window>().ok()).and_then(|w| w.child()).unwrap_or_else(|| card.clone().upcast());
-        if menu.parent().as_ref() != Some(&host) {
-            if menu.parent().is_some() {
-                menu.unparent();
-            }
-            menu.set_parent(&host);
-        }
-        menu.set_child(Some(&choices(&rr, &menu, i, &path)));
-        let at = if host == card.clone().upcast::<gtk::Widget>() {
-            gdk::Rectangle::new(x as i32, y as i32, 1, 1)
-        } else {
-            gdk::Rectangle::new(host.width() / 2, (host.height() as f64 * 0.08) as i32, 1, 1)
-        };
-        menu.set_pointing_to(Some(&at));
+        let p = Panel::Menu(menu.clone(), card.clone().upcast());
+        p.set_child(Some(&choices(&rr, &p, i, &path)));
+        menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         menu.popup();
     });
     frame.add_controller(click);
     frame.upcast()
+}
+
+/// The character's right-click panel: the small menu pops up on its card;
+/// a bigger view (status, friendships, wardrobe, fitting) opens as a dialog
+/// in the middle of the window.
+#[derive(Clone)]
+enum Panel {
+    Menu(gtk::Popover, gtk::Widget),
+    View(adw::Dialog),
+}
+
+impl Panel {
+    fn set_child(&self, w: Option<&impl IsA<gtk::Widget>>) {
+        match self {
+            Panel::Menu(p, _) => p.set_child(w),
+            Panel::View(d) => {
+                let wrapped = w.map(|w| {
+                    let b = gtk::Box::builder().margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
+                    b.append(w);
+                    b
+                });
+                d.set_child(wrapped.as_ref());
+            }
+        }
+    }
+
+    fn popdown(&self) {
+        match self {
+            Panel::Menu(p, _) => p.popdown(),
+            Panel::View(d) => {
+                d.close();
+            }
+        }
+    }
+
+    /// A bigger view: from the menu, in a dialog in the middle; in the dialog, in its place.
+    fn open(&self, make: impl FnOnce(&Panel) -> gtk::Widget) {
+        match self {
+            Panel::Menu(p, parent) => {
+                p.popdown();
+                let d = adw::Dialog::builder().follows_content_size(true).build();
+                let view = Panel::View(d.clone());
+                let w = make(&view);
+                view.set_child(Some(&w));
+                d.present(Some(parent));
+            }
+            Panel::View(_) => {
+                let w = make(self);
+                self.set_child(Some(&w));
+            }
+        }
+    }
 }
 
 fn menu_button(label: &str, icon: &str) -> gtk::Button {
@@ -197,7 +238,7 @@ fn menu_button(label: &str, icon: &str) -> gtk::Button {
     b
 }
 
-fn choices(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, path: &str) -> gtk::Widget {
+fn choices(r: &Rc<Roster>, pop: &Panel, i: usize, path: &str) -> gtk::Widget {
     let name = name_of(path);
     let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
     let title = gtk::Label::builder().label(&name).xalign(0.0).margin_start(8).margin_bottom(4).build();
@@ -205,19 +246,19 @@ fn choices(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, path: &str) -> gtk::Wid
     list.append(&title);
     let status = menu_button("Status", "dialog-information-symbolic");
     let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
-    status.connect_clicked(move |_| p.set_child(Some(&status_view(&rr, &p, i, &n))));
+    status.connect_clicked(move |_| p.open(|q| status_view(&rr, q, i, &n)));
     list.append(&status);
     let friends = menu_button("Friendships", "system-users-symbolic");
     let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
-    friends.connect_clicked(move |_| p.set_child(Some(&friends_view(&rr, &p, i, &n))));
+    friends.connect_clicked(move |_| p.open(|q| friends_view(&rr, q, i, &n)));
     list.append(&friends);
     let wear = menu_button("Wardrobe", "applications-graphics-symbolic");
     let (rr, p, n) = (r.clone(), pop.clone(), name.clone());
-    wear.connect_clicked(move |_| p.set_child(Some(&wardrobe_view(&rr, &p, i, &n))));
+    wear.connect_clicked(move |_| p.open(|q| wardrobe_view(&rr, q, i, &n)));
     list.append(&wear);
     let fit = menu_button("Fit accessories", "object-flip-horizontal-symbolic");
     let (rr, p, n, pth) = (r.clone(), pop.clone(), name.clone(), path.to_string());
-    fit.connect_clicked(move |_| p.set_child(Some(&fit_view(&rr, &p, i, &n, &pth))));
+    fit.connect_clicked(move |_| p.open(|q| fit_view(&rr, q, i, &n, &pth)));
     list.append(&fit);
     list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let remove = menu_button("Remove from line-up", "user-trash-symbolic");
@@ -234,7 +275,7 @@ fn choices(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, path: &str) -> gtk::Wid
     list.upcast()
 }
 
-fn back_header(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, title: &str) -> gtk::Box {
+fn back_header(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str, title: &str) -> gtk::Box {
     let head = gtk::Box::builder().spacing(6).margin_bottom(6).build();
     let back = gtk::Button::builder().icon_name("go-previous-symbolic").tooltip_text("Back").build();
     back.add_css_class("flat");
@@ -264,7 +305,7 @@ fn save_eye_fixes(m: &serde_json::Map<String, serde_json::Value>) {
 
 /// Click on the character's eyes: its sleep mask goes there from now on.
 #[allow(dead_code)]
-fn mask_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str) -> gtk::Widget {
+fn mask_view(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str, path: &str) -> gtk::Widget {
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(260).build();
     b.append(&back_header(r, pop, i, name, "Sleep mask"));
     let hint = gtk::Label::builder().label("Click between its eyes. The mask moves there at once.").wrap(true).xalign(0.0).build();
@@ -366,11 +407,11 @@ fn sprite_surface(path: &str) -> Option<(gtk::cairo::ImageSurface, image::RgbaIm
 /// Fitting what it wears by hand: each accessory is a box on the picture;
 /// drag it to move it, drag its corner or scroll to size it. Saved as it's
 /// done, and shown on the desktop at once.
-fn fit_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str) -> gtk::Widget {
+fn fit_view(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str, path: &str) -> gtk::Widget {
     fit_pose(r, pop, i, name, path, false)
 }
 
-fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str, happy: bool) -> gtk::Widget {
+fn fit_pose(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str, path: &str, happy: bool) -> gtk::Widget {
     use anima::render::character::wear;
     use std::cell::{Cell, RefCell};
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(320).build();
@@ -699,7 +740,7 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
     b.upcast()
 }
 
-fn wardrobe_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk::Widget {
+fn wardrobe_view(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str) -> gtk::Widget {
     use anima::render::character::wear;
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(280).build();
     b.append(&back_header(r, pop, i, name, "Wardrobe"));
@@ -766,7 +807,7 @@ fn live() -> Option<Vec<serde_json::Value>> {
     reply.data?.as_array().cloned()
 }
 
-fn status_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk::Widget {
+fn status_view(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str) -> gtk::Widget {
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(260).build();
     b.append(&back_header(r, pop, i, name, "Status"));
     let me = live().and_then(|all| all.into_iter().find(|c| c["name"].as_str() == Some(name)));
@@ -835,7 +876,7 @@ fn status_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk:
     b.upcast()
 }
 
-fn friends_view(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str) -> gtk::Widget {
+fn friends_view(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str) -> gtk::Widget {
     let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).width_request(300).build();
     b.append(&back_header(r, pop, i, name, "Friendships"));
     let me = live().and_then(|all| all.into_iter().find(|c| c["name"].as_str() == Some(name)));

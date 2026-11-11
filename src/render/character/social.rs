@@ -1029,7 +1029,7 @@ impl CharacterOverlay {
             let x = self.strip_px(m);
             for f in 0..n {
                 let wk = self.walk_ref(f);
-                if c.members.contains(&f) || wk.ws != ws || !wk.at_leisure() || (self.strip_px(f) - x).abs() > range {
+                if c.members.contains(&f) || wk.ws != ws || !wk.at_leisure() || (self.strip_px(f) - x).abs() > range || self.on_shift(f) {
                     continue;
                 }
                 let b = self.bond(m, f).0;
@@ -1420,6 +1420,11 @@ impl CharacterOverlay {
 
     fn on_screen(&self, i: usize) -> bool {
         let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
+        // in the park, cafe or farm: alive even while that window is scrolled
+        // out of view (the three sit side by side, only one shows at a time)
+        if r[2] > r[0] && self.place_here(i).is_some() {
+            return true;
+        }
         // an empty box: not drawn yet
         r[2] > r[0] && r[2] >= 0.0 && r[0] <= self.view_w
     }
@@ -1951,6 +1956,10 @@ impl CharacterOverlay {
 
     /// Start a game this group hasn't played yet, if it has the energy.
     fn next_game(&mut self, c: &mut Chat) -> bool {
+        // in the cafe or on the farm they talk; games are for the park and the desktop
+        if c.members.iter().any(|&i| self.no_games_here(i)) {
+            return false;
+        }
         let mean = c.members.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / c.members.len() as f32;
         if mean < tn().energy_game_need || self.social_age < tn().warm_small {
             return false;
@@ -2802,7 +2811,7 @@ impl CharacterOverlay {
         let i = forced.or_else(|| {
             (0..n).find(|&i| {
                 let wk = self.walk_ref(i);
-                wk.at_leisure() && wk.act == Act::Idle && wk.energy >= tn().train_energy && wk.bored >= tn().train_bored && wk.train_cool <= 0.0 && self.on_screen(i)
+                wk.at_leisure() && wk.act == Act::Idle && wk.energy >= tn().train_energy && wk.bored >= tn().train_bored && wk.train_cool <= 0.0 && self.on_screen(i) && !self.no_games_here(i)
             })
         })?;
         if forced.is_none() && self.walk_of(i).rand() >= every / tn().train_every.max(1.0) {

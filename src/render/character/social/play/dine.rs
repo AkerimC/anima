@@ -87,9 +87,10 @@ impl CharacterOverlay {
             return false;
         }
         let park = park_now();
-        let free = park.things.iter().enumerate().filter(|(_, t)| t.kind == "table" && t.place == "cafe").find(|(k, _)| {
-            let used = chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| p.kind == "dine" && p.thing == *k)).map(|c| c.members.len()).sum::<usize>();
-            used < 4
+        let unit = self.park_unit(self.extras.len() + 1);
+        let free = park.things.iter().enumerate().filter(|(_, t)| t.kind == "table" && t.place == "cafe").find(|(k, t)| {
+            let used = chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| matches!(p.kind.as_str(), "dine" | "table") && p.thing == *k)).map(|c| c.members.len()).sum::<usize>();
+            used < self.table_seats(t, self.thing_px(t), unit).len()
         });
         let Some((k, _)) = free else { return false };
         log::debug!("cafe: {i} comes in to eat");
@@ -255,6 +256,13 @@ impl CharacterOverlay {
     pub(super) fn play_dine(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
         let seats = self.table_seats(t, mid, unit);
         let mut off = Vec::new();
+        // more diners than places: the extra ones find another table (or go)
+        while p.riders.len() > seats.len().max(1) {
+            if let Some(r) = p.riders.pop() {
+                set_order(r.i, |o| o.state = Ask::Failed);
+                self.get_off(c, p, r.i);
+            }
+        }
         let waiter = self.on_duty("waiter").is_some();
         let pickup = self.pickup();
         // the queue at the counter, in order

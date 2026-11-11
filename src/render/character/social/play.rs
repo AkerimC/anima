@@ -266,6 +266,23 @@ impl CharacterOverlay {
         }
     }
 
+    /// Work first, at its workplace, with a job there (full or part-time):
+    /// on shift, so no chats or games, only the work.
+    pub(in crate::render::character) fn on_shift(&self, i: usize) -> bool {
+        if !working() {
+            return false;
+        }
+        let name = self.character_name(i);
+        let Some(job) = park::job_of(&name).or_else(|| park::part_of(&name)) else { return false };
+        let at = park::JOBS.iter().find(|j| j.0 == job).map_or("", |j| j.2);
+        self.place_here(i).is_some_and(|p| p.place == at)
+    }
+
+    /// In the cafe or on the farm: no games there (the park and the desktop are for that).
+    pub(super) fn no_games_here(&self, i: usize) -> bool {
+        self.place_here(i).is_some_and(|p| p.place != "park")
+    }
+
     /// The park, cafe or farm window `i` is standing in, if any.
     pub(super) fn place_here(&self, i: usize) -> Option<governor::Place> {
         governor::place_at(self.walk_ref(i).ws, self.strip_px(i))
@@ -551,7 +568,7 @@ impl CharacterOverlay {
         let mut free: Vec<(usize, f32)> = (0..n)
             .filter(|&i| {
                 let wk = self.walk_ref(i);
-                wk.ws == park.ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none()
+                wk.ws == park.ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none() && !self.on_shift(i) && wk.energy >= tn().energy_game_need * 0.5
             })
             .map(|i| (i, (self.strip_px(i) - middle).abs()))
             .collect();
@@ -1036,6 +1053,12 @@ impl CharacterOverlay {
     /// a dish on it, they eat it together and get closer.
     fn play_table(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
         let seats = self.table_seats(t, mid, unit);
+        // more of them than places: the extra ones don't stay
+        while p.riders.len() > seats.len().max(1) {
+            if let Some(r) = p.riders.pop() {
+                self.get_off(c, p, r.i);
+            }
+        }
         for k in 0..p.riders.len().min(4) {
             let i = p.riders[k].i;
             let (x, up) = seats[k.min(seats.len() - 1)];
@@ -1397,14 +1420,26 @@ impl CharacterOverlay {
     /// at), then standing places round it.
     pub(super) fn table_seats(&self, t: &Thing, mid: f32, unit: f32) -> Vec<(f32, f32)> {
         let park = park_now();
-        let mut chairs: Vec<f32> = park.things.iter().filter(|c| c.kind == "chair" && c.place == t.place && (c.y - t.y).abs() < 0.02).map(|c| self.thing_px(c)).filter(|x| (x - mid).abs() < 1.3 * unit).collect();
+        // each chair belongs to the nearest table only (no two at one chair)
+        let tables: Vec<f32> = park.things.iter().filter(|o| o.kind == "table" && o.place == t.place).map(|o| self.thing_px(o)).collect();
+        let mut chairs: Vec<f32> = park
+            .things
+            .iter()
+            .filter(|c| c.kind == "chair" && c.place == t.place && (c.y - t.y).abs() < 0.02)
+            .map(|c| self.thing_px(c))
+            .filter(|x| (x - mid).abs() < 1.3 * unit)
+            .filter(|x| tables.iter().all(|o| (x - o).abs() >= (x - mid).abs() - 0.5))
+            .collect();
         chairs.sort_by(|a, b| (a - mid).abs().total_cmp(&(b - mid).abs()));
         let mut seats: Vec<(f32, f32)> = chairs.into_iter().take(4).map(|x| (x, park::SEAT * unit + 0.02 * unit)).collect();
+        // then standing places round it, clear of chairs and of other tables' places
+        let others: Vec<f32> = tables.iter().copied().filter(|o| (o - mid).abs() > 1.0).collect();
         for x in [mid - 0.85 * unit, mid + 0.85 * unit, mid - 1.3 * unit, mid + 1.3 * unit] {
             if seats.len() >= 4 {
                 break;
             }
-            if !seats.iter().any(|s| (s.0 - x).abs() < 0.4 * unit) {
+            let clear = !seats.iter().any(|s| (s.0 - x).abs() < 0.4 * unit) && others.iter().all(|o| (o - x).abs() > 0.85 * unit);
+            if clear {
                 seats.push((x, 0.0));
             }
         }
@@ -1948,6 +1983,24 @@ impl CharacterOverlay {
     /// Every frame: the hens and cows potter about (and run from whoever is
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
+        // on shift: kept out of chats (the wait is longer than any chat ignores)
+        let keep_out = tn().overlap_cool + 5.0;
+        let mut fisher_free = None;
+        for i in 0..n {
+            if self.walk_ref(i).social.is_none() && self.on_shift(i) {
+                let wk = self.walk_of(i);
+                wk.social_cool = wk.social_cool.max(keep_out);
+                if wk.at_leisure() && wk.act == Act::Idle && wk.fish_cool <= 0.0 && self.may_work(i, "fisher") && (self.is_job(i, "fisher") || self.is_part(i, "fisher")) {
+                    fisher_free = Some(i);
+                }
+            }
+        }
+        // the fisher on shift: off to fish (not off the meadow)
+        if let Some(i) = fisher_free.filter(|&i| self.walk_ref(i).air <= 0.0) {
+            log::debug!("{i} fishes on its shift");
+            let c = self.fish_alone(i, false);
+            chats.push(c);
+        }
         self.restaurant_tick(chats);
         self.hunger_tick(chats, dt, n);
         self.visit_tick(chats, dt, n);

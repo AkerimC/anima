@@ -900,7 +900,7 @@ impl CharacterOverlay {
     pub(super) fn seek_company(&mut self, n: usize, every: f32) {
         for i in 0..n {
             let wk = self.walk_ref(i);
-            if wk.act != Act::Idle || !wk.at_leisure() || wk.climb_like() {
+            if wk.act != Act::Idle || !wk.at_leisure() || wk.climb_like() || self.on_shift(i) {
                 continue;
             }
             let ws = wk.ws;
