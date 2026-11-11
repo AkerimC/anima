@@ -3107,8 +3107,11 @@ impl CharacterOverlay {
                 wk.gesture = true;
                 t = 2.5 + self.walk.rand() * 2.5;
             } else if roll < 0.8 {
-                // a stroll along the bank, never right on top of an angler
-                let (a, b) = ((lo - size * 3.0).max(size), (hi + size * 3.0).min((width - size).max(size)));
+                // a stroll along the bank, never right on top of an angler (and
+                // at the farm's pond, on dry land, not out on the pier)
+                let land = self.dry_land(w);
+                let (a, b) = ((lo - size * 3.0).max(size).max(land.0), (hi + size * 3.0).min((width - size).max(size)).min(land.1));
+                let (a, b) = if a < b { (a, b) } else { (land.1 - size * 3.0, land.1) };
                 let mut goal = x;
                 for _ in 0..6 {
                     let g = a + self.walk.rand() * (b - a).max(1.0);
@@ -5402,7 +5405,10 @@ impl CharacterOverlay {
         let hi = c.members.iter().map(|&m| self.goal_of(m)).fold(f32::MIN, f32::max);
         let step = size * 0.85 * c.watchers.len() as f32;
         let goal = if self.strip_px(i) < (lo + hi) * 0.5 { lo - step } else { hi + step };
-        self.go(i, goal.clamp(0.0, self.strip_width_of(i)), 0.18);
+        // watching the farm's anglers: from the bank, not the pier
+        let land = self.dry_land(i);
+        let goal = goal.clamp(0.0, self.strip_width_of(i)).clamp(land.0, land.1.max(land.0));
+        self.go(i, goal, 0.18);
     }
 
     /// The game's over: some of those watching come in, the rest move on.

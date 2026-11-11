@@ -133,6 +133,15 @@ impl CharacterOverlay {
         self.place_here(i).filter(|p| p.place == "farm").map(|p| (p.x + park::PIER.0 * p.w, p.x + park::PIER.1 * p.w))
     }
 
+    /// Where `i` can stand on dry ground (strip px): on the farm's workspace,
+    /// short of the pond; elsewhere anywhere.
+    pub(super) fn dry_land(&self, i: usize) -> (f32, f32) {
+        match governor::place_rect("farm").filter(|p| p.ws == self.walk_ref(i).ws) {
+            Some(p) if self.strip_px(i) >= p.x - 1.0 => (p.x, p.x + (1.0 - park::POND - 0.02) * p.w),
+            _ => (f32::MIN, f32::MAX),
+        }
+    }
+
     /// The farm's pier, if the farm is on `i`'s workspace (it can walk there).
     pub(super) fn pier_near(&self, i: usize) -> Option<(f32, f32)> {
         governor::place_rect("farm").filter(|p| p.ws == self.walk_ref(i).ws).map(|p| (p.x + park::PIER.0 * p.w, p.x + park::PIER.1 * p.w))
@@ -669,7 +678,7 @@ impl CharacterOverlay {
             "chair" | "bench" => self.play_sit(c, &mut p, &thing, mid, unit),
             "table" => self.play_table(c, &mut p, &thing, mid, unit, dt),
             "stove" => self.play_stove(c, &mut p, &thing, mid, unit, dt),
-            "carrots" | "wheat" | "apple_tree" | "coop" | "barn" => self.play_farm(c, &mut p, &thing, mid, unit, dt),
+            "carrots" | "wheat" | "apple_tree" | "coop" | "barn" | "tree" => self.play_farm(c, &mut p, &thing, mid, unit, dt),
             "sandbox" => self.play_sandbox(c, &mut p, mid, unit, dt),
             "stall" => self.play_stall(c, &mut p, mid, unit, dt),
             _ => true,
@@ -1270,7 +1279,19 @@ impl CharacterOverlay {
                 let mut farm = park::read_farm();
                 let (_, ready) = park::farm_state(t, &farm);
                 let key = t.id.to_string();
-                if ready > 0 {
+                if ready > 0 && t.kind == "tree" {
+                    // logs fallen under the tree: into the chest
+                    let name = self.character_name(r.i);
+                    for _ in 0..ready {
+                        park::add(&name, "wood");
+                    }
+                    park::earn(&name, ready);
+                    farm.insert(key, park::now());
+                    park::write_farm(&farm);
+                    log::debug!("{} picks up {ready} wood", r.i);
+                    self.set_happy(r.i, true);
+                    self.walk_of(r.i).start_bob(tn().jump_height * 0.3);
+                } else if ready > 0 {
                     let (food, k) = match t.kind.as_str() {
                         "carrots" => ("carrot", 2),
                         "wheat" => ("wheat", 2),
@@ -1997,7 +2018,7 @@ impl CharacterOverlay {
         // anything newly built on the farm starts growing now
         let mut farm = park::read_farm_cached();
         let mut changed = false;
-        for t in park.things.iter().filter(|t| t.place == "farm" && matches!(t.kind.as_str(), "carrots" | "wheat" | "apple_tree" | "coop" | "barn")) {
+        for t in park.things.iter().filter(|t| (t.place == "farm" && matches!(t.kind.as_str(), "carrots" | "wheat" | "apple_tree" | "coop" | "barn")) || t.kind == "tree") {
             let key = t.id.to_string();
             if t.id != 0 && !farm.contains_key(&key) {
                 farm.insert(key, park::now());

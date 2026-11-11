@@ -923,6 +923,18 @@ fn draw_extras(sh: &mut Shared, cr: &gtk::cairo::Context, t: &park::Thing, x: f6
                 cr.fill().ok();
             }
         }
+        "tree" => {
+            // logs fallen under it, waiting to be picked up
+            for k in 0..ready {
+                let lx = x - 0.35 * u + k as f64 * 0.28 * u;
+                cr.set_source_rgb(0.55, 0.36, 0.2);
+                rect(cr, lx - 0.12 * u, gy - 0.1 * u, lx + 0.12 * u, gy);
+                cr.set_source_rgb(0.85, 0.7, 0.45);
+                cr.arc(lx + 0.12 * u, gy - 0.05 * u, 0.05 * u, 0.0, std::f64::consts::TAU);
+                cr.fill().ok();
+            }
+            let _ = g;
+        }
         "coop" => {
             cr.set_source_rgb(0.85, 0.75, 0.55);
             rect(cr, x - 0.45 * u, gy - 0.6 * u, x + 0.45 * u, gy);

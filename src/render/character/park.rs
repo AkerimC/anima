@@ -217,6 +217,7 @@ pub fn room(kind: &str) -> usize {
         "stove" => 3,
         "table" | "slide" | "sandbox" => 4,
         "carrots" | "wheat" | "apple_tree" | "coop" | "barn" => 2,
+        "tree" => 1,
         _ => 0,
     }
 }
@@ -239,6 +240,8 @@ pub const CROP_GROW: f64 = 360.0;
 pub const APPLE_GROW: f64 = 480.0;
 pub const EGG_EVERY: f64 = 180.0;
 pub const MILK_EVERY: f64 = 240.0;
+/// A tree (park or farm) drops wood: one log this often, up to three.
+pub const WOOD_EVERY: f64 = 240.0;
 /// The pond's share of the farm window, on the right; the pier runs out over it.
 pub const POND: f32 = 0.13;
 pub const PIER: (f32, f32) = (0.855, 0.975);
@@ -295,6 +298,10 @@ pub fn farm_state(t: &Thing, farm: &Farm) -> (f32, u32) {
         "barn" => {
             let k = ((gone / MILK_EVERY) as u32).min(2);
             (k as f32 / 2.0, k)
+        }
+        "tree" => {
+            let k = ((gone / WOOD_EVERY) as u32).min(3);
+            (k as f32 / 3.0, k)
         }
         _ => (0.0, 0),
     }

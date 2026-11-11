@@ -222,6 +222,7 @@ impl CharacterOverlay {
         let slot = meal_slot();
         // mealtime: most go to eat, two at a time; three stay behind
         if let Some(slot) = slot {
+            // (three stay behind on the desktop)
             if governor::place_rect("cafe").is_some() && on_desk > 3 {
                 let go: Vec<usize> = free.iter().copied().filter(|&i| self.walk_ref(i).fed_meal != slot).take(2.min(on_desk - 3)).collect();
                 for i in go {
@@ -241,11 +242,8 @@ impl CharacterOverlay {
                 }
             }
         }
-        // outside mealtimes, only a few away at once
-        let room = if slot.is_some() { n } else { 4 };
-        if away >= room {
-            return;
-        }
+        // (no limit on how many are over in the windows at once)
+        let _ = away;
         // hungry: to the cafe
         if let Some(&i) = free.iter().find(|&&i| self.hungry(i)) {
             if governor::place_rect("cafe").is_some() {
