@@ -4380,7 +4380,8 @@ impl CharacterOverlay {
                 }
             }
         }
-        // blind man's buff: the hiding places, the blindfold, the giggles
+        // blind man's buff: the hiding places, an arrow over "it", the giggles
+        let time = self.start.elapsed().as_secs_f32();
         for c in self.chats.iter().filter(|c| c.stage == Stage::Blind) {
             let Some(b) = c.blind.as_ref() else { continue };
             let rect = |i: usize| if i == 0 { self.hit_rect } else { self.extras.get(i - 1).map_or([0.0; 4], |e| e.hit_rect) };
@@ -4392,21 +4393,28 @@ impl CharacterOverlay {
             }
             let own = if b.it == 0 { self.own_view } else { self.extras[b.it - 1].own_view };
             let view = own[0] * self.view_w * 0.5;
-            let floor = r[3] - height * (1.0 - op(b.it)[2]);
+            // the ground: the lowest feet among them (whoever hops, the
+            // hiding places stay put)
+            let floor = c
+                .members
+                .iter()
+                .map(|&m| {
+                    let r = rect(m);
+                    r[3] - (r[3] - r[1]) * (1.0 - op(m)[2])
+                })
+                .fold(f32::MIN, f32::max);
             for &(x, kind) in &b.spots {
                 let (w, h) = (height * 0.7, height * 0.66);
                 let sx = x - view;
                 v.push((kind, [sx - w * 0.5, floor - h, sx + w * 0.5, floor], false, c.members[0]));
             }
-            // over the eyes, knotted at the back of the head
+            // "it": a little arrow bobbing over its head
             let o = op(b.it);
-            let top = r[1] + height * o[1];
-            let body = (r[3] - r[1]) * (o[2] - o[1]);
-            let eyes = top + body * 0.3;
-            let half = (r[2] - r[0]) * o[0] * 0.75;
-            let cx = (r[0] + r[2]) * 0.5;
-            let band = height * 0.05;
-            v.push((8, [cx - half, eyes - band, cx + half, eyes + band], !self.walk_ref(b.it).left, b.it));
+            let size = height * 0.16;
+            let x = (r[0] + r[2]) * 0.5;
+            let head = r[1] + height * o[1];
+            let y = head - size * (0.9 + 0.25 * (time * 6.0).sin());
+            v.push((7, [x - size * 0.5, y - size * 0.5, x + size * 0.5, y + size * 0.5], false, b.it));
             for &(h, t) in &b.notes {
                 let r = rect(h);
                 let size = (r[3] - r[1]) * 0.15;
@@ -4416,7 +4424,6 @@ impl CharacterOverlay {
             }
         }
         // tag: a little arrow bobbing over whoever is "it"
-        let time = self.start.elapsed().as_secs_f32();
         for c in self.chats.iter().filter(|c| c.stage == Stage::Tag && c.step != 9) {
             let r = if c.it == 0 { self.hit_rect } else if let Some(e) = self.extras.get(c.it - 1) { e.hit_rect } else { continue };
             let height = r[3] - r[1];

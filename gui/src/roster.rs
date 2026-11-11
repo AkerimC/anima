@@ -161,14 +161,27 @@ fn card(r: &Rc<Roster>, i: usize, m: &team::Member) -> gtk::Widget {
     }
     frame.append(&col);
 
-    // right-click: a small menu, each choice opening its own little view
-    let menu = gtk::Popover::new();
-    menu.set_parent(&frame);
+    // right-click: a small menu, each choice opening its own little view;
+    // opened in the middle of the window, near the top, so it never runs
+    // off the bottom (a card low down used to push it out of sight)
+    let menu = gtk::Popover::builder().has_arrow(false).position(gtk::PositionType::Bottom).build();
     let click = gtk::GestureClick::builder().button(3).build();
-    let (rr, path) = (r.clone(), m.path.clone());
+    let (rr, path, card) = (r.clone(), m.path.clone(), frame.clone());
     click.connect_pressed(move |_, _, x, y| {
+        let host: gtk::Widget = card.root().and_then(|root| root.downcast::<gtk::Window>().ok()).and_then(|w| w.child()).unwrap_or_else(|| card.clone().upcast());
+        if menu.parent().as_ref() != Some(&host) {
+            if menu.parent().is_some() {
+                menu.unparent();
+            }
+            menu.set_parent(&host);
+        }
         menu.set_child(Some(&choices(&rr, &menu, i, &path)));
-        menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let at = if host == card.clone().upcast::<gtk::Widget>() {
+            gdk::Rectangle::new(x as i32, y as i32, 1, 1)
+        } else {
+            gdk::Rectangle::new(host.width() / 2, (host.height() as f64 * 0.08) as i32, 1, 1)
+        };
+        menu.set_pointing_to(Some(&at));
         menu.popup();
     });
     frame.add_controller(click);
@@ -623,7 +636,9 @@ fn fit_pose(r: &Rc<Roster>, pop: &gtk::Popover, i: usize, name: &str, path: &str
             }
             let id = items[pick.get()].id.clone();
             let f = fit_of(&id).unwrap_or([0.0, 0.0, 1.0, 1.0]);
-            let k = if dy < 0.0 { 1.06 } else { 1.0 / 1.06 };
+            // by how far it was scrolled: a wheel click is 3%, a touchpad's
+            // stream of little scrolls adds up smoothly instead of racing
+            let k = 1.03f64.powf(-dy.clamp(-3.0, 3.0)) as f32;
             set_fit(&id, [f[0], f[1], (f[2] * k).clamp(0.1, 6.0), (f[3] * k).clamp(0.1, 6.0)]);
             area2.queue_draw();
             save();
