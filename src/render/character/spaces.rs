@@ -646,6 +646,25 @@ impl CharacterOverlay {
                 return;
             }
         }
+        // the park is where they meet: someone idle in the cafe or on the
+        // farm (and not at work there) wanders over now and then
+        if let Some(park) = places.iter().find(|p| p.place == "park").cloned() {
+            if self.walk.rand() < 1.0 / tn().park_meet_every.max(1.0) {
+                let pick = (0..n).find(|&i| {
+                    let job_here = super::park::job_of(&self.character_name(i)).and_then(|j| super::park::JOBS.iter().find(|x| x.0 == j).map(|x| x.2)) == in_place(self, i).as_deref();
+                    free(self, i) && self.walk_ref(i).here_t >= 30.0 && in_place(self, i).is_some_and(|p| p != "park") && !job_here
+                });
+                if let Some(i) = pick {
+                    if self.walk_ref(i).ws == park.ws {
+                        log::debug!("park: {i} wanders over to the park");
+                        self.walk_into(i, &park);
+                    } else if moving < tn().ws_max as usize {
+                        self.send_to(i, park.ws);
+                    }
+                    return;
+                }
+            }
+        }
         // from one to another: an empty one gets someone soon
         if places.len() >= 2 {
             let lonely = places.iter().any(|p| count(self, p) == 0);

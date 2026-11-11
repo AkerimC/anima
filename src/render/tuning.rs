@@ -144,6 +144,9 @@ tuning! {
         cook_known: "A cook makes a recipe it knows instead of trying something new (share)" = 0.6, 0.0, 1.0, 0.05, 2;
         meadow_stroll: "Someone free on the farm strolls up the meadow (chance each look)" = 0.06, 0.0, 1.0, 0.01, 2;
         chase_chicken: "Someone free on the farm chases a hen (chance each look)" = 0.04, 0.0, 1.0, 0.01, 2;
+        park_game_every: "Game time in the park about every (s)" = 150.0, 20.0, 3600.0, 10.0, 0;
+        park_busy_most: "At most this share of them off on their own things at once" = 0.5, 0.1, 1.0, 0.05, 2;
+        park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
         park_out_stay: "Stays out (s)" = 180.0, 10.0, 7200.0, 10.0, 0;

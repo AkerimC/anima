@@ -340,12 +340,12 @@ impl CharacterOverlay {
         let i = who[(self.walk.rand() * who.len() as f32) as usize % who.len()];
         let Some(place) = self.place_here(i).map(|p| p.place) else { return };
         // on the farm: now and then a stroll up the meadow
-        if place == "farm" && self.walk_of(i).rand() < tn().meadow_stroll {
+        if place == "farm" && self.walk_of(i).rand() < tn().meadow_stroll && !self.too_busy(chats, n) {
             self.start_play(chats, i, usize::MAX, "meadow");
             return;
         }
         // on the farm: now and then after a hen instead
-        if place == "farm" && self.walk_of(i).rand() < tn().chase_chicken {
+        if place == "farm" && self.walk_of(i).rand() < tn().chase_chicken && !self.too_busy(chats, n) {
             let hens: Vec<usize> = LIVE.lock().unwrap().beasts.iter().enumerate().filter(|b| b.1.kind == "chicken" && b.1.flee_t <= 0.0).map(|b| b.0).collect();
             let taken: Vec<usize> = chats.iter().filter_map(|c| c.play.as_ref()).filter(|p| p.kind == "chase").map(|p| p.thing).collect();
             if let Some(&k) = hens.iter().find(|k| !taken.contains(k)) {
@@ -357,7 +357,7 @@ impl CharacterOverlay {
         if place == "cafe" && self.maybe_dine(chats, i) {
             return;
         }
-        if self.walk_of(i).rand() >= tn().park_play {
+        if self.walk_of(i).rand() >= tn().park_play || self.too_busy(chats, n) {
             return;
         }
         let restaurant = self.restaurant_open();
@@ -407,6 +407,73 @@ impl CharacterOverlay {
         };
         let kind = park.things[k].kind.clone();
         self.start_play(chats, i, k, &kind);
+    }
+
+    /// Enough of them off doing things on their own (on the slide, up the
+    /// meadow, at the coop...): the rest stay free to get together and play.
+    fn too_busy(&self, chats: &[Chat], n: usize) -> bool {
+        let busy: usize = chats
+            .iter()
+            .filter_map(|c| c.play.as_ref().map(|p| (p, c.members.len())))
+            .filter(|(p, _)| !matches!(p.kind.as_str(), "dine" | "order" | "serve" | "down"))
+            .map(|(_, k)| k)
+            .sum();
+        busy as f32 >= n as f32 * tn().park_busy_most
+    }
+
+    /// Game time in the park: now and then the free ones in it (and nearby)
+    /// get together for one of the usual games.
+    fn game_time(&mut self, chats: &mut Vec<Chat>, n: usize) {
+        static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+        {
+            let mut next = NEXT.lock().unwrap();
+            let every = tn().park_game_every.max(10.0);
+            match *next {
+                None => {
+                    *next = Some(Instant::now() + std::time::Duration::from_secs_f32(every * 0.5));
+                    return;
+                }
+                Some(t) if Instant::now() < t => return,
+                _ => {}
+            }
+            let r = self.walk.rand();
+            *next = Some(Instant::now() + std::time::Duration::from_secs_f32(every * (0.6 + r * 0.8)));
+        }
+        let Some(park) = governor::place_rect("park") else { return };
+        if self.race.is_some() {
+            return;
+        }
+        let middle = park.x + park.w * 0.5;
+        // the park's free ones first, then the nearest from next door
+        let mut free: Vec<(usize, f32)> = (0..n)
+            .filter(|&i| {
+                let wk = self.walk_ref(i);
+                wk.ws == park.ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none()
+            })
+            .map(|i| (i, (self.strip_px(i) - middle).abs()))
+            .collect();
+        free.sort_by(|a, b| a.1.total_cmp(&b.1));
+        free.truncate(6);
+        if free.len() < 3 {
+            log::debug!("park: game time, but only {} free", free.len());
+            return;
+        }
+        let members: Vec<usize> = free.iter().map(|f| f.0).collect();
+        let rivalry = self.rivalry(&members);
+        let Some(game) = self.choose_game(&[], members.len(), rivalry) else { return };
+        self.chat_id = self.chat_id.wrapping_add(1);
+        let id = self.chat_id;
+        for &i in &members {
+            self.enlist(i, id);
+        }
+        log::debug!("chat {id}: game time in the park, {game:?} with {members:?}");
+        if let Some(&first) = members.first() {
+            tell(&format!("Game time in the park! {} calls the others", self.character_name(first)));
+        }
+        let mut c = Chat::new(id, members, Stage::Approach, 0.0);
+        c.forced = Some(game);
+        self.arrange(&c);
+        chats.push(c);
     }
 
     /// `i` goes to play on thing `k`, with whoever is on it already.
@@ -1687,6 +1754,7 @@ impl CharacterOverlay {
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
         self.restaurant_tick(chats);
         self.leftovers(chats, n);
+        self.game_time(chats, n);
         self.farm_calls(chats, n);
         // down from up the meadow, on foot
         let down: Vec<usize> = std::mem::take(&mut *DOWN.lock().unwrap());
