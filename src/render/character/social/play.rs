@@ -1465,7 +1465,7 @@ impl CharacterOverlay {
                     park::write_farm(&farm);
                     log::debug!("{} picks up {ready} wood", r.i);
                     self.set_happy(r.i, true);
-                    self.walk_of(r.i).start_bob(tn().jump_height * 0.3);
+
                 } else if ready > 0 {
                     let (food, k) = match t.kind.as_str() {
                         "carrots" => ("carrot", 2),
@@ -1480,7 +1480,7 @@ impl CharacterOverlay {
                     self.work(r.i, "farmer", 2.0);
                     log::debug!("{} takes {k} {food}", r.i);
                     self.set_happy(r.i, true);
-                    self.walk_of(r.i).start_bob(tn().jump_height * 0.3);
+
                 } else {
                     // nothing yet: tends it, and it comes on a little faster
                     let push = match t.kind.as_str() {
@@ -1495,12 +1495,10 @@ impl CharacterOverlay {
                         park::write_farm(&farm);
                     }
                     self.work(r.i, "farmer", 1.0);
-                    self.walk_of(r.i).start_bob(tn().jump_height * 0.12);
+
                 }
             }
-            if r.phase == 2 && self.walk.rand() < dt * 0.6 {
-                self.walk_of(r.i).start_bob(tn().jump_height * 0.08);
-            }
+
             if r.phase == 2 && r.t > 5.0 {
                 r.phase = 3;
                 self.set_happy(r.i, false);
