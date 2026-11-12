@@ -150,6 +150,8 @@ tuning! {
         park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
         hunger_time: "From full to starving, doing nothing (s)" = 2400.0, 60.0, 36000.0, 60.0, 0;
         hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
+        hunger_stage0: "Hunger pace with nothing to cook on yet" = 0.5, 0.0, 2.0, 0.05, 2;
+        hunger_stage1: "Hunger pace with a stove but no chef" = 0.8, 0.0, 2.0, 0.05, 2;
         hunger_meal: "At mealtimes, this share of that is enough" = 0.75, 0.1, 1.0, 0.05, 2;
         full_time: "Full after a meal for (s)" = 1800.0, 0.0, 7200.0, 60.0, 0;
         full_busy: "Working or playing, full passes this much quicker" = 0.5, 0.0, 3.0, 0.1, 1;

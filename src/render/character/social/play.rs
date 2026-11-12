@@ -188,6 +188,14 @@ impl CharacterOverlay {
 
     /// `i` brings `k` of `id` to the pantry, and is paid for it in carrot coins.
     pub(super) fn bring_food(&mut self, i: usize, id: &str, k: u32) {
+        // early days, nowhere to cook: a hungry one eats it there and then
+        if self.food_stage() == 0 && self.hungry(i) {
+            log::debug!("{} eats the {id} raw", self.character_name(i));
+            self.eat(i, "snack");
+            let name = self.character_name(i);
+            park::earn(&name, park::food_worth(id) * k);
+            return;
+        }
         park::add_food(id, k);
         let name = self.character_name(i);
         park::earn(&name, park::food_worth(id) * k);

@@ -84,11 +84,26 @@ impl CharacterOverlay {
         want && (!self.broke(i) || h >= tn().beg_hunger)
     }
 
+    /// How far along the place is: 0 nothing to cook on yet, 1 a stove in the
+    /// cafe (they cook for themselves), 2 a chef or waiter (the restaurant).
+    pub(in crate::render::character) fn food_stage(&self) -> u8 {
+        let jobs = park::jobs_cached();
+        if jobs.jobs.values().chain(jobs.part.values()).any(|j| j == "chef" || j == "waiter") {
+            return 2;
+        }
+        if park_now().things.iter().any(|t| t.kind == "stove" && t.place == "cafe") {
+            return 1;
+        }
+        0
+    }
+
     /// Nothing to eat: a nap only once starving; otherwise it gets on with
     /// things and doesn't look again for a while.
     pub(super) fn nothing_to_eat(&mut self, i: usize) {
+        let early = self.food_stage() == 0;
         let wk = self.walk_of(i);
-        if wk.hunger >= tn().beg_hunger {
+        // (early days nobody naps for want of food: there's nothing to cook on yet)
+        if !early && wk.hunger >= tn().beg_hunger {
             let secs = tn().hungry_nap;
             wk.lie_down(secs);
         } else {
@@ -135,7 +150,9 @@ impl CharacterOverlay {
             return;
         }
         let visiting = visit::visiting_mode();
-        let rate = dt / tn().hunger_time.max(60.0);
+        // early days get hungry slower
+        let pace = [tn().hunger_stage0, tn().hunger_stage1, 1.0][self.food_stage() as usize];
+        let rate = dt * pace / tn().hunger_time.max(60.0);
         for i in 0..n {
             let starving = {
                 let wk = self.walk_of(i);
