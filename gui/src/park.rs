@@ -681,7 +681,7 @@ fn jobs_list() -> gtk::Widget {
             if near.is_empty() {
                 "Nobody yet".to_string()
             } else {
-                near.iter().take(2).map(|(n, v)| format!("{n} {:.0}/{:.0}", v.min(park::JOB_AT), park::JOB_AT)).collect::<Vec<_>>().join(", ")
+                near.iter().take(2).map(|(n, v)| format!("{n} {}/{:.0}", v.min(park::JOB_AT).floor(), park::JOB_AT)).collect::<Vec<_>>().join(", ")
             }
         } else {
             holders.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
