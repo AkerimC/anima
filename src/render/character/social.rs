@@ -12,6 +12,7 @@ use crate::backend::governor;
 mod free;
 mod life;
 mod play;
+mod watch;
 
 pub(super) use free::Want;
 
@@ -291,7 +292,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
+        Chat { watch_left: Vec::new(), stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
     }
 }
 
@@ -366,6 +367,8 @@ pub(super) struct Chat {
     played: Vec<Game>,
     // saw the game and came over: they join when it's done
     watchers: Vec<usize>,
+    // and how much longer each of them will stay
+    watch_left: Vec<(usize, f32)>,
     // the other games: places, where each one started, how far the rope has
     // moved, who's "it" (tag), the two sides of the rope
     spots: Vec<f32>,
@@ -812,6 +815,7 @@ impl CharacterOverlay {
             }
         }
         chats.retain_mut(|c| {
+            self.watch_tick(c, dt);
             let keep = self.prune(c, n) && self.within_limit(c, dt) && self.advance(c, dt, mouse);
             if !keep {
                 self.finish(c, n);
@@ -3047,92 +3051,6 @@ impl CharacterOverlay {
         }
     }
 
-    /// Those watching the anglers: stroll about the bank, stop to look, or
-    /// have a word with someone next to them.
-    fn fish_watchers(&mut self, c: &Chat, f: &mut Fishing, dt: f32) {
-        f.idle.retain(|d| c.watchers.contains(&d.0));
-        for &w in &c.watchers {
-            if !f.idle.iter().any(|d| d.0 == w) {
-                f.idle.push((w, 1.0 + self.walk.rand() * 2.0, None));
-            }
-        }
-        if f.beast.is_some() || f.anglers.is_empty() {
-            return;
-        }
-        let xs: Vec<f32> = f.anglers.iter().map(|a| a.at).collect();
-        let (lo, hi) = (xs.iter().copied().fold(f32::MAX, f32::min), xs.iter().copied().fold(f32::MIN, f32::max));
-        for k in 0..f.idle.len() {
-            let (w, mut t, mut with) = f.idle[k];
-            if !self.arrived(w) {
-                continue;
-            }
-            t -= dt;
-            if let Some(o) = with {
-                // talking: faces the other one and nods along now and then
-                self.face(w, o);
-                if self.walk.rand() < dt * 0.9 {
-                    self.walk_of(w).start_bob(tn().jump_height * 0.07);
-                }
-                if self.walk.rand() < dt * 0.25 {
-                    self.walk_of(w).gesture = true;
-                }
-            }
-            if t > 0.0 {
-                f.idle[k] = (w, t, with);
-                continue;
-            }
-            if with.take().is_some() {
-                if let Some(r) = self.walk_of(w).social.as_mut() {
-                    r.happy = false;
-                }
-            }
-            let size = self.width_of(w);
-            let width = self.strip_width_of(w);
-            let x = self.strip_px(w);
-            let roll = self.walk.rand();
-            // someone near to talk to: another watcher or an angler waiting for a bite
-            let near = c.watchers.iter().copied().filter(|&o| o != w && self.arrived(o))
-                .chain(f.anglers.iter().filter(|a| a.phase == 2 && !a.blown).map(|a| a.i))
-                .filter(|&o| (self.strip_px(o) - x).abs() < size * 2.5)
-                .min_by(|&a, &b| (self.strip_px(a) - x).abs().total_cmp(&(self.strip_px(b) - x).abs()));
-            if roll < 0.35 && near.is_some() {
-                let o = near.unwrap_or(w);
-                with = Some(o);
-                self.face(w, o);
-                let wk = self.walk_of(w);
-                if let Some(r) = wk.social.as_mut() {
-                    r.happy = true;
-                }
-                wk.gesture = true;
-                t = 2.5 + self.walk.rand() * 2.5;
-            } else if roll < 0.8 {
-                // a stroll along the bank, never right on top of an angler (and
-                // at the farm's pond, on dry land, not out on the pier)
-                let land = self.dry_land(w);
-                let (a, b) = ((lo - size * 3.0).max(size).max(land.0), (hi + size * 3.0).min((width - size).max(size)).min(land.1));
-                let (a, b) = if a < b { (a, b) } else { (land.1 - size * 3.0, land.1) };
-                let mut goal = x;
-                for _ in 0..6 {
-                    let g = a + self.walk.rand() * (b - a).max(1.0);
-                    if xs.iter().all(|&ax| (ax - g).abs() > size * 0.8) {
-                        goal = g;
-                        break;
-                    }
-                }
-                let pace = 0.1 + self.walk.rand() * 0.05;
-                self.go(w, goal, pace);
-                t = 1.5 + self.walk.rand() * 2.0;
-            } else {
-                // stops to look at the nearest rod
-                if let Some(a) = f.anglers.iter().min_by(|p, q| (self.strip_px(p.i) - x).abs().total_cmp(&(self.strip_px(q.i) - x).abs())) {
-                    let i = a.i;
-                    self.face(w, i);
-                }
-                t = 2.0 + self.walk.rand() * 2.0;
-            }
-            f.idle[k] = (w, t, with);
-        }
-    }
 
     /// The confetti goes off with a bang: everyone close by is blown back,
     /// lands on their feet and laughs. Returns who went flying.
@@ -5382,75 +5300,7 @@ impl CharacterOverlay {
         self.run_to(c.it, if held { ahead.clamp(lo, hi) } else { ahead }, tn().tag_it * pace * knack);
     }
 
-    /// Someone around sees a game going on: they come and stand by to watch,
-    /// and join when it's over.
-    fn try_watch(&mut self, c: &mut Chat, n: usize) {
-        let fishing = c.stage == Stage::Fishing;
-        // not before the anglers are in their places; and nobody stands about
-        // watching them in the park, cafe or farm (they've things to do there)
-        if fishing && (c.step == 9 || c.members.iter().any(|&m| self.place_here(m).is_some())) {
-            // any already watching there go off about their business
-            for w in std::mem::take(&mut c.watchers) {
-                self.leave(w, c.id);
-            }
-            return;
-        }
-        for &w in &c.watchers.clone() {
-            if !fishing && Some(w) != c.cheater && self.arrived(w) {
-                self.face(w, c.talker);
-                if self.walk.rand() < 0.12 {
-                    self.walk_of(w).start_bob(tn().jump_height * 0.1);
-                }
-            }
-        }
-        // nobody new once the group would be too big anyway
-        if c.members.len() + c.watchers.len() >= tn().max_group as usize {
-            return;
-        }
-        let spots: Vec<f32> = c.members.iter().map(|&i| self.strip_px(i)).collect();
-        let size = self.width_of(c.members[0]);
-        let free: Vec<(usize, f32)> = (0..n)
-            .filter(|&i| {
-                self.walk_ref(i).ws == self.walk_ref(c.members[0]).ws && self.free_for(i, Want::Watch)
-            })
-            .map(|i| {
-                let x = self.strip_px(i);
-                (i, spots.iter().map(|p| (p - x).abs()).fold(f32::MAX, f32::min))
-            })
-            .filter(|f| f.1 < size * tn().see_range)
-            .collect();
-        let Some(&(i, _)) = free.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else { return };
-        if self.walk.rand() >= tn().see_chance {
-            return;
-        }
-        self.spend(i, tn().energy_watch_cost);
-        self.enlist(i, c.id);
-        c.watchers.push(i);
-        log::debug!("chat {}: {i} comes to watch", c.id);
-        // beside the row, not in the way
-        let lo = c.members.iter().map(|&m| self.goal_of(m)).fold(f32::MAX, f32::min);
-        let hi = c.members.iter().map(|&m| self.goal_of(m)).fold(f32::MIN, f32::max);
-        let step = size * 0.85 * c.watchers.len() as f32;
-        let goal = if self.strip_px(i) < (lo + hi) * 0.5 { lo - step } else { hi + step };
-        // watching the farm's anglers: from the bank, not the pier
-        let land = self.dry_land(i);
-        let goal = goal.clamp(0.0, self.strip_width_of(i)).clamp(land.0, land.1.max(land.0));
-        self.go(i, goal, 0.18);
-    }
 
-    /// The game's over: some of those watching come in, the rest move on.
-    fn take_in_watchers(&mut self, c: &mut Chat) {
-        for i in std::mem::take(&mut c.watchers) {
-            if self.walk.rand() < tn().watch_join {
-                log::debug!("chat {}: {i} joins after the game", c.id);
-                c.members.push(i);
-                c.regroup = true;
-                c.quiet = 0.0;
-            } else {
-                self.leave(i, c.id);
-            }
-        }
-    }
 
     /// A big crowd doesn't have to stay one: half of it goes off to do its
     /// own thing as a separate group.
