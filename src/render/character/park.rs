@@ -497,6 +497,9 @@ pub struct Jobs {
     pub part: BTreeMap<String, String>,
 }
 
+/// Work done to be taken on as an apprentice (part-time).
+pub const APPRENTICE_AT: f32 = 5.0;
+
 /// How many can help out part-time in each job.
 pub const PART_SLOTS: usize = 2;
 
@@ -525,8 +528,9 @@ fn shift_holds(j: &Jobs, job: &str, name: &str) -> bool {
     let mut holders: Vec<&String> = j.jobs.iter().chain(j.part.iter()).filter(|e| e.1 == job).map(|e| e.0).collect();
     holders.sort();
     let slots = JOBS.iter().find(|x| x.0 == job).map_or(1, |x| x.3);
+    // room for all: apprentices work alongside
     if holders.len() <= slots {
-        return j.jobs.get(name).is_some_and(|v| v == job);
+        return holders.iter().any(|h| *h == name);
     }
     let len = crate::render::tuning::get().shift_len.max(60.0) as u64;
     let shift = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / len) as usize;
@@ -578,10 +582,27 @@ pub fn tidy_jobs(team: &[String], prune: bool) -> Vec<String> {
     for (id, _, _, most) in JOBS {
         while j.jobs.values().filter(|v| *v == id).count() < most {
             let pts = |name: &String| j.points.get(name).and_then(|p| p.get(id)).copied().unwrap_or(0.0);
-            let Some(name) = j.part.iter().filter(|p| p.1 == id).map(|p| p.0.clone()).max_by(|a, b| pts(a).total_cmp(&pts(b))) else { break };
+            // only those who've done enough of it; apprentices wait
+            let Some(name) = j.part.iter().filter(|p| p.1 == id && pts(p.0) >= JOB_AT).map(|p| p.0.clone()).max_by(|a, b| pts(a).total_cmp(&pts(b))) else { break };
             j.part.remove(&name);
             j.jobs.insert(name.clone(), id.to_string());
             told.push(format!("{name} is now the {}", job_label(id).to_lowercase()));
+        }
+    }
+    // a job with someone at it takes on apprentices: those without a job who
+    // have done most of it, so one alone doesn't keep all the work
+    if !team.is_empty() {
+        for (id, _, _, _) in JOBS {
+            if !j.jobs.values().any(|v| v == id) {
+                continue;
+            }
+            while j.part.values().filter(|v| *v == id).count() < PART_SLOTS {
+                let pts = |name: &String| j.points.get(name).and_then(|p| p.get(id)).copied().unwrap_or(0.0);
+                let free = team.iter().filter(|n| !j.jobs.contains_key(*n) && !j.part.contains_key(*n) && pts(n) >= APPRENTICE_AT);
+                let Some(name) = free.max_by(|a, b| pts(a).total_cmp(&pts(b))).cloned() else { break };
+                j.part.insert(name.clone(), id.to_string());
+                told.push(format!("{name} helps out as {}", job_label(id).to_lowercase()));
+            }
         }
     }
     if (j.jobs.clone(), j.part.clone()) != before {
