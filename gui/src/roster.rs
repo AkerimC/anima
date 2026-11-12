@@ -1028,15 +1028,37 @@ fn picker(r: &Rc<Roster>) -> gtk::Widget {
         pop.connect_show(move |p| p.set_child(Some(&outfits(&rr, &dir, p))));
         grid.append(&b);
     }
-    let mut next = 0usize;
-    glib::idle_add_local(move || {
-        for (pic, path) in pending.iter().skip(next).take(8) {
-            if let Some(t) = load_texture(path, 52) {
-                pic.set_paintable(Some(&t));
+    // the pictures are made off the main thread, a few workers at once, and
+    // put in as they come (the window stays smooth meanwhile)
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, u32, u32, Vec<u8>)>();
+    let paths: Vec<PathBuf> = pending.iter().map(|p| p.1.clone()).collect();
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6);
+    for w in 0..workers {
+        let (tx, paths) = (tx.clone(), paths.clone());
+        std::thread::spawn(move || {
+            for (k, path) in paths.iter().enumerate().skip(w).step_by(workers) {
+                if let Some((pw, ph, px)) = crate::pages::thumb_pixels(path, 52) {
+                    if tx.send((k, pw, ph, px)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    drop(tx);
+    glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+        for _ in 0..48 {
+            match rx.try_recv() {
+                Ok((k, w, h, px)) => {
+                    if let Some((pic, _)) = pending.get(k) {
+                        pic.set_paintable(Some(&crate::pages::texture(w, h, px)));
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
             }
         }
-        next += 8;
-        if next < pending.len() { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+        glib::ControlFlow::Continue
     });
     let (s, ds) = (search.clone(), dirs.clone());
     grid.set_filter_func(move |child| {

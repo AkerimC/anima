@@ -7,7 +7,7 @@ use anima::render::tuning::{FIELDS, Field};
 use gtk::{gdk, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// Runs the last call only, after things have been quiet for a moment.
@@ -65,8 +65,32 @@ impl Ui {
 /// the character fills it, scaled down smoothly at twice the size so it stays
 /// sharp.
 pub(crate) fn load_texture(path: &Path, size: i32) -> Option<gdk::Texture> {
+    let (w, h, px) = thumb_pixels(path, size)?;
+    Some(texture(w, h, px))
+}
+
+/// RGBA pixels into a texture (on the main thread).
+pub(crate) fn texture(w: u32, h: u32, px: Vec<u8>) -> gdk::Texture {
+    let bytes = glib::Bytes::from_owned(px);
+    gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &bytes, w as usize * 4).upcast()
+}
+
+/// The trimmed, scaled pixels for `load_texture`: safe to make on any thread,
+/// and kept on disk so the next time is only a small read.
+pub(crate) fn thumb_pixels(path: &Path, size: i32) -> Option<(u32, u32, Vec<u8>)> {
+    use std::hash::{Hash, Hasher};
     if path.extension().is_some_and(|e| e == "glb") {
         return None;
+    }
+    let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (path, size, stamp).hash(&mut hasher);
+    let cache = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/anima/thumbs"));
+    let file = cache.as_ref().map(|c| c.join(format!("{:016x}.png", hasher.finish())));
+    if let Some(img) = file.as_ref().and_then(|f| image::open(f).ok()) {
+        let img = img.into_rgba8();
+        let (w, h) = img.dimensions();
+        return Some((w, h, img.into_raw()));
     }
     let img = image::open(path).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
@@ -88,8 +112,11 @@ pub(crate) fn load_texture(path: &Path, size: i32) -> Option<gdk::Texture> {
     let k = (target / cw.max(ch) as f32).min(1.0);
     let (nw, nh) = (((cw as f32 * k).round() as u32).max(1), ((ch as f32 * k).round() as u32).max(1));
     let small = image::imageops::resize(&crop, nw, nh, image::imageops::FilterType::Lanczos3);
-    let bytes = glib::Bytes::from_owned(small.into_raw());
-    Some(gdk::MemoryTexture::new(nw as i32, nh as i32, gdk::MemoryFormat::R8g8b8a8, &bytes, nw as usize * 4).upcast())
+    if let (Some(c), Some(f)) = (cache, file) {
+        let _ = std::fs::create_dir_all(c);
+        let _ = small.save(f);
+    }
+    Some((nw, nh, small.into_raw()))
 }
 
 /// A sprite preview, or an icon for 3D models and unreadable files.
