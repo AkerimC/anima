@@ -844,9 +844,13 @@ fn draw_extras(sh: &mut Shared, cr: &gtk::cairo::Context, t: &park::Thing, x: f6
             }
         }
         "table" => {
-            let Some((_, dish, left)) = sh.world.dishes.iter().find(|d| d.0 == t.id).cloned() else { return };
-            let size = 0.4 * u * (0.35 + 0.65 * left as f64);
-            draw_picture(sh, cr, &park::food_picture(&dish), x - size * 0.5, gy - 0.66 * u - size * 0.9, size, false);
+            // one dish each: two sat at it, one at each end in front of them
+            let on: Vec<_> = sh.world.dishes.iter().filter(|d| d.0 == t.id).cloned().collect();
+            for (k, (_, dish, left)) in on.iter().enumerate() {
+                let off = if on.len() < 2 { 0.0 } else { (k as f64 / (on.len() - 1) as f64 - 0.5) * 0.6 * u };
+                let size = 0.4 * u * (0.35 + 0.65 * *left as f64);
+                draw_picture(sh, cr, &park::food_picture(dish), x + off - size * 0.5, gy - 0.66 * u - size * 0.9, size, false);
+            }
         }
         "stall" => {
             // a little striped stand with its snacks on show

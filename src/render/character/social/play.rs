@@ -1210,7 +1210,9 @@ impl CharacterOverlay {
         }
         if let Some((dish, left)) = dish_on(t.id) {
             let eaters: Vec<usize> = p.riders.iter().filter(|r| r.phase == 1).map(|r| r.i).collect();
-            if !eaters.is_empty() {
+            // the food waits till everyone's sat down (or it's been a while)
+            let all_sat = eaters.len() == p.riders.len() || p.t > 45.0;
+            if !eaters.is_empty() && all_sat {
                 // a bite now and then, happy about it
                 for &i in &eaters {
                     if self.walk.rand() < dt * 0.9 {
@@ -1364,8 +1366,10 @@ impl CharacterOverlay {
                 p.meal = Some(Meal { dish: String::new(), ..m });
                 return false;
             }
-            // now and then it's eaten as a picnic in the park
-            if !m.burnt && self.walk.rand() < tn().picnic_chance {
+            // now and then it's eaten as a picnic in the park; always so when
+            // every table's taken, rather than eaten standing round the stove
+            let no_table = !park_now().things.iter().any(|x| x.kind == "table" && x.place == t.place && dish_on(x.id).is_none());
+            if !m.burnt && (no_table || self.walk.rand() < tn().picnic_chance) {
                 if let Some(pk) = governor::place_rect("park").filter(|pk| pk.ws == self.walk_ref(cook).ws) {
                     let r = self.walk.rand();
                     let x = pk.x + pk.w * (0.2 + 0.6 * r);

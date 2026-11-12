@@ -3174,12 +3174,14 @@ impl CharacterOverlay {
                             }
                         }
                         // now and then something for the park chest instead
-                        if self.walk.rand() < tn().fish_material {
+                        // (only in place of junk: a real fish is kept)
+                        let fish = (FISH..CREATURE).contains(&a.item);
+                        if !fish && self.walk.rand() < tn().fish_material {
                             let n = super::park::MATERIALS.len();
                             a.item = MATERIAL + (self.walk.rand() * n as f32) as i32 % n as i32;
                         }
                         // now and then something to wear it hasn't got yet
-                        if self.walk.rand() < tn().fish_find {
+                        if !fish && self.walk.rand() < tn().fish_find {
                             let name = self.character_name(a.i);
                             let roll = self.walk.rand();
                             if let Some(k) = super::wear::unfound(&name, roll) {

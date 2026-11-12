@@ -439,7 +439,13 @@ impl CharacterOverlay {
                 21 => {
                     if self.seat_walk(i, seat, seat_up, dt) {
                         let dish = order_of(i).map(|o| o.dish).unwrap_or_default();
-                        LIVE.lock().unwrap().dishes.push((t.id, dish, 1.0));
+                        // the left one's plate first, so it's drawn on its side
+                        let mut l = LIVE.lock().unwrap();
+                        match l.dishes.iter().position(|d| d.0 == t.id).filter(|_| seat < mid) {
+                            Some(k) => l.dishes.insert(k, (t.id, dish, 1.0)),
+                            None => l.dishes.push((t.id, dish, 1.0)),
+                        }
+                        drop(l);
                         set_order(i, |o| o.state = Ask::Served);
                         self.set_face(i, seat > mid);
                         r.phase = 30;
@@ -450,6 +456,9 @@ impl CharacterOverlay {
                 30 => {
                     if self.seat_walk(i, seat, seat_up, dt) {
                         self.set_face(i, seat > mid);
+                    } else {
+                        // not sat down yet: the meal waits (all but stuck)
+                        r.t -= dt * 0.9;
                     }
                     let dish = order_of(i).map(|o| o.dish).unwrap_or_default();
                     let left = (1.0 - r.t / EAT).max(0.0);

@@ -49,15 +49,15 @@ impl CharacterOverlay {
     pub(super) fn staff_meal(&mut self, i: usize) -> bool {
         let pantry = park::read_pantry();
         let have: Vec<&str> = park::INGREDIENTS.iter().map(|x| x.0).filter(|x| pantry.get(*x).copied().unwrap_or(0) > 0).collect();
-        if have.len() < 2 {
+        if have.is_empty() {
             return false;
         }
-        // something it knows how to make, else just two things
+        // something it knows how to make, else whatever's there
         let book = park::read_book();
         let known = park::DISHES.iter().find(|d| book.found.contains_key(d.0) && d.2.iter().all(|x| have.contains(x)));
         let (stuff, dish): (Vec<&str>, &str) = match known {
             Some(d) => (d.2.to_vec(), d.0),
-            None => (have[..2].to_vec(), "snack"),
+            None => (have[..have.len().min(2)].to_vec(), "snack"),
         };
         if !park::take_food(&stuff) {
             return false;
@@ -211,7 +211,20 @@ impl CharacterOverlay {
                 }
                 self.walk_of(i).on_break = false;
             }
-            if !self.staff_meal(i) && self.walk_ref(i).visit_for == 0 {
+            if self.staff_meal(i) {
+                return;
+            }
+            // nothing in the kitchen: off on a break to find something
+            // elsewhere, rather than falling asleep at the stove
+            if self.walk_ref(i).hunger >= tn().hunger_eat {
+                if let Some(pk) = governor::place_rect("park").filter(|pk| pk.ws == self.walk_ref(i).ws) {
+                    log::debug!("cafe: {} goes out for something to eat", self.character_name(i));
+                    self.walk_of(i).on_break = true;
+                    self.walk_into(i, &pk);
+                    return;
+                }
+            }
+            if self.walk_ref(i).visit_for == 0 {
                 self.nothing_to_eat(i);
             }
             return;
