@@ -84,8 +84,10 @@ impl CharacterOverlay {
         }
         let fishing = chats.iter().filter(|c| c.stage == Stage::Fishing).flat_map(|c| c.members.iter()).filter(|&&i| self.pier_near(i).is_some()).count();
         // the pantry running low: one more out fishing
-        let low = park::read_pantry().values().sum::<u32>() < 4 + tn().staff_keep as u32;
-        if fishing >= if low { 3 } else { 2 } {
+        // fishing for the pantry only while it needs filling: one at it, two when low
+        let total = park::pantry_total_cached();
+        let want = if total < 4 + tn().staff_keep as u32 { 2 } else if total < 12 { 1 } else { 0 };
+        if fishing >= want {
             return;
         }
         let fisher = |this: &Self, i: usize| this.is_job(i, "fisher") || this.is_part(i, "fisher");
@@ -161,7 +163,7 @@ impl CharacterOverlay {
                     // no job: fishing off the pier, if it isn't crowded
                     None => {
                         let at_pier = chats.iter().filter(|c| c.stage == Stage::Fishing).flat_map(|c| c.members.iter()).filter(|&&j| self.pier_near(j).is_some()).count();
-                        if at_pier < 6 && self.walk_ref(i).fish_cool <= 0.0 && governor::place_rect("farm").is_some_and(|f| f.ws == self.walk_ref(i).ws) && !self.hungry(i) {
+                        if at_pier < 2 && park::pantry_total_cached() < 12 && self.walk_ref(i).fish_cool <= 0.0 && governor::place_rect("farm").is_some_and(|f| f.ws == self.walk_ref(i).ws) && !self.hungry(i) {
                             log::debug!("idle: {i} goes fishing");
                             let c = self.fish_alone(i, false);
                             chats.push(c);
