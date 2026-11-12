@@ -356,6 +356,16 @@ pub fn pantry_path() -> PathBuf {
     crate::util::data_dir().join("pantry.json")
 }
 
+/// `read_pantry`, at most once a second (for checks made every frame).
+pub fn pantry_total_cached() -> u32 {
+    static C: std::sync::Mutex<Option<(std::time::Instant, u32)>> = std::sync::Mutex::new(None);
+    let mut c = C.lock().unwrap();
+    if c.is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 1.0) {
+        *c = Some((std::time::Instant::now(), read_pantry().values().sum()));
+    }
+    c.map_or(0, |x| x.1)
+}
+
 pub fn read_pantry() -> Pantry {
     std::fs::read_to_string(pantry_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
@@ -509,22 +519,45 @@ pub fn jobs_cached() -> Jobs {
     c.as_ref().map(|x| x.1.clone()).unwrap_or_default()
 }
 
-/// Asked many times a frame: looked up in the cache without copying it.
-pub fn job_of(name: &str) -> Option<String> {
-    let mut c = JOBS_CACHE.lock().unwrap();
-    if c.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 2.0) {
-        *c = Some((std::time::Instant::now(), read_jobs()));
+/// Everyone who knows `job` (its own and those helping out) takes turns at
+/// it: the job's places go round them a shift at a time, the rest help out.
+fn shift_holds(j: &Jobs, job: &str, name: &str) -> bool {
+    let mut holders: Vec<&String> = j.jobs.iter().chain(j.part.iter()).filter(|e| e.1 == job).map(|e| e.0).collect();
+    holders.sort();
+    let slots = JOBS.iter().find(|x| x.0 == job).map_or(1, |x| x.3);
+    if holders.len() <= slots {
+        return j.jobs.get(name).is_some_and(|v| v == job);
     }
-    c.as_ref().and_then(|x| x.1.jobs.get(name).cloned())
+    let len = crate::render::tuning::get().shift_len.max(60.0) as u64;
+    let shift = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / len) as usize;
+    (0..slots).any(|k| holders[(shift * slots + k) % holders.len()] == name)
 }
 
-/// The job `name` helps out with part-time, if any.
-pub fn part_of(name: &str) -> Option<String> {
+fn with_jobs<T>(f: impl FnOnce(&Jobs) -> T) -> T {
     let mut c = JOBS_CACHE.lock().unwrap();
     if c.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs_f32() > 2.0) {
         *c = Some((std::time::Instant::now(), read_jobs()));
     }
-    c.as_ref().and_then(|x| x.1.part.get(name).cloned())
+    match c.as_ref() {
+        Some(x) => f(&x.1),
+        None => f(&Jobs::default()),
+    }
+}
+
+/// The job `name` is on shift for now. Asked many times a frame (cached).
+pub fn job_of(name: &str) -> Option<String> {
+    with_jobs(|j| {
+        let job = j.jobs.get(name).or_else(|| j.part.get(name))?;
+        shift_holds(j, job, name).then(|| job.clone())
+    })
+}
+
+/// The job `name` helps out with while it's not its shift, if any.
+pub fn part_of(name: &str) -> Option<String> {
+    with_jobs(|j| {
+        let job = j.jobs.get(name).or_else(|| j.part.get(name))?;
+        (!shift_holds(j, job, name)).then(|| job.clone())
+    })
 }
 
 pub fn job_label(id: &str) -> &'static str {

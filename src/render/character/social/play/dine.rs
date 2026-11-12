@@ -143,10 +143,8 @@ impl CharacterOverlay {
         }
         let park = park_now();
         let unit = self.park_unit(self.extras.len() + 1);
-        let free = park.things.iter().enumerate().filter(|(_, t)| t.kind == "table" && t.place == "cafe").find(|(k, t)| {
-            let used = chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| matches!(p.kind.as_str(), "dine" | "table") && p.thing == *k)).map(|c| c.members.len()).sum::<usize>();
-            used < self.table_seats(t, self.thing_px(t), unit).len()
-        });
+        // a place of its own, kept for it from now on (not just a table with room)
+        let free = park.things.iter().enumerate().filter(|(_, t)| t.kind == "table" && t.place == "cafe").find(|(k, t)| seat_slot(*k, i, self.table_seats(t, self.thing_px(t), unit).len()).is_some());
         let Some((k, _)) = free else { return false };
         log::debug!("cafe: {i} comes in to eat");
         self.start_play(chats, i, k, "dine");
@@ -518,6 +516,10 @@ impl CharacterOverlay {
                         if park::favorite(&name) == dish {
                             if let Some(c) = &chef {
                                 park::pay(&name, 2, &[(c.as_str(), 1.0)]);
+                            }
+                            // and for whoever brought it
+                            if let Some(w) = &waiter {
+                                park::pay(&name, 2, &[(w.as_str(), 1.0)]);
                             }
                         }
                         if !treated && !to.is_empty() && !park::pay(&name, price, &to) {

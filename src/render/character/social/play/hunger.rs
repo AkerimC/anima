@@ -247,12 +247,10 @@ impl CharacterOverlay {
         }
         *last = Some(Instant::now());
         let jobs = park::read_jobs();
-        for name in jobs.jobs.keys() {
-            park::earn(name, tn().wage as u32);
-        }
-        // part-time: half
-        for name in jobs.part.keys() {
-            park::earn(name, (tn().wage * 0.5).round() as u32);
+        // on shift: the full wage; helping out: half
+        for name in jobs.jobs.keys().chain(jobs.part.keys()) {
+            let full = park::job_of(name).is_some();
+            park::earn(name, if full { tn().wage as u32 } else { (tn().wage * 0.5).round() as u32 });
         }
         log::debug!("wages paid");
     }

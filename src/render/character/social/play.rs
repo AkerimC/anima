@@ -341,7 +341,7 @@ impl CharacterOverlay {
                 let state = park::read_farm_cached();
                 park_now().things.iter().filter(|t| t.place == "farm" && park::farm_state(t, &state).1 > 0).count() >= 3
             }
-            "fisher" => park::read_pantry().values().sum::<u32>() < 4 + tn().staff_keep as u32,
+            "fisher" => park::pantry_total_cached() < 4 + tn().staff_keep as u32,
             _ => false,
         }
     }
