@@ -86,15 +86,7 @@ impl CharacterOverlay {
             c.host_paid = true;
             if let Some(w) = c.winner.filter(|w| c.members.contains(w)) {
                 let name = self.character_name(w);
-                // from the piggy bank while there's anything in it
-                let prize = tn().host_prize as u32;
-                if !park::pay("Park", prize, &[(name.as_str(), 1.0)]) {
-                    park::earn(&name, prize);
-                }
-                // and the attendant is paid for calling it
-                let hname = self.character_name(h);
-                park::pay_upto("Park", tn().host_fee as u32, &hname);
-                log::debug!("chat {}: the attendant gives {name} {} coins", c.id, tn().host_prize);
+                log::debug!("chat {}: the attendant cheers {name} on", c.id);
                 let wk = self.walk_of(h);
                 wk.gesture = true;
                 wk.start_bob(tn().jump_height * 0.3);

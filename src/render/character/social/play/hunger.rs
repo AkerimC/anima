@@ -41,7 +41,8 @@ impl CharacterOverlay {
         if LIVE.lock().unwrap().dishes.iter().any(|d| counters.contains(&d.0)) {
             return true;
         }
-        stall && park.things.iter().any(|t| t.kind == "stall") && park::coins(&self.character_name(i)) >= park::SNACK_PRICE
+        let _ = i;
+        stall && park.things.iter().any(|t| t.kind == "stall")
     }
 
     /// The chef or a waiter at work and hungry: a quick bite in the kitchen,
@@ -114,7 +115,9 @@ impl CharacterOverlay {
 
     /// The restaurant's open and it can't pay for a meal.
     pub(super) fn broke(&self, i: usize) -> bool {
-        self.restaurant_open() && park::coins(&self.character_name(i)) < 8
+        // (no coins any more: nobody is)
+        let _ = i;
+        false
     }
 
     /// `i` eats `dish`: less hungry, happy (more so for its favourite).
@@ -186,7 +189,6 @@ impl CharacterOverlay {
             }
             *next = Some(Instant::now());
         }
-        self.pay_wages();
         self.start_picnics(chats);
         // the chef and waiters at work never have a free moment to go and eat
         // (always cooking or carrying): a bite in the kitchen as they go
@@ -260,7 +262,7 @@ impl CharacterOverlay {
         let name = self.character_name(i);
         // a snack at the stall, if it's in the park with some coins
         let stall = park.things.iter().enumerate().find(|(_, t)| t.kind == "stall").map(|(k, _)| k);
-        if here.as_deref() == Some("park") && park::coins(&name) >= park::SNACK_PRICE && self.walk.rand() < 0.4 {
+        if here.as_deref() == Some("park") && self.walk.rand() < 0.4 {
             if let Some(k) = stall {
                 log::debug!("{name} buys a snack");
                 self.start_play(chats, i, k, "stall");
@@ -294,37 +296,6 @@ impl CharacterOverlay {
             }
             _ => {}
         }
-    }
-
-    /// Those with a job are paid now and then (every 20 minutes).
-    fn pay_wages(&mut self) {
-        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-        let mut last = LAST.lock().unwrap();
-        if last.is_none() {
-            *last = Some(Instant::now());
-            return;
-        }
-        if last.is_some_and(|t| t.elapsed().as_secs_f32() < 1200.0) {
-            return;
-        }
-        *last = Some(Instant::now());
-        let jobs = park::read_jobs();
-        // on shift: the full wage; helping out: half
-        for name in jobs.jobs.keys().chain(jobs.part.keys()) {
-            let full = park::job_of(name).is_some();
-            park::earn(name, if full { tn().wage as u32 } else { (tn().wage * 0.5).round() as u32 });
-        }
-        // the park gets its share too, to buy the farm's and the pier's food
-        park::earn("Park", (tn().wage * tn().park_grant).round() as u32);
-        park::new_budget();
-        // and a tax: the more one has, the bigger the share
-        let paid = park::tax(&[(tn().tax_low_at as u32, tn().tax_low), (tn().tax_high_at as u32, tn().tax_high - tn().tax_low)]);
-        if let Some((name, k)) = paid.iter().max_by_key(|p| p.1) {
-            let total: u32 = paid.iter().map(|p| p.1).sum();
-            log::info!("tax day: {total} coins to the park");
-            tell(&format!("Tax day: {total} coins to the park ({name} paid the most, {k})"));
-        }
-        log::debug!("wages paid");
     }
 
     /// A meal to be eaten in the park: everyone for it goes along.
@@ -421,15 +392,7 @@ impl CharacterOverlay {
                 } else if self.arrived(i) && (self.strip_px(i) - spot).abs() <= 8.0 {
                     self.set_face(i, true);
                     let name = self.character_name(i);
-                    // the coins go to the chef, if there is one
-                    let chef = park::read_jobs().jobs.iter().find(|j| j.1 == "chef").map(|j| j.0.clone());
-                    let paid = match &chef {
-                        Some(c) => park::pay(&name, park::SNACK_PRICE, &[(c.as_str(), 0.67), ("Park", 0.33)]),
-                        None => park::pay(&name, park::SNACK_PRICE, &[("Park", 1.0)]),
-                    };
-                    if !paid {
-                        return true;
-                    }
+                    let _ = name;
                     let snack = park::SNACKS[(self.walk.rand() * park::SNACKS.len() as f32) as usize % park::SNACKS.len()];
                     p.meal = Some(Meal { dish: snack.to_string(), new: false, burnt: false, stuff: Vec::new() });
                     self.walk_of(i).start_bob(tn().jump_height * 0.2);

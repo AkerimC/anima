@@ -192,14 +192,10 @@ impl CharacterOverlay {
         if self.food_stage() == 0 && self.hungry(i) {
             log::debug!("{} eats the {id} raw", self.character_name(i));
             self.eat(i, "snack");
-            let name = self.character_name(i);
-            park::park_buys(&name, park::food_worth(id) * k);
             return;
         }
         park::add_food(id, k);
-        // the park buys it, with what's in the piggy bank
-        let name = self.character_name(i);
-        park::park_buys(&name, park::food_worth(id) * k);
+
     }
 
     /// `i` has this job.
@@ -1527,7 +1523,6 @@ impl CharacterOverlay {
                     for _ in 0..ready {
                         park::add(&name, "wood");
                     }
-                    park::park_buys(&name, ready);
                     farm.insert(key, park::now());
                     park::write_farm(&farm);
                     log::debug!("{} picks up {ready} wood", r.i);

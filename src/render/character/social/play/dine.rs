@@ -536,51 +536,8 @@ impl CharacterOverlay {
                         let name = self.character_name(i);
                         let o = order_of(i);
                         let dish = o.as_ref().map(|o| o.dish.clone()).unwrap_or_default();
-                        let price = park::dish_price(&dish);
-                        // the cook's share to whoever cooked it
-                        let chef = order_of(i).and_then(|o| o.cook).or_else(|| self.on_duty("chef")).map(|c| self.character_name(c));
-                        let waiter = o.and_then(|o| o.waiter).map(|w| self.character_name(w));
-                        let to: Vec<(&str, f32)> = match (&chef, &waiter) {
-                            // what it's made of goes back to the park, which bought it
-                            (Some(c), Some(w)) => vec![(c.as_str(), 0.45), (w.as_str(), 0.3), ("Park", 0.25)],
-                            (Some(c), None) => vec![(c.as_str(), 0.75), ("Park", 0.25)],
-                            (None, Some(w)) => vec![(w.as_str(), 0.75), ("Park", 0.25)],
-                            (None, None) => Vec::new(),
-                        };
-                        // now and then a friend at the table treats it
-                        let treat = p.riders.iter().map(|o| o.i).filter(|&o| o != i && self.close(i, o)).find(|&o| park::coins(&self.character_name(o)) >= price * 2);
-                        let treated = match treat.filter(|_| !to.is_empty() && self.walk.rand() < 0.3) {
-                            Some(f) => {
-                                let fname = self.character_name(f);
-                                let ok = park::pay(&fname, price, &to);
-                                if ok {
-                                    log::debug!("cafe: {fname} treats {name}");
-                                    self.add_bond(i, f, tn().bond_game * 2.0, 0.0);
-                                }
-                                ok
-                            }
-                            None => false,
-                        };
-                        // its favourite: a tip for the chef
-                        if park::favorite(&name) == dish {
-                            if let Some(c) = &chef {
-                                park::pay(&name, 2, &[(c.as_str(), 1.0)]);
-                            }
-                            // and for whoever brought it
-                            if let Some(w) = &waiter {
-                                park::pay(&name, 2, &[(w.as_str(), 1.0)]);
-                            }
-                        }
-                        if !treated && !to.is_empty() && !park::pay(&name, price, &to) {
-                            // short: a friend at the table pays, and they get closer for it
-                            let friend = p.riders.iter().map(|o| o.i).filter(|&o| o != i).find(|&o| park::coins(&self.character_name(o)) >= price);
-                            if let Some(f) = friend {
-                                let fname = self.character_name(f);
-                                park::pay(&fname, price, &to);
-                                self.add_bond(i, f, tn().bond_game * 2.0, 0.0);
-                            }
-                        }
-                        log::debug!("cafe: {name} pays {price} for the {dish}");
+                        // a thank-you at the counter on the way out
+                        log::debug!("cafe: {name} thanks them for the {dish}");
 
                         self.walk_of(i).start_bob(tn().jump_height * 0.2);
                         r.phase = 41;
@@ -616,7 +573,6 @@ impl CharacterOverlay {
                 let x = (rect[0] + rect[2]) * 0.5;
                 let kind = match r.phase {
                     21 => order_of(r.i).and_then(|o| park::DISHES.iter().position(|d| d.0 == o.dish)).map(|k| super::super::FOOD + k as i32),
-                    41 => Some(super::super::COIN),
                     _ => None,
                 };
                 let Some(kind) = kind else { continue };

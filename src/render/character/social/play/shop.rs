@@ -6,9 +6,17 @@
 
 use super::*;
 
+/// The shop ran on carrot coins, which are gone.
+const SHOPPING: bool = false;
+
 impl CharacterOverlay {
     /// Now and then: someone with coins goes shopping; a full piggy bank is spent.
     pub(super) fn shop_tick(&mut self, chats: &mut Vec<Chat>, n: usize) {
+        // no coins any more: no shopping
+        if !SHOPPING {
+            let _ = (chats, n);
+            return;
+        }
         static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
         {
             let mut next = NEXT.lock().unwrap();
