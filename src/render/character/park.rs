@@ -313,6 +313,7 @@ pub fn farm_state(t: &Thing, farm: &Farm) -> (f32, u32) {
 pub const INGREDIENTS: [(&str, &str); 6] = [("fish", "Fish"), ("carrot", "Carrot"), ("wheat", "Wheat"), ("apple", "Apple"), ("egg", "Egg"), ("milk", "Milk")];
 
 /// What can come out: id, label, what goes in (sorted as in INGREDIENTS).
+/// Each ingredient goes in four or five of them.
 pub const DISHES: [(&str, &str, &[&str]); 12] = [
     ("fish_soup", "Fish soup", &["fish", "carrot"]),
     ("pancakes", "Pancakes", &["wheat", "egg", "milk"]),
@@ -322,10 +323,10 @@ pub const DISHES: [(&str, &str, &[&str]); 12] = [
     ("fried_fish", "Fried fish", &["fish", "wheat"]),
     ("sushi", "Sushi", &["fish", "egg"]),
     ("salad", "Salad", &["carrot", "apple"]),
-    ("carrot_cake", "Carrot cake", &["carrot", "wheat", "egg"]),
+    ("carrot_cake", "Carrot cake", &["carrot", "apple", "egg"]),
     ("cookies", "Cookies", &["wheat", "egg"]),
     ("ice_cream", "Ice cream", &["apple", "milk"]),
-    ("stew", "Stew", &["fish", "carrot", "egg"]),
+    ("stew", "Stew", &["fish", "carrot", "milk"]),
 ];
 
 pub fn food_picture(id: &str) -> PathBuf {
