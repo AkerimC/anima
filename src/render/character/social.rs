@@ -2000,6 +2000,7 @@ impl CharacterOverlay {
         let id = self.chat_id;
         let mut other = Chat::new(id, players, Stage::Approach, 0.0);
         other.played = c.played.clone();
+        other.games = c.games;
         other.forced = Some(game);
         log::debug!("chat {}: {:?} go off to play {game:?} as chat {id}, {talkers:?} keep talking", c.id, other.members);
         for &i in &other.members.clone() {
@@ -2663,6 +2664,8 @@ impl CharacterOverlay {
         log::debug!("chat {id}: concert by {top:?}");
         let mut chat = Chat::new(id, top.clone(), Stage::Concert, tn().concert_time);
         chat.watchers = crowd;
+        // the race was the game
+        chat.games = 1;
         chat.talker = top[0];
         chat.winner = Some(top[0]);
         self.new_chats.push(chat);
@@ -2773,6 +2776,9 @@ impl CharacterOverlay {
         c.scores = vec![(i, 0.0)];
         c.step = 9;
         c.timer = 30.0;
+        // that's this group's game: no fishing again straight after
+        c.played.push(Game::Fishing);
+        c.games = 1;
         c
     }
 
@@ -2843,6 +2849,7 @@ impl CharacterOverlay {
         }
         log::debug!("chat {id}: {i} goes to practise {game} ({own:.2}){}", mentor.map_or(String::new(), |m| format!(", {m} shows how")));
         let mut c = Chat::new(id, members, Stage::Practice, 0.0);
+        c.games = 1;
         let reps = tn().train_reps as u32 + (self.walk.rand() * 3.0) as u32;
         c.practice = Some(Practice { game, drill, learner: i, mentor, at, reps, showing: mentor.is_some(), wait: 0.0, intro: 2.0 });
         c.step = 9;
@@ -5767,7 +5774,8 @@ impl CharacterOverlay {
     /// After a game some have had enough and drift off; the lively and the
     /// keen stay, and the liveliest holds up what to play next.
     fn plan_encore(&mut self, c: &mut Chat) {
-        if self.race.is_some() || c.members.len() < 2 {
+        // enough games for one group: they talk, then go their ways
+        if self.race.is_some() || c.members.len() < 2 || c.games as f32 >= tn().max_games {
             return;
         }
         let (mut keen, mut tired) = (Vec::new(), Vec::new());
