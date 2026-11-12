@@ -50,6 +50,33 @@ impl CharacterOverlay {
         }
     }
 
+    /// A chat belongs to one world, the desktop or the windows: a talker who
+    /// wanders over into the other one is out of it. All of them going over
+    /// together take the chat with them.
+    pub(super) fn keep_world(&mut self, c: &mut Chat, n: usize) {
+        let inside = |this: &Self, i: usize| this.place_here(i).is_some();
+        let members: Vec<usize> = c.members.iter().copied().filter(|&i| i < n).collect();
+        if members.is_empty() {
+            return;
+        }
+        let first = inside(self, members[0]);
+        if members.iter().all(|&i| inside(self, i) == first) {
+            c.world = Some(first);
+            return;
+        }
+        let Some(world) = c.world else { return };
+        if !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk) {
+            return;
+        }
+        for i in members {
+            if inside(self, i) != world && !self.walk_ref(i).social.is_some_and(|s| s.grabbed) {
+                log::debug!("chat {}: {i} is in the other world now, out of it", c.id);
+                c.members.retain(|&m| m != i);
+                self.leave(i, c.id);
+            }
+        }
+    }
+
     /// Time in the current stage; false once it's gone on far too long.
     pub(super) fn within_limit(&mut self, c: &mut Chat, dt: f32) -> bool {
         if c.stage != c.last_stage {

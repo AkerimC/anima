@@ -293,7 +293,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { watch_left: Vec::new(), stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
+        Chat { world: None, watch_left: Vec::new(), stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
     }
 }
 
@@ -354,6 +354,8 @@ pub(super) struct Chat {
     // seconds in this stage, and which stage that was (see life.rs)
     stage_t: f32,
     last_stage: Stage,
+    // in the park, cafe or farm (true) or out on the desktop
+    world: Option<bool>,
     timer: f32,
     // whose turn to talk, seconds left of it, seconds to the next nod
     talker: usize,
@@ -1173,6 +1175,7 @@ impl CharacterOverlay {
     /// too few are left to go on.
     fn prune(&mut self, c: &mut Chat, n: usize) -> bool {
         let id = c.id;
+        self.keep_world(c, n);
         let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Volley | Stage::Cheer);
         // tag: you can carry someone off and they're still in it when put down
         let tag = matches!(c.stage, Stage::Fishing | Stage::Blind | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Long);
