@@ -160,6 +160,7 @@ tuning! {
         hungry_nap: "Nothing to eat: a nap of (s)" = 240.0, 10.0, 3600.0, 10.0, 0;
         picnic_chance: "A meal cooked for oneself is eaten as a picnic in the park (share)" = 0.25, 0.0, 1.0, 0.05, 2;
         wage: "Coins each job pays every 20 minutes" = 5.0, 0.0, 100.0, 1.0, 0;
+        host_prize: "The attendant's prize for a game's winner (coins)" = 3.0, 0.0, 50.0, 1.0, 0;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
         park_out_stay: "Stays out (s)" = 180.0, 10.0, 7200.0, 10.0, 0;

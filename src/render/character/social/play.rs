@@ -9,6 +9,7 @@ use super::*;
 use crate::render::character::park::{self, Park, Thing};
 
 mod dine;
+mod host;
 mod hunger;
 mod places;
 mod visit;
@@ -665,8 +666,9 @@ impl CharacterOverlay {
                 _ => {}
             }
             let r = self.walk.rand();
-            // work first: game time a third as often
+            // work first: game time a third as often; with nobody to call it, rarer still
             let every = if working() { every * 3.0 } else { every };
+            let every = if self.park_host(n).is_none() { every * 1.5 } else { every };
             *next = Some(Instant::now() + std::time::Duration::from_secs_f32(every * (0.6 + r * 0.8)));
             drop(next);
             if visit::visiting_mode() {
@@ -681,11 +683,12 @@ impl CharacterOverlay {
             return;
         }
         let middle = park.x + park.w * 0.5;
+        let host = self.park_host(n);
         // the park's free ones first, then the nearest from next door
         let mut free: Vec<(usize, f32)> = (0..n)
             .filter(|&i| {
                 let wk = self.walk_ref(i);
-                wk.ws == park.ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none() && !self.on_shift(i) && wk.energy >= tn().energy_game_need * 0.5
+                Some(i) != host && wk.ws == park.ws && wk.at_leisure() && wk.trip.is_none() && wk.rest.is_none() && !self.on_shift(i) && wk.energy >= tn().energy_game_need * 0.5
             })
             .map(|i| (i, (self.strip_px(i) - middle).abs()))
             .collect();
@@ -707,6 +710,9 @@ impl CharacterOverlay {
         let mut c = Chat::new(id, members, Stage::Approach, 0.0);
         c.forced = Some(game);
         self.arrange(&c);
+        if let Some(h) = host {
+            self.host_call(&mut c, h, middle);
+        }
         chats.push(c);
     }
 
@@ -2103,6 +2109,7 @@ impl CharacterOverlay {
         self.restaurant_tick(chats);
         self.work_calls(chats, n);
         self.idle_nudge(chats, dt, n);
+        self.host_help(n);
         self.hunger_tick(chats, dt, n);
         self.visit_tick(chats, dt, n);
         self.leftovers(chats, n);

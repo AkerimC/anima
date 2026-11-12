@@ -34,6 +34,9 @@ impl CharacterOverlay {
     /// The chat is over: everyone in it and watching it goes.
     pub(super) fn finish(&mut self, c: &Chat, n: usize) {
         let big = c.members.len() >= tn().big_group as usize;
+        if let Some(h) = c.host.filter(|&h| h < n) {
+            self.leave(h, c.id);
+        }
         for &i in c.watchers.iter().filter(|&&i| i < n) {
             self.leave(i, c.id);
         }

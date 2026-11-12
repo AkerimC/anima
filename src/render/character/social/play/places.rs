@@ -170,7 +170,11 @@ impl CharacterOverlay {
                     }
                 }
             }
-            // something to play on here, or off to the park
+            // something to play on here, or off to the park (in the park the
+            // attendant asks it over)
+            if here.as_deref() == Some("park") {
+                self.host_invite(i, n);
+            }
             if self.play_for(chats, i, n, true) {
                 log::debug!("idle: {i} finds something to do");
                 continue;
