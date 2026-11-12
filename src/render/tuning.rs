@@ -153,7 +153,7 @@ tuning! {
         hunger_stage0: "Hunger pace with nothing to cook on yet" = 0.5, 0.0, 2.0, 0.05, 2;
         hunger_stage1: "Hunger pace with a stove but no chef" = 0.8, 0.0, 2.0, 0.05, 2;
         hunger_meal: "At mealtimes, this share of that is enough" = 0.75, 0.1, 1.0, 0.05, 2;
-        full_time: "Full after a meal for (s)" = 1800.0, 0.0, 7200.0, 60.0, 0;
+        full_time: "Full after a meal for (s)" = 900.0, 0.0, 7200.0, 60.0, 0;
         full_busy: "Working or playing, full passes this much quicker" = 0.5, 0.0, 3.0, 0.1, 1;
         staff_keep: "Kept in the pantry for those at work" = 2.0, 0.0, 10.0, 1.0, 0;
         beg_hunger: "No coins: eats anyway only this hungry (0..1)" = 0.9, 0.5, 1.0, 0.05, 2;

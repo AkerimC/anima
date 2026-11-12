@@ -7,6 +7,9 @@
 
 use super::*;
 
+/// Sent off to eat, not sat down yet: (who, since when).
+static ON_WAY: Mutex<Vec<(usize, Instant)>> = Mutex::new(Vec::new());
+
 /// Picnics being set up: (who, where on the strip, the dish, since when).
 pub(super) static PICNIC: Mutex<Vec<(usize, f32, String, Instant)>> = Mutex::new(Vec::new());
 
@@ -105,7 +108,11 @@ impl CharacterOverlay {
         let early = self.food_stage() == 0;
         let wk = self.walk_of(i);
         // (early days nobody naps for want of food: there's nothing to cook on yet)
-        if !early && wk.hunger >= tn().beg_hunger {
+        let _ = wk;
+        let staff = self.is_job(i, "chef") || self.is_job(i, "waiter") || self.is_part(i, "chef") || self.is_part(i, "waiter");
+        let wk = self.walk_of(i);
+        // (the cooks and waiters don't: they'd sleep at the stove)
+        if !early && !staff && wk.hunger >= tn().beg_hunger {
             let secs = tn().hungry_nap;
             wk.lie_down(secs);
         } else {
@@ -202,10 +209,20 @@ impl CharacterOverlay {
                 break;
             }
         }
-        // one hungry one at a time goes to eat
-        // (in mode 3 those on the desktop are sent over by the visits)
-        let hungry: Vec<usize> = (0..n)
-            .filter(|&i| self.walk_ref(i).at_leisure() && self.walk_ref(i).trip.is_none() && self.hungry(i))
+        // as many go to eat as there are free seats in the cafe, the
+        // hungriest first; they drop a game or chat for it (not the cooks)
+        let seats = self.cafe_seats();
+        let eating = chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| p.kind == "dine")).map(|c| c.members.len()).sum::<usize>();
+        let on_way = {
+            let mut w = ON_WAY.lock().unwrap();
+            w.retain(|(i, t)| t.elapsed().as_secs_f32() < 60.0 && !chats.iter().any(|c| c.members.contains(i) && c.play.as_ref().is_some_and(|p| p.kind == "dine")));
+            w.len()
+        };
+        // (no tables yet: one at a time, to cook for itself)
+        let room = if seats == 0 { usize::from(on_way == 0) } else { seats.saturating_sub(eating + on_way) };
+        let going: Vec<usize> = ON_WAY.lock().unwrap().iter().map(|w| w.0).collect();
+        let mut hungry: Vec<usize> = (0..n)
+            .filter(|&i| !going.contains(&i) && self.walk_ref(i).trip.is_none() && self.hungry(i) && self.may_stop_for_food(chats, i))
             // in mode 3 only those here to eat, and the chef and waiters at work;
             // anyone else here for something else eats once back home and sent over
             .filter(|&i| {
@@ -214,7 +231,52 @@ impl CharacterOverlay {
                         && (matches!(self.walk_ref(i).visit_for, visit::MEAL | visit::HUNGRY) || (self.walk_ref(i).visit_for == visit::WORK)))
             })
             .collect();
-        let Some(&i) = hungry.get((self.walk.rand() * hungry.len().max(1) as f32) as usize % hungry.len().max(1)) else { return };
+        hungry.sort_by(|a, b| self.walk_ref(*b).hunger.total_cmp(&self.walk_ref(*a).hunger));
+        for i in hungry.into_iter().take(room) {
+            // out of the game or chat it's in
+            if !self.walk_ref(i).at_leisure() {
+                for c in chats.iter_mut() {
+                    if c.members.contains(&i) {
+                        c.members.retain(|&x| x != i);
+                        self.let_down(i);
+                        self.leave(i, c.id);
+                    }
+                }
+            }
+            if !self.walk_ref(i).at_leisure() {
+                continue;
+            }
+            ON_WAY.lock().unwrap().push((i, Instant::now()));
+            self.go_eat(chats, i);
+        }
+    }
+
+    /// Seats at the cafe's tables, all told.
+    fn cafe_seats(&self) -> usize {
+        let park = park_now();
+        let unit = self.park_unit(self.extras.len() + 1);
+        park.things.iter().filter(|t| t.kind == "table" && t.place == "cafe").map(|t| self.table_seats(t, self.thing_px(t), unit).len()).sum()
+    }
+
+    /// Free, or in something it can leave to eat (a chat or a game; not a
+    /// meal, the cooking or serving, a race, or asleep).
+    fn may_stop_for_food(&self, chats: &[Chat], i: usize) -> bool {
+        let wk = self.walk_ref(i);
+        if wk.at_leisure() {
+            return true;
+        }
+        if wk.fret || wk.race.is_some() || wk.crowd.is_some() || wk.circle || !matches!(wk.act, Act::Idle | Act::Walk) {
+            return false;
+        }
+        // the cooks and waiters at work eat in the kitchen instead
+        if self.on_duty("chef") == Some(i) || self.on_duty("waiter") == Some(i) {
+            return false;
+        }
+        !chats.iter().any(|c| c.members.contains(&i) && c.play.as_ref().is_some_and(|p| matches!(p.kind.as_str(), "dine" | "stove" | "serve" | "order" | "picnic" | "table" | "stall")))
+    }
+
+    /// `i` is hungry: a seat in the cafe, or the way there.
+    fn go_eat(&mut self, chats: &mut Vec<Chat>, i: usize) {
         let here = self.place_here(i).map(|p| p.place);
         // at work in the cafe: a break to sit down and eat if someone can stand
         // in (the waiter always can: diners fetch their own meanwhile), else a
