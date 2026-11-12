@@ -9,7 +9,11 @@ use super::CharacterOverlay;
 use super::walk::{Act, WalkState};
 use crate::backend::governor;
 
+mod free;
+mod life;
 mod play;
+
+pub(super) use free::Want;
 
 /// A game asked for from the settings window (`anima game <name>`).
 pub static GAME_NOW: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -285,7 +289,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
+        Chat { stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
     }
 }
 
@@ -343,6 +347,9 @@ pub(super) struct Chat {
     id: u32,
     members: Vec<usize>,
     stage: Stage,
+    // seconds in this stage, and which stage that was (see life.rs)
+    stage_t: f32,
+    last_stage: Stage,
     timer: f32,
     // whose turn to talk, seconds left of it, seconds to the next nod
     talker: usize,
@@ -803,7 +810,7 @@ impl CharacterOverlay {
             }
         }
         chats.retain_mut(|c| {
-            let keep = self.prune(c, n) && self.advance(c, dt, mouse);
+            let keep = self.prune(c, n) && self.within_limit(c, dt) && self.advance(c, dt, mouse);
             if !keep {
                 self.finish(c, n);
             }
@@ -1028,8 +1035,7 @@ impl CharacterOverlay {
         for &m in &c.members {
             let x = self.strip_px(m);
             for f in 0..n {
-                let wk = self.walk_ref(f);
-                if c.members.contains(&f) || wk.ws != ws || !wk.at_leisure() || (self.strip_px(f) - x).abs() > range || self.on_shift(f) {
+                if c.members.contains(&f) || self.walk_ref(f).ws != ws || !self.free_for(f, Want::Called) || (self.strip_px(f) - x).abs() > range {
                     continue;
                 }
                 let b = self.bond(m, f).0;
@@ -1391,28 +1397,6 @@ impl CharacterOverlay {
         }
     }
 
-    fn leave(&mut self, i: usize, id: u32) {
-        let wk = self.walk_of(i);
-        if wk.social.is_some_and(|s| s.chat == id) {
-            wk.social = None;
-            wk.social_cool = tn().cool_base + wk.rand() * tn().cool_rand;
-        }
-    }
-
-    fn finish(&mut self, c: &Chat, n: usize) {
-        let big = c.members.len() >= tn().big_group as usize;
-        for &i in c.watchers.iter().filter(|&&i| i < n) {
-            self.leave(i, c.id);
-        }
-        for &i in c.members.iter().filter(|&&i| i < n) {
-            self.leave(i, c.id);
-            if big {
-                let wk = self.walk_of(i);
-                wk.crowd_rest = tn().crowd_rest_base + wk.rand() * tn().crowd_rest_rand;
-            }
-        }
-    }
-
     pub(super) fn width_of(&self, i: usize) -> f32 {
         let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
         (r[2] - r[0]).max(1.0)
@@ -1441,8 +1425,7 @@ impl CharacterOverlay {
     fn find_pair(&mut self, n: usize, room: bool) -> Option<Chat> {
         let free: Vec<(usize, f32, f32, f32)> = (0..n)
             .filter(|&i| {
-                let wk = self.walk_ref(i);
-                wk.act == Act::Idle && wk.crowd.is_none() && wk.social.is_none() && wk.race.is_none() && !wk.circle && self.on_screen(i)
+                self.free_for(i, Want::Pair)
             })
             .map(|i| (i, self.strip_px(i), self.width_of(i), chat_cool(self.walk_ref(i))))
             .collect();
@@ -1564,8 +1547,7 @@ impl CharacterOverlay {
         let size = self.width_of(c.members[0]);
         let free: Vec<(usize, f32, f32)> = (0..n)
             .filter(|&i| {
-                let wk = self.walk_ref(i);
-                wk.ws == self.walk_ref(c.members[0]).ws && grounded(wk) && wk.crowd.is_none() && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_join_need && chat_cool(wk) <= 0.0 && self.on_screen(i)
+                self.walk_ref(i).ws == self.walk_ref(c.members[0]).ws && self.free_for(i, Want::Join)
             })
             .map(|i| {
                 let x = self.strip_px(i);
@@ -1590,8 +1572,7 @@ impl CharacterOverlay {
     fn overlap_join(&mut self, c: &mut Chat, n: usize, full: bool) -> bool {
         let mut hit: Option<(f32, usize, usize)> = None;
         for i in 0..n {
-            let wk = self.walk_ref(i);
-            if wk.act != Act::Idle || wk.ws != self.walk_ref(c.members[0]).ws || wk.social.is_some() || wk.race.is_some() || wk.circle || !self.on_screen(i) {
+            if self.walk_ref(i).ws != self.walk_ref(c.members[0]).ws || !self.free_for(i, Want::Overlap) {
                 continue;
             }
             let x = self.strip_px(i);
@@ -3213,8 +3194,7 @@ impl CharacterOverlay {
         let (lo, hi) = (xs.iter().copied().fold(f32::MAX, f32::min), xs.iter().copied().fold(f32::MIN, f32::max));
         let range = self.view_w * 0.6;
         let who = (0..n).find(|&j| {
-            let wk = self.walk_ref(j);
-            !c.members.contains(&j) && wk.fish_cool <= 0.0 && wk.ws == ws && wk.at_leisure() && self.on_screen(j) && (self.strip_px(j) - (lo + hi) * 0.5).abs() < range
+            !c.members.contains(&j) && self.walk_ref(j).ws == ws && self.free_for(j, Want::Fish) && (self.strip_px(j) - (lo + hi) * 0.5).abs() < range
         });
         let Some(j) = who else { return };
         let keen = 1.0 + c.members.iter().map(|&m| self.bond(j, m).0).fold(0.0, f32::max);
@@ -5408,8 +5388,7 @@ impl CharacterOverlay {
         let size = self.width_of(c.members[0]);
         let free: Vec<(usize, f32)> = (0..n)
             .filter(|&i| {
-                let wk = self.walk_ref(i);
-                wk.ws == self.walk_ref(c.members[0]).ws && grounded(wk) && wk.crowd.is_none() && wk.social.is_none() && wk.race.is_none() && !wk.circle && wk.energy >= tn().energy_watch_need && chat_cool(wk) <= tn().overlap_cool && self.on_screen(i)
+                self.walk_ref(i).ws == self.walk_ref(c.members[0]).ws && self.free_for(i, Want::Watch)
             })
             .map(|i| {
                 let x = self.strip_px(i);

@@ -1,0 +1,66 @@
+//! A chat's life: everyone comes in one way and goes out one way, every
+//! stage has a longest time, and whoever leaves rests a while before the
+//! next thing can take it.
+
+use super::super::CharacterOverlay;
+use super::{Chat, Stage};
+use crate::render::tuning::get as tn;
+
+/// Longest a chat may stay in one stage before it's ended for good.
+pub(super) fn stage_limit(stage: Stage) -> f32 {
+    let t = tn();
+    match stage {
+        Stage::Notice | Stage::Approach | Stage::Stroll => 90.0,
+        Stage::Talk | Stage::RaceCall => 240.0,
+        Stage::Part | Stage::Cheer => 60.0,
+        Stage::RaceWait | Stage::Concert => 600.0,
+        Stage::Fishing => t.fish_time + 120.0,
+        Stage::Play => 900.0,
+        _ => t.chat_max,
+    }
+}
+
+impl CharacterOverlay {
+    /// `i` is out of chat `id`: free, after a rest.
+    pub(super) fn leave(&mut self, i: usize, id: u32) {
+        let wk = self.walk_of(i);
+        if wk.social.is_some_and(|s| s.chat == id) {
+            wk.social = None;
+            let rest = tn().cool_base + wk.rand() * tn().cool_rand;
+            wk.social_cool = wk.social_cool.max(rest);
+        }
+    }
+
+    /// The chat is over: everyone in it and watching it goes.
+    pub(super) fn finish(&mut self, c: &Chat, n: usize) {
+        let big = c.members.len() >= tn().big_group as usize;
+        for &i in c.watchers.iter().filter(|&&i| i < n) {
+            self.leave(i, c.id);
+        }
+        for &i in c.members.iter().filter(|&&i| i < n) {
+            // up a jetty or a seat: down on foot, not a fall
+            if self.walk_ref(i).air > 0.05 && self.walk_ref(i).social.is_some_and(|s| s.chat == c.id) {
+                self.push_down(i);
+            }
+            self.leave(i, c.id);
+            if big {
+                let wk = self.walk_of(i);
+                wk.crowd_rest = tn().crowd_rest_base + wk.rand() * tn().crowd_rest_rand;
+            }
+        }
+    }
+
+    /// Time in the current stage; false once it's gone on far too long.
+    pub(super) fn within_limit(&mut self, c: &mut Chat, dt: f32) -> bool {
+        if c.stage != c.last_stage {
+            c.last_stage = c.stage;
+            c.stage_t = 0.0;
+        }
+        c.stage_t += dt;
+        if c.stage_t <= stage_limit(c.stage) {
+            return true;
+        }
+        log::warn!("chat {}: {:?} ran over its time ({:.0}s), ended", c.id, c.stage, c.stage_t);
+        false
+    }
+}

@@ -899,11 +899,10 @@ impl CharacterOverlay {
     /// waiting to bump into someone. Called a few times a second.
     pub(super) fn seek_company(&mut self, n: usize, every: f32) {
         for i in 0..n {
-            let wk = self.walk_ref(i);
-            if wk.act != Act::Idle || !wk.at_leisure() || wk.climb_like() || self.on_shift(i) {
+            if !self.free_for(i, super::social::Want::Seek) {
                 continue;
             }
-            let ws = wk.ws;
+            let ws = self.walk_ref(i).ws;
             let here: Vec<usize> = (0..n).filter(|&j| j != i && self.walk_ref(j).ws == ws && self.walk_ref(j).act != Act::Travel).collect();
             if here.is_empty() {
                 continue;

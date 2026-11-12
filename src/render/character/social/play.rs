@@ -490,8 +490,7 @@ impl CharacterOverlay {
         }
         let who: Vec<usize> = (0..n)
             .filter(|&i| {
-                let wk = self.walk_ref(i);
-                homes.iter().any(|h| h.ws == wk.ws) && wk.at_leisure() && wk.act == Act::Idle && wk.trip.is_none() && wk.rest.is_none() && chat_cool(wk) <= tn().overlap_cool && wk.energy >= tn().energy_watch_need
+                homes.iter().any(|h| h.ws == self.walk_ref(i).ws) && self.free_for(i, Want::Play)
             })
             .collect();
         if who.is_empty() {
@@ -1721,8 +1720,7 @@ impl CharacterOverlay {
         // free on the farm's workspace (in any of the windows: the farmer
         // comes over from wherever it is)
         let free = |this: &Self, i: usize| {
-            let wk = this.walk_ref(i);
-            wk.ws == farm.ws && wk.at_leisure() && wk.act == Act::Idle && wk.trip.is_none() && wk.rest.is_none() && wk.air <= 0.0 && this.place_here(i).is_some()
+            this.walk_ref(i).ws == farm.ws && this.free_for(i, Want::Work) && this.place_here(i).is_some()
         };
         let who = self.who_for("farmer", at, n, &free);
         if let Some(i) = who {
@@ -1748,8 +1746,7 @@ impl CharacterOverlay {
         }
         let places = governor::places();
         let free = |this: &Self, i: usize| {
-            let wk = this.walk_ref(i);
-            places.iter().any(|p| p.ws == wk.ws) && wk.at_leisure() && wk.act == Act::Idle && wk.trip.is_none() && wk.rest.is_none() && wk.air <= 0.0
+            places.iter().any(|p| p.ws == this.walk_ref(i).ws) && this.free_for(i, Want::Work)
         };
         // to work: one at a time, whoever isn't at its workplace
         for i in 0..n {

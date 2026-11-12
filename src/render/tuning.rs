@@ -390,6 +390,9 @@ tuning! {
         see_range: "Notice from (widths)" = 6.0, 0.5, 40.0, 0.5, 1;
         see_chance: "Chance to notice" = 0.15, 0.0, 1.0, 0.01, 2;
         watch_join: "Join when the game ends" = 0.35, 0.0, 1.0, 0.05, 2;
+        watch_stay_min: "Watches at least (s)" = 25.0, 5.0, 600.0, 5.0, 0;
+        watch_stay_rand: "Random extra watching (s)" = 35.0, 0.0, 600.0, 5.0, 0;
+        chat_max: "Longest any game lasts (s)" = 360.0, 60.0, 3600.0, 10.0, 0;
     }
     "Games", "Splitting a crowd" {
         split_min: "Group big enough to split" = 6.0, 2.0, 20.0, 1.0, 0;
