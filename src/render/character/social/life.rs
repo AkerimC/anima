@@ -64,3 +64,20 @@ impl CharacterOverlay {
         false
     }
 }
+
+/// What a stage lets its members do; anything else is put back.
+pub(super) struct Allows {
+    pub(super) lean: bool,
+    pub(super) perched: bool,
+    pub(super) game_flags: bool,
+}
+
+pub(super) fn allows(stage: Stage) -> Allows {
+    let talk = matches!(stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer);
+    Allows {
+        lean: stage == Stage::Tug,
+        // up on a net, a box, a seat or a jetty
+        perched: matches!(stage, Stage::Volley | Stage::Gift | Stage::Play | Stage::Fishing),
+        game_flags: !talk,
+    }
+}
