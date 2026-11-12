@@ -724,7 +724,11 @@ fn jobs_list() -> gtk::Widget {
     let head = gtk::Label::builder().label("<b>Carrot coins</b>").use_markup(true).xalign(0.0).build();
     row.append(&head);
     list.append(&row);
-    let mut w: Vec<(String, u32)> = park::read_wallets().into_iter().filter(|e| e.1 > 0).collect();
+    // the park's piggy bank on its own: taxes in, food bought out
+    let bank = park::read_wallets().get("Park").copied().unwrap_or(0);
+    let l = gtk::Label::builder().label(format!("<b>Park's piggy bank: {bank}</b>\n<small>Taxes and cafe shares come in; it buys the farm's and pier's food and pays the attendant</small>")).use_markup(true).xalign(0.0).wrap(true).max_width_chars(36).build();
+    list.append(&l);
+    let mut w: Vec<(String, u32)> = park::read_wallets().into_iter().filter(|e| e.1 > 0 && e.0 != "Park").collect();
     w.sort_by(|a, b| b.1.cmp(&a.1));
     let text = if w.is_empty() { "Nobody has any yet: they earn them bringing food to the pantry".to_string() } else { w.iter().map(|(n, k)| format!("{n}: {k}")).collect::<Vec<_>>().join("\n") };
     let l = gtk::Label::builder().label(text).xalign(0.0).wrap(true).max_width_chars(36).build();
