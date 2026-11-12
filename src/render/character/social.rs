@@ -293,7 +293,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { host: None, host_called: false, host_paid: false, world: None, watch_left: Vec::new(), stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
+        Chat { by_hand: false, host: None, host_called: false, host_paid: false, world: None, watch_left: Vec::new(), stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
     }
 }
 
@@ -359,6 +359,8 @@ pub(super) struct Chat {
     // the park attendant looking after this game, whether it called time,
     // whether the winner has had its prize
     host: Option<usize>,
+    // started from the settings window
+    by_hand: bool,
     host_called: bool,
     host_paid: bool,
     timer: f32,
@@ -1795,7 +1797,7 @@ impl CharacterOverlay {
 
     fn start_game(&mut self, c: &mut Chat, game: Game) {
         // played in the park when that's where they are
-        let park = crate::backend::governor::place_rect("park").filter(|p| c.members.iter().all(|&i| self.place_here(i).is_some_and(|q| q.place == "park")));
+        let park = crate::backend::governor::place_rect("park").filter(|_| c.by_hand && c.members.iter().all(|&i| self.place_here(i).is_some_and(|q| q.place == "park")));
         GAME_AREA.with(|a| a.set(park.map(|p| (p.x + p.w * 0.05, p.w * 0.9))));
         self.start_game_here(c, game);
         GAME_AREA.with(|a| a.set(None));
@@ -1900,7 +1902,9 @@ impl CharacterOverlay {
         }
         // living in the park, cafe and farm: the game's in the park, and the
         // others there come over to it first
-        let park = crate::backend::governor::place_rect("park").filter(|p| p.ws == self.spaces.active || self.spaces.active == 0);
+        // (only when they live there: in the desktop modes it's the desktop on screen)
+        let lives_there = matches!(tn().park_mode.round() as i32, 1 | 2);
+        let park = crate::backend::governor::place_rect("park").filter(|_| lives_there);
         let in_park = |this: &Self, i: usize| this.place_here(i).is_some_and(|p| p.place == "park");
         if let Some(p) = park.as_ref() {
             for i in 0..n {
@@ -1912,6 +1916,11 @@ impl CharacterOverlay {
             }
         }
         let middle = park.as_ref().map_or(middle, |p| p.x + p.w * 0.5);
+        let park_ws = park.as_ref().map(|p| p.ws);
+        let here = |this: &Self, i: usize| match park_ws {
+            Some(ws) => this.walk_ref(i).ws == ws,
+            None => here(this, i),
+        };
         let mut free: Vec<(usize, f32)> = (0..n)
             .filter(|&i| !playing.contains(&i) && here(self, i) && !self.walk_ref(i).circle && matches!(self.walk_ref(i).act, Act::Idle | Act::Walk | Act::Jump))
             .filter(|&i| park.is_none() || in_park(self, i))
@@ -1957,6 +1966,7 @@ impl CharacterOverlay {
         log::debug!("chat {id}: {name} by hand, {members:?}");
         let mut c = Chat::new(id, members, Stage::Approach, 0.0);
         c.forced = Some(game);
+        c.by_hand = true;
         self.arrange(&c);
         chats.push(c);
         true
