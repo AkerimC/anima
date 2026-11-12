@@ -2941,10 +2941,15 @@ impl CharacterOverlay {
             self.end_game(c);
             return;
         }
-        // keeping their places on the pier and the jetties
+        // keeping their places on the pier and the jetties, facing the water
         for a in &f.anglers {
             if a.up > 0.0 || self.pier_of(a.i).is_some() {
                 self.hold_spot(a.i, a.at, a.up);
+                if a.phase >= 1 && !a.blown && self.arrived(a.i) {
+                    if let Some(r) = self.walk_of(a.i).social.as_mut() {
+                        r.face_left = false;
+                    }
+                }
             }
         }
         if c.step == 9 {

@@ -272,7 +272,8 @@ impl CharacterOverlay {
         }
         let mut spots = SPOTS.lock().unwrap();
         spots.retain(|s| s.3.elapsed().as_secs_f32() < 2.0 && s.0 != i);
-        let free = slots.into_iter().find(|&(x, up)| !spots.iter().any(|s| (s.1 - x).abs() < gap * 0.9 && (s.2 - up).abs() < 8.0))?;
+        // never right above or below another (the jetties climb the shore)
+        let free = slots.into_iter().find(|&(x, _)| !spots.iter().any(|s| (s.1 - x).abs() < gap * 0.9))?;
         spots.push((i, free.0, free.1, Instant::now()));
         Some(free)
     }
@@ -578,7 +579,9 @@ impl CharacterOverlay {
         for (k, t) in park.things.iter().enumerate() {
             let room = park::room(&t.kind);
             // tables are for eating; the stove is the chef's once there is one
-            if room == 0 || t.place != place || t.kind == "table" || (t.kind == "chair" && t.place == "cafe") || (restaurant && t.kind == "stove" && t.place == "cafe") {
+            // the stove is for cooking a meal: only the hungry (or the chef) go
+            let cook_ok = self.hungry(i) || job.as_deref() == Some("chef");
+            if room == 0 || t.place != place || t.kind == "table" || (t.kind == "chair" && t.place == "cafe") || (restaurant && t.kind == "stove" && t.place == "cafe") || (t.kind == "stove" && !cook_ok) {
                 continue;
             }
             // farm work is the farmer's (if there is one); others with a job keep to theirs
@@ -903,7 +906,9 @@ impl CharacterOverlay {
             if let Some(k) = p.meal.as_ref().and_then(|m| m.dish.strip_prefix("table:")).and_then(|k| k.parse::<usize>().ok()) {
                 let server = SERVE.lock().unwrap().iter().find(|s| s.table == k).map(|s| s.who);
                 let mut q = PENDING.lock().unwrap();
-                for r in p.riders.iter().filter(|r| Some(r.i) != server) {
+                // the cook, and those waiting with it who are hungry too
+                let cook = p.riders.first().map(|r| r.i);
+                for r in p.riders.iter().filter(|r| Some(r.i) != server && (Some(r.i) == cook || self.hungry(r.i))) {
                     q.push((r.i, k));
                 }
             }
@@ -1356,7 +1361,10 @@ impl CharacterOverlay {
                     let r = self.walk.rand();
                     let x = pk.x + pk.w * (0.2 + 0.6 * r);
                     let mut q = hunger::PICNIC.lock().unwrap();
-                    for rd in &p.riders {
+                    for (n, rd) in p.riders.iter().enumerate() {
+                        if n > 0 && !self.hungry(rd.i) {
+                            continue;
+                        }
                         q.push((rd.i, x, m.dish.clone(), Instant::now()));
                     }
                     log::debug!("chat {}: the {} goes out for a picnic", c.id, m.dish);
