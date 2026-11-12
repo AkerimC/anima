@@ -182,6 +182,18 @@ impl CharacterOverlay {
         }
         self.pay_wages();
         self.start_picnics(chats);
+        // the chef and waiters at work never have a free moment to go and eat
+        // (always cooking or carrying): a bite in the kitchen as they go
+        for i in 0..n {
+            let wk = self.walk_ref(i);
+            if wk.full > 0.0 || wk.hunger < tn().hunger_eat || wk.at_leisure() {
+                continue;
+            }
+            let staff = self.on_duty("chef") == Some(i) || self.on_duty("waiter") == Some(i) || self.is_part(i, "chef") || self.is_part(i, "waiter");
+            if staff && self.place_here(i).is_some_and(|p| p.place == "cafe") && self.staff_meal(i) {
+                break;
+            }
+        }
         // one hungry one at a time goes to eat
         // (in mode 3 those on the desktop are sent over by the visits)
         let hungry: Vec<usize> = (0..n)

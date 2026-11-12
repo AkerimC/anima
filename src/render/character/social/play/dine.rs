@@ -98,8 +98,10 @@ impl CharacterOverlay {
         let chef = (0..n).find(|&i| self.is_job(i, "chef") && here(i));
         let helper = (0..n).find(|&i| self.is_part(i, "chef") && here(i) && free(i));
         let turns = *IN_A_ROW.lock().unwrap();
+        // a hungry chef hands the cooking over, to have a moment to eat
+        let hungry = |i: usize| self.walk_ref(i).hunger >= tn().hunger_eat;
         match (chef, helper) {
-            (Some(c), Some(h)) if turns >= 2 || !free(c) => Some(h),
+            (Some(c), Some(h)) if turns >= 2 || !free(c) || hungry(c) => Some(h),
             (Some(c), _) => Some(c),
             (None, h) => h.or_else(|| self.on_duty("chef")),
         }
@@ -160,7 +162,8 @@ impl CharacterOverlay {
         SEATS.lock().unwrap().retain(|s| seated.contains(&(s.0, s.2)));
         // a break with no meal to it is over
         for i in 0..self.extras.len() + 1 {
-            if self.walk_ref(i).on_break && !diners.contains(&i) {
+            // (one gone out for something to eat stays on its break till it's eaten)
+            if self.walk_ref(i).on_break && !diners.contains(&i) && self.place_here(i).is_some_and(|p| p.place == "cafe") {
                 self.walk_of(i).on_break = false;
             }
         }

@@ -148,7 +148,7 @@ tuning! {
         park_game_every: "Game time in the park about every (s)" = 150.0, 20.0, 3600.0, 10.0, 0;
         park_busy_most: "At most this share of them off on their own things at once" = 0.5, 0.1, 1.0, 0.05, 2;
         park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
-        hunger_time: "From full to starving, doing nothing (s)" = 2400.0, 60.0, 36000.0, 60.0, 0;
+        hunger_time: "From full to starving, doing nothing (s)" = 4200.0, 60.0, 36000.0, 60.0, 0;
         hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
         hunger_stage0: "Hunger pace with nothing to cook on yet" = 0.5, 0.0, 2.0, 0.05, 2;
         hunger_stage1: "Hunger pace with a stove but no chef" = 0.8, 0.0, 2.0, 0.05, 2;
