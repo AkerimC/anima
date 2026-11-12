@@ -97,7 +97,9 @@ impl CharacterOverlay {
         // helpers on the shift take every other dish, whenever they're not busy
         let free = |i: usize| self.walk_ref(i).at_leisure();
         let chef = (0..n).find(|&i| self.is_job(i, "chef") && here(i));
-        let helper = (0..n).find(|&i| self.is_part(i, "chef") && here(i) && free(i));
+        // (not one standing in as the waiter)
+        let waiter = self.on_duty("waiter");
+        let helper = (0..n).find(|&i| self.is_part(i, "chef") && here(i) && free(i) && Some(i) != waiter);
         let turns = *IN_A_ROW.lock().unwrap();
         // a hungry chef hands the cooking over, to have a moment to eat
         let hungry = |i: usize| self.walk_ref(i).hunger >= tn().hunger_eat;
@@ -184,6 +186,20 @@ impl CharacterOverlay {
         if self.on_duty("waiter").is_none() {
             for o in ORDERS.lock().unwrap().iter_mut().filter(|o| o.state == Ask::Asked) {
                 o.state = Ask::Waiting;
+            }
+        }
+        // an order nobody's come to take for a while: straight to the chef
+        {
+            static ASKED: Mutex<Vec<(usize, Instant)>> = Mutex::new(Vec::new());
+            let mut asked = ASKED.lock().unwrap();
+            let mut orders = ORDERS.lock().unwrap();
+            asked.retain(|a| orders.iter().any(|o| o.diner == a.0 && o.state == Ask::Asked));
+            for o in orders.iter_mut().filter(|o| o.state == Ask::Asked) {
+                match asked.iter().find(|a| a.0 == o.diner) {
+                    Some(a) if a.1.elapsed().as_secs_f32() > 20.0 && !busy(chats, "order") => o.state = Ask::Waiting,
+                    Some(_) => {}
+                    None => asked.push((o.diner, Instant::now())),
+                }
             }
         }
         let orders = ORDERS.lock().unwrap().clone();
