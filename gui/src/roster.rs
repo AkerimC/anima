@@ -165,6 +165,17 @@ fn card(r: &Rc<Roster>, i: usize, m: &team::Member) -> gtk::Widget {
     // opens comes up in the middle of the window
     let menu = gtk::Popover::new();
     menu.set_parent(&frame);
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let mm = menu.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            mm.popdown();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    menu.add_controller(keys);
     let click = gtk::GestureClick::builder().button(3).build();
     let (rr, path, card) = (r.clone(), m.path.clone(), frame.clone());
     click.connect_pressed(move |_, _, x, y| {
@@ -216,6 +227,18 @@ impl Panel {
             Panel::Menu(p, parent) => {
                 p.popdown();
                 let d = adw::Dialog::builder().follows_content_size(true).build();
+                // Esc closes it, wherever the focus is inside
+                let keys = gtk::EventControllerKey::new();
+                keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let dd = d.clone();
+                keys.connect_key_pressed(move |_, key, _, _| {
+                    if key == gdk::Key::Escape {
+                        dd.close();
+                        return glib::Propagation::Stop;
+                    }
+                    glib::Propagation::Proceed
+                });
+                d.add_controller(keys);
                 let view = Panel::View(d.clone());
                 let w = make(&view);
                 view.set_child(Some(&w));
