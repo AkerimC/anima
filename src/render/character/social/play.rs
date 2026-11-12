@@ -11,6 +11,7 @@ use crate::render::character::park::{self, Park, Thing};
 mod dine;
 mod host;
 mod hunger;
+mod shop;
 mod places;
 mod visit;
 
@@ -30,6 +31,8 @@ pub(super) struct Play {
     by_cook: bool,
     // cooking for / taking the order of this diner (usize::MAX: nobody)
     diner: usize,
+    // at the stall to buy something to keep, not a snack
+    shop: bool,
 }
 
 #[derive(Clone)]
@@ -303,6 +306,10 @@ impl CharacterOverlay {
             return Some(i);
         }
         let part: Vec<usize> = (0..n).filter(|&i| self.is_part(i, job)).collect();
+        // the job's own are just busy: they'll get to it, unless it's piling up
+        if !full.is_empty() && !self.part_needed(job) {
+            return None;
+        }
         if let Some(i) = part.iter().copied().filter(|&i| free(self, i)).min_by(near) {
             return Some(i);
         }
@@ -738,7 +745,7 @@ impl CharacterOverlay {
             "seesaw" => 10.0 + self.walk.rand() * 8.0,
             _ => 0.0,
         };
-        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay, meal: None, from: 0.0, counter: 0, by_cook: false, diner: usize::MAX });
+        c.play = Some(Play { thing: k, kind: kind.clone(), riders: Vec::new(), t: 0.0, stay, meal: None, from: 0.0, counter: 0, by_cook: false, diner: usize::MAX, shop: false });
         log::debug!("chat {id}: {i} goes to the {kind}");
         chats.push(c);
     }
@@ -873,6 +880,7 @@ impl CharacterOverlay {
             "stove" => self.play_stove(c, &mut p, &thing, mid, unit, dt),
             "carrots" | "wheat" | "apple_tree" | "coop" | "barn" | "tree" => self.play_farm(c, &mut p, &thing, mid, unit, dt),
             "sandbox" => self.play_sandbox(c, &mut p, mid, unit, dt),
+            "stall" if p.shop => self.play_shop(c, &mut p, mid, unit, dt),
             "stall" => self.play_stall(c, &mut p, mid, unit, dt),
             _ => true,
         };
@@ -2110,6 +2118,7 @@ impl CharacterOverlay {
         self.work_calls(chats, n);
         self.idle_nudge(chats, dt, n);
         self.host_help(n);
+        self.shop_tick(chats, n);
         self.hunger_tick(chats, dt, n);
         self.visit_tick(chats, dt, n);
         self.leftovers(chats, n);

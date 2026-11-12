@@ -161,6 +161,13 @@ tuning! {
         picnic_chance: "A meal cooked for oneself is eaten as a picnic in the park (share)" = 0.25, 0.0, 1.0, 0.05, 2;
         wage: "Coins each job pays every 20 minutes" = 5.0, 0.0, 100.0, 1.0, 0;
         shift_len: "Jobs change hands every (s)" = 1800.0, 300.0, 14400.0, 300.0, 0;
+        shop_rich: "Goes shopping with at least (coins)" = 30.0, 0.0, 1000.0, 5.0, 0;
+        shop_chance: "Chance to go shopping, every 8 s" = 0.08, 0.0, 1.0, 0.01, 2;
+        shop_wear: "Something to wear costs" = 15.0, 0.0, 500.0, 1.0, 0;
+        shop_gift: "A present for a friend costs" = 8.0, 0.0, 500.0, 1.0, 0;
+        shop_recipe: "A recipe costs" = 12.0, 0.0, 500.0, 1.0, 0;
+        shop_material: "Materials for the chest cost" = 6.0, 0.0, 500.0, 1.0, 0;
+        bank_full: "The park's piggy bank buys something at (coins, 0 never)" = 60.0, 0.0, 5000.0, 10.0, 0;
         host_prize: "The attendant's prize for a game's winner (coins)" = 3.0, 0.0, 50.0, 1.0, 0;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
