@@ -74,6 +74,21 @@ fn main() {
         m.anims.len(),
         m.raw_vertices.len()
     );
+    let world = m.rest_world();
+    for (i, bone) in m.bones.iter().enumerate() {
+        let w = world[i];
+        println!(
+            "  bone {:>2} {:<12} parent={:>3} world=({:8.1},{:8.1}) rot={:6.3} scale=({:.3},{:.3})",
+            i,
+            bone.name,
+            bone.parent,
+            w[4],
+            w[5],
+            w[1].atan2(w[0]),
+            w[0].hypot(w[1]),
+            w[2].hypot(w[3])
+        );
+    }
     let b = bounds(&skin(&m, &m.base_pose));
     println!(
         "base pose bounds x[{:.1},{:.1}] y[{:.1},{:.1}] size {:.1}x{:.1}",

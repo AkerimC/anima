@@ -140,7 +140,10 @@ void main() {
                     1.0 - world.y / u_ortho.y * 2.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv = a_uv;
-    v_scene_uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    // GL render-target textures have v = 0 at the bottom, so screen UVs map
+    // straight from NDC.  Flipping here would sample the snapshot upside
+    // down and paint a mirrored copy of the scene inside the layer's AABB.
+    v_scene_uv = ndc * 0.5 + 0.5;
 }
 "#;
 
@@ -1588,6 +1591,20 @@ struct SceneObject {
     anim: Option<Box<ObjAnim>>,
     /// Animated texture (TEXS spritesheet or decoded MP4) for image layers.
     sprite: Option<crate::pkg::SpritesheetMeta>,
+    /// Set when this layer is parented to a puppet bone (`attachment`).
+    attach: Option<AttachPoint>,
+}
+
+/// A layer that follows a bone of its parent puppet, possibly animated.
+#[derive(Clone)]
+struct AttachPoint {
+    /// Index of the parent puppet object in `SceneRenderer::objects`.
+    parent: usize,
+    /// Bone name from the scene's `attachment` field.
+    bone: String,
+    /// The layer's local transform (translation * rotation * scale) in
+    /// attachment space.
+    local: Affine,
 }
 
 // ---------------------------------------------------------------------------
@@ -1815,7 +1832,7 @@ impl ObjAnim {
         any.then(|| Box::new(a))
     }
 
-    fn eval(&self, time: f32, daytime: f32, now: text::LocalTime) -> (Affine, Option<f32>) {
+    fn eval_local(&self, time: f32, daytime: f32, now: text::LocalTime) -> (Affine, Option<f32>) {
         let mut origin = self.origin;
         let mut scale = self.scale;
         let mut angles = self.angles;
@@ -1846,6 +1863,11 @@ impl ObjAnim {
             .alpha_track
             .as_ref()
             .map(|t| t.apply([self.base_alpha; 3], time)[0].clamp(0.0, 1.0));
+        (local, alpha)
+    }
+
+    fn eval(&self, time: f32, daytime: f32, now: text::LocalTime) -> (Affine, Option<f32>) {
+        let (local, alpha) = self.eval_local(time, daytime, now);
         (self.parent.mul(local), alpha)
     }
 }
@@ -2530,6 +2552,7 @@ impl SceneRenderer {
                     kind: ObjectKind::Particle(idx),
                     anim: None,
                     sprite: None,
+                    attach: None,
                 });
                 continue;
             }
@@ -2578,6 +2601,7 @@ impl SceneRenderer {
                         kind: ObjectKind::Text(Box::new(layer)),
                         anim: None,
                         sprite: None,
+                        attach: None,
                     });
                 }
                 continue;
@@ -2612,6 +2636,7 @@ impl SceneRenderer {
                     kind: ObjectKind::Post,
                     anim: None,
                     sprite: None,
+                    attach: None,
                 });
                 continue;
             }
@@ -2658,6 +2683,7 @@ impl SceneRenderer {
                     kind: ObjectKind::Compose { copy_background },
                     anim: None,
                     sprite: None,
+                    attach: None,
                 });
                 continue;
             }
@@ -2703,6 +2729,7 @@ impl SceneRenderer {
                     kind: ObjectKind::Solid,
                     anim: None,
                     sprite: None,
+                    attach: None,
                 });
                 continue;
             }
@@ -2814,6 +2841,7 @@ impl SceneRenderer {
                     kind,
                     anim: None,
                     sprite: None,
+                    attach: None,
                 });
                 continue;
             }
@@ -2943,6 +2971,67 @@ impl SceneRenderer {
                 kind,
                 anim: None,
                 sprite: None,
+                attach: None,
+            });
+        }
+
+        // Wallpaper Engine attachments: a layer parented to a puppet is placed
+        // at a named bone (or an `MDAT` attachment point) rather than at the
+        // model origin.  The bone matrix lives in the puppet's model space, so
+        // it composes directly with the parent object's world transform.
+        let obj_id_of = |j: usize| -> Option<String> {
+            raws[j]
+                .obj
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .map(|n| n.to_string())
+        };
+        let mut obj_by_id: HashMap<String, usize> = HashMap::new();
+        for (j, o) in self.objects.iter().enumerate() {
+            if let Some(id) = o.id {
+                obj_by_id.insert(id.to_string(), j);
+            }
+        }
+        for i in 0..raws.len() {
+            let Some(att) = raws[i].obj.get("attachment").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(p) = parent_index(i) else { continue };
+            let (Some(child_id), Some(parent_id)) = (obj_id_of(i), obj_id_of(p)) else {
+                continue;
+            };
+            let (Some(&child_obj), Some(&parent_obj)) =
+                (obj_by_id.get(&child_id), obj_by_id.get(&parent_id))
+            else {
+                continue;
+            };
+            let bone = match &self.objects[parent_obj].kind {
+                ObjectKind::Puppet { mdl, .. } => mdl.attachment_world(att),
+                _ => None,
+            };
+            let Some(bone) = bone else {
+                log::debug!(
+                    "attachment '{att}' on '{}': parent puppet has no such bone",
+                    raws[i].obj.get("name").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+                continue;
+            };
+            let bone_aff = Affine {
+                a: bone[0],
+                b: bone[1],
+                c: bone[2],
+                d: bone[3],
+                tx: bone[4],
+                ty: bone[5],
+            };
+            let parent_transform = self.objects[parent_obj].transform;
+            self.objects[child_obj].transform =
+                parent_transform.mul(bone_aff).mul(raws[i].local);
+            // Keep the binding so the layer can follow the animated bone pose.
+            self.objects[child_obj].attach = Some(AttachPoint {
+                parent: parent_obj,
+                bone: att.to_string(),
+                local: raws[i].local,
             });
         }
 
@@ -3277,6 +3366,7 @@ impl SceneRenderer {
                 kind: ObjectKind::Image(texture),
                 anim: None,
                 sprite: None,
+                attach: None,
             });
         }
         for p in doc.particles {
@@ -3308,6 +3398,7 @@ impl SceneRenderer {
                 kind: ObjectKind::Particle(idx),
                 anim: None,
                 sprite: None,
+                attach: None,
             });
         }
         Ok(())
@@ -3942,7 +4033,9 @@ impl Renderer for SceneRenderer {
                 }
                 if let Some(anim) = &obj.anim {
                     let (t, alpha) = anim.eval(time, daytime, now);
-                    obj.transform = t;
+                    if obj.attach.is_none() {
+                        obj.transform = t;
+                    }
                     if let Some(a) = alpha {
                         obj.color[3] = a;
                     }
@@ -3967,6 +4060,36 @@ impl Renderer for SceneRenderer {
                     _ => {}
                 }
             }
+        }
+
+        // Attached layers follow the animated bone of their puppet parent, so
+        // eyes, brows and hair ornaments move with the head instead of staying
+        // at the rest pose.
+        for i in 0..self.objects.len() {
+            let Some(att) = self.objects[i].attach.clone() else {
+                continue;
+            };
+            let parent_world = self.objects[att.parent].transform;
+            let bone = match &self.objects[att.parent].kind {
+                ObjectKind::Puppet {
+                    mdl, anim_layers, ..
+                } => mdl.animated_attachment_world(time, anim_layers, &att.bone),
+                _ => None,
+            };
+            let Some(bone) = bone else { continue };
+            let bone_aff = Affine {
+                a: bone[0],
+                b: bone[1],
+                c: bone[2],
+                d: bone[3],
+                tx: bone[4],
+                ty: bone[5],
+            };
+            let local = match &self.objects[i].anim {
+                Some(anim) => anim.eval_local(time, daytime, now).0,
+                None => att.local,
+            };
+            self.objects[i].transform = parent_world.mul(bone_aff).mul(local);
         }
 
         // Clear the scene framebuffer.
