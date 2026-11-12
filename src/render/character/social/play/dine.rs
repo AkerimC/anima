@@ -94,14 +94,15 @@ impl CharacterOverlay {
     fn next_cook(&self) -> Option<usize> {
         let n = self.extras.len() + 1;
         let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe") && !self.walk_ref(i).on_break;
-        let free = |i: usize| self.walk_ref(i).at_leisure() && self.walk_ref(i).act == Act::Idle;
+        // helpers on the shift take every other dish, whenever they're not busy
+        let free = |i: usize| self.walk_ref(i).at_leisure();
         let chef = (0..n).find(|&i| self.is_job(i, "chef") && here(i));
         let helper = (0..n).find(|&i| self.is_part(i, "chef") && here(i) && free(i));
         let turns = *IN_A_ROW.lock().unwrap();
         // a hungry chef hands the cooking over, to have a moment to eat
         let hungry = |i: usize| self.walk_ref(i).hunger >= tn().hunger_eat;
         match (chef, helper) {
-            (Some(c), Some(h)) if turns >= 2 || !free(c) || hungry(c) => Some(h),
+            (Some(c), Some(h)) if turns >= 1 || !free(c) || hungry(c) => Some(h),
             (Some(c), _) => Some(c),
             (None, h) => h.or_else(|| self.on_duty("chef")),
         }
@@ -186,6 +187,21 @@ impl CharacterOverlay {
             }
         }
         let orders = ORDERS.lock().unwrap().clone();
+        // a dish left waiting for a waiter who was away: one back and free takes it
+        for o in orders.iter().filter(|o| o.state == Ask::Ready && o.by_waiter && !o.dish.is_empty()) {
+            let Some(w) = self.on_duty("waiter").filter(|&w| self.walk_ref(w).at_leisure()) else { break };
+            if SERVE.lock().unwrap().iter().any(|s| s.diner == Some(o.diner)) {
+                continue;
+            }
+            // (only off a serving counter: with none, the diner fetches it)
+            let Some((from, counter)) = self.pickup().filter(|p| p.1 != 0) else { break };
+            SERVE.lock().unwrap().push(Serve { who: w, table: o.table, dish: o.dish.clone(), from, counter, by_cook: false, diner: Some(o.diner) });
+            set_order(o.diner, |x| {
+                x.waiter = Some(w);
+                x.state = Ask::Cooking;
+            });
+            break;
+        }
         // the waiter goes over to whoever has sat down
         if let Some(o) = orders.iter().find(|o| o.state == Ask::Asked) {
             if !busy(chats, "order") {
@@ -203,8 +219,11 @@ impl CharacterOverlay {
         }
         // the chef cooks the next order
         if let Some(o) = orders.iter().find(|o| o.state == Ask::Waiting) {
-            let cooking = chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.kind == "stove" && p.diner != usize::MAX));
-            if !cooking {
+            // as many orders at once as there are stoves: a helper takes the next
+            // while the chef's busy with one
+            let cooking = chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| p.kind == "stove" && p.diner != usize::MAX)).count();
+            let stoves = park_now().things.iter().filter(|t| t.kind == "stove" && t.place == "cafe").count();
+            if cooking < stoves.max(1) {
                 if let Some(chef) = self.next_cook() {
                     // whose turn: the chef's count goes up, a helper's turn resets it
                     {
@@ -234,7 +253,7 @@ impl CharacterOverlay {
                         .things
                         .iter()
                         .enumerate()
-                        .filter(|(_, t)| t.kind == "stove" && t.place == "cafe")
+                        .filter(|(k, t)| t.kind == "stove" && t.place == "cafe" && !chats.iter().any(|c| c.play.as_ref().is_some_and(|p| p.kind == "stove" && p.thing == *k)))
                         .min_by(|a, b| (self.thing_px(a.1) - me).abs().total_cmp(&(self.thing_px(b.1) - me).abs()))
                         .map(|(k, _)| k);
                     // someone's still at that stove: next time
@@ -397,8 +416,9 @@ impl CharacterOverlay {
                         r.phase = 30;
                         r.t = 0.0;
                     }
-                    // the waiter's gone: fetches it itself
-                    Some(Ask::Ready) => {
+                    // the waiter's gone: it waits for one to bring it; with no
+                    // waiter at all (or after a long wait), fetches it itself
+                    Some(Ask::Ready) if self.on_duty("waiter").is_none() || self.pickup().is_none_or(|p| p.1 == 0) || r.t > 150.0 => {
                         r.phase = 20;
                         r.t = 0.0;
                     }

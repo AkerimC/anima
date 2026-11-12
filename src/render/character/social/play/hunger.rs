@@ -70,7 +70,8 @@ impl CharacterOverlay {
     /// Hungry enough to go and eat.
     pub(in crate::render::character) fn hungry(&self, i: usize) -> bool {
         // come to the cafe for a meal: eats whatever its hunger
-        if self.walk_ref(i).visit_for == visit::MEAL && self.walk_ref(i).full <= 0.0 {
+        // (still only if it's a bit hungry: eating is for hunger, not to pass the time)
+        if self.walk_ref(i).visit_for == visit::MEAL && self.walk_ref(i).full <= 0.0 && self.walk_ref(i).hunger >= tn().hunger_eat * tn().hunger_meal {
             return true;
         }
         let wk = self.walk_ref(i);
@@ -118,6 +119,11 @@ impl CharacterOverlay {
 
     /// `i` eats `dish`: less hungry, happy (more so for its favourite).
     pub(super) fn eat(&mut self, i: usize, dish: &str) {
+        // not hungry: a taste to be polite, no more (it only keeps company)
+        if self.walk_ref(i).hunger < tn().hunger_eat * 0.5 {
+            log::debug!("{} isn't hungry and leaves it", self.character_name(i));
+            return;
+        }
         let name = self.character_name(i);
         let fav = park::favorite(&name) == dish;
         let k = park::fills(dish, fav);

@@ -1209,9 +1209,11 @@ impl CharacterOverlay {
             }
         }
         if let Some((dish, left)) = dish_on(t.id) {
-            let eaters: Vec<usize> = p.riders.iter().filter(|r| r.phase == 1).map(|r| r.i).collect();
+            let sat: Vec<usize> = p.riders.iter().filter(|r| r.phase == 1).map(|r| r.i).collect();
+            // only the hungry eat; the rest just keep them company
+            let eaters: Vec<usize> = sat.iter().copied().filter(|&i| self.walk_ref(i).hunger >= tn().hunger_eat * 0.5).collect();
             // the food waits till everyone's sat down (or it's been a while)
-            let all_sat = eaters.len() == p.riders.len() || p.t > 45.0;
+            let all_sat = sat.len() == p.riders.len() || p.t > 45.0;
             if !eaters.is_empty() && all_sat {
                 // a bite now and then, happy about it
                 for &i in &eaters {
