@@ -50,8 +50,8 @@ tuning! {
         fish_find: "Something to wear on the line (share of catches)" = 0.12, 0.0, 1.0, 0.01, 2;
         fish_boom: "Confetti goes off with a bang" = 0.25, 0.0, 1.0, 0.05, 2;
         fish_boom_reach: "Explosion reach (widths)" = 3.0, 0.5, 15.0, 0.5, 1;
-        fish_beast: "Something comes up to scare them (per s)" = 0.02, 0.0, 2.0, 0.01, 2;
-        fish_beast_cool: "Quiet after a scare (s)" = 15.0, 0.0, 300.0, 5.0, 0;
+        fish_beast: "Something comes up to scare them (per s)" = 0.004, 0.0, 2.0, 0.01, 2;
+        fish_beast_cool: "Quiet after a scare (s)" = 120.0, 0.0, 300.0, 5.0, 0;
         fish_beast_reach: "Scares anglers within (widths)" = 5.0, 1.0, 30.0, 0.5, 1;
         fish_reel: "Reeling in takes (s)" = 2.5, 0.3, 15.0, 0.1, 1;
         fish_stay_min: "Stays interested, at least (s)" = 180.0, 10.0, 3600.0, 10.0, 0;

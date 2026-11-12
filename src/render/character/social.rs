@@ -2768,9 +2768,13 @@ impl CharacterOverlay {
             return;
         }
         f.beast_cool -= dt;
-        if f.beast_cool > 0.0 || self.walk.rand() >= dt * tn().fish_beast {
+        // one scare at a time anywhere: several groups fishing don't each get their own
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let quiet = LAST.lock().unwrap().is_some_and(|t| t.elapsed().as_secs_f32() < tn().fish_beast_cool);
+        if quiet || f.beast_cool > 0.0 || self.walk.rand() >= dt * tn().fish_beast {
             return;
         }
+        *LAST.lock().unwrap() = Some(std::time::Instant::now());
         let ready: Vec<usize> = (0..f.anglers.len()).filter(|&k| (1..=5).contains(&f.anglers[k].phase) && !f.anglers[k].blown && f.anglers[k].up <= 0.0).collect();
         if ready.is_empty() {
             return;
