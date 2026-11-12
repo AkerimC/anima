@@ -350,32 +350,6 @@ impl CharacterOverlay {
         }
     }
 
-    /// Friends walking past each other stop for a happy little wave.
-    pub(super) fn wave_at_friends(&mut self, n: usize) {
-        for i in 0..n {
-            for j in i + 1..n {
-                let (a, b) = (self.walk_ref(i), self.walk_ref(j));
-                let free = |w: &WalkState| w.act == Act::Walk && w.social.is_none() && w.race.is_none() && w.crowd.is_none() && w.greet_cool <= 0.0 && !w.fret;
-                if !free(a) || !free(b) || a.ws != b.ws {
-                    continue;
-                }
-                let (xi, xj) = (self.strip_px(i), self.strip_px(j));
-                if (xi - xj).abs() > self.width_of(i) * 1.3 || self.bond(i, j).0 < tn().bond_friend {
-                    continue;
-                }
-                log::debug!("{i} and {j} wave at each other");
-                for (k, other_x, me_x) in [(i, xj, xi), (j, xi, xj)] {
-                    let wk = self.walk_of(k);
-                    wk.left = other_x < me_x;
-                    wk.act = Act::Idle;
-                    wk.timer = 1.0 + wk.rand() * 0.6;
-                    wk.target = wk.x;
-                    wk.greet_cool = tn().greet_cool;
-                    wk.start_jump(tn().jump_height * 0.35);
-                }
-            }
-        }
-    }
 
     fn run_protests(&mut self, dt: f32, n: usize) {
         let mut list = std::mem::take(&mut self.moods.protests);
@@ -895,46 +869,6 @@ impl CharacterOverlay {
         a != b && self.bond(a, b).0 >= tn().close_friend
     }
 
-    /// Few on this workspace: they go looking for company instead of
-    /// waiting to bump into someone. Called a few times a second.
-    pub(super) fn seek_company(&mut self, n: usize, every: f32) {
-        for i in 0..n {
-            if !self.free_for(i, super::social::Want::Seek) {
-                continue;
-            }
-            let ws = self.walk_ref(i).ws;
-            let here: Vec<usize> = (0..n).filter(|&j| j != i && self.walk_ref(j).ws == ws && self.walk_ref(j).act != Act::Travel).collect();
-            if here.is_empty() {
-                continue;
-            }
-            // the fewer around, the keener; a friend in sight is worth going to anyway
-            let few = (tn().seek_few / (here.len() + 1) as f32).clamp(0.0, 3.0);
-            let x0 = self.strip_px(i);
-            let friend_near = here.iter().any(|&j| self.bond(i, j).0 >= tn().meet_friend && (self.strip_px(j) - x0).abs() < self.view_w * 0.7);
-            let keen = if friend_near { few.max(1.5) } else { few };
-            if keen < 1.0 || self.walk_of(i).rand() >= every * keen / tn().seek_every.max(1.0) {
-                continue;
-            }
-            let x = self.strip_px(i);
-            // the best friend there, else whoever is nearest
-            let pick = here
-                .iter()
-                .copied()
-                .max_by(|a, b| {
-                    let score = |j: usize| self.bond(i, j).0 * 600.0 - (self.strip_px(j) - x).abs();
-                    score(*a).total_cmp(&score(*b))
-                })
-                .unwrap_or(here[0]);
-            let to = self.strip_px(pick);
-            let side = if x < to { -1.0 } else { 1.0 };
-            let goal = to + side * self.width_of(pick) * 0.9;
-            let view = self.view_w.max(1.0);
-            let wk = self.walk_of(i);
-            wk.target = wk.x + (goal - x) * 2.0 / view;
-            wk.act = Act::Walk;
-            log::debug!("{i} goes to find {pick}");
-        }
-    }
 
     /// How good `i` is at `game`, 0 (first tries) to 1 (a master).
     pub(super) fn skill(&mut self, i: usize, game: &str) -> f32 {

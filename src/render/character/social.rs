@@ -9,6 +9,7 @@ use super::CharacterOverlay;
 use super::walk::{Act, WalkState};
 use crate::backend::governor;
 
+mod desktop;
 mod free;
 mod life;
 mod play;
@@ -836,7 +837,7 @@ impl CharacterOverlay {
                 }
                 for c in chats.iter_mut() {
                     let full = c.members.len() >= self.group_cap();
-                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Concert | Stage::Blind | Stage::Fishing | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part | Stage::Play) && self.overlap_join(c, n, full) {
+                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Concert | Stage::Blind | Stage::Fishing | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part | Stage::Play | Stage::Practice) && self.overlap_join(c, n, full) {
                         continue;
                     }
                     if !full && matches!(c.stage, Stage::Talk | Stage::Stroll) {
@@ -1031,32 +1032,6 @@ impl CharacterOverlay {
         pairs.iter().map(|&(a, b)| self.bond(a, b).1).sum::<f32>() / pairs.len().max(1) as f32
     }
 
-    /// Someone in the chat spots a friend wandering past and waves it over.
-    fn call_friend_over(&mut self, c: &mut Chat, n: usize, every: f32) {
-        if c.members.len() >= self.group_cap() || self.walk.rand() >= every * tn().intro_call / 60.0 {
-            return;
-        }
-        let ws = self.walk_ref(c.members[0]).ws;
-        let range = self.view_w * 0.6;
-        let mut best: Option<(usize, usize, f32)> = None;
-        for &m in &c.members {
-            let x = self.strip_px(m);
-            for f in 0..n {
-                if c.members.contains(&f) || self.walk_ref(f).ws != ws || !self.free_for(f, Want::Called) || (self.strip_px(f) - x).abs() > range {
-                    continue;
-                }
-                let b = self.bond(m, f).0;
-                if b >= tn().meet_friend && best.is_none_or(|x| b > x.2) {
-                    best = Some((m, f, b));
-                }
-            }
-        }
-        if let Some((m, f, _)) = best {
-            log::debug!("chat {}: {m} calls {f} over", c.id);
-            self.walk_of(m).start_bob(tn().jump_height * 0.25);
-            self.join(c, f);
-        }
-    }
 
     /// What each character is up to, for the settings window.
     pub(super) fn social_report(&mut self) -> serde_json::Value {
@@ -1426,238 +1401,11 @@ impl CharacterOverlay {
         wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0 });
     }
 
-    /// Two standing close, on screen and free: maybe they notice each other.
-    /// `room`: not too many chats going on (standing inside each other is
-    /// worth one anyway).
-    fn find_pair(&mut self, n: usize, room: bool) -> Option<Chat> {
-        let free: Vec<(usize, f32, f32, f32)> = (0..n)
-            .filter(|&i| {
-                self.free_for(i, Want::Pair)
-            })
-            .map(|i| (i, self.strip_px(i), self.width_of(i), chat_cool(self.walk_ref(i))))
-            .collect();
-        let mut overlap: Option<(f32, usize, usize)> = None;
-        let mut near: Option<(f32, usize, usize)> = None;
-        let mut crowded: Option<(f32, usize, usize)> = None;
-        for (k, p) in free.iter().enumerate() {
-            for q in &free[k + 1..] {
-                if self.walk_ref(p.0).ws != self.walk_ref(q.0).ws {
-                    continue;
-                }
-                let d = (p.1 - q.1).abs();
-                let size = (p.2 + q.2) * 0.5;
-                // old friends notice each other from further off, rivals less
-                let (friend, rival) = self.bond(p.0, q.0);
-                let pull = 1.0 + friend * tn().bond_pull;
-                let rank = d / pull * (1.0 + rival * 0.5);
-                let slot = if d < size * tn().overlap {
-                    if p.3 <= tn().overlap_cool && q.3 <= tn().overlap_cool { &mut overlap } else { &mut crowded }
-                } else if d < size * tn().near_range * pull && p.3 <= 0.0 && q.3 <= 0.0 {
-                    &mut near
-                } else {
-                    continue;
-                };
-                // ties go either way, not to whoever is first in the team
-                let rank = rank * (1.0 + self.walk.rand() * 0.02);
-                if slot.is_none_or(|s| rank < s.0) {
-                    *slot = Some((rank, p.0, q.0));
-                }
-            }
-        }
-        let roll = self.walk.rand();
-        let pair = match (overlap, near) {
-            (Some(o), _) if roll < tn().overlap_chance => o,
-            (_, Some(o)) if room && roll < tn().near_chance * self.fewness(o.1) => o,
-            _ => {
-                if let Some((d, a, b)) = crowded {
-                    if self.walk.rand() < tn().step_chance {
-                        let (i, other) = if self.walk.rand() < 0.5 { (a, b) } else { (b, a) };
-                        self.step_aside(i, other, d);
-                    }
-                }
-                return None;
-            }
-        };
-        // either may be the one who notices first
-        let (a, b) = if self.walk.rand() < 0.5 { (pair.1, pair.2) } else { (pair.2, pair.1) };
-        self.chat_id = self.chat_id.wrapping_add(1);
-        let id = self.chat_id;
-        self.enlist(a, id);
-        self.enlist(b, id);
-        let timer = 1.2 + self.walk.rand() * 0.8;
-        self.face(a, b);
-        // now they've met
-        if self.bond(a, b).0 < tn().first_meet {
-            self.add_bond(a, b, tn().first_meet, 0.0);
-        }
-        // friends are pleased to see each other
-        if self.bond(a, b).0 >= tn().bond_friend {
-            for i in [a, b] {
-                let wk = self.walk_of(i);
-                wk.notify_jump = Some(0.1 + wk.rand() * 0.3);
-            }
-        }
-        log::debug!("chat {id}: {a} and {b}{}", if pair.0 < self.width_of(a) * tn().overlap { " (were inside each other)" } else { "" });
-        Some(Chat::new(id, vec![a, b], Stage::Notice, timer))
-    }
 
-    /// Someone new on the workspace: whoever knows it least goes to say hello.
-    pub(super) fn greet_newcomer(&mut self, i: usize, n: usize) {
-        if self.social_age < tn().warm_alone || self.moods.fretting {
-            return;
-        }
-        let (ws, x) = (self.walk_ref(i).ws, self.strip_px(i));
-        let view = self.view_w.max(1.0);
-        let host = (0..n)
-            .filter(|&j| j != i && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure())
-            .map(|j| (j, self.bond(i, j).0 * 2.0 + (self.strip_px(j) - x).abs() / view))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        let Some((host, _)) = host else { return };
-        self.chat_id = self.chat_id.wrapping_add(1);
-        let id = self.chat_id;
-        self.enlist(host, id);
-        self.enlist(i, id);
-        self.face(host, i);
-        log::debug!("chat {id}: {host} comes to meet newcomer {i}");
-        let timer = 1.2 + self.walk.rand() * 0.8;
-        self.new_chats.push(Chat::new(id, vec![host, i], Stage::Notice, timer));
-    }
 
-    /// Standing inside someone with nothing to say: one shuffles over.
-    fn step_aside(&mut self, i: usize, other: usize, d: f32) {
-        let (x, o) = (self.strip_px(i), self.strip_px(other));
-        let far = (self.width_of(i) + self.width_of(other)) * 0.5 * 0.8;
-        let dist = (far - d).max(30.0);
-        let mut dir = if x < o {
-            -1.0
-        } else if x > o {
-            1.0
-        } else if self.walk.rand() < 0.5 {
-            -1.0
-        } else {
-            1.0
-        };
-        if !(0.0..=self.strip_width_of(i)).contains(&(x + dir * dist)) {
-            dir = -dir;
-        }
-        let step = dir * dist * 2.0 / self.view_w.max(1.0);
-        log::debug!("chat: {i} steps aside from {other}");
-        let wk = self.walk_of(i);
-        wk.target = wk.x + step;
-        wk.act = Act::Walk;
-    }
 
-    /// Someone free close to a chat: it may catch their eye. Joining starts
-    /// the chat's time over; enough of them set off a race.
-    fn try_join(&mut self, c: &mut Chat, n: usize) {
-        let spots: Vec<f32> = c.members.iter().map(|&i| self.strip_px(i)).collect();
-        let size = self.width_of(c.members[0]);
-        let free: Vec<(usize, f32, f32)> = (0..n)
-            .filter(|&i| {
-                self.walk_ref(i).ws == self.walk_ref(c.members[0]).ws && self.free_for(i, Want::Join)
-            })
-            .map(|i| {
-                let x = self.strip_px(i);
-                let friend = c.members.iter().map(|&m| self.bond(i, m).0).fold(0.0, f32::max);
-                (i, spots.iter().map(|p| (p - x).abs()).fold(f32::MAX, f32::min), friend)
-            })
-            .filter(|f| f.1 < size * join_range(c.members.len()) * (1.0 + f.2 * tn().bond_pull))
-            .collect();
-        let Some(&(i, _, friend)) = free.iter().min_by(|a, b| (a.1 / (1.0 + a.2 * tn().bond_pull)).total_cmp(&(b.1 / (1.0 + b.2 * tn().bond_pull)))) else { return };
-        let moving = c.stage == Stage::Stroll || self.walk_ref(i).act == Act::Walk;
-        let chance = join_chance(c.members.len()) * if moving { tn().walk_join } else { 1.0 } * (1.0 + friend);
-        if self.walk.rand() >= chance {
-            return;
-        }
-        self.spend(i, tn().energy_join_cost);
-        self.join(c, i);
-    }
 
-    /// Someone standing inside a member of a chat: a chat right there is
-    /// hard to miss, so they join; if they've only just had one, they
-    /// shuffle out of the way instead. True if it dealt with someone.
-    fn overlap_join(&mut self, c: &mut Chat, n: usize, full: bool) -> bool {
-        let mut hit: Option<(f32, usize, usize)> = None;
-        for i in 0..n {
-            if self.walk_ref(i).ws != self.walk_ref(c.members[0]).ws || !self.free_for(i, Want::Overlap) {
-                continue;
-            }
-            let x = self.strip_px(i);
-            for &m in &c.members {
-                let d = (x - self.strip_px(m)).abs();
-                let range = if self.walk_ref(i).dropped > 0.0 { tn().drop_range } else { tn().overlap };
-                if d < (self.width_of(i) + self.width_of(m)) * 0.5 * range && hit.is_none_or(|h| d < h.0) {
-                    hit = Some((d, i, m));
-                }
-            }
-        }
-        let Some((d, i, m)) = hit else { return false };
-        // put right there by hand: no question about it
-        if self.walk_ref(i).dropped > 0.0 {
-            self.join(c, i);
-        } else if !full && chat_cool(self.walk_ref(i)) <= tn().overlap_cool {
-            if self.walk.rand() < tn().overlap_chance {
-                self.join(c, i);
-            }
-        } else if self.walk.rand() < tn().step_chance {
-            self.step_aside(i, m, d);
-        }
-        true
-    }
 
-    fn join(&mut self, c: &mut Chat, i: usize) {
-        c.quiet = 0.0;
-        self.enlist(i, c.id);
-        if !matches!(c.stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::RaceCall | Stage::RaceWait) {
-            if let Some(r) = self.walk_of(i).social.as_mut() {
-                r.no_pat = true;
-            }
-        }
-        // someone here it knows: they introduce it to the rest
-        let friend = c.members.iter().copied().find(|&m| self.bond(i, m).0 >= tn().meet_friend);
-        if let Some(f) = friend {
-            for m in c.members.clone() {
-                if m != f && self.bond(i, m).0 < tn().intro_bond {
-                    log::debug!("chat {}: {f} introduces {i} to {m}", c.id);
-                    self.add_bond(i, m, tn().intro_bond, 0.0);
-                }
-            }
-        }
-        c.members.push(i);
-        self.face(i, c.members[0]);
-        self.walk_of(i).start_bob(tn().jump_height * 0.2);
-        log::debug!("chat {}: {i} joins, now {}", c.id, c.members.len());
-        match c.stage {
-            Stage::Stroll => {
-                self.catch_up(c, i);
-                c.joined_walking = true;
-            }
-            // straight into the game
-            Stage::Cursor => {
-                if let Some(r) = self.walk_of(i).social.as_mut() {
-                    r.chasing = true;
-                }
-                c.scores.push((i, 0.0));
-            }
-            _ => {
-                // nobody waits for them and nobody shuffles along: the
-                // newcomer walks round to the end of the row, looking in
-                self.catch_up(c, i);
-                let mean = c.members.iter().filter(|&&m| m != i).map(|&m| self.strip_px(m)).sum::<f32>() / (c.members.len() - 1).max(1) as f32;
-                let left_of_row = self.strip_px(i) < mean;
-                let pace = 0.11 + self.walk.rand() * 0.05;
-                if let Some(r) = self.walk_of(i).social.as_mut() {
-                    r.face_left = !left_of_row;
-                    r.speed = pace;
-                }
-                if c.stage == Stage::Contest {
-                    c.queue.push(i);
-                } else if c.stage == Stage::Talk {
-                    c.timer = self.talk_length() + Self::crowd_talk(c);
-                }
-            }
-        }
-    }
 
     /// One of a small group suggests a race; the others agree.
     fn call_race(&mut self, c: &mut Chat) {
@@ -5887,6 +5635,9 @@ impl CharacterOverlay {
         log::debug!("chat {}: part", c.id);
         let width = self.strip_width_of(c.members[0]);
         let (lo, hi) = (tn().edge_px.min(width * 0.5), (width - tn().edge_px).max(width * 0.5));
+        // at the farm: on dry land, not off into the pond
+        let land = self.dry_land(c.members[0]);
+        let (lo, hi) = if land.0.max(lo) < land.1.min(hi) { (land.0.max(lo), land.1.min(hi)) } else { (lo, hi) };
         let mean = c.members.iter().map(|&i| self.strip_px(i)).sum::<f32>() / c.members.len() as f32;
         let ws = self.walk_ref(c.members[0]).ws;
         // where other groups on this workspace are standing
