@@ -563,5 +563,17 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     view.add_top_bar(&header);
     ui.toast.set_child(Some(&view));
 
-    adw::ApplicationWindow::builder().application(app).title("Anima").default_width(1120).default_height(740).content(&ui.toast).build()
+    let win = adw::ApplicationWindow::builder().application(app).title("Anima").default_width(1120).default_height(740).content(&ui.toast).build();
+    // Esc closes the window (a menu or dialog open inside closes first)
+    let keys = gtk::EventControllerKey::new();
+    let w = win.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            w.close();
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    win.add_controller(keys);
+    win
 }
