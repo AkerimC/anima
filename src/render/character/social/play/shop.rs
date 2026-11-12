@@ -19,7 +19,8 @@ impl CharacterOverlay {
         }
         // the piggy bank's full: new things for the park's chest
         let full = tn().bank_full as u32;
-        if full > 0 && park::coins("Park") >= full && park::pay("Park", full, &[]) {
+        // (only what's well over what it needs to buy the food: 60 at a time)
+        if full > 0 && park::coins("Park") >= full && park::pay("Park", 60, &[]) {
             for _ in 0..3 {
                 let k = (self.walk.rand() * park::MATERIALS.len() as f32) as usize % park::MATERIALS.len();
                 park::add("Park", park::MATERIALS[k].0);

@@ -169,7 +169,7 @@ tuning! {
         shop_gift: "A present for a friend costs" = 8.0, 0.0, 500.0, 1.0, 0;
         shop_recipe: "A recipe costs" = 12.0, 0.0, 500.0, 1.0, 0;
         shop_material: "Materials for the chest cost" = 6.0, 0.0, 500.0, 1.0, 0;
-        bank_full: "The park's piggy bank buys something at (coins, 0 never)" = 60.0, 0.0, 5000.0, 10.0, 0;
+        bank_full: "The park's piggy bank buys something at (coins, 0 never)" = 600.0, 0.0, 5000.0, 10.0, 0;
         game_material: "A game's winner finds something for the chest (share)" = 0.6, 0.0, 1.0, 0.05, 2;
         game_material_all: "The other players do (share each)" = 0.15, 0.0, 1.0, 0.05, 2;
         park_grant: "Wages the park gets each pay day, to buy food" = 6.0, 0.0, 20.0, 0.5, 1;
