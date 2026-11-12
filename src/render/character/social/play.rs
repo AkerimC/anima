@@ -1214,6 +1214,10 @@ impl CharacterOverlay {
             let eaters: Vec<usize> = sat.iter().copied().filter(|&i| self.walk_ref(i).hunger >= tn().hunger_eat * 0.5).collect();
             // the food waits till everyone's sat down (or it's been a while)
             let all_sat = sat.len() == p.riders.len() || p.t > 45.0;
+            // all sat and nobody hungry: they don't sit over it for ever
+            if eaters.is_empty() && all_sat && p.t > 20.0 {
+                return true;
+            }
             if !eaters.is_empty() && all_sat {
                 // a bite now and then, happy about it
                 for &i in &eaters {
@@ -1714,7 +1718,9 @@ impl CharacterOverlay {
         let park = park_now();
         let Some(counter) = park.things.iter().find(|t| t.id == old.0).cloned() else { return };
         let table = park.things.iter().enumerate().filter(|(_, t)| t.kind == "table" && t.place == counter.place && dish_on(t.id).is_none()).map(|(k, _)| k).next();
-        let who = (0..n).find(|&i| self.walk_ref(i).at_leisure() && self.place_here(i).is_some_and(|p| p.place == counter.place));
+        // only someone hungry, and not the staff at work: otherwise it waits there
+        let staff = |i: usize| self.on_duty("chef") == Some(i) || self.on_duty("waiter") == Some(i);
+        let who = (0..n).find(|&i| self.walk_ref(i).at_leisure() && !staff(i) && self.hungry(i) && self.place_here(i).is_some_and(|p| p.place == counter.place));
         if let (Some(k), Some(i)) = (table, who) {
             log::debug!("cafe: {i} takes the left-over {} to a table", old.1);
             SEEN.lock().unwrap().retain(|s| !(s.0 == old.0 && s.1 == old.1));
@@ -1749,8 +1755,8 @@ impl CharacterOverlay {
             return;
         }
         drop(seen);
-        let mut who: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).at_leisure() && self.place_here(i).is_some_and(|p| p.place == place)).collect();
-        who.sort_by_key(|&i| !self.hungry(i));
+        // only someone hungry sits down to it (and not the staff at work)
+        let who: Vec<usize> = (0..n).filter(|&i| self.walk_ref(i).at_leisure() && self.hungry(i) && self.on_duty("chef") != Some(i) && self.on_duty("waiter") != Some(i) && self.place_here(i).is_some_and(|p| p.place == place)).collect();
         if let Some(&i) = who.first() {
             log::debug!("{i} sits down to a dish left on a table");
             self.start_play(chats, i, k, "table");
