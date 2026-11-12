@@ -4818,7 +4818,10 @@ impl CharacterOverlay {
         }
         c.tag_free -= dt;
         // put down somewhere else: runs back to its place in the row
-        let width = self.strip_width_of(c.members[0]);
+        // (the strip is at least as wide as where they stand: a park window can
+        // sit further along than the workspace's own width says)
+        let furthest = c.base.iter().map(|b| b.1).fold(0.0, f32::max);
+        let width = self.strip_width_of(c.members[0]).max(furthest + 300.0);
         let far = (tn().samba_step * 1.6).max(30.0);
         let slot = |x: f32, marched: f32| (x + marched).clamp(0.0, width);
         let mut away = Vec::new();
