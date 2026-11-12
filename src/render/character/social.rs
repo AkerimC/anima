@@ -3610,8 +3610,17 @@ impl CharacterOverlay {
             all.swap(k, j);
         }
         // a crowd gets a taller net; the teams must still come out equal
+        // (a shorter one for a few, so each side still has someone on it)
         let tall = all.len() >= tn().volley_big as usize;
-        let high = if tall { 4 } else { 3 };
+        let mut high = if tall { 4 } else { 3 };
+        while high > 1 && all.len() < high + 3 {
+            high -= 1;
+        }
+        if all.len() < high + 3 {
+            // not even one a side: no game
+            self.end_game(c);
+            return;
+        }
         if (all.len() - high - 1) % 2 == 1 {
             if let Some(i) = all.pop() {
                 self.leave(i, c.id);
