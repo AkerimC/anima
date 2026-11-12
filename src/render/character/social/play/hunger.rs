@@ -15,7 +15,11 @@ pub(super) static PICNIC: Mutex<Vec<(usize, f32, String, Instant)>> = Mutex::new
 pub(super) fn pantry_spare(need: u32) -> bool {
     let p = park::read_pantry();
     let total: u32 = p.values().sum();
-    p.values().filter(|&&v| v > 0).count() >= 2 && total >= need + tn().staff_keep as u32
+    // the staff's share only once there's staff to keep it for
+    let jobs = park::jobs_cached();
+    let staff = jobs.jobs.values().chain(jobs.part.values()).any(|j| j == "chef" || j == "waiter");
+    let keep = if staff { tn().staff_keep as u32 } else { 0 };
+    p.values().filter(|&&v| v > 0).count() >= 2 && total >= need + keep
 }
 
 /// Breakfast, lunch or dinner time: hungry sooner.
@@ -78,6 +82,18 @@ impl CharacterOverlay {
         let want = h >= tn().hunger_eat || (mealtime() && h >= tn().hunger_eat * tn().hunger_meal);
         // no coins for the restaurant: only once too hungry to work (then it asks)
         want && (!self.broke(i) || h >= tn().beg_hunger)
+    }
+
+    /// Nothing to eat: a nap only once starving; otherwise it gets on with
+    /// things and doesn't look again for a while.
+    pub(super) fn nothing_to_eat(&mut self, i: usize) {
+        let wk = self.walk_of(i);
+        if wk.hunger >= tn().beg_hunger {
+            let secs = tn().hungry_nap;
+            wk.lie_down(secs);
+        } else {
+            wk.full = wk.full.max(300.0);
+        }
     }
 
     /// The restaurant's open and it can't pay for a meal.
@@ -179,8 +195,7 @@ impl CharacterOverlay {
                 self.walk_of(i).on_break = false;
             }
             if !self.staff_meal(i) && self.walk_ref(i).visit_for == 0 {
-                let secs = tn().hungry_nap;
-                self.walk_of(i).lie_down(secs);
+                self.nothing_to_eat(i);
             }
             return;
         }
@@ -188,9 +203,8 @@ impl CharacterOverlay {
         let stall = here.as_deref() == Some("park");
         if !self.food_for(i, stall) && (here.as_deref() == Some("cafe") || governor::place_rect("cafe").is_none()) {
             if self.walk_ref(i).visit_for == 0 {
-                log::debug!("{} finds nothing to eat and has a nap", self.character_name(i));
-                let secs = tn().hungry_nap;
-                self.walk_of(i).lie_down(secs);
+                log::debug!("{} finds nothing to eat", self.character_name(i));
+                self.nothing_to_eat(i);
             }
             return;
         }

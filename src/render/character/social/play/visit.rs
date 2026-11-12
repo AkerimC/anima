@@ -195,13 +195,15 @@ impl CharacterOverlay {
                 wk.visit_for = 0;
                 match self.desktop_home(from) {
                     Some(home) if home != ws => {
-                        self.walk_of(i).nap_on_arrival = true;
+                        // home again; a nap there only if starving
+                        let starving = self.walk_ref(i).hunger >= tn().beg_hunger;
+                        self.walk_of(i).nap_on_arrival = starving;
+                        if !starving {
+                            self.walk_of(i).full = self.walk_ref(i).full.max(300.0);
+                        }
                         self.send_to(i, home);
                     }
-                    _ => {
-                        let secs = tn().hungry_nap;
-                        self.walk_of(i).lie_down(secs);
-                    }
+                    _ => self.nothing_to_eat(i),
                 }
                 continue;
             }
