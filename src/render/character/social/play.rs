@@ -311,14 +311,47 @@ impl CharacterOverlay {
         (0..n).filter(|&i| free(self, i) && park::job_of(&self.character_name(i)).is_none() && park::part_of(&self.character_name(i)).is_none()).min_by(near)
     }
 
-    /// Work first, at its workplace, with a job there (full or part-time):
-    /// on shift, so no chats or games, only the work.
+    /// The work `i` should be doing now: its own job, or the one it helps
+    /// out with part-time while that's needed.
+    pub(in crate::render::character) fn job_now(&self, i: usize) -> Option<String> {
+        let name = self.character_name(i);
+        if let Some(j) = park::job_of(&name) {
+            return Some(j);
+        }
+        park::part_of(&name).filter(|j| self.part_needed(j))
+    }
+
+    /// A part-timer is called in when the job's own aren't there, are on a
+    /// break or asleep, or the work is piling up; otherwise it's free.
+    pub(in crate::render::character) fn part_needed(&self, job: &str) -> bool {
+        let n = self.extras.len() + 1;
+        let at = park::JOBS.iter().find(|j| j.0 == job).map_or("", |j| j.2);
+        let working = (0..n).filter(|&j| self.is_job(j, job)).any(|j| {
+            let wk = self.walk_ref(j);
+            self.place_here(j).is_some_and(|p| p.place == at) && !wk.on_break && wk.act != Act::Rest
+        });
+        if !working {
+            return true;
+        }
+        match job {
+            "chef" => dine::ORDERS.lock().unwrap().iter().filter(|o| o.state == dine::Ask::Waiting).count() >= 2,
+            "waiter" => dine::ORDERS.lock().unwrap().iter().filter(|o| matches!(o.state, dine::Ask::Asked | dine::Ask::Ready)).count() >= 2,
+            "farmer" => {
+                let state = park::read_farm_cached();
+                park_now().things.iter().filter(|t| t.place == "farm" && park::farm_state(t, &state).1 > 0).count() >= 3
+            }
+            "fisher" => park::read_pantry().values().sum::<u32>() < 4 + tn().staff_keep as u32,
+            _ => false,
+        }
+    }
+
+    /// Work first, at its workplace, with a job there (full or part-time
+    /// while needed): on shift, so no chats or games, only the work.
     pub(in crate::render::character) fn on_shift(&self, i: usize) -> bool {
         if !working() {
             return false;
         }
-        let name = self.character_name(i);
-        let Some(job) = park::job_of(&name).or_else(|| park::part_of(&name)) else { return false };
+        let Some(job) = self.job_now(i) else { return false };
         let at = park::JOBS.iter().find(|j| j.0 == job).map_or("", |j| j.2);
         self.place_here(i).is_some_and(|p| p.place == at)
     }
@@ -2035,6 +2068,20 @@ impl CharacterOverlay {
     /// Every frame: the hens and cows potter about (and run from whoever is
     /// after them), new beds start growing, and those who've cooked go to eat.
     pub(super) fn farm_tick(&mut self, chats: &mut Vec<Chat>, dt: f32, n: usize) {
+        {
+            static TIDY: Mutex<Option<Instant>> = Mutex::new(None);
+            let mut t = TIDY.lock().unwrap();
+            if t.is_none_or(|t| t.elapsed().as_secs_f32() > 10.0) {
+                *t = Some(Instant::now());
+                drop(t);
+                let team: Vec<String> = (0..n).map(|i| self.character_name(i)).collect();
+                let settled = self.social_age > 120.0 && n >= 2;
+                for line in park::tidy_jobs(&team, settled) {
+                    log::info!("{line}");
+                    tell(&format!("{line}!"));
+                }
+            }
+        }
         // on shift: kept out of chats (the wait is longer than any chat ignores)
         let keep_out = tn().overlap_cool + 5.0;
         let mut fisher_free = None;

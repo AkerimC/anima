@@ -66,8 +66,7 @@ impl CharacterOverlay {
             if !free(self, i) {
                 continue;
             }
-            let name = self.character_name(i);
-            let Some(job) = park::job_of(&name).or_else(|| park::part_of(&name)) else { continue };
+            let Some(job) = self.job_now(i) else { continue };
             let at = park::JOBS.iter().find(|j| j.0 == job).map_or("park", |j| j.2);
             if self.place_here(i).is_some_and(|p| p.place == at) {
                 continue;
@@ -127,8 +126,7 @@ impl CharacterOverlay {
             }
         }
         for i in due {
-            let name = self.character_name(i);
-            let job = park::job_of(&name).or_else(|| park::part_of(&name));
+            let job = self.job_now(i);
             let here = self.place_here(i).map(|p| p.place);
             if working() {
                 match job.as_deref() {

@@ -531,6 +531,35 @@ pub fn job_label(id: &str) -> &'static str {
     JOBS.iter().find(|j| j.0 == id).map_or("", |j| j.1)
 }
 
+/// Jobs only for those in the team; a place come free goes to whoever
+/// helps out with that job and has done the most of it.
+pub fn tidy_jobs(team: &[String], prune: bool) -> Vec<String> {
+    let mut j = read_jobs();
+    let before = (j.jobs.clone(), j.part.clone());
+    // (only once the team is surely all loaded)
+    if prune && !team.is_empty() {
+        j.jobs.retain(|name, _| team.contains(name));
+        j.part.retain(|name, _| team.contains(name));
+    }
+    let mut told = Vec::new();
+    for (id, _, _, most) in JOBS {
+        while j.jobs.values().filter(|v| *v == id).count() < most {
+            let pts = |name: &String| j.points.get(name).and_then(|p| p.get(id)).copied().unwrap_or(0.0);
+            let Some(name) = j.part.iter().filter(|p| p.1 == id).map(|p| p.0.clone()).max_by(|a, b| pts(a).total_cmp(&pts(b))) else { break };
+            j.part.remove(&name);
+            j.jobs.insert(name.clone(), id.to_string());
+            told.push(format!("{name} is now the {}", job_label(id).to_lowercase()));
+        }
+    }
+    if (j.jobs.clone(), j.part.clone()) != before {
+        if let Ok(text) = serde_json::to_string_pretty(&j) {
+            let _ = crate::util::atomic_write(&jobs_path(), text.as_bytes());
+        }
+        *JOBS_CACHE.lock().unwrap() = Some((std::time::Instant::now(), j));
+    }
+    told
+}
+
 /// `name` did some of `job`'s work. Returns the job if that just earned it.
 pub fn add_work(name: &str, job: &str, k: f32) -> Option<String> {
     let mut j = read_jobs();
