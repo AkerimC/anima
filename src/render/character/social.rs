@@ -479,6 +479,11 @@ fn chat_cool(wk: &WalkState) -> f32 {
     }
 }
 
+thread_local! {
+    /// While a game is being set up in the park: the park's stretch of strip.
+    static GAME_AREA: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
+}
+
 /// How many play a game started by hand, if the team has that many.
 const FORCED_PLAYERS: usize = 6;
 
@@ -805,7 +810,7 @@ impl CharacterOverlay {
         let mut chats = std::mem::take(&mut self.chats);
         // asked for by hand: tried again for a while if players have to come over first
         if let Some(name) = GAME_NOW.lock().unwrap().take() {
-            self.game_wait = Some((name, 20.0, 0.0));
+            self.game_wait = Some((name, 45.0, 0.0));
         }
         if let Some((name, left, next)) = self.game_wait.take() {
             let (left, next) = (left - dt, next - dt);
@@ -1789,6 +1794,14 @@ impl CharacterOverlay {
     }
 
     fn start_game(&mut self, c: &mut Chat, game: Game) {
+        // played in the park when that's where they are
+        let park = crate::backend::governor::place_rect("park").filter(|p| c.members.iter().all(|&i| self.place_here(i).is_some_and(|q| q.place == "park")));
+        GAME_AREA.with(|a| a.set(park.map(|p| (p.x + p.w * 0.05, p.w * 0.9))));
+        self.start_game_here(c, game);
+        GAME_AREA.with(|a| a.set(None));
+    }
+
+    fn start_game_here(&mut self, c: &mut Chat, game: Game) {
         for k in 0..c.members.len() {
             let wk = self.walk_of(c.members[k]);
             wk.notify_jump = None;
@@ -1885,10 +1898,30 @@ impl CharacterOverlay {
                 wk.timer = 1.0;
             }
         }
+        // living in the park, cafe and farm: the game's in the park, and the
+        // others there come over to it first
+        let park = crate::backend::governor::place_rect("park").filter(|p| p.ws == self.spaces.active || self.spaces.active == 0);
+        let in_park = |this: &Self, i: usize| this.place_here(i).is_some_and(|p| p.place == "park");
+        if let Some(p) = park.as_ref() {
+            for i in 0..n {
+                let wk = self.walk_ref(i);
+                if !playing.contains(&i) && wk.ws == p.ws && self.place_here(i).is_some() && !in_park(self, i) && wk.trip.is_none() && matches!(wk.act, Act::Idle | Act::Walk) && wk.race.is_none() {
+                    self.walk_of(i).social = None;
+                    self.walk_into(i, p);
+                }
+            }
+        }
+        let middle = park.as_ref().map_or(middle, |p| p.x + p.w * 0.5);
         let mut free: Vec<(usize, f32)> = (0..n)
             .filter(|&i| !playing.contains(&i) && here(self, i) && !self.walk_ref(i).circle && matches!(self.walk_ref(i).act, Act::Idle | Act::Walk | Act::Jump))
+            .filter(|&i| park.is_none() || in_park(self, i))
             .map(|i| (i, (self.strip_px(i) - middle).abs()))
             .collect();
+        // still walking over to the park: wait for them (asked again in a second)
+        if park.is_some() && free.len() < need {
+            log::debug!("game {name}: {} in the park so far, waiting for more", free.len());
+            return false;
+        }
         free.sort_by(|a, b| a.1.total_cmp(&b.1));
         if free.len() < need {
             // not enough here: the others are called over from their workspaces
@@ -4884,6 +4917,10 @@ impl CharacterOverlay {
 
     /// `biggest_column`, at least half a screen long.
     fn big_window(&self) -> (f32, f32) {
+        // a game in the park: the park is the playing field
+        if let Some(area) = GAME_AREA.with(|a| a.get()) {
+            return area;
+        }
         let (x, cw) = self.biggest_column();
         let len = cw.max(self.view_w * 0.5);
         (x + cw * 0.5 - len * 0.5, len)
