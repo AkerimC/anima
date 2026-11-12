@@ -3734,7 +3734,10 @@ impl CharacterOverlay {
         let Some(mut v) = c.volley.take() else { return };
         let intact = c.members.contains(&v.ball)
             && v.net.iter().all(|i| c.members.contains(i))
-            && v.teams.iter().flatten().all(|i| c.members.contains(i));
+            && v.teams.iter().flatten().all(|i| c.members.contains(i))
+            // a side with nobody on it (or no net) can't be played
+            && v.teams.iter().all(|t| !t.is_empty())
+            && !v.net.is_empty();
         if !intact || c.timer <= 0.0 {
             self.end_game(c);
             return;
