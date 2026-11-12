@@ -738,6 +738,32 @@ pub fn tax(steps: &[(u32, f32)]) -> Vec<(String, u32)> {
     paid
 }
 
+/// What the park pays each one for food this pay day: what's in the piggy
+/// bank shared out evenly among those who bring it, so the quickest doesn't
+/// take it all. Halfway to the next pay day, whatever's left is anyone's.
+static BUDGET: std::sync::Mutex<Option<(std::time::Instant, u32, BTreeMap<String, u32>)>> = std::sync::Mutex::new(None);
+
+/// A new pay day: everyone's share starts over.
+pub fn new_budget() {
+    *BUDGET.lock().unwrap() = None;
+}
+
+/// The park buys `k` coins' worth from `name`, up to its share; what was paid.
+pub fn park_buys(name: &str, k: u32) -> u32 {
+    let mut b = BUDGET.lock().unwrap();
+    let b = b.get_or_insert_with(|| {
+        let j = read_jobs();
+        let n = j.jobs.values().chain(j.part.values()).filter(|v| *v == "farmer" || *v == "fisher").count().max(1) as u32;
+        (std::time::Instant::now(), (coins("Park") / n).max(1), BTreeMap::new())
+    });
+    let free = b.0.elapsed().as_secs_f32() > 600.0;
+    let had = b.2.get(name).copied().unwrap_or(0);
+    let room = if free { k } else { b.1.saturating_sub(had).min(k) };
+    let paid = pay_upto("Park", room, name);
+    *b.2.entry(name.to_string()).or_default() += paid;
+    paid
+}
+
 // --- hunger, favourites, snacks, pay
 
 /// Each one's favourite dish: always the same one for a name.

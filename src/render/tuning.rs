@@ -172,7 +172,7 @@ tuning! {
         bank_full: "The park's piggy bank buys something at (coins, 0 never)" = 60.0, 0.0, 5000.0, 10.0, 0;
         game_material: "A game's winner finds something for the chest (share)" = 0.6, 0.0, 1.0, 0.05, 2;
         game_material_all: "The other players do (share each)" = 0.15, 0.0, 1.0, 0.05, 2;
-        park_grant: "Wages the park gets each pay day, to buy food" = 3.0, 0.0, 20.0, 0.5, 1;
+        park_grant: "Wages the park gets each pay day, to buy food" = 6.0, 0.0, 20.0, 0.5, 1;
         tax_low_at: "Tax: coins above this pay the low rate" = 50.0, 0.0, 1000.0, 10.0, 0;
         tax_low: "Tax: low rate each pay day" = 0.05, 0.0, 0.5, 0.01, 2;
         tax_high_at: "Tax: coins above this pay the high rate" = 150.0, 0.0, 5000.0, 10.0, 0;
