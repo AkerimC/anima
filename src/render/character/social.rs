@@ -1706,6 +1706,30 @@ impl CharacterOverlay {
         pool.last().map(|g| g.0)
     }
 
+    /// In the cafe or on the farm and up for a game: they agree to go over to
+    /// the park and play there (not those at work or hungry).
+    fn to_park(&mut self, c: &mut Chat) -> bool {
+        if !c.members.iter().any(|&i| self.no_games_here(i)) {
+            return false;
+        }
+        let Some(park) = crate::backend::governor::place_rect("park") else { return false };
+        let mean = c.members.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / c.members.len() as f32;
+        if mean < tn().energy_game_need || c.members.iter().any(|&i| self.on_shift(i) || self.hungry(i)) {
+            return false;
+        }
+        let who = c.members.clone();
+        log::debug!("chat {}: off to the park to play", c.id);
+        self.part(c);
+        for i in who {
+            if self.walk_ref(i).ws == park.ws {
+                self.walk_into(i, &park);
+            } else {
+                self.send_to(i, park.ws);
+            }
+        }
+        true
+    }
+
     /// Start a game this group hasn't played yet, if it has the energy.
     fn next_game(&mut self, c: &mut Chat) -> bool {
         // in the cafe or on the farm they talk; games are for the park and the desktop
@@ -5885,6 +5909,8 @@ impl CharacterOverlay {
                     let keen = self.fewness(c.members[0]).min(1.6);
                     if self.walk.rand() >= tn().game_chance * keen * if pair_only { tn().tug_pair_chance } else { 1.0 } {
                         c.quiet = -2.0 * tn().game_after;
+                    } else if self.to_park(c) {
+                        return true;
                     } else if self.next_game(c) {
                         c.games += 1;
                         c.quiet = 0.0;
