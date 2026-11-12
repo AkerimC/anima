@@ -994,11 +994,9 @@ fn condition_macros(src: &str) -> Vec<String> {
         let bytes = expr.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            if (bytes[i] as char).is_alphabetic() || bytes[i] == b'_' {
+            if is_ident_start(bytes[i]) {
                 let start = i;
-                while i < bytes.len()
-                    && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && is_ident_char(bytes[i]) {
                     i += 1;
                 }
                 let word = &expr[start..i];
@@ -1018,11 +1016,13 @@ fn condition_macros(src: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 fn is_ident_start(c: u8) -> bool {
-    (c as char).is_alphabetic() || c == b'_'
+    // ASCII only: shader sources can contain UTF-8 comments, and treating
+    // continuation bytes as letters would cut a slice inside a character.
+    c.is_ascii_alphabetic() || c == b'_'
 }
 
 fn is_ident_char(c: u8) -> bool {
-    (c as char).is_alphanumeric() || c == b'_'
+    c.is_ascii_alphanumeric() || c == b'_'
 }
 
 fn is_qualifier(word: &str) -> bool {
@@ -3246,10 +3246,10 @@ fn replace_word(src: &str, from: &str, to: &str) -> String {
     let bytes = src.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let is_word_start = (bytes[i] as char).is_alphabetic() || bytes[i] == b'_';
+        let is_word_start = is_ident_start(bytes[i]);
         if is_word_start {
             let start = i;
-            while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_') {
+            while i < bytes.len() && is_ident_char(bytes[i]) {
                 i += 1;
             }
             let word = &src[start..i];
