@@ -56,7 +56,7 @@ impl CharacterOverlay {
     }
 
     /// Hungry enough to go and eat.
-    pub(super) fn hungry(&self, i: usize) -> bool {
+    pub(in crate::render::character) fn hungry(&self, i: usize) -> bool {
         // come to the cafe for a meal: eats whatever its hunger
         if self.walk_ref(i).visit_for == visit::MEAL {
             return true;

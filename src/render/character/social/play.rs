@@ -2046,7 +2046,7 @@ impl CharacterOverlay {
             if self.walk_ref(i).social.is_none() && self.on_shift(i) {
                 let wk = self.walk_of(i);
                 wk.social_cool = wk.social_cool.max(keep_out);
-                if wk.at_leisure() && wk.act == Act::Idle && wk.fish_cool <= 0.0 && self.may_work(i, "fisher") && (self.is_job(i, "fisher") || self.is_part(i, "fisher")) {
+                if wk.at_leisure() && wk.act == Act::Idle && wk.fish_cool <= 0.0 && !self.hungry(i) && self.may_work(i, "fisher") && (self.is_job(i, "fisher") || self.is_part(i, "fisher")) {
                     fisher_free = Some(i);
                 }
             }

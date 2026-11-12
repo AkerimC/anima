@@ -148,7 +148,7 @@ impl CharacterOverlay {
                         }
                     }
                     // the fisher: fishing
-                    Some("fisher") if self.walk_ref(i).fish_cool <= 0.0 && governor::place_rect("farm").is_some() => {
+                    Some("fisher") if self.walk_ref(i).fish_cool <= 0.0 && !self.hungry(i) && governor::place_rect("farm").is_some() => {
                         log::debug!("idle: {i} fishes");
                         let c = self.fish_alone(i, false);
                         chats.push(c);

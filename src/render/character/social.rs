@@ -1002,7 +1002,7 @@ impl CharacterOverlay {
                 }
             }
             if !fixed.is_empty() {
-                log::debug!("state {i}: {was:?}, put right: {}", fixed.join(", "));
+                log::info!("state {i}: {was:?}, put right: {}", fixed.join(", "));
             }
         }
     }
@@ -3055,8 +3055,8 @@ impl CharacterOverlay {
                     a.patience = tn().fish_stay_min + self.walk.rand() * tn().fish_stay_rand;
                 }
                 a.patience -= dt;
-                // lost interest: only between catches, never mid-reel
-                if a.patience <= 0.0 && matches!(a.phase, 1 | 2) {
+                // lost interest or hungry: only between catches, never mid-reel
+                if (a.patience <= 0.0 || self.hungry(a.i)) && matches!(a.phase, 1 | 2) {
                     bored_off.push(a.i);
                     f.anglers[k] = a;
                     continue;
@@ -5417,6 +5417,10 @@ impl CharacterOverlay {
     fn end_game(&mut self, c: &mut Chat) {
         // fishing's over: whoever is up a jetty walks down and is done
         if c.stage == Stage::Fishing {
+            for &i in &c.members {
+                let wk = self.walk_of(i);
+                wk.fish_cool = wk.fish_cool.max(tn().fish_again);
+            }
             for i in c.members.clone() {
                 if self.walk_ref(i).air > 0.05 {
                     c.members.retain(|&m| m != i);
