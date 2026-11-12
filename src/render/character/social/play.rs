@@ -193,12 +193,13 @@ impl CharacterOverlay {
             log::debug!("{} eats the {id} raw", self.character_name(i));
             self.eat(i, "snack");
             let name = self.character_name(i);
-            park::earn(&name, park::food_worth(id) * k);
+            park::pay_upto("Park", park::food_worth(id) * k, &name);
             return;
         }
         park::add_food(id, k);
+        // the park buys it, with what's in the piggy bank
         let name = self.character_name(i);
-        park::earn(&name, park::food_worth(id) * k);
+        park::pay_upto("Park", park::food_worth(id) * k, &name);
     }
 
     /// `i` has this job.
@@ -1516,7 +1517,7 @@ impl CharacterOverlay {
                     for _ in 0..ready {
                         park::add(&name, "wood");
                     }
-                    park::earn(&name, ready);
+                    park::pay_upto("Park", ready, &name);
                     farm.insert(key, park::now());
                     park::write_farm(&farm);
                     log::debug!("{} picks up {ready} wood", r.i);

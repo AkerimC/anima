@@ -283,6 +283,8 @@ impl CharacterOverlay {
             let full = park::job_of(name).is_some();
             park::earn(name, if full { tn().wage as u32 } else { (tn().wage * 0.5).round() as u32 });
         }
+        // the park gets its share too, to buy the farm's and the pier's food
+        park::earn("Park", (tn().wage * tn().park_grant).round() as u32);
         log::debug!("wages paid");
     }
 
@@ -383,7 +385,7 @@ impl CharacterOverlay {
                     // the coins go to the chef, if there is one
                     let chef = park::read_jobs().jobs.iter().find(|j| j.1 == "chef").map(|j| j.0.clone());
                     let paid = match &chef {
-                        Some(c) => park::pay(&name, park::SNACK_PRICE, &[(c.as_str(), 1.0)]),
+                        Some(c) => park::pay(&name, park::SNACK_PRICE, &[(c.as_str(), 0.67), ("Park", 0.33)]),
                         None => park::pay(&name, park::SNACK_PRICE, &[("Park", 1.0)]),
                     };
                     if !paid {

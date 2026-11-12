@@ -91,6 +91,9 @@ impl CharacterOverlay {
                 if !park::pay("Park", prize, &[(name.as_str(), 1.0)]) {
                     park::earn(&name, prize);
                 }
+                // and the attendant is paid for calling it
+                let hname = self.character_name(h);
+                park::pay_upto("Park", tn().host_fee as u32, &hname);
                 log::debug!("chat {}: the attendant gives {name} {} coins", c.id, tn().host_prize);
                 let wk = self.walk_of(h);
                 wk.gesture = true;

@@ -686,6 +686,15 @@ pub fn pay(from: &str, k: u32, to: &[(&str, f32)]) -> bool {
     true
 }
 
+/// `from` pays up to `k` to `to`; returns what was paid.
+pub fn pay_upto(from: &str, k: u32, to: &str) -> u32 {
+    let k = k.min(coins(from));
+    if k > 0 {
+        pay(from, k, &[(to, 1.0)]);
+    }
+    k
+}
+
 // --- hunger, favourites, snacks, pay
 
 /// Each one's favourite dish: always the same one for a name.

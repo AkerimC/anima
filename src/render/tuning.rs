@@ -172,6 +172,8 @@ tuning! {
         bank_full: "The park's piggy bank buys something at (coins, 0 never)" = 60.0, 0.0, 5000.0, 10.0, 0;
         game_material: "A game's winner finds something for the chest (share)" = 0.6, 0.0, 1.0, 0.05, 2;
         game_material_all: "The other players do (share each)" = 0.15, 0.0, 1.0, 0.05, 2;
+        park_grant: "Wages the park gets each pay day, to buy food" = 3.0, 0.0, 20.0, 0.5, 1;
+        host_fee: "The attendant's pay for each game it calls (coins)" = 2.0, 0.0, 50.0, 1.0, 0;
         host_prize: "The attendant's prize for a game's winner (coins)" = 3.0, 0.0, 50.0, 1.0, 0;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;

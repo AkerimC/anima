@@ -493,9 +493,10 @@ impl CharacterOverlay {
                         let chef = order_of(i).and_then(|o| o.cook).or_else(|| self.on_duty("chef")).map(|c| self.character_name(c));
                         let waiter = o.and_then(|o| o.waiter).map(|w| self.character_name(w));
                         let to: Vec<(&str, f32)> = match (&chef, &waiter) {
-                            (Some(c), Some(w)) => vec![(c.as_str(), 0.6), (w.as_str(), 0.4)],
-                            (Some(c), None) => vec![(c.as_str(), 1.0)],
-                            (None, Some(w)) => vec![(w.as_str(), 1.0)],
+                            // what it's made of goes back to the park, which bought it
+                            (Some(c), Some(w)) => vec![(c.as_str(), 0.45), (w.as_str(), 0.3), ("Park", 0.25)],
+                            (Some(c), None) => vec![(c.as_str(), 0.75), ("Park", 0.25)],
+                            (None, Some(w)) => vec![(w.as_str(), 0.75), ("Park", 0.25)],
                             (None, None) => Vec::new(),
                         };
                         // now and then a friend at the table treats it
