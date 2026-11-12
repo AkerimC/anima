@@ -1,7 +1,7 @@
 //! The window: a tab for the characters, one per group of behaviour
 //! settings (built from anima's tuning table) and one for general options.
 
-use crate::{config, daemon, roster, team};
+use crate::{config, daemon, library, roster, team};
 use adw::prelude::*;
 use anima::render::tuning::{FIELDS, Field};
 use gtk::{gdk, glib};
@@ -32,6 +32,8 @@ pub(crate) struct Ui {
     pub(crate) data: RefCell<team::Team>,
     // pictures are rebuilt on every change: don't decode them again
     pub(crate) team_thumbs: RefCell<HashMap<String, gdk::Texture>>,
+    /// The wallpaper card currently marked as applied (library page).
+    current_card: RefCell<Option<gtk::Button>>,
     toast: adw::ToastOverlay,
     power: gtk::Switch,
     syncing: Cell<bool>,
@@ -43,6 +45,15 @@ impl Ui {
     pub(crate) fn say(&self, text: &str) {
         self.toast
             .add_toast(adw::Toast::builder().title(text).timeout(2).build());
+    }
+
+    /// Mark one wallpaper card as the applied one, clearing the previous.
+    pub(crate) fn set_current_card(&self, button: &gtk::Button) {
+        if let Some(old) = self.current_card.borrow_mut().take() {
+            old.remove_css_class("current");
+        }
+        button.add_css_class("current");
+        *self.current_card.borrow_mut() = Some(button.clone());
     }
 
     pub(crate) fn is_on(&self) -> bool {
@@ -741,6 +752,11 @@ const STYLE: &str = "
 .main-badge { background-color: @accent_bg_color; color: @accent_fg_color; border-radius: 99px; padding: 1px 9px; font-size: 0.8em; font-weight: bold; }
 .bottom-bar { padding: 10px 14px; border-radius: 14px; background-color: alpha(currentColor, 0.045); }
 .picker { background-color: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.12); }
+.wp-card { padding: 8px; border-radius: 12px; background-color: alpha(currentColor, 0.04); }
+.wp-card:hover { background-color: alpha(currentColor, 0.10); }
+.wp-card.current { outline: 2px solid @accent_bg_color; outline-offset: -2px; }
+.wp-title { font-weight: bold; }
+.wp-badge { border-radius: 99px; padding: 1px 8px; font-size: 0.75em; font-weight: bold; background-color: alpha(currentColor, 0.12); }
 ";
 
 pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
@@ -761,6 +777,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let ui = Rc::new(Ui {
         data: RefCell::new(team::Team::load()),
         team_thumbs: RefCell::default(),
+        current_card: RefCell::default(),
         toast: adw::ToastOverlay::new(),
         power: power.clone(),
         syncing: Cell::new(false),
@@ -798,6 +815,12 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         Some("characters"),
         "Team",
         "avatar-default-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &library::page(&ui),
+        Some("wallpapers"),
+        "Library",
+        "preferences-desktop-wallpaper-symbolic",
     );
     for (tab, icon) in [
         ("Roaming", "find-location-symbolic"),
