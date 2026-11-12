@@ -285,6 +285,13 @@ impl CharacterOverlay {
         }
         // the park gets its share too, to buy the farm's and the pier's food
         park::earn("Park", (tn().wage * tn().park_grant).round() as u32);
+        // and a tax: the more one has, the bigger the share
+        let paid = park::tax(&[(tn().tax_low_at as u32, tn().tax_low), (tn().tax_high_at as u32, tn().tax_high - tn().tax_low)]);
+        if let Some((name, k)) = paid.iter().max_by_key(|p| p.1) {
+            let total: u32 = paid.iter().map(|p| p.1).sum();
+            log::info!("tax day: {total} coins to the park");
+            tell(&format!("Tax day: {total} coins to the park ({name} paid the most, {k})"));
+        }
         log::debug!("wages paid");
     }
 

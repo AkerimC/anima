@@ -695,6 +695,28 @@ pub fn pay_upto(from: &str, k: u32, to: &str) -> u32 {
     k
 }
 
+/// Pay day's tax: of what each one has, a share of the part above each
+/// step goes to the park. Returns who paid how much.
+pub fn tax(steps: &[(u32, f32)]) -> Vec<(String, u32)> {
+    let mut w = read_wallets();
+    let mut paid = Vec::new();
+    let mut total = 0;
+    for (name, have) in w.iter_mut() {
+        if name == "Park" {
+            continue;
+        }
+        let due: u32 = steps.iter().map(|&(over, rate)| (have.saturating_sub(over) as f32 * rate).floor() as u32).sum::<u32>().min(*have);
+        if due > 0 {
+            *have -= due;
+            total += due;
+            paid.push((name.clone(), due));
+        }
+    }
+    *w.entry("Park".to_string()).or_default() += total;
+    write_wallets(&w);
+    paid
+}
+
 // --- hunger, favourites, snacks, pay
 
 /// Each one's favourite dish: always the same one for a name.
