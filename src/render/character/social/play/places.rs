@@ -84,7 +84,9 @@ impl CharacterOverlay {
             return;
         }
         let fishing = chats.iter().filter(|c| c.stage == Stage::Fishing).flat_map(|c| c.members.iter()).filter(|&&i| self.pier_near(i).is_some()).count();
-        if fishing >= 2 {
+        // the pantry running low: one more out fishing
+        let low = park::read_pantry().values().sum::<u32>() < 4 + tn().staff_keep as u32;
+        if fishing >= if low { 3 } else { 2 } {
             return;
         }
         let fisher = |this: &Self, i: usize| this.is_job(i, "fisher") || this.is_part(i, "fisher");

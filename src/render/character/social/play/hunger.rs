@@ -10,6 +10,14 @@ use super::*;
 /// Picnics being set up: (who, where on the strip, the dish, since when).
 pub(super) static PICNIC: Mutex<Vec<(usize, f32, String, Instant)>> = Mutex::new(Vec::new());
 
+/// Enough in the pantry for `need` things and still the staff's share left
+/// (at least two different things to cook with).
+pub(super) fn pantry_spare(need: u32) -> bool {
+    let p = park::read_pantry();
+    let total: u32 = p.values().sum();
+    p.values().filter(|&&v| v > 0).count() >= 2 && total >= need + tn().staff_keep as u32
+}
+
 /// Breakfast, lunch or dinner time: hungry sooner.
 pub(super) fn mealtime() -> bool {
     let m = super::super::super::weather::minutes_now();
@@ -21,7 +29,7 @@ impl CharacterOverlay {
     /// left on a serving counter (not someone else's on a table); with
     /// `stall`, also a snack at the stall it can pay for.
     pub(super) fn food_for(&self, i: usize, stall: bool) -> bool {
-        if park::read_pantry().values().filter(|&&v| v > 0).count() >= 2 {
+        if pantry_spare(2) {
             return true;
         }
         let park = park_now();
@@ -61,8 +69,20 @@ impl CharacterOverlay {
         if self.walk_ref(i).visit_for == visit::MEAL {
             return true;
         }
-        let h = self.walk_ref(i).hunger;
-        h >= tn().hunger_eat || (mealtime() && h >= tn().hunger_eat * 0.55)
+        let wk = self.walk_ref(i);
+        // just eaten: not yet (unless starving)
+        if wk.full > 0.0 && wk.hunger < tn().beg_hunger {
+            return false;
+        }
+        let h = wk.hunger;
+        let want = h >= tn().hunger_eat || (mealtime() && h >= tn().hunger_eat * tn().hunger_meal);
+        // no coins for the restaurant: only once too hungry to work (then it asks)
+        want && (!self.broke(i) || h >= tn().beg_hunger)
+    }
+
+    /// The restaurant's open and it can't pay for a meal.
+    pub(super) fn broke(&self, i: usize) -> bool {
+        self.restaurant_open() && park::coins(&self.character_name(i)) < 8
     }
 
     /// `i` eats `dish`: less hungry, happy (more so for its favourite).
@@ -73,6 +93,9 @@ impl CharacterOverlay {
         let wk = self.walk_of(i);
         wk.hunger = (wk.hunger - k).max(0.0);
         wk.energy = (wk.energy + k * 0.5).min(1.0);
+        wk.full = tn().full_time;
+        // a break's over once it's eaten
+        wk.on_break = false;
         // came over to eat: that's done
         if matches!(wk.visit_for, visit::MEAL | visit::HUNGRY) {
             wk.visit_for = visit::DONE;
@@ -105,6 +128,8 @@ impl CharacterOverlay {
                     continue;
                 }
                 wk.hunger = (wk.hunger + rate).min(1.0);
+                let busy = if wk.social.is_some() { 1.0 + tn().full_busy } else { 1.0 };
+                wk.full = (wk.full - dt * busy).max(0.0);
                 wk.hunger >= 0.9
             };
             // too worn out for games
@@ -138,8 +163,21 @@ impl CharacterOverlay {
             .collect();
         let Some(&i) = hungry.get((self.walk.rand() * hungry.len().max(1) as f32) as usize % hungry.len().max(1)) else { return };
         let here = self.place_here(i).map(|p| p.place);
-        // at work in the cafe: a quick bite in the kitchen
-        if here.as_deref() == Some("cafe") && (self.on_duty("chef") == Some(i) || self.on_duty("waiter") == Some(i)) && self.restaurant_open() {
+        // at work in the cafe: a break to sit down and eat if someone can stand
+        // in (the waiter always can: diners fetch their own meanwhile), else a
+        // quick bite in the kitchen from the staff's share
+        let chef = self.on_duty("chef") == Some(i);
+        if here.as_deref() == Some("cafe") && (chef || self.on_duty("waiter") == Some(i)) && self.restaurant_open() {
+            let n = self.extras.len() + 1;
+            let cover = !chef || (0..n).any(|j| j != i && self.is_part(j, "chef") && self.place_here(j).is_some_and(|p| p.place == "cafe"));
+            if cover {
+                self.walk_of(i).on_break = true;
+                if self.maybe_dine(chats, i) {
+                    log::debug!("cafe: {} takes a break to eat", self.character_name(i));
+                    return;
+                }
+                self.walk_of(i).on_break = false;
+            }
             if !self.staff_meal(i) && self.walk_ref(i).visit_for == 0 {
                 let secs = tn().hungry_nap;
                 self.walk_of(i).lie_down(secs);
@@ -173,7 +211,7 @@ impl CharacterOverlay {
             (Some("cafe"), _) => {
                 if self.restaurant_open() {
                     self.maybe_dine(chats, i);
-                } else if park::read_pantry().values().filter(|&&v| v > 0).count() >= 2 {
+                } else if pantry_spare(2) {
                     // a free stove to cook at, or one with room to wait at (and share)
                     let used = |k: usize| chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| p.thing == k && p.kind == "stove")).map(|c| c.members.len()).sum::<usize>();
                     let stove = park.things.iter().enumerate().filter(|(_, t)| t.kind == "stove" && t.place == "cafe").map(|(k, _)| k).min_by_key(|&k| used(k)).filter(|&k| used(k) < park::room("stove"));

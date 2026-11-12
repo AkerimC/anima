@@ -150,6 +150,11 @@ tuning! {
         park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
         hunger_time: "From full to starving, doing nothing (s)" = 2400.0, 60.0, 36000.0, 60.0, 0;
         hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
+        hunger_meal: "At mealtimes, this share of that is enough" = 0.75, 0.1, 1.0, 0.05, 2;
+        full_time: "Full after a meal for (s)" = 1800.0, 0.0, 7200.0, 60.0, 0;
+        full_busy: "Working or playing, full passes this much quicker" = 0.5, 0.0, 3.0, 0.1, 1;
+        staff_keep: "Kept in the pantry for those at work" = 2.0, 0.0, 10.0, 1.0, 0;
+        beg_hunger: "No coins: eats anyway only this hungry (0..1)" = 0.9, 0.5, 1.0, 0.05, 2;
         play_tire: "Only playing: a go on the slide or swing tires them by" = 0.12, 0.0, 1.0, 0.01, 2;
         idle_nudge: "Standing about in the park, cafe or farm for (s), then off to do something" = 20.0, 3.0, 600.0, 1.0, 0;
         hungry_nap: "Nothing to eat: a nap of (s)" = 240.0, 10.0, 3600.0, 10.0, 0;

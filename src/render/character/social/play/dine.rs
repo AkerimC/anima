@@ -50,6 +50,23 @@ pub(super) fn set_order(diner: usize, f: impl FnOnce(&mut Order)) {
     }
 }
 
+/// Who sits where: (table, place at it, who). One list for every table, so
+/// nobody is ever given a chair that's someone else's.
+static SEATS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+
+/// `i`'s place at table `k` (of `len`): the one it has, else the first free.
+pub(super) fn seat_slot(k: usize, i: usize, len: usize) -> Option<usize> {
+    let mut seats = SEATS.lock().unwrap();
+    if let Some(s) = seats.iter().find(|s| s.0 == k && s.2 == i) {
+        return (s.1 < len).then_some(s.1);
+    }
+    // a place somewhere else is given up
+    seats.retain(|s| s.2 != i);
+    let free = (0..len).find(|&p| !seats.iter().any(|s| s.0 == k && s.1 == p))?;
+    seats.push((k, free, i));
+    Some(free)
+}
+
 /// How long a dish takes to eat, slowly, talking.
 const EAT: f32 = 30.0;
 
@@ -62,7 +79,7 @@ impl CharacterOverlay {
     /// out part-time waits on the tables (not the one at the stove).
     pub(super) fn on_duty(&self, job: &str) -> Option<usize> {
         let n = self.extras.len() + 1;
-        let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe");
+        let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe") && !self.walk_ref(i).on_break;
         let found = (0..n).find(|&i| self.is_job(i, job) && here(i)).or_else(|| (0..n).find(|&i| self.is_part(i, job) && here(i)));
         if found.is_some() || job != "waiter" {
             return found;
@@ -76,7 +93,7 @@ impl CharacterOverlay {
     /// busy, eating say).
     fn next_cook(&self) -> Option<usize> {
         let n = self.extras.len() + 1;
-        let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe");
+        let here = |i: usize| self.place_here(i).is_some_and(|p| p.place == "cafe") && !self.walk_ref(i).on_break;
         let free = |i: usize| self.walk_ref(i).at_leisure() && self.walk_ref(i).act == Act::Idle;
         let chef = (0..n).find(|&i| self.is_job(i, "chef") && here(i));
         let helper = (0..n).find(|&i| self.is_part(i, "chef") && here(i) && free(i));
@@ -114,7 +131,14 @@ impl CharacterOverlay {
         if !self.hungry(i) {
             return false;
         }
-        if park::read_pantry().values().filter(|&&v| v > 0).count() < 2 {
+        // no coins: asks nicely for a free one
+        if self.broke(i) {
+            log::debug!("cafe: {} has no coins and asks for a free meal", self.character_name(i));
+            let wk = self.walk_of(i);
+            wk.gesture = true;
+            wk.start_bob(tn().jump_height * 0.15);
+        }
+        if !hunger::pantry_spare(2) {
             return false;
         }
         let park = park_now();
@@ -133,6 +157,15 @@ impl CharacterOverlay {
     /// them, and orders whose diner has gone are dropped.
     pub(super) fn restaurant_tick(&mut self, chats: &mut Vec<Chat>) {
         let diners: Vec<usize> = chats.iter().filter(|c| c.play.as_ref().is_some_and(|p| p.kind == "dine")).flat_map(|c| c.members.clone()).collect();
+        // places at tables go back once whoever had them has left the table
+        let seated: Vec<(usize, usize)> = chats.iter().filter_map(|c| c.play.as_ref().filter(|p| matches!(p.kind.as_str(), "dine" | "table")).map(|p| (p.thing, c.members.clone()))).flat_map(|(k, m)| m.into_iter().map(move |i| (k, i))).collect();
+        SEATS.lock().unwrap().retain(|s| seated.contains(&(s.0, s.2)));
+        // a break with no meal to it is over
+        for i in 0..self.extras.len() + 1 {
+            if self.walk_ref(i).on_break && !diners.contains(&i) {
+                self.walk_of(i).on_break = false;
+            }
+        }
         ORDERS.lock().unwrap().retain(|o| diners.contains(&o.diner) && o.state != Ask::Failed);
         // an order nobody is working on any more (the chef or waiter was
         // picked up, say): back to the chef
@@ -234,7 +267,7 @@ impl CharacterOverlay {
         if LIVE.lock().unwrap().dishes.iter().filter(|d| d.0 == counter).count() >= 3 {
             return;
         }
-        if park::read_pantry().values().filter(|&&v| v > 0).count() < 2 {
+        if !hunger::pantry_spare(2) {
             return;
         }
         let park = park_now();
@@ -322,11 +355,11 @@ impl CharacterOverlay {
     pub(super) fn play_dine(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
         let seats = self.table_seats(t, mid, unit);
         let mut off = Vec::new();
-        // more diners than places: the extra ones find another table (or go)
-        while p.riders.len() > seats.len().max(1) {
-            if let Some(r) = p.riders.pop() {
-                set_order(r.i, |o| o.state = Ask::Failed);
-                self.get_off(c, p, r.i);
+        // no place of its own at this table: it goes (and may try another)
+        for i in p.riders.iter().map(|r| r.i).collect::<Vec<_>>() {
+            if seat_slot(p.thing, i, seats.len()).is_none() {
+                set_order(i, |o| o.state = Ask::Failed);
+                self.get_off(c, p, i);
             }
         }
         let waiter = self.on_duty("waiter").is_some();
@@ -336,7 +369,7 @@ impl CharacterOverlay {
         for k in 0..p.riders.len() {
             let mut r = p.riders[k];
             let i = r.i;
-            let (seat, seat_up) = seats[k.min(seats.len() - 1)];
+            let Some((seat, seat_up)) = seat_slot(p.thing, i, seats.len()).map(|s| seats[s]) else { continue };
             r.t += dt;
             let go = |this: &mut Self, x: f32, speed: f32| {
                 if !this.walk_ref(i).social.is_some_and(|s| s.moving) && (this.strip_px(i) - x).abs() > 8.0 && this.arrived(i) {

@@ -859,14 +859,6 @@ impl CharacterOverlay {
                 for r in p.riders.iter().filter(|r| Some(r.i) != server) {
                     q.push((r.i, k));
                 }
-                // and a couple more from the same room, the hungry first
-                let mut others: Vec<usize> = (0..self.extras.len() + 1)
-                    .filter(|&j| !p.riders.iter().any(|r| r.i == j) && self.walk_ref(j).at_leisure() && self.place_here(j).is_some_and(|q| q.place == thing.place))
-                    .collect();
-                others.sort_by_key(|&j| !self.hungry(j));
-                for j in others.into_iter().take(2) {
-                    q.push((j, k));
-                }
             }
         }
         if done {
@@ -1137,15 +1129,15 @@ impl CharacterOverlay {
     /// a dish on it, they eat it together and get closer.
     fn play_table(&mut self, c: &mut Chat, p: &mut Play, t: &Thing, mid: f32, unit: f32, dt: f32) -> bool {
         let seats = self.table_seats(t, mid, unit);
-        // more of them than places: the extra ones don't stay
-        while p.riders.len() > seats.len().max(1) {
-            if let Some(r) = p.riders.pop() {
-                self.get_off(c, p, r.i);
+        // no place of its own at this table (diners may have it): it doesn't stay
+        for i in p.riders.iter().map(|r| r.i).collect::<Vec<_>>() {
+            if dine::seat_slot(p.thing, i, seats.len()).is_none() {
+                self.get_off(c, p, i);
             }
         }
-        for k in 0..p.riders.len().min(4) {
+        for k in 0..p.riders.len() {
             let i = p.riders[k].i;
-            let (x, up) = seats[k.min(seats.len() - 1)];
+            let Some((x, up)) = dine::seat_slot(p.thing, i, seats.len()).map(|s| seats[s]) else { continue };
             if p.riders[k].phase == 0 {
                 if self.seat_walk(i, x, up, dt) {
                     p.riders[k].phase = 1;
@@ -1406,7 +1398,8 @@ impl CharacterOverlay {
             }
             pick
         };
-        if !park::take_food(&stuff) {
+        // the staff's share stays in the pantry
+        if !hunger::pantry_spare(stuff.len() as u32) || !park::take_food(&stuff) {
             return None;
         }
         let dish = park::dish_of(stuff.clone());
@@ -1589,7 +1582,10 @@ impl CharacterOverlay {
                         self.work(r.i, "waiter", 2.0);
                     }
                     self.set_happy(r.i, true);
-                    PENDING.lock().unwrap().push((r.i, p.thing));
+                    // the one who cooked it eats it; a waiter only carried it
+                    if p.by_cook {
+                        PENDING.lock().unwrap().push((r.i, p.thing));
+                    }
                     p.riders[0] = r;
                     return true;
                 }

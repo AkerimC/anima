@@ -70,6 +70,10 @@ pub(super) struct WalkState {
     pub(super) energy: f32,
     // how hungry, 0 (full) to 1 (starving): work and time make it, food mends it
     pub(super) hunger: f32,
+    // just eaten: seconds before it wants food again (work and games make it pass quicker)
+    pub(super) full: f32,
+    // chef or waiter off duty for a meal
+    pub(super) on_break: bool,
     // over in the park, cafe or farm for a reason (play.rs, visit), for how
     // long, where from; the mealtime it last went to eat at
     pub(super) visit_for: u8,
