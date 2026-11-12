@@ -5493,6 +5493,7 @@ impl CharacterOverlay {
                 }
             }
             c.winner = None;
+            self.game_loot(c);
             c.all_cheer = true;
             c.timer = tn().cheer_time;
             c.stage = Stage::Cheer;
@@ -5500,6 +5501,7 @@ impl CharacterOverlay {
         }
         let best = c.scores.iter().filter(|s| s.1 > 0.0 && c.members.contains(&s.0)).max_by(|a, b| a.1.total_cmp(&b.1));
         c.winner = best.map(|s| s.0);
+        self.game_loot(c);
         log::debug!("chat {}: game over, {:?} won of {:?}", c.id, c.winner, c.scores);
         if let Some(w) = c.winner {
             c.talker = w;
@@ -5512,6 +5514,25 @@ impl CharacterOverlay {
             c.stage = Stage::Cheer;
         } else {
             self.talk_it_over(c);
+        }
+    }
+
+    /// Something for the park's chest out of a game: the winner likely, the
+    /// others now and then (fishing has its own catches).
+    fn game_loot(&mut self, c: &Chat) {
+        if c.stage == Stage::Fishing || c.stage == Stage::Practice {
+            return;
+        }
+        for &i in &c.members.clone() {
+            let chance = if Some(i) == c.winner { tn().game_material } else { tn().game_material_all };
+            if self.walk.rand() >= chance {
+                continue;
+            }
+            let k = (self.walk.rand() * super::park::MATERIALS.len() as f32) as usize % super::park::MATERIALS.len();
+            let name = self.character_name(i);
+            super::park::add(&name, super::park::MATERIALS[k].0);
+            log::debug!("chat {}: {name} gets {} from the game", c.id, super::park::MATERIALS[k].1);
+            self.walk_of(i).start_bob(tn().jump_height * 0.2);
         }
     }
 
