@@ -560,7 +560,7 @@ impl CharacterOverlay {
         // a sign held up in both hands, in front of its chest
         if let Some(k) = wk.sign.filter(|_| wk.act == Act::Idle) {
             if let Some(image) = super::sign::picture(k) {
-                out.push(Worn { turn: 0.0, id: "", kind: 100, rect: place(Anchor::Chest, [0.95, 0.68], [0.5, 0.15], [0.0, 0.0]), flip: false, behind: false, image: Some(image) });
+                out.push(Worn { turn: 0.0, id: "", kind: 100, rect: place(Anchor::Chest, [1.15, 0.75], [0.5, 0.1], [0.0, 0.0]), flip: false, behind: false, image: Some(image) });
             }
         }
         let weather = super::weather::now();
