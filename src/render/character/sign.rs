@@ -14,7 +14,7 @@ fn font() -> Option<ab_glyph::FontVec> {
 
 /// The picture of sign `k`, made if it isn't there yet.
 pub fn picture(k: usize) -> Option<PathBuf> {
-    let path = crate::util::data_dir().join("props/signs").join(format!("sign{}_v2.png", k % SIGNS.len()));
+    let path = crate::util::data_dir().join("props/signs").join(format!("sign{}_v3.png", k % SIGNS.len()));
     if !path.is_file() {
         let _ = std::fs::create_dir_all(path.parent()?);
         make(SIGNS[k % SIGNS.len()], &font()?).save(&path).ok()?;
@@ -54,7 +54,9 @@ fn make(text: &str, font: &ab_glyph::FontVec) -> image::RgbaImage {
         }
     }
     let lines = text.lines().count().max(1) as f32;
-    let px = if lines > 1.0 { 112.0 } else { 140.0 };
+    // as big as fits: the widest line across the board, the lines down it
+    let widest = text.lines().map(|l| crate::render::text::measure(font, l, 100.0, 0.0)).fold(1.0f32, f32::max);
+    let px = (100.0 * (w as f32 - 40.0) / widest).min((h as f32 - 30.0) / lines / 1.05).min(150.0);
     let t = rasterize(font, text, px, 0.0, [0.0, -14.0], HAlign::Center, VAlign::Center, None, 0, Some([w - 24, h - 20]));
     let (ox, oy) = (12, 10);
     for y in 0..t.height.min(h - oy) {
