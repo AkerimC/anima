@@ -32,6 +32,7 @@ mod pat;
 pub mod park;
 mod race;
 mod rope;
+mod sign;
 mod social;
 mod spaces;
 mod uma;

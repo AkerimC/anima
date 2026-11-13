@@ -541,6 +541,25 @@ impl CharacterOverlay {
                 wk.carry_t = 60.0 + wk.rand() * 120.0;
                 wk.carry = wk.keepsake.is_some() && wk.rand() < tn().carry_keepsake;
             }
+            // now and then it stands still and holds up a sign
+            let wk = self.walk_of(i);
+            wk.sign_t -= dt;
+            if wk.sign.is_some() {
+                wk.sign_left -= dt;
+                if wk.sign_left <= 0.0 || !wk.at_leisure() {
+                    wk.sign = None;
+                } else {
+                    wk.act = Act::Idle;
+                    wk.timer = wk.timer.max(0.5);
+                    wk.target = wk.x;
+                }
+            } else if wk.sign_t <= 0.0 {
+                wk.sign_t = 120.0 + wk.rand() * 300.0;
+                if wk.act == Act::Idle && wk.at_leisure() && wk.rand() < 0.6 {
+                    wk.sign = Some((wk.rand() * super::sign::SIGNS.len() as f32) as usize);
+                    wk.sign_left = 7.0 + wk.rand() * 6.0;
+                }
+            }
             // swung about hard in the rain: the umbrella flies out of its hand
             let wk = self.walk_ref(i);
             if wk.act == Act::Held {

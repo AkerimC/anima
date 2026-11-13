@@ -557,6 +557,12 @@ impl CharacterOverlay {
                 out.push(Worn { turn: 0.0, id: "", kind, rect: place(Anchor::Back, [0.5, 0.44], [0.5, 0.5], [0.0, -0.05]), flip, behind: true, image: None });
             }
         }
+        // a sign held up in both hands, in front of its chest
+        if let Some(k) = wk.sign.filter(|_| wk.act == Act::Idle) {
+            if let Some(image) = super::sign::picture(k) {
+                out.push(Worn { turn: 0.0, id: "", kind: 100, rect: place(Anchor::Chest, [1.25, 0.9], [0.5, 0.45], [0.0, 0.0]), flip: false, behind: false, image: Some(image) });
+            }
+        }
         let weather = super::weather::now();
         // Christmas: a Santa hat, the tip falling away from where it looks
         let xmas = super::weather::christmas();

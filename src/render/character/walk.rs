@@ -162,6 +162,10 @@ pub(super) struct WalkState {
     pub(super) fav_t: f32,
     pub(super) carry: bool,
     pub(super) carry_t: f32,
+    // a sign held up (which one), for how much longer, until it thinks of one again
+    pub(super) sign: Option<usize>,
+    pub(super) sign_left: f32,
+    pub(super) sign_t: f32,
     // night: seconds until it goes to bed, and whether it's in bed for the night
     pub(super) night_wait: Option<f32>,
     pub(super) night_sleep: bool,
