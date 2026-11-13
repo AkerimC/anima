@@ -542,7 +542,9 @@ impl CharacterOverlay {
                 wk.carry = wk.keepsake.is_some() && wk.rand() < tn().carry_keepsake;
             }
             // now and then it stands still and holds up a sign
+            let here = self.spaces.active;
             let wk = self.walk_of(i);
+            let seen = here == 0 || wk.ws == here;
             wk.sign_t -= dt;
             if wk.sign.is_some() {
                 wk.sign_left -= dt;
@@ -555,9 +557,9 @@ impl CharacterOverlay {
                 }
             } else if wk.sign_t <= 0.0 {
                 wk.sign_t = 120.0 + wk.rand() * 300.0;
-                if wk.act == Act::Idle && wk.at_leisure() && wk.rand() < 0.6 {
+                if seen && wk.act == Act::Idle && wk.at_leisure() && wk.rand() < 0.6 {
                     wk.sign = Some((wk.rand() * super::sign::SIGNS.len() as f32) as usize);
-                    wk.sign_left = 7.0 + wk.rand() * 6.0;
+                    wk.sign_left = 20.0 + wk.rand() * 10.0;
                 }
             }
             // swung about hard in the rain: the umbrella flies out of its hand
