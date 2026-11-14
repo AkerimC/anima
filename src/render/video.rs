@@ -405,11 +405,38 @@ impl Renderer for VideoRenderer {
                     }
                 }
                 "mute" | "muted" => {
-                    self.muted = value == "true" || value == "1" || value == "yes";
+                    self.muted =
+                        value.eq_ignore_ascii_case("true") || value == "1" || value.eq_ignore_ascii_case("yes");
                     self.apply_audio();
                 }
+                "ui_brightness" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        let mpv = (v.clamp(-1.0, 1.0) * 100.0).round();
+                        set_prop(self.handle, "brightness", &mpv.to_string())?;
+                    }
+                }
+                "ui_contrast" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        let c = v.clamp(0.0, 3.0);
+                        let mpv = if c >= 1.0 { (c - 1.0) * 50.0 } else { (c - 1.0) * 100.0 };
+                        set_prop(self.handle, "contrast", &mpv.clamp(-100.0, 100.0).round().to_string())?;
+                    }
+                }
+                "ui_saturation" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        let s = v.clamp(0.0, 3.0);
+                        let mpv = if s >= 1.0 { (s - 1.0) * 50.0 } else { (s - 1.0) * 100.0 };
+                        set_prop(self.handle, "saturation", &mpv.clamp(-100.0, 100.0).round().to_string())?;
+                    }
+                }
+                "ui_hue" | "hue" | "hueshift" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        let mpv = (v.clamp(-180.0, 180.0) / 180.0 * 100.0).round();
+                        set_prop(self.handle, "hue", &mpv.to_string())?;
+                    }
+                }
                 "brightness" | "contrast" | "saturation" | "gamma" | "panscan" => {
-                    set_prop(self.handle, key, value)?;
+                    set_prop(self.handle, &key.to_ascii_lowercase(), value)?;
                 }
                 _ => {}
             }

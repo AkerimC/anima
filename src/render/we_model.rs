@@ -272,25 +272,26 @@ pub fn parse_mdl(bytes: &[u8]) -> Option<ParsedMdl> {
     if bytes.len() < 32 || !bytes.starts_with(b"MDLV") {
         return None;
     }
-    let material = {
+    let mdl_ver = std::str::from_utf8(bytes.get(4..8)?)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+    let (material, mat_end) = {
         let start = bytes
             .windows(10)
             .position(|w| w == b"materials/")
-            .map(|p| p)
             .or_else(|| bytes.windows(9).position(|w| w == b"material/"))?;
         let end = bytes[start..].iter().position(|&b| b == 0)? + start;
-        std::str::from_utf8(&bytes[start..end])
+        let s = std::str::from_utf8(&bytes[start..end])
             .ok()
-            .map(str::to_string)
+            .map(str::to_string);
+        (s, end + 1)
     };
 
     // The material path is followed by padding and a five-byte vertex-block
     // marker `00 <stride-variant> 00 80 01`, then a 32-bit vertex byte count.
-    let search_from = material
-        .as_ref()
-        .and_then(|_| bytes.windows(10).position(|w| w == b"materials/"))
-        .unwrap_or(0);
-    let marker = bytes[search_from..]
+    // Older MDLV0013 omits the vertex-format marker (`00 00 00 00` then u32
+    // byte count), and unskinned MDLV0016 uses `00 <variant> 00 00 00`.
+    let n_off = bytes[mat_end..]
         .windows(5)
         .position(|w| {
             w[0] == 0
@@ -299,9 +300,22 @@ pub fn parse_mdl(bytes: &[u8]) -> Option<ParsedMdl> {
                 && w[3] == 0x80
                 && w[4] == 0x01
         })
-        .map(|p| p + search_from)?;
-    let n = u32::from_le_bytes(bytes.get(marker + 5..marker + 9)?.try_into().ok()?) as usize;
-    let data_start = marker + 9;
+        .map(|p| mat_end + p + 5)
+        .or_else(|| match mdl_ver {
+            Some(v) if v <= 13 => {
+                (bytes.get(mat_end..mat_end + 4) == Some(&[0, 0, 0, 0][..])).then_some(mat_end + 4)
+            }
+            Some(14..=16) => {
+                let flags = bytes.get(mat_end + 4..mat_end + 8)?;
+                (bytes.get(mat_end..mat_end + 4) == Some(&[0, 0, 0, 0][..])
+                    && matches!(flags[0], 9 | 13 | 15 | 17 | 19 | 21 | 23)
+                    && flags[2] == 0)
+                    .then_some(mat_end + 8)
+            }
+            _ => None,
+        })?;
+    let n = u32::from_le_bytes(bytes.get(n_off..n_off + 4)?.try_into().ok()?) as usize;
+    let data_start = n_off + 4;
     if n == 0 || data_start + n + 8 > bytes.len() {
         return None;
     }

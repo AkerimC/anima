@@ -133,6 +133,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         audio,
         lyrics,
         cursor_pos: None,
+        pointer_down: false,
         active_window: None,
         focused_monitor: std::env::var("ANIMA_MONITOR").ok(),
         any_fullscreen: false,
@@ -287,6 +288,10 @@ struct OutputCtx {
     start: Instant,
     frames: u64,
     fps_since: Instant,
+    /// Whether this output's renderer currently wants the desktop audio
+    /// analyzer.  Scenes load lazily on the first frame, so this has to be
+    /// re-checked after rendering instead of only when the renderer is built.
+    audio_users: bool,
 }
 
 impl OutputCtx {
@@ -319,6 +324,7 @@ impl OutputCtx {
             start: Instant::now(),
             frames: 0,
             fps_since: Instant::now(),
+            audio_users: false,
         }
     }
 }
@@ -343,6 +349,7 @@ pub struct App {
     audio: AudioAnalyzer,
     lyrics: LyricsEngine,
     cursor_pos: Option<(f32, f32)>,
+    pointer_down: bool,
     active_window: Option<WindowRect>,
 
     focused_monitor: Option<String>,
@@ -781,9 +788,10 @@ impl App {
                     let _ = renderer.set_property("mute", if muted { "true" } else { "false" });
                     renderer.set_volume(config.volume_for(&name));
                 }
-                if let Some(mcfg) = config.monitor(&name) {
-                    for (k, v) in &mcfg.properties {
-                        let _ = renderer.set_property(k, v);
+                if let Some(wp) = &oc.wallpaper {
+                    let wp_id = wallpaper_id(wp);
+                    for (k, v) in config.properties_for(&name, &wp_id) {
+                        let _ = renderer.set_property(&k, &v);
                     }
                 }
                 oc.error = None;
@@ -924,6 +932,7 @@ impl App {
             beat: 0.0,
             mouth: [0.0; 4],
             mouse: [-10000.0, -10000.0],
+            mouse_down: false,
             scale: scale as f32,
         };
         let _ = ch.render(gl, &info, None, &mut SharedSurface);
@@ -1034,6 +1043,8 @@ impl App {
             beat: audio_snap.beat,
             mouth: fused_mouth,
             mouse,
+            mouse_down: self.pointer_down
+                || crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed),
             scale: oc.scale as f32,
         };
 
@@ -1075,6 +1086,16 @@ impl App {
                 }
             }
         };
+
+        // The renderer may have loaded its scene (and therefore discovered
+        // audio-reactive effects) on this very frame; enable the analyzer now.
+        let wants_audio = renderer.uses_audio();
+        let mut audio_changed = false;
+        if wants_audio != oc.audio_users {
+            log::info!("monitor {name}: renderer uses audio = {wants_audio}");
+            oc.audio_users = wants_audio;
+            audio_changed = true;
+        }
 
         // Also render the transparent front overlay surface if active!
         if let Some(fo) = oc.front_overlay.as_mut() {
@@ -1181,6 +1202,9 @@ impl App {
             oc.fps_since = Instant::now();
         }
         oc.animating = keep_going;
+        if audio_changed {
+            self.update_audio_state();
+        }
         keep_going
     }
 
@@ -1545,11 +1569,15 @@ impl App {
                     })
                     .map(|(i, oc)| {
                         let name = self.monitor_name(i);
-                        let props = self
-                            .config
-                            .monitor(&name)
-                            .map(|m| m.properties.clone())
-                            .unwrap_or_default();
+                        let props = if let Some(wp) = &oc.wallpaper {
+                            let wp_id = wallpaper_id(wp);
+                            self.config.properties_for(&name, &wp_id)
+                        } else {
+                            self.config
+                                .monitor(&name)
+                                .map(|m| m.properties.clone())
+                                .unwrap_or_default()
+                        };
                         serde_json::json!({
                             "name": name,
                             "size": format!("{}x{}", oc.width, oc.height),
@@ -1730,8 +1758,13 @@ impl App {
                 let targets = self.target_outputs(monitor.as_deref());
                 for idx in targets {
                     let name = self.monitor_name(idx);
-                    let mcfg = self.config.ensure_monitor(&name);
-                    mcfg.properties.insert(key.clone(), value.clone());
+                    if let Some(wp) = &self.outputs[idx].wallpaper {
+                        let wp_id = wallpaper_id(wp);
+                        self.config.set_property_for(&name, &wp_id, &key, &value);
+                    } else {
+                        let mcfg = self.config.ensure_monitor(&name);
+                        mcfg.properties.insert(key.clone(), value.clone());
+                    }
                     if let Some(r) = &mut self.outputs[idx].renderer {
                         let _ = r.set_property(&key, &value);
                     }
@@ -1749,11 +1782,15 @@ impl App {
                 let mut result = Vec::new();
                 for idx in targets {
                     let name = self.monitor_name(idx);
-                    let overrides = self
-                        .config
-                        .monitor(&name)
-                        .map(|m| m.properties.clone())
-                        .unwrap_or_default();
+                    let overrides = if let Some(wp) = &self.outputs[idx].wallpaper {
+                        let wp_id = wallpaper_id(wp);
+                        self.config.properties_for(&name, &wp_id)
+                    } else {
+                        self.config
+                            .monitor(&name)
+                            .map(|m| m.properties.clone())
+                            .unwrap_or_default()
+                    };
                     let schema = self.outputs[idx]
                         .wallpaper
                         .as_ref()
@@ -1762,6 +1799,8 @@ impl App {
                     result.push(serde_json::json!({
                         "monitor": name,
                         "wallpaper": self.outputs[idx].wallpaper.as_ref().map(|w| &w.title),
+                        "kind": self.outputs[idx].wallpaper.as_ref().map(|w| w.kind.as_str()),
+                        "workshop_id": self.outputs[idx].wallpaper.as_ref().and_then(|w| w.workshop_id.as_deref()),
                         "schema": schema,
                         "overrides": overrides,
                     }));
@@ -1770,6 +1809,78 @@ impl App {
                     "wallpaper properties",
                     serde_json::json!({ "monitors": result }),
                 )
+            }
+            Request::ResetProperties { monitor, key } => {
+                let targets = self.target_outputs(monitor.as_deref());
+                for idx in targets {
+                    let name = self.monitor_name(idx);
+                    let wp_id = self.outputs[idx].wallpaper.as_ref().map(wallpaper_id);
+                    if let Some(wp_id) = &wp_id {
+                        self.config
+                            .reset_properties_for(&name, wp_id, key.as_deref());
+                    }
+                    if let Some(mcfg) = self.config.monitor_mut(&name) {
+                        match &key {
+                            Some(k) => {
+                                if let Some(found) = mcfg
+                                    .properties
+                                    .keys()
+                                    .find(|ek| ek.eq_ignore_ascii_case(k))
+                                    .cloned()
+                                {
+                                    mcfg.properties.remove(&found);
+                                }
+                            }
+                            None => mcfg.properties.clear(),
+                        }
+                    }
+
+                    let schema = self.outputs[idx]
+                        .wallpaper
+                        .as_ref()
+                        .map(|w| w.properties.clone())
+                        .unwrap_or_default();
+                    if let Some(r) = &mut self.outputs[idx].renderer {
+                        match &key {
+                            Some(k) => {
+                                let def = schema
+                                    .iter()
+                                    .find(|p| p.key.eq_ignore_ascii_case(k))
+                                    .map(|p| p.default_value.as_str())
+                                    .unwrap_or_else(|| universal_default_for_key(k));
+                                let _ = r.set_property(k, def);
+                            }
+                            None => {
+                                for p in &schema {
+                                    if p.prop_type != "group" && p.prop_type != "text" {
+                                        let _ = r.set_property(&p.key, &p.default_value);
+                                    }
+                                }
+                                for (uk, uv) in [
+                                    ("ui_brightness", "0.0"),
+                                    ("ui_contrast", "1.0"),
+                                    ("ui_saturation", "1.0"),
+                                    ("ui_hue", "0.0"),
+                                ] {
+                                    if !schema.iter().any(|p| p.key.eq_ignore_ascii_case(uk)) {
+                                        let _ = r.set_property(uk, uv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !self.outputs[idx].animating {
+                        self.outputs[idx].animating = true;
+                        self.schedule_render(idx);
+                    }
+                }
+                self.update_audio_state();
+                let _ = self.config.save(&self.config_path);
+                let msg = match &key {
+                    Some(k) => format!("reset property {k} to default"),
+                    None => "reset all properties to defaults".to_string(),
+                };
+                Response::ok(msg)
             }
             Request::Playlist {
                 interval_secs,
@@ -2423,32 +2534,63 @@ impl SeatHandler for App {
 }
 
 impl PointerHandler for App {
-    // the pointer only reaches us over a character: use the exact position
+    // Forward Wayland pointer position and left-button state over both the
+    // wallpaper layer surface and any character overlay surfaces.
     fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for ev in events {
-            if !matches!(ev.kind, PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }) {
-                continue;
-            }
-            // the overlay covers the output; a character window sits at its
-            // last drawn spot
-            let Some((oc, (wx, wy))) = self.outputs.iter().find_map(|oc| {
-                let fo = oc.front_overlay.as_ref()?;
-                if fo.layer.wl_surface() == &ev.surface {
-                    return Some((oc, (0, 0)));
+            let hit = self.outputs.iter().find_map(|oc| {
+                let (wx, wy) = if oc.layer.wl_surface() == &ev.surface {
+                    (0, 0)
+                } else if let Some(fo) = oc.front_overlay.as_ref() {
+                    if fo.layer.wl_surface() == &ev.surface {
+                        (0, 0)
+                    } else if let Some((x, y)) = fo.windows.origin_of(&ev.surface) {
+                        let s = oc.scale.max(1);
+                        (x / s, y / s)
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                };
+                let (ox, oy) = self
+                    .output_state
+                    .info(&oc.output)
+                    .and_then(|i| i.logical_position)
+                    .unwrap_or((0, 0));
+                Some((
+                    (ox + wx) as f32 + ev.position.0 as f32,
+                    (oy + wy) as f32 + ev.position.1 as f32,
+                ))
+            });
+            match ev.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    if let Some(p) = hit {
+                        self.cursor_pos = Some(p);
+                        *crate::backend::pointer::SYNC.lock().unwrap() = Some(p);
+                    }
                 }
-                let (x, y) = fo.windows.origin_of(&ev.surface)?;
-                let s = oc.scale.max(1);
-                Some((oc, (x / s, y / s)))
-            }) else {
-                continue;
-            };
-            let (ox, oy) = self
-                .output_state
-                .info(&oc.output)
-                .and_then(|i| i.logical_position)
-                .unwrap_or((0, 0));
-            let p = ((ox + wx) as f32 + ev.position.0 as f32, (oy + wy) as f32 + ev.position.1 as f32);
-            *crate::backend::pointer::SYNC.lock().unwrap() = Some(p);
+                PointerEventKind::Press { button, .. } if button == 0x110 => {
+                    if let Some(p) = hit {
+                        self.cursor_pos = Some(p);
+                        *crate::backend::pointer::SYNC.lock().unwrap() = Some(p);
+                        self.pointer_down = true;
+                        crate::backend::pointer::BUTTON_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                PointerEventKind::Release { button, .. } if button == 0x110 => {
+                    if let Some(p) = hit {
+                        self.cursor_pos = Some(p);
+                        *crate::backend::pointer::SYNC.lock().unwrap() = Some(p);
+                    }
+                    self.pointer_down = false;
+                    crate::backend::pointer::BUTTON_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.pointer_down = false;
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -2519,5 +2661,27 @@ fn lock_write(pixels: Vec<u8>, w: u32, h: u32) {
     });
     if spawned.is_err() {
         BUSY.store(false, Relaxed);
+    }
+}
+
+fn wallpaper_id(wp: &Wallpaper) -> String {
+    if let Some(id) = &wp.workshop_id {
+        id.clone()
+    } else {
+        wp.entry.to_string_lossy().into_owned()
+    }
+}
+
+fn universal_default_for_key(key: &str) -> &'static str {
+    match key.to_ascii_lowercase().as_str() {
+        "ui_brightness" | "brightness" | "ui_hue" | "hue" | "hueshift" => "0.0",
+        "ui_contrast" | "contrast" | "ui_saturation" | "saturation" | "speed" | "parallax" => {
+            "1.0"
+        }
+        "mute" => "true",
+        "volume" => "0.0",
+        "fit" => "cover",
+        "schemecolor" => "0.05 0.06 0.09",
+        _ => "",
     }
 }

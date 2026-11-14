@@ -15,6 +15,9 @@ pub struct Config {
     pub character: CharacterConfig,
     #[serde(rename = "monitor")]
     pub monitors: Vec<MonitorConfig>,
+    /// Per-wallpaper saved property overrides keyed by `"<monitor>::<wallpaper_id>"`.
+    #[serde(default)]
+    pub wallpaper_properties: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for Config {
@@ -23,6 +26,7 @@ impl Default for Config {
             general: General::default(),
             character: CharacterConfig::default(),
             monitors: Vec::new(),
+            wallpaper_properties: BTreeMap::new(),
         }
     }
 }
@@ -197,5 +201,57 @@ impl Config {
                     .unwrap_or_else(|| PathBuf::from("/tmp"))
                     .join("Wallpapers")
             })
+    }
+
+    fn wp_prop_key(monitor: &str, wp_id: &str) -> String {
+        format!("{monitor}::{wp_id}")
+    }
+
+    /// Saved property overrides for a specific `(monitor, wallpaper_id)` pair.
+    pub fn properties_for(&self, monitor: &str, wp_id: &str) -> BTreeMap<String, String> {
+        self.wallpaper_properties
+            .get(&Self::wp_prop_key(monitor, wp_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Persist one property override for a specific `(monitor, wallpaper_id)` pair.
+    pub fn set_property_for(&mut self, monitor: &str, wp_id: &str, key: &str, value: &str) {
+        let entry = self
+            .wallpaper_properties
+            .entry(Self::wp_prop_key(monitor, wp_id))
+            .or_default();
+        if let Some(dup) = entry
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(key) && k.as_str() != key)
+            .cloned()
+        {
+            entry.remove(&dup);
+        }
+        entry.insert(key.to_string(), value.to_string());
+    }
+
+    /// Reset one (or all, when `key` is `None`) saved property overrides for `(monitor, wp_id)`.
+    pub fn reset_properties_for(&mut self, monitor: &str, wp_id: &str, key: Option<&str>) {
+        let outer = Self::wp_prop_key(monitor, wp_id);
+        match key {
+            Some(target) => {
+                if let Some(map) = self.wallpaper_properties.get_mut(&outer) {
+                    if let Some(found) = map
+                        .keys()
+                        .find(|k| k.eq_ignore_ascii_case(target))
+                        .cloned()
+                    {
+                        map.remove(&found);
+                    }
+                    if map.is_empty() {
+                        self.wallpaper_properties.remove(&outer);
+                    }
+                }
+            }
+            None => {
+                self.wallpaper_properties.remove(&outer);
+            }
+        }
     }
 }

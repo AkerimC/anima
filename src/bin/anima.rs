@@ -67,16 +67,21 @@ enum Cmd {
         #[arg(long, short)]
         monitor: Option<String>,
     },
-    /// Inspect or modify Wallpaper Engine / Anima user properties at runtime.
+    /// Inspect, modify, or reset Wallpaper Engine / Anima user properties at runtime.
     Prop {
         /// Property key (e.g. `schemecolor`, `speed`, `parallax`, `clock`, `bars`, `fit`).
         /// Omit to list all properties for the active wallpaper.
         key: Option<String>,
         /// New value to assign.
         value: Option<String>,
+        /// Reset `key` (or all properties if `key` is omitted) back to defaults.
+        #[arg(long, short)]
+        reset: bool,
         #[arg(long, short)]
         monitor: Option<String>,
     },
+    /// Launch the desktop GUI (`anima-gui`), focused on the wallpapers inspector.
+    Gui,
     /// Configure automatic slideshow / playlist timer and shuffle mode.
     Playlist {
         /// Rotation interval in seconds (0 disables automatic timer).
@@ -259,6 +264,9 @@ fn run() -> Result<()> {
         Cmd::Tui => {
             return run_tui(&socket);
         }
+        Cmd::Gui => {
+            return launch_gui();
+        }
         Cmd::Ping => {
             let response = ipc::request(&socket, &Request::Ping)?;
             println!("{}", response.message);
@@ -304,25 +312,38 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Prop {
+            reset: true,
+            key,
+            monitor,
+            ..
+        } => Request::ResetProperties { monitor, key },
+        Cmd::Prop {
             key: Some(key),
             value: Some(value),
             monitor,
+            reset: false,
         } => Request::SetProperty {
             monitor,
             key,
             value,
         },
         Cmd::Prop {
-            key: None, monitor, ..
+            key: None,
+            monitor,
+            reset: false,
+            ..
         } => Request::ListProperties { monitor },
         Cmd::Prop {
             key: Some(key),
             value: None,
             monitor,
+            reset: false,
         } => {
             let resp = ipc::request(&socket, &Request::ListProperties { monitor })?;
             if let Some(data) = &resp.data {
-                println!("{}", serde_json::to_string_pretty(data)?);
+                if !print_single_property(data, &key) {
+                    anyhow::bail!("property `{key}` not found on active wallpaper");
+                }
             } else {
                 println!("property {key}: {}", resp.message);
             }
@@ -382,6 +403,7 @@ fn run() -> Result<()> {
         | Cmd::Workshop { .. }
         | Cmd::Unpack { .. }
         | Cmd::Tui
+        | Cmd::Gui
         | Cmd::Ping
         | Cmd::Quit => unreachable!(),
     };
@@ -396,27 +418,7 @@ fn run() -> Result<()> {
         }
     } else if matches!(request, Request::ListProperties { .. }) {
         if let Some(data) = &response.data {
-            if let Some(mons) = data.get("monitors").and_then(|m| m.as_array()) {
-                for m in mons {
-                    let mname = m.get("monitor").and_then(|v| v.as_str()).unwrap_or("?");
-                    let wp = m.get("wallpaper").and_then(|v| v.as_str()).unwrap_or("-");
-                    println!("Monitor {mname} ({wp}):");
-                    let overrides = m.get("overrides").and_then(|o| o.as_object());
-                    if let Some(schema) = m.get("schema").and_then(|s| s.as_array()) {
-                        for prop in schema {
-                            let k = prop.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-                            let ty = prop.get("prop_type").and_then(|v| v.as_str()).unwrap_or("?");
-                            let def = prop.get("default_value").and_then(|v| v.as_str()).unwrap_or("");
-                            let txt = prop.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                            let cur = overrides
-                                .and_then(|o| o.get(k))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(def);
-                            println!("  {k:<16} = {cur:<18} [{ty}] {txt}");
-                        }
-                    }
-                }
-            }
+            print_properties_report(data, false);
         }
     } else {
         println!("{}", response.message);
@@ -505,6 +507,241 @@ fn run_unpack(input: &Path, output: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn json_val_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn collect_monitor_values(
+    monitor_entry: &serde_json::Value,
+    schema: &[anima::wallpaper::WallpaperProperty],
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::HashSet<String>,
+) {
+    let mut values = std::collections::BTreeMap::new();
+    let mut overridden = std::collections::HashSet::new();
+    let ov = monitor_entry.get("overrides").and_then(|o| o.as_object());
+    for p in schema {
+        let mut cur = p.default_value.clone();
+        if let Some(v) = ov.and_then(|m| m.get(&p.key)) {
+            cur = json_val_to_string(v);
+            if cur.trim() != p.default_value.trim() {
+                overridden.insert(p.key.clone());
+            }
+        }
+        values.insert(p.key.clone(), cur);
+    }
+    if let Some(m) = ov {
+        for (k, v) in m {
+            if !values.contains_key(k) {
+                values.insert(k.clone(), json_val_to_string(v));
+                overridden.insert(k.clone());
+            }
+        }
+    }
+    (values, overridden)
+}
+
+fn prop_type_hint(p: &anima::wallpaper::WallpaperProperty) -> String {
+    match p.prop_type.as_str() {
+        "slider" => match (p.min, p.max) {
+            (Some(lo), Some(hi)) => format!("slider {lo}..{hi}"),
+            _ => "slider".to_string(),
+        },
+        "combo" if !p.options.is_empty() => {
+            let preview: Vec<String> = p
+                .options
+                .iter()
+                .take(4)
+                .map(|o| format!("{}={}", o.value, o.label))
+                .collect();
+            let suffix = if p.options.len() > 4 { ", …" } else { "" };
+            format!("combo: {}{suffix}", preview.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+fn print_properties_report(data: &serde_json::Value, show_indices: bool) -> Vec<String> {
+    let mut keys = Vec::new();
+    let Some(mons) = data.get("monitors").and_then(|m| m.as_array()) else {
+        return keys;
+    };
+    for m in mons {
+        let mname = m.get("monitor").and_then(|v| v.as_str()).unwrap_or("?");
+        let kind = m.get("kind").and_then(|v| v.as_str()).unwrap_or("-");
+        let wp = m.get("wallpaper").and_then(|v| v.as_str()).unwrap_or("-");
+        println!("Monitor {mname} [{kind}] ({wp}):");
+
+        let schema: Vec<anima::wallpaper::WallpaperProperty> = m
+            .get("schema")
+            .and_then(|s| serde_json::from_value(s.clone()).ok())
+            .unwrap_or_default();
+        if schema.is_empty() {
+            println!("  (no configurable properties)");
+            continue;
+        }
+        let (values, overridden) = collect_monitor_values(m, &schema);
+
+        let mut in_playback = false;
+        let mut printed_author_header = false;
+        for p in &schema {
+            let is_playback = p.order.unwrap_or(0) < 0;
+            if is_playback && !in_playback {
+                in_playback = true;
+                println!("  -- Playback & Color Adjustments --");
+            } else if !is_playback && in_playback {
+                in_playback = false;
+                if p.prop_type != "group" {
+                    printed_author_header = true;
+                    println!("  -- Wallpaper Properties --");
+                }
+            } else if !is_playback && !printed_author_header && p.prop_type != "group" {
+                printed_author_header = true;
+                println!("  -- Wallpaper Properties --");
+            }
+
+            if p.prop_type == "group" {
+                printed_author_header = true;
+                println!("  -- {} --", p.text);
+                continue;
+            }
+            if p.prop_type == "text" {
+                if !p.text.trim().is_empty() {
+                    println!("    [note] {}", p.text);
+                }
+                continue;
+            }
+
+            let idx = keys.len();
+            keys.push(p.key.clone());
+            let cur = values
+                .get(&p.key)
+                .map(String::as_str)
+                .unwrap_or(&p.default_value);
+            let mark = if overridden.contains(&p.key) { "*" } else { " " };
+            let hidden = p
+                .condition
+                .as_deref()
+                .is_some_and(|c| !wallpaper::eval_property_condition(c, &values));
+            let vis_tag = if hidden { " [hidden by condition]" } else { "" };
+            let hint = prop_type_hint(p);
+            let label = if p.text.is_empty() { "" } else { &p.text };
+            if show_indices {
+                println!(
+                    " {mark}[p{idx:<2}] {:<18} = {:<16} [{hint}] {label}{vis_tag}",
+                    p.key, cur
+                );
+            } else {
+                println!(
+                    " {mark}{:<20} = {:<16} [{hint}] {label}{vis_tag}",
+                    p.key, cur
+                );
+            }
+        }
+    }
+    keys
+}
+
+fn print_single_property(data: &serde_json::Value, key: &str) -> bool {
+    let Some(mons) = data.get("monitors").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    let mut found = false;
+    for m in mons {
+        let mname = m.get("monitor").and_then(|v| v.as_str()).unwrap_or("?");
+        let schema: Vec<anima::wallpaper::WallpaperProperty> = m
+            .get("schema")
+            .and_then(|s| serde_json::from_value(s.clone()).ok())
+            .unwrap_or_default();
+        let (values, overridden) = collect_monitor_values(m, &schema);
+        if let Some(p) = schema.iter().find(|p| p.key.eq_ignore_ascii_case(key)) {
+            found = true;
+            let cur = values
+                .get(&p.key)
+                .map(String::as_str)
+                .unwrap_or(&p.default_value);
+            let modified = if overridden.contains(&p.key) {
+                " (modified)"
+            } else {
+                " (default)"
+            };
+            println!("Monitor {mname}: {}", p.key);
+            if !p.text.is_empty() {
+                println!("  label    : {}", p.text);
+            }
+            println!("  type     : {}", p.prop_type);
+            println!("  value    : {cur}{modified}");
+            println!("  default  : {}", p.default_value);
+            if let (Some(lo), Some(hi)) = (p.min, p.max) {
+                let step = p
+                    .step
+                    .map(|s| format!(" step {s}"))
+                    .unwrap_or_default();
+                println!("  range    : {lo}..{hi}{step}");
+            }
+            if !p.options.is_empty() {
+                let opts: Vec<String> = p
+                    .options
+                    .iter()
+                    .map(|o| format!("{} ({})", o.value, o.label))
+                    .collect();
+                println!("  options  : {}", opts.join(", "));
+            }
+            if let Some(cond) = &p.condition {
+                let vis = wallpaper::eval_property_condition(cond, &values);
+                println!("  visible  : {vis} (condition: {cond})");
+            }
+        } else if let Some(val) = m
+            .get("overrides")
+            .and_then(|o| o.as_object())
+            .and_then(|o| o.get(key))
+        {
+            found = true;
+            println!("Monitor {mname}: {key}");
+            println!("  value    : {} (override)", json_val_to_string(val));
+        }
+    }
+    found
+}
+
+fn resolve_tui_prop_key(token: &str, prop_keys: &[String]) -> String {
+    if let Some(num) = token.strip_prefix('p').or_else(|| token.strip_prefix('P')) {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(idx) = num.parse::<usize>() {
+                if let Some(k) = prop_keys.get(idx) {
+                    return k.clone();
+                }
+            }
+        }
+    }
+    token.to_string()
+}
+
+fn launch_gui() -> Result<()> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("anima-gui")))
+        .filter(|p| p.is_file());
+    let bin = sibling
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("anima-gui"));
+    let mut cmd = std::process::Command::new(&bin);
+    if std::env::var_os("ANIMA_GUI_TAB").is_none() {
+        cmd.env("ANIMA_GUI_TAB", "wallpapers");
+    }
+    cmd.spawn()
+        .with_context(|| "could not launch anima-gui; is it built or installed on PATH?")?;
+    println!("launched anima-gui");
+    Ok(())
+}
+
 fn run_tui(socket: &Path) -> Result<()> {
     let cfg = anima::config::Config::load(&util::config_path()).unwrap_or_default();
     let mut items: Vec<Wallpaper> = Vec::new();
@@ -537,9 +774,11 @@ fn run_tui(socket: &Path) -> Result<()> {
     }
     println!("--------------------------------------------------------------");
     println!("  Commands: <number> apply | n next | p prev | space toggle");
-    println!("            prop <key> <val> | vol <0..1> | status | q quit");
+    println!("            props | prop <k|pN> <v> | reset [k|pN]");
+    println!("            vol <0..1> | status | gui | q quit");
     println!("--------------------------------------------------------------");
 
+    let mut prop_keys: Vec<String> = Vec::new();
     let stdin = io::stdin();
     loop {
         print!("anima> ");
@@ -571,6 +810,28 @@ fn run_tui(socket: &Path) -> Result<()> {
             continue;
         }
         let parts: Vec<&str> = cmd.split_whitespace().collect();
+        match parts.as_slice() {
+            ["props"] | ["pr"] => {
+                match ipc::request(socket, &Request::ListProperties { monitor: None }) {
+                    Ok(resp) => {
+                        if let Some(data) = &resp.data {
+                            prop_keys = print_properties_report(data, true);
+                        } else {
+                            println!("{}", resp.message);
+                        }
+                    }
+                    Err(e) => println!("error: {e}"),
+                }
+                continue;
+            }
+            ["gui"] => {
+                if let Err(e) = launch_gui() {
+                    println!("error: {e}");
+                }
+                continue;
+            }
+            _ => {}
+        }
         let req = match parts.as_slice() {
             ["n"] | ["next"] => Some(Request::Next { monitor: None }),
             ["p"] | ["prev"] => Some(Request::Prev { monitor: None }),
@@ -581,11 +842,21 @@ fn run_tui(socket: &Path) -> Result<()> {
                 volume: Some(lvl),
                 mute: Some(lvl <= 0.0),
             }),
-            ["prop", k, rest @ ..] if !rest.is_empty() => Some(Request::SetProperty {
+            ["reset"] => Some(Request::ResetProperties {
                 monitor: None,
-                key: (*k).to_string(),
-                value: rest.join(" "),
+                key: None,
             }),
+            ["reset", k] => Some(Request::ResetProperties {
+                monitor: None,
+                key: Some(resolve_tui_prop_key(k, &prop_keys)),
+            }),
+            ["prop", k, rest @ ..] | ["set", k, rest @ ..] if !rest.is_empty() => {
+                Some(Request::SetProperty {
+                    monitor: None,
+                    key: resolve_tui_prop_key(k, &prop_keys),
+                    value: rest.join(" "),
+                })
+            }
             ["s", path] | ["set", path] => Some(Request::Set {
                 monitor: None,
                 path: (*path).to_string(),

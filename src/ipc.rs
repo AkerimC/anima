@@ -52,6 +52,10 @@ pub enum Request {
     ListProperties {
         monitor: Option<String>,
     },
+    ResetProperties {
+        monitor: Option<String>,
+        key: Option<String>,
+    },
     Playlist {
         interval_secs: Option<u64>,
         shuffle: Option<bool>,

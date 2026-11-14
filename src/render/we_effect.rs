@@ -835,9 +835,14 @@ fn preprocess(src: &str, vertex: bool, combos: &[(String, i32)]) -> String {
         src = src.replace("gl_FragColor", "fragColor");
     }
     src = src.replace("texture2D(", "texture(");
-    // `sample` is a reserved word in GLSL ES 3.00 but a common local variable
-    // name in Wallpaper Engine's shaders.
+    // `sample` and `input` are reserved words in GLSL ES 3.00 but common local
+    // variable names in Wallpaper Engine's HLSL shaders.
     src = replace_word(&src, "sample", "sample_");
+    src = replace_word(&src, "input", "input_");
+
+    // Strip HLSL preprocessor trailing `;` on `#if`/`#elif` and accidental
+    // swizzles on top-level `in`/`out` varying declarations (e.g. `in vec4 v_Size.xy;`).
+    src = sanitize_preprocessor_and_varyings(&src);
 
     // Relax HLSL-style `const` on local runtime initializers and unsized arrays.
     src = src
@@ -874,8 +879,9 @@ fn preprocess(src: &str, vertex: bool, combos: &[(String, i32)]) -> String {
     // initializers.
     src = rename_builtin_redefinitions(&src);
     src = coerce_bool_arithmetic(&src);
-    let types = identifier_widths(&src);
+    let mut types = identifier_widths(&src);
     let functions = function_widths(&src);
+    collect_define_widths(&src, &mut types, &functions);
     let params = function_params(&src, &types);
     src = coerce_mixed_arithmetic(&src, &types, &functions);
     src = coerce_assignments(&src, &types, &functions);
@@ -891,7 +897,11 @@ fn preprocess(src: &str, vertex: bool, combos: &[(String, i32)]) -> String {
             int_names.push(name.clone());
         }
     }
-    src = coerce_bool_conditions(&src, &int_names);
+    let float_scalars: Vec<String> = types
+        .iter()
+        .filter_map(|(k, &w)| (w == 1 && !functions.contains_key(k)).then(|| k.clone()))
+        .collect();
+    src = coerce_bool_conditions(&src, &int_names, &float_scalars);
 
     // Balance stray `#endif` directives in custom Workshop shaders.
     let mut if_depth = 0i32;
@@ -1488,6 +1498,19 @@ fn infer_width(expr: &str, types: &HashMap<String, u8>, funcs: &HashMap<String, 
             pending = true;
             continue;
         }
+        if c == b'(' {
+            let end = matching_paren(expr, i).unwrap_or(bytes.len());
+            let mut w = infer_width(&expr[i + 1..end], types, funcs);
+            i = (end + 1).min(bytes.len());
+            let (sw, ni) = parse_swizzle_len(expr, i);
+            if sw > 0 {
+                w = sw;
+                i = ni;
+            }
+            atom = w;
+            pending = true;
+            continue;
+        }
         if c == b'.' {
             let (sw, ni) = parse_swizzle_len(expr, i);
             if sw > 0 {
@@ -1687,9 +1710,99 @@ fn function_widths(src: &str) -> HashMap<String, u8> {
     map
 }
 
-/// Map user function names to the widths of their parameters.
-fn function_params(src: &str, types: &HashMap<String, u8>) -> HashMap<String, Vec<u8>> {
-    let mut map: HashMap<String, Vec<u8>> = HashMap::new();
+/// Collect widths of object-like `#define NAME expr` macros so mixed-width
+/// arithmetic (e.g. `v_TexCoord - texScaleCenter`) knows macro operand sizes.
+fn collect_define_widths(
+    src: &str,
+    types: &mut HashMap<String, u8>,
+    funcs: &HashMap<String, u8>,
+) {
+    let mut defs: Vec<(&str, &str)> = Vec::new();
+    for raw in src.lines() {
+        let code = strip_line_comment(raw).trim();
+        let Some(rest) = code.strip_prefix("#define ") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let name_end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            continue;
+        }
+        // Skip function-like macros `#define FOO(x) ...`.
+        if rest.as_bytes().get(name_end) == Some(&b'(') {
+            continue;
+        }
+        let name = &rest[..name_end];
+        let rhs = rest[name_end..].trim();
+        if !rhs.is_empty() && !types.contains_key(name) {
+            defs.push((name, rhs));
+        }
+    }
+    for _ in 0..2 {
+        for &(name, rhs) in &defs {
+            if !types.contains_key(name) {
+                let w = infer_width(rhs, types, funcs);
+                if w > 0 {
+                    types.insert(name.to_string(), w);
+                }
+            }
+        }
+    }
+}
+
+/// Strip stray HLSL semicolons on `#if`/`#elif` lines and accidental swizzle
+/// suffixes on top-level `in`/`out` varying declarations.
+fn sanitize_preprocessor_and_varyings(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut depth = 0i32;
+    for raw in src.lines() {
+        let code = strip_line_comment(raw);
+        let comment = if code.len() < raw.len() {
+            &raw[code.len()..]
+        } else {
+            ""
+        };
+        let trimmed = code.trim_start();
+        let mut line = raw.to_string();
+        if (trimmed.starts_with("#if") || trimmed.starts_with("#elif"))
+            && code.trim_end().ends_with(';')
+        {
+            let clean = code.trim_end().trim_end_matches(';').trim_end();
+            line = if comment.is_empty() {
+                clean.to_string()
+            } else {
+                format!("{clean} {comment}")
+            };
+        } else if depth == 0 && (trimmed.starts_with("in ") || trimmed.starts_with("out ")) {
+            if let Some(semi) = code.find(';') {
+                let before_semi = code[..semi].trim_end();
+                if let Some(dot) = before_semi.rfind('.') {
+                    let swz = &before_semi[dot + 1..];
+                    if !swz.is_empty()
+                        && swz.bytes().all(|c| matches!(c, b'x' | b'y' | b'z' | b'w' | b'r' | b'g' | b'b' | b'a' | b's' | b't' | b'p' | b'q'))
+                    {
+                        line = format!("{}{}{comment}", &code[..dot], &code[semi..]);
+                    }
+                }
+            }
+        }
+        depth += code.matches('{').count() as i32;
+        depth -= code.matches('}').count() as i32;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Map `(function name, arity)` to parameter type codes:
+/// `1..=4` = `float`/`vec2`/`vec3`/`vec4`, `-1` = `int`, `-2` = `uint`, `0` = other.
+fn function_params(
+    src: &str,
+    types: &HashMap<String, u8>,
+) -> HashMap<(String, usize), Vec<Vec<i8>>> {
+    let mut map: HashMap<(String, usize), Vec<Vec<i8>>> = HashMap::new();
     let text = src;
     let bytes = text.as_bytes();
     let mut i = 0usize;
@@ -1703,14 +1816,10 @@ fn function_params(src: &str, types: &HashMap<String, u8>) -> HashMap<String, Ve
             i += 1;
         }
         let word = &text[start..i];
-        let ret_width = match word {
-            "float" => 1,
-            "vec2" => 2,
-            "vec3" => 3,
-            "vec4" => 4,
-            _ => 0,
-        };
-        if ret_width == 0 {
+        if !matches!(
+            word,
+            "void" | "float" | "vec2" | "vec3" | "vec4" | "int" | "uint" | "bool"
+        ) {
             continue;
         }
         let mut j = i;
@@ -1736,31 +1845,32 @@ fn function_params(src: &str, types: &HashMap<String, u8>) -> HashMap<String, Ve
         };
         let params_src = &text[j + 1..end];
         let mut widths = Vec::new();
-        for param in split_top_level(params_src, ',') {
-            let mut w = 0u8;
-            for token in param.split_whitespace() {
-                if is_qualifier(token) {
-                    continue;
-                }
-                w = w.max(*types.get(token).unwrap_or(&0));
-            }
-            if w == 0 {
+        if !params_src.trim().is_empty() {
+            for param in split_top_level(params_src, ',') {
+                let mut kind = 0i8;
                 for token in param.split_whitespace() {
                     if is_qualifier(token) {
                         continue;
                     }
-                    w = w.max(match token {
+                    kind = match token {
+                        "int" => -1,
+                        "uint" => -2,
                         "float" => 1,
                         "vec2" => 2,
                         "vec3" => 3,
                         "vec4" => 4,
-                        _ => 0,
-                    });
+                        _ => (*types.get(token).unwrap_or(&0)) as i8,
+                    };
+                    if kind != 0 {
+                        break;
+                    }
                 }
+                widths.push(kind);
             }
-            widths.push(w);
         }
-        map.entry(name.to_string()).or_insert(widths);
+        map.entry((name.to_string(), widths.len()))
+            .or_default()
+            .push(widths);
         i = end + 1;
     }
     map
@@ -1893,8 +2003,9 @@ fn coerce_assignment_line(
         "vec4" => 4,
         _ => 0,
     };
+    let decl_int = matches!(first_word, "int" | "uint");
 
-    if decl_width > 0 {
+    if decl_width > 0 || decl_int {
         let rest = trimmed[first_word.len()..].trim_start();
         let semi = match rest.find(';') {
             Some(p) => p,
@@ -1916,13 +2027,23 @@ fn coerce_assignment_line(
             if let Some(eq) = find_assignment(declarator) {
                 let lhs = &declarator[..eq];
                 let rhs = declarator[eq + 1..].trim();
-                let coerced = coerce_expr(rhs, decl_width, types, funcs);
+                let coerced = if decl_int {
+                    coerce_int_expr(rhs, first_word, types, funcs)
+                } else {
+                    coerce_expr(rhs, decl_width, types, funcs)
+                };
                 pieces.push(format!("{lhs}= {coerced}"));
             } else {
                 pieces.push(declarator.to_string());
             }
         }
-        return format!("{indent}{first_word} {};{comment}", pieces.join(", "));
+        let tail_code = &rest[semi + 1..];
+        let tail = if tail_code.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" {}", coerce_assignment_line(tail_code, types, funcs).trim_start())
+        };
+        return format!("{indent}{first_word} {};{tail}{comment}", pieces.join(", "));
     }
 
     // Plain assignment: `<ident> = <expr>;`
@@ -1941,16 +2062,63 @@ fn coerce_assignment_line(
     };
     let rhs = trimmed[eq + 1..eq + 1 + semi].trim();
     let coerced = coerce_expr(rhs, lhs_width, types, funcs);
-    format!("{indent}{lhs} = {coerced};{comment}")
+    let tail_code = &trimmed[eq + 1 + semi + 1..];
+    let tail = if tail_code.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" {}", coerce_assignment_line(tail_code, types, funcs).trim_start())
+    };
+    format!("{indent}{lhs} = {coerced};{tail}{comment}")
+}
+
+fn coerce_int_expr(
+    expr: &str,
+    ty: &str,
+    types: &HashMap<String, u8>,
+    funcs: &HashMap<String, u8>,
+) -> String {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() || trimmed.starts_with(&format!("{ty}(")) {
+        return expr.to_string();
+    }
+    if let Some(lit) = strip_whole_float_suffix(trimmed) {
+        return if ty == "uint" {
+            format!("{lit}u")
+        } else {
+            lit.to_string()
+        };
+    }
+    let w = infer_width(trimmed, types, funcs);
+    let has_float = w >= 1
+        || trimmed.contains('.')
+        || contains_word(trimmed, "mod")
+        || contains_word(trimmed, "floor")
+        || contains_word(trimmed, "ceil")
+        || contains_word(trimmed, "round");
+    if has_float {
+        if w > 1 {
+            return format!("{ty}(({trimmed}).x)");
+        }
+        return format!("{ty}({trimmed})");
+    }
+    expr.to_string()
+}
+
+fn strip_whole_float_suffix(s: &str) -> Option<&str> {
+    let core = s.strip_suffix(['f', 'F']).unwrap_or(s);
+    let num = core.strip_suffix(".0")?;
+    let digits = num.strip_prefix(['-', '+']).unwrap_or(num);
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(num)
 }
 
 /// Coerce arguments of calls to user-defined functions (HLSL lets a `vec4`
-/// argument bind to a `vec3` parameter by truncation).
+/// argument bind to a `vec3` parameter by truncation, and integer literals
+/// promoted earlier to `.0` bind back to `int`/`uint` parameters).
 fn coerce_call_args(
     src: &str,
     types: &HashMap<String, u8>,
     funcs: &HashMap<String, u8>,
-    params: &HashMap<String, Vec<u8>>,
+    params: &HashMap<(String, usize), Vec<Vec<i8>>>,
 ) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len() + 64);
@@ -1966,44 +2134,60 @@ fn coerce_call_args(
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
-            if bytes.get(j) == Some(&b'(') && params.contains_key(word) {
-                // Skip the definition itself: the preceding token is a type.
-                let mut k = start;
-                while k > 0 && src.as_bytes()[k - 1].is_ascii_whitespace() {
-                    k -= 1;
-                }
-                let mut w = k;
-                while w > 0 && is_ident_char(src.as_bytes()[w - 1]) {
-                    w -= 1;
-                }
-                let prev = &src[w..k];
-                if matches!(prev, "float" | "vec2" | "vec3" | "vec4" | "void" | "int" | "uint") {
-                    out.push_str(word);
-                    continue;
-                }
-                let Some(end) = matching_paren(src, j) else {
-                    out.push_str(word);
-                    continue;
-                };
-                let args = &src[j + 1..end];
-                let expected = params.get(word).cloned().unwrap_or_default();
-                let mut coerced = Vec::new();
-                for (idx, arg) in split_top_level(args, ',').into_iter().enumerate() {
-                    let expected_w = expected.get(idx).copied().unwrap_or(0);
-                    if expected_w == 0 || arg.trim().is_empty() {
-                        coerced.push(arg.to_string());
+            if bytes.get(j) == Some(&b'(') {
+                if let Some(end) = matching_paren(src, j) {
+                    let args = &src[j + 1..end];
+                    let arg_list = if args.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        split_top_level(args, ',')
+                    };
+                    if let Some(overloads) = params.get(&(word.to_string(), arg_list.len())) {
+                        // Skip the definition itself: the preceding token is a type.
+                        let mut k = start;
+                        while k > 0 && src.as_bytes()[k - 1].is_ascii_whitespace() {
+                            k -= 1;
+                        }
+                        let mut w = k;
+                        while w > 0 && is_ident_char(src.as_bytes()[w - 1]) {
+                            w -= 1;
+                        }
+                        let prev = &src[w..k];
+                        if matches!(
+                            prev,
+                            "float" | "vec2" | "vec3" | "vec4" | "void" | "int" | "uint" | "bool"
+                        ) {
+                            out.push_str(word);
+                            continue;
+                        }
+                        let mut coerced = Vec::new();
+                        for (idx, arg) in arg_list.into_iter().enumerate() {
+                            let first = overloads[0].get(idx).copied().unwrap_or(0);
+                            let agreed = overloads
+                                .iter()
+                                .all(|sig| sig.get(idx).copied().unwrap_or(0) == first);
+                            if !agreed || first == 0 || arg.trim().is_empty() {
+                                coerced.push(arg.to_string());
+                                continue;
+                            }
+                            let nested = coerce_call_args(arg, types, funcs, params);
+                            let c = if first == -1 {
+                                coerce_int_expr(&nested, "int", types, funcs)
+                            } else if first == -2 {
+                                coerce_int_expr(&nested, "uint", types, funcs)
+                            } else {
+                                coerce_expr(&nested, first as u8, types, funcs)
+                            };
+                            coerced.push(c);
+                        }
+                        out.push_str(word);
+                        out.push('(');
+                        out.push_str(&coerced.join(", "));
+                        out.push(')');
+                        i = end + 1;
                         continue;
                     }
-                    let nested = coerce_call_args(arg, types, funcs, params);
-                    let c = coerce_expr(&nested, expected_w, types, funcs);
-                    coerced.push(c);
                 }
-                out.push_str(word);
-                out.push('(');
-                out.push_str(&coerced.join(", "));
-                out.push(')');
-                i = end + 1;
-                continue;
             }
             out.push_str(word);
             continue;
@@ -2083,7 +2267,11 @@ fn left_atom(
             }
             start = s;
         }
-        let w = infer_width(&text[start..end], types, funcs);
+        let w = if bytes[start].is_ascii_digit() {
+            1
+        } else {
+            infer_width(&text[start..end], types, funcs)
+        };
         return Some((start, end, w));
     }
     if is_ident_char(bytes[j]) {
@@ -2102,7 +2290,11 @@ fn left_atom(
             }
             break;
         }
-        let w = infer_width(&text[start..end], types, funcs);
+        let w = if bytes[start].is_ascii_digit() {
+            1
+        } else {
+            infer_width(&text[start..end], types, funcs)
+        };
         return Some((start, end, w));
     }
     if bytes[j].is_ascii_digit() {
@@ -2140,7 +2332,11 @@ fn right_atom(
     if bytes[j] == b'(' {
         let close = matching_paren(text, j)?;
         let end = close + 1;
-        let w = infer_width(&text[start..end], types, funcs);
+        let w = if bytes[start].is_ascii_digit() {
+            1
+        } else {
+            infer_width(&text[start..end], types, funcs)
+        };
         return Some((start, end, w));
     }
     if is_ident_start(bytes[j]) {
@@ -2184,6 +2380,55 @@ fn right_atom(
     None
 }
 
+/// Find the start of the enclosing left-hand arithmetic subexpression before
+/// `op` (respecting parentheses and `*`/`/` vs `+`/`-` precedence).
+fn left_subexpr_start(text: &str, op: usize, is_mul_div: bool) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = op;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' => {
+                if depth == 0 {
+                    return skip_ws(text, i + 1);
+                }
+                depth -= 1;
+            }
+            b',' | b'=' | b';' | b'?' | b':' | b'<' | b'>' | b'&' | b'|' | b'!' if depth == 0 => {
+                return skip_ws(text, i + 1);
+            }
+            b'+' | b'-' if is_mul_div && depth == 0 => {
+                // Only stop if binary `+`/`-`.
+                let mut p = i;
+                while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+                    p -= 1;
+                }
+                let binary = p > 0
+                    && !matches!(
+                        bytes[p - 1],
+                        b'(' | b',' | b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/'
+                            | b'%' | b'&' | b'|' | b'?' | b':'
+                    );
+                if binary {
+                    return skip_ws(text, i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    skip_ws(text, 0)
+}
+
+fn skip_ws(text: &str, mut pos: usize) -> usize {
+    let bytes = text.as_bytes();
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    pos
+}
+
 /// HLSL shaders in the Workshop occasionally mix vector widths in arithmetic
 /// (`vec3 - vec2`).  GLSL ES rejects this, so truncate the wider operand to the
 /// narrower width.
@@ -2194,65 +2439,74 @@ fn coerce_mixed_arithmetic(
 ) -> String {
     let mut out = String::with_capacity(src.len() + 64);
     for raw in src.lines() {
-        let code = strip_line_comment(raw);
-        let trimmed = code.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            out.push_str(raw);
-            out.push('\n');
-            continue;
-        }
-        let bytes = code.as_bytes();
-        let mut inserts: Vec<(usize, String)> = Vec::new();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let c = bytes[i];
-            if matches!(c, b'+' | b'-' | b'*' | b'/' | b'%') {
-                let next = bytes.get(i + 1).copied().unwrap_or(0);
-                let prev = if i == 0 { 0 } else { bytes[i - 1] };
-                if next == b'=' || next == c || prev == c {
-                    i += 1;
-                    continue;
-                }
-                let mut p = i;
-                while p > 0 && bytes[p - 1].is_ascii_whitespace() {
-                    p -= 1;
-                }
-                let prev_char = if p == 0 { 0 } else { bytes[p - 1] };
-                let unary = p == 0
-                    || matches!(
-                        prev_char,
-                        b'(' | b',' | b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/'
-                            | b'%' | b'&' | b'|' | b'?'
-                    );
-                if unary {
-                    i += 1;
-                    continue;
-                }
-                if let (Some((_, le, lw)), Some((_, re, rw))) =
-                    (left_atom(code, i, types, funcs), right_atom(code, i, types, funcs))
-                {
-                    if lw >= 2 && rw >= 2 && lw != rw {
-                        let swizzle = swizzle_for_width(lw.min(rw));
-                        if lw > rw {
-                            inserts.push((le, format!(".{swizzle}")));
-                        } else {
-                            inserts.push((re, format!(".{swizzle}")));
+        let mut line = raw.to_string();
+        for _ in 0..16 {
+            let code = strip_line_comment(&line).to_string();
+            let trimmed = code.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                break;
+            }
+            let bytes = code.as_bytes();
+            let mut edit: Option<(usize, usize, String)> = None;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if matches!(c, b'+' | b'-' | b'*' | b'/' | b'%') {
+                    let next = bytes.get(i + 1).copied().unwrap_or(0);
+                    let prev = if i == 0 { 0 } else { bytes[i - 1] };
+                    if next == b'=' || next == c || prev == c {
+                        i += 1;
+                        continue;
+                    }
+                    let mut p = i;
+                    while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+                        p -= 1;
+                    }
+                    let prev_char = if p == 0 { 0 } else { bytes[p - 1] };
+                    let unary = p == 0
+                        || matches!(
+                            prev_char,
+                            b'(' | b',' | b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/'
+                                | b'%' | b'&' | b'|' | b'?'
+                        );
+                    if unary {
+                        i += 1;
+                        continue;
+                    }
+                    if let (Some((_, le, lw)), Some((_, re, rw))) =
+                        (left_atom(&code, i, types, funcs), right_atom(&code, i, types, funcs))
+                    {
+                        if lw >= 2 && rw >= 2 && lw != rw {
+                            let swizzle = swizzle_for_width(lw.min(rw));
+                            if lw > rw {
+                                edit = Some((le, le, format!(".{swizzle}")));
+                            } else {
+                                edit = Some((re, re, format!(".{swizzle}")));
+                            }
+                            break;
+                        }
+                        if lw <= 1 && rw >= 2 && matches!(c, b'+' | b'-' | b'*' | b'/') {
+                            let sub_start = left_subexpr_start(&code, i, matches!(c, b'*' | b'/'));
+                            if sub_start < le {
+                                let sub_w = infer_width(&code[sub_start..le], types, funcs);
+                                if sub_w > rw {
+                                    let swizzle = swizzle_for_width(rw);
+                                    edit = Some((
+                                        sub_start,
+                                        le,
+                                        format!("({}).{swizzle}", &code[sub_start..le]),
+                                    ));
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
+                i += 1;
             }
-            i += 1;
-        }
-        if inserts.is_empty() {
-            out.push_str(raw);
-            out.push('\n');
-            continue;
-        }
-        inserts.sort_by(|a, b| b.0.cmp(&a.0));
-        let mut line = raw.to_string();
-        for (pos, s) in inserts {
-            if pos <= line.len() {
-                line.insert_str(pos, &s);
+            match edit {
+                Some((s, e, rep)) => line.replace_range(s..e, &rep),
+                None => break,
             }
         }
         out.push_str(&line);
@@ -2261,29 +2515,26 @@ fn coerce_mixed_arithmetic(
     out
 }
 
-/// Move global initializers that reference uniforms into `main()`; GLSL ES
-/// requires global initializers to be constant expressions.
+/// Move non-constant global initializers (e.g. referencing uniforms or other
+/// non-const globals) into `main()`; GLSL ES requires constant expressions on globals.
 fn hoist_global_initializers(src: &str) -> String {
-    let mut uniforms: Vec<String> = Vec::new();
+    let mut non_const: Vec<String> = Vec::new();
     for raw in src.lines() {
         let line = strip_line_comment(raw).trim_start();
         if let Some(rest) = line.strip_prefix("uniform ") {
             if let Some(eq) = find_assignment(rest) {
                 let lhs = rest[..eq].trim();
                 if let Some(name) = lhs.split_whitespace().last() {
-                    uniforms.push(name.trim_end_matches(|c: char| c == '[' || c == ']').to_string());
+                    non_const.push(name.trim_end_matches(|c: char| c == '[' || c == ']').to_string());
                 }
             } else {
                 let lhs = rest.trim().trim_end_matches(';').trim();
                 if let Some(name) = lhs.split_whitespace().last() {
                     let name = name.split('[').next().unwrap_or(name);
-                    uniforms.push(name.to_string());
+                    non_const.push(name.to_string());
                 }
             }
         }
-    }
-    if uniforms.is_empty() {
-        return src.to_string();
     }
 
     let mut depth = 0i32;
@@ -2293,30 +2544,34 @@ fn hoist_global_initializers(src: &str) -> String {
         let code = strip_line_comment(raw);
         let trimmed = code.trim_start();
         let mut replaced = raw.to_string();
-        if depth == 0 && !trimmed.starts_with('#') {
+        if depth == 0 && !trimmed.starts_with('#') && !trimmed.starts_with("const ") {
             let first_word = trimmed
                 .find(|c: char| !(c.is_alphanumeric() || c == '_'))
                 .map(|p| &trimmed[..p])
                 .unwrap_or(trimmed);
-            let width = match first_word {
-                "float" | "vec2" | "vec3" | "vec4" => 1,
-                _ => 0,
-            };
-            if width > 0 && trimmed.contains(';') {
+            let is_val_type = matches!(
+                first_word,
+                "float" | "vec2" | "vec3" | "vec4" | "mat2" | "mat3" | "mat4" | "int" | "uint"
+            );
+            if is_val_type && trimmed.contains(';') {
                 let rest = trimmed[first_word.len()..].trim_start();
                 let body = &rest[..rest.find(';').unwrap()];
                 if !body.contains('(') || body.find('=').map_or(false, |eq| eq < body.find('(').unwrap()) {
                     if let Some(eq) = find_assignment(body) {
                         let lhs = body[..eq].trim();
                         let rhs = body[eq + 1..].trim();
-                        if !lhs.contains(',')
-                            && !lhs.contains('[')
-                            && uniforms.iter().any(|u| contains_word(rhs, u))
-                        {
-                            let indent = &raw[..raw.len() - raw.trim_start().len()];
+                        if !lhs.contains(',') && !lhs.contains('[') {
                             let name = lhs.split_whitespace().last().unwrap_or(lhs);
-                            replaced = format!("{indent}{first_word} {name};");
-                            assigns.push(format!("{name} = {rhs};"));
+                            if non_const.iter().any(|u| contains_word(rhs, u)) {
+                                let indent = &raw[..raw.len() - raw.trim_start().len()];
+                                replaced = format!("{indent}{first_word} {name};");
+                                assigns.push(format!("{name} = {rhs};"));
+                            }
+                            non_const.push(name.to_string());
+                        }
+                    } else if !body.contains(',') && !body.contains('[') {
+                        if let Some(name) = body.split_whitespace().last() {
+                            non_const.push(name.to_string());
                         }
                     }
                 }
@@ -3078,8 +3333,21 @@ fn coerce_return_values(
     out
 }
 
-/// Convert integer conditions (`INVERT ? a : b`, `if (INVERT)`) to booleans.
-fn coerce_bool_conditions(src: &str, int_names: &[String]) -> String {
+/// Convert integer and float scalar conditions (`INVERT ? a : b`, `if (INVERT)`) to booleans.
+fn coerce_bool_conditions(
+    src: &str,
+    int_names: &[String],
+    float_scalars: &[String],
+) -> String {
+    let cond_suffix = |word: &str| -> Option<&'static str> {
+        if int_names.iter().any(|n| n == word) {
+            Some("!= 0")
+        } else if float_scalars.iter().any(|n| n == word) {
+            Some("!= 0.0")
+        } else {
+            None
+        }
+    };
     let mut out = String::with_capacity(src.len() + 32);
     for raw in src.lines() {
         let code = strip_line_comment(raw);
@@ -3102,8 +3370,8 @@ fn coerce_bool_conditions(src: &str, int_names: &[String]) -> String {
                 if line.as_bytes().get(j) == Some(&b'(') {
                     if let Some(end) = matching_paren(&line, j) {
                         let inner = line[j + 1..end].trim();
-                        if int_names.iter().any(|n| n == inner) {
-                            let replacement = format!("({inner} != 0)");
+                        if let Some(suffix) = cond_suffix(inner) {
+                            let replacement = format!("({inner} {suffix})");
                             line.replace_range(j + 1..end, &replacement);
                         }
                         from = end + 1;
@@ -3125,14 +3393,14 @@ fn coerce_bool_conditions(src: &str, int_names: &[String]) -> String {
             }
             if k < end {
                 let word = &line[k..end];
-                if int_names.iter().any(|n| n == word) {
+                if let Some(suffix) = cond_suffix(word) {
                     let before_ok = k == 0
                         || matches!(
                             line.as_bytes()[k - 1],
-                            b'(' | b'=' | b'!' | b'&' | b'|' | b',' | b' ' | b'\t'
+                            b'(' | b'=' | b'!' | b'&' | b'|' | b',' | b' ' | b'\t' | b':'
                         );
                     if before_ok {
-                        line.replace_range(k..end, &format!("({word} != 0)"));
+                        line.replace_range(k..end, &format!("({word} {suffix})"));
                     }
                 }
             }
@@ -3241,6 +3509,292 @@ fn reconcile_varyings(vert: &str, frag: &str) -> (String, String) {
     (new_vert, frag.to_string())
 }
 
+/// Move `v_TexCoordKernel[49]` (used by `textoutline7x7`) from vertex outputs
+/// into the fragment shader so total varying vector count fits GLSL ES limits.
+fn lower_large_varying_kernels(vert: &str, frag: &str) -> (String, String) {
+    if !vert.contains("out vec2 v_TexCoordKernel[49];")
+        || !frag.contains("in vec2 v_TexCoordKernel[49];")
+    {
+        return (vert.to_string(), frag.to_string());
+    }
+    let new_vert = vert.replace(
+        "out vec2 v_TexCoordKernel[49];",
+        "vec2 v_TexCoordKernel[49];",
+    );
+    let mut extra_decls = String::new();
+    if !frag.contains("g_Texture0Resolution") {
+        extra_decls.push_str("uniform vec4 g_Texture0Resolution;\n");
+    }
+    if !frag.contains("g_OutlineWidth") {
+        extra_decls.push_str("uniform float g_OutlineWidth;\n");
+    }
+    let mut new_frag = frag.replace("in vec2 v_TexCoordKernel[49];", extra_decls.trim_end());
+    if let Some(pos) = new_frag.find("void main") {
+        if let Some(open) = new_frag[pos..].find('{') {
+            let at = pos + open + 1;
+            let setup = "\n\tvec2 v_TexCoordKernel[49];\n\tvec2 _tk_step = vec2(1.0 / g_Texture0Resolution.z, 1.0 / g_Texture0Resolution.w) * g_OutlineWidth;\n\tint _tk_idx = 0;\n\tfor (int _tk_y = -3; _tk_y <= 3; _tk_y++) {\n\t\tfor (int _tk_x = -3; _tk_x <= 3; _tk_x++) {\n\t\t\tv_TexCoordKernel[_tk_idx++] = v_TexCoord.xy + vec2(float(_tk_x), float(_tk_y)) * _tk_step;\n\t\t}\n\t}\n";
+            new_frag.insert_str(at, setup);
+        }
+    }
+    (new_vert, new_frag)
+}
+
+/// True if `code` writes to `name` (`name =`, `name.xy =`, `name +=`, etc.).
+fn writes_ident(code: &str, name: &str) -> bool {
+    let bytes = code.as_bytes();
+    let nbytes = name.as_bytes();
+    let mut i = 0usize;
+    while i + nbytes.len() <= bytes.len() {
+        if &bytes[i..i + nbytes.len()] == nbytes
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && (i + nbytes.len() == bytes.len() || !is_ident_char(bytes[i + nbytes.len()]))
+        {
+            let mut j = i + nbytes.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'.' {
+                let (_, ni) = parse_swizzle_len(code, j);
+                j = ni;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            } else if j < bytes.len() && bytes[j] == b'[' {
+                if let Some(close) = bytes[j..].iter().position(|&b| b == b']') {
+                    j += close + 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                }
+            }
+            let b0 = bytes.get(j).copied().unwrap_or(0);
+            let b1 = bytes.get(j + 1).copied().unwrap_or(0);
+            if (b0 == b'=' && b1 != b'=')
+                || (matches!(b0, b'+' | b'-' | b'*' | b'/') && b1 == b'=')
+                || (b0 == b'+' && b1 == b'+')
+                || (b0 == b'-' && b1 == b'-')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Shadow fragment `in` varyings that the shader writes to (valid in HLSL
+/// `PS_INPUT`, forbidden in GLSL ES 3.00 where `in` is read-only).
+fn make_written_inputs_mutable(frag: &str) -> String {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    for raw in frag.lines() {
+        let code = strip_line_comment(raw);
+        let t = code.trim_start();
+        if depth == 0 {
+            if let Some(rest) = t.strip_prefix("in ") {
+                let mut words = rest.split_whitespace();
+                if let (Some(ty), Some(raw_name)) = (words.next(), words.next()) {
+                    if matches!(ty, "float" | "vec2" | "vec3" | "vec4")
+                        && !raw_name.contains('[')
+                        && !raw_name.contains('(')
+                    {
+                        let name = raw_name.trim_end_matches(';');
+                        if !name.is_empty() && !candidates.iter().any(|c| c == name) {
+                            candidates.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        depth += code.matches('{').count() as i32;
+        depth -= code.matches('}').count() as i32;
+    }
+    if candidates.is_empty() {
+        return frag.to_string();
+    }
+
+    let mut written: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    for raw in frag.lines() {
+        let code = strip_line_comment(raw);
+        let t = code.trim_start();
+        if depth > 0 && !t.starts_with('#') {
+            for cand in &candidates {
+                if !written.iter().any(|w| w == cand) && writes_ident(code, cand) {
+                    written.push(cand.clone());
+                }
+            }
+        }
+        depth += code.matches('{').count() as i32;
+        depth -= code.matches('}').count() as i32;
+    }
+    if written.is_empty() {
+        return frag.to_string();
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    for raw in frag.lines() {
+        let code = strip_line_comment(raw);
+        let t = code.trim_start();
+        let mut emitted = false;
+        if depth == 0 {
+            if let Some(rest) = t.strip_prefix("in ") {
+                let mut words = rest.split_whitespace();
+                if let (Some(ty), Some(raw_name)) = (words.next(), words.next()) {
+                    let name = raw_name.trim_end_matches(';');
+                    if written.iter().any(|w| w == name) {
+                        let indent = &raw[..raw.len() - raw.trim_start().len()];
+                        out_lines.push(raw.to_string());
+                        out_lines.push(format!("{indent}{ty} _rw_{name};"));
+                        emitted = true;
+                    }
+                }
+            }
+        }
+        if !emitted {
+            let mut line = raw.to_string();
+            let is_if_dir = matches!(
+                t.split_whitespace().next(),
+                Some("#if" | "#elif" | "#ifdef" | "#ifndef" | "#endif" | "#else")
+            );
+            if !is_if_dir && (depth > 0 || t.starts_with("#define ")) {
+                let comment_pos = line.find("//");
+                let (head, tail) = match comment_pos {
+                    Some(p) => (&line[..p], &line[p..]),
+                    None => (line.as_str(), ""),
+                };
+                let mut new_head = head.to_string();
+                for name in &written {
+                    new_head = replace_word(&new_head, name, &format!("_rw_{name}"));
+                }
+                line = format!("{new_head}{tail}");
+            }
+            out_lines.push(line);
+        }
+        depth += code.matches('{').count() as i32;
+        depth -= code.matches('}').count() as i32;
+    }
+
+    let mut out = out_lines.join("\n");
+    if let Some(pos) = out.find("void main") {
+        if let Some(open) = out[pos..].find('{') {
+            let at = pos + open + 1;
+            let inits: Vec<String> = written
+                .iter()
+                .map(|name| format!("_rw_{name} = {name};"))
+                .collect();
+            out.insert_str(at, &format!("\n\t{}", inits.join("\n\t")));
+        }
+    }
+    out
+}
+
+fn uniform_widths(src: &str) -> HashMap<String, u8> {
+    let mut map = HashMap::new();
+    for raw in src.lines() {
+        let t = strip_line_comment(raw).trim_start();
+        if let Some(rest) = t.strip_prefix("uniform ") {
+            let mut words = rest.split_whitespace();
+            if let (Some(ty), Some(raw_name)) = (words.next(), words.next()) {
+                let w = match ty {
+                    "float" => 1,
+                    "vec2" => 2,
+                    "vec3" => 3,
+                    "vec4" => 4,
+                    _ => 0,
+                };
+                if w > 0 && !raw_name.contains('[') {
+                    let name = raw_name.trim_end_matches(';');
+                    map.insert(name.to_string(), w);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn promote_uniforms_in_shader(src: &str, updates: &HashMap<String, (u8, u8)>) -> String {
+    if updates.is_empty() {
+        return src.to_string();
+    }
+    let type_for = |w: u8| match w {
+        1 => "float",
+        2 => "vec2",
+        3 => "vec3",
+        _ => "vec4",
+    };
+    let mut depth = 0i32;
+    let mut out = String::with_capacity(src.len() + 32);
+    for raw in src.lines() {
+        let code = strip_line_comment(raw);
+        let t = code.trim_start();
+        let mut handled = false;
+        if depth == 0 {
+            if let Some(rest) = t.strip_prefix("uniform ") {
+                let mut words = rest.split_whitespace();
+                if let (Some(_ty), Some(raw_name)) = (words.next(), words.next()) {
+                    let name = raw_name.trim_end_matches(';');
+                    if let Some(&(_, to_w)) = updates.get(name) {
+                        let indent = &raw[..raw.len() - raw.trim_start().len()];
+                        out.push_str(&format!("{indent}uniform {} {name};\n", type_for(to_w)));
+                        handled = true;
+                    }
+                }
+            }
+        }
+        if !handled {
+            let is_if_dir = matches!(
+                t.split_whitespace().next(),
+                Some("#if" | "#elif" | "#ifdef" | "#ifndef" | "#endif" | "#else")
+            );
+            if !is_if_dir && (depth > 0 || t.starts_with("#define ")) {
+                let comment_pos = raw.find("//");
+                let (head, tail) = match comment_pos {
+                    Some(p) => (&raw[..p], &raw[p..]),
+                    None => (raw, ""),
+                };
+                let mut new_head = head.to_string();
+                for (name, &(from_w, _)) in updates {
+                    let swz = swizzle_for_width(from_w);
+                    new_head = replace_word(&new_head, name, &format!("({name}.{swz})"));
+                }
+                out.push_str(&new_head);
+                out.push_str(tail);
+                out.push('\n');
+            } else {
+                out.push_str(raw);
+                out.push('\n');
+            }
+        }
+        depth += code.matches('{').count() as i32;
+        depth -= code.matches('}').count() as i32;
+    }
+    out
+}
+
+/// Make vertex and fragment uniforms agree when both stages declare the same
+/// name with different vector widths (e.g. `frame_builder`'s `u_refResolution`).
+fn reconcile_uniforms(vert: &str, frag: &str) -> (String, String) {
+    let vu = uniform_widths(vert);
+    let fu = uniform_widths(frag);
+    let mut v_updates = HashMap::new();
+    let mut f_updates = HashMap::new();
+    for (name, &vw) in &vu {
+        if let Some(&fw) = fu.get(name) {
+            if vw > fw {
+                f_updates.insert(name.clone(), (fw, vw));
+            } else if fw > vw {
+                v_updates.insert(name.clone(), (vw, fw));
+            }
+        }
+    }
+    (
+        promote_uniforms_in_shader(vert, &v_updates),
+        promote_uniforms_in_shader(frag, &f_updates),
+    )
+}
+
 fn replace_word(src: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let bytes = src.as_bytes();
@@ -3332,6 +3886,9 @@ impl CompiledProgram {
         let vs = preprocess(vert_src, true, combos);
         let fs = preprocess(frag_src, false, combos);
         let (vs, fs) = reconcile_varyings(&vs, &fs);
+        let (vs, fs) = reconcile_uniforms(&vs, &fs);
+        let (vs, fs) = lower_large_varying_kernels(&vs, &fs);
+        let fs = make_written_inputs_mutable(&fs);
         let prog = match Program::new(gl, &vs, &fs) {
             Ok(p) => p,
             Err(err) => {
@@ -3352,6 +3909,19 @@ impl CompiledProgram {
         let mut all = uniforms;
         for u in uniforms_v {
             if let Some(existing) = all.iter_mut().find(|x| x.name == u.name) {
+                let kind_rank = |k: &UniformKind| match k {
+                    UniformKind::Float => 1,
+                    UniformKind::Vec2 => 2,
+                    UniformKind::Vec3 => 3,
+                    UniformKind::Vec4 => 4,
+                    _ => 0,
+                };
+                if kind_rank(&u.kind) > kind_rank(&existing.kind) {
+                    existing.kind = u.kind.clone();
+                    if u.default.is_some() {
+                        existing.default = u.default.clone();
+                    }
+                }
                 if existing.material.is_none() {
                     existing.material = u.material.clone();
                 } else if let Some(m) = u.material {
@@ -3390,7 +3960,7 @@ impl CompiledProgram {
             let vbo = gl.create_buffer().map_err(|e| anyhow!(e))?;
             gl.bind_vertex_array(Some(vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck_cast(&QUAD), glow::STATIC_DRAW);
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck_cast(&QUAD), glow::DYNAMIC_DRAW);
             let stride = 5 * 4;
             let pos_attr = gl
                 .get_attrib_location(prog.id, "a_Position")
@@ -3634,6 +4204,8 @@ pub struct EffectInstance {
     fbos: Vec<(String, i32)>,
     named: HashMap<String, Canvas>,
     dims: (i32, i32),
+    /// Raw `visible` field from the effect definition (`scene.json`) so user toggles re-evaluate live.
+    pub visible_raw: Option<Value>,
 }
 
 impl EffectInstance {
@@ -3681,6 +4253,7 @@ pub struct EffectContext<'a> {
     pub composites: &'a HashMap<i64, Canvas>,
     pub self_id: Option<i64>,
     pub dependencies: &'a [i64],
+    pub props: &'a HashMap<String, Value>,
 }
 
 fn read_text(pkg: &PackageFs, path: &str) -> Option<String> {
@@ -3919,6 +4492,7 @@ impl EffectInstance {
             fbos,
             named: HashMap::new(),
             dims: (0, 0),
+            visible_raw: scene_effect.get("visible").cloned(),
         })
     }
 
@@ -4025,6 +4599,35 @@ impl EffectInstance {
 
             let Some(program) = pass.program.as_mut() else { continue };
             program.prog.bind(gl);
+            let hw = (tw.max(1) as f32) * 0.5;
+            let hh = (th.max(1) as f32) * 0.5;
+            let has_mvp = unsafe {
+                gl.get_uniform_location(program.prog.id, "g_ModelViewProjectionMatrix")
+            }
+            .is_some();
+            if has_mvp {
+                let quad: [f32; 20] = [
+                    -hw, -hh, 0.0, 0.0, 0.0,
+                     hw, -hh, 0.0, 1.0, 0.0,
+                    -hw,  hh, 0.0, 0.0, 1.0,
+                     hw,  hh, 0.0, 1.0, 1.0,
+                ];
+                unsafe {
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(program.vbo));
+                    gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytemuck_cast(&quad));
+                    gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                }
+            }
+            let mvp = if has_mvp {
+                [
+                    1.0 / hw, 0.0, 0.0, 0.0,
+                    0.0, 1.0 / hh, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ]
+            } else {
+                identity4()
+            };
 
             // Resolve every sampler slot first so our texture-unit mapping is
             // stable and `g_TextureNResolution` matches the real texture.
@@ -4188,7 +4791,12 @@ impl EffectInstance {
                     continue;
                 }
                 if spec.name == "g_ModelViewProjectionMatrix"
-                    || spec.name == "g_ModelMatrix"
+                    || spec.name == "g_EffectModelViewProjectionMatrix"
+                {
+                    set_mat4(gl, &mut program.prog, &loc_name, &mvp);
+                    continue;
+                }
+                if spec.name == "g_ModelMatrix"
                     || spec.name == "g_ViewProjectionMatrix"
                     || spec.name == "g_EffectTextureProjectionMatrix"
                 {
@@ -4290,13 +4898,85 @@ impl EffectInstance {
     }
 }
 
+fn resolve_effect_user_prop(val: &Value, props: &HashMap<String, Value>) -> Value {
+    let Some(obj) = val.as_object() else {
+        return val.clone();
+    };
+    if let Some(user) = obj.get("user") {
+        let lookup = |name: &str| -> Option<&Value> {
+            props.get(name).or_else(|| {
+                props
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            })
+        };
+        match user {
+            Value::String(name) => {
+                if let Some(actual) = lookup(name) {
+                    return actual.clone();
+                }
+            }
+            Value::Object(uobj) => {
+                if let Some(name) = uobj.get("name").and_then(|n| n.as_str()) {
+                    if let Some(actual) = lookup(name) {
+                        if let Some(cond) = uobj.get("condition").and_then(|c| c.as_str()) {
+                            let s_actual = match actual {
+                                Value::String(s) => s.clone(),
+                                Value::Bool(b) => b.to_string(),
+                                Value::Number(n) => n.to_string(),
+                                other => other.to_string(),
+                            };
+                            let a_trim = s_actual.trim();
+                            let c_trim = cond.trim();
+                            let matched = if a_trim == c_trim {
+                                true
+                            } else if let (Ok(na), Ok(nc)) =
+                                (a_trim.parse::<f64>(), c_trim.parse::<f64>())
+                            {
+                                (na - nc).abs() < 1e-6
+                            } else {
+                                false
+                            };
+                            return Value::Bool(matched);
+                        }
+                        return actual.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = obj.clone();
+    let mut changed = false;
+    if let Some(inner) = obj.get("value").filter(|v| v.is_object()) {
+        out.insert("value".into(), resolve_effect_user_prop(inner, props));
+        changed = true;
+    }
+    if let Some(sp) = obj.get("scriptproperties").and_then(|v| v.as_object()) {
+        let mut new_sp = serde_json::Map::with_capacity(sp.len());
+        for (k, v) in sp {
+            new_sp.insert(k.clone(), resolve_effect_user_prop(v, props));
+        }
+        out.insert("scriptproperties".into(), Value::Object(new_sp));
+        changed = true;
+    }
+    if changed {
+        Value::Object(out)
+    } else {
+        val.clone()
+    }
+}
+
 /// Evaluate Wallpaper Engine dynamic shader constant objects:
+/// - user property bindings (`"user": "<prop>"`),
 /// - keyframe timeline animations (`"animation": { "c0": [...], "options": ... }`),
 /// - `engine.timeOfDay` smoothStep blend scripts (`START_HOUR` / `END_HOUR`),
 /// - `engine.registerAudioBuffers` audio-frequency response scripts.
 fn eval_dynamic_constant(val: &Value, ctx: &EffectContext) -> Value {
-    let Some(obj) = val.as_object() else {
-        return val.clone();
+    let resolved_prop = resolve_effect_user_prop(val, ctx.props);
+    let Some(obj) = resolved_prop.as_object() else {
+        return resolved_prop;
     };
     if let Some(anim) = obj.get("animation").and_then(|a| a.as_object()) {
         let opts = anim.get("options").and_then(|o| o.as_object());
@@ -4713,3 +5393,48 @@ void main() {
     gl_Position = vec4(a_pos, 0.0, 1.0);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipping_mask_arithmetic_coerces_vec4_to_vec2() {
+        let frag = r#"
+uniform vec4 g_Texture0Resolution;
+uniform vec4 g_Texture1Resolution;
+uniform vec2 u_textureOffset;
+uniform vec2 u_textureScale;
+uniform vec2 u_texScaleCenter;
+varying vec4 v_TexCoord;
+#define ratioDiff_0 (g_Texture0Resolution.x / g_Texture0Resolution.y)
+#define ratioDiff_1 (g_Texture1Resolution.x / g_Texture1Resolution.y)
+#define ratioDiff vec2(ratioDiff_1, ratioDiff_0)
+#define texScaleCenter (u_texScaleCenter * 2.0 - 1.0)
+void main() {
+vec2 uvTex = ((v_TexCoord * 2.0 - 1.0 - texScaleCenter) / ratioDiff / u_textureScale + 1.0 + texScaleCenter) / 2.0 - u_textureOffset;
+}
+"#;
+        let out = preprocess(frag, false, &[]);
+        let out_line = out.lines().find(|l| l.contains("uvTex")).unwrap_or("");
+        assert!(
+            out_line.contains("(v_TexCoord * 2.0 - 1.0).xy - texScaleCenter"),
+            "unexpected uvTex coercion: {out_line}"
+        );
+    }
+
+    #[test]
+    fn preserves_multiple_statements_on_declaration_line() {
+        let frag = r#"
+void main() {
+    vec3 p = vec3(1.0);
+    vec3 a = p; a.z = frac(a.z) - 0.5;
+    float x = 1.0; x = x + 2.0;
+    gl_FragColor = vec4(a.z, x, 0.0, 1.0);
+}
+"#;
+        let out = preprocess(frag, false, &[]);
+        assert!(out.contains("a.z = frac(a.z) - 0.5;"), "lost trailing stmt: {out}");
+        assert!(out.contains("x = x + 2.0;"), "lost trailing scalar stmt: {out}");
+    }
+}

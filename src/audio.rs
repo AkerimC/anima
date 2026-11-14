@@ -259,6 +259,7 @@ fn audio_worker(inner: Arc<(Mutex<SharedState>, Condvar)>) {
     let mut im = [0.0f32; FFT_SIZE];
     let mut smooth_bands = [0.0f32; 4];
     let mut smooth_spec = [0.0f32; 64];
+    let mut spec_agc_peak = 0.5f32;
     let mut energy_ema = 0.01f32;
     let mut smooth_beat = 0.0f32;
     let mut vocal_fast_env = 0.0f32;
@@ -455,16 +456,7 @@ fn audio_worker(inner: Arc<(Mutex<SharedState>, Condvar)>) {
                 smooth_mouth[i] * (1.0 - mouth_alphas[i]) + target_mouth[i] * mouth_alphas[i];
         }
 
-        // 64 logarithmic spectrum bars across bins 1..256.
-        for bar in 0..64 {
-            let t0 = (bar as f32) / 64.0;
-            let t1 = ((bar + 1) as f32) / 64.0;
-            let b0 = (1.0 + (240.0f32).powf(t0)) as usize;
-            let b1 = ((1.0 + (240.0f32).powf(t1)) as usize).max(b0 + 1).min(half - 1);
-            let v = (avg_slice(&mags[b0..b1]) * (20.0 + bar as f32 * 0.6)).clamp(0.0, 1.0);
-            let alpha = if v > smooth_spec[bar] { 0.5 } else { 0.2 };
-            smooth_spec[bar] = smooth_spec[bar] * (1.0 - alpha) + v * alpha;
-        }
+        compute_spectrum64(&mags, rms, &mut spec_agc_peak, &mut smooth_spec);
 
         if let Ok(mut guard) = lock.lock() {
             guard.snapshot = AudioSnapshot {
@@ -534,3 +526,87 @@ pub(crate) fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
 
 #[allow(dead_code)]
 fn _cstr_unused(_: &CStr) {}
+
+/// Map FFT bin magnitudes and RMS into 64 smoothed, bounded-AGC spectrum bars.
+fn compute_spectrum64(
+    mags: &[f32],
+    rms: f32,
+    spec_agc_peak: &mut f32,
+    smooth_spec: &mut [f32; 64],
+) {
+    let half = mags.len();
+    let mut raw_spec = [0.0f32; 64];
+    let mut frame_peak = 0.0f32;
+    for (bar, slot) in raw_spec.iter_mut().enumerate() {
+        let t0 = (bar as f32) / 64.0;
+        let t1 = ((bar + 1) as f32) / 64.0;
+        let b0 = ((240.0f32).powf(t0).floor() as usize).clamp(1, half - 2);
+        let b1 = ((240.0f32).powf(t1).floor() as usize)
+            .max(b0 + 1)
+            .min(half - 1);
+        // Compensate Hann coherent gain (0.5) so calibrated sine energy matches unwindowed FFT.
+        let v = avg_slice(&mags[b0..b1]) * 2.0 * (20.0 + bar as f32 * 0.6);
+        *slot = v;
+        frame_peak = frame_peak.max(v);
+    }
+    let agc_gain = if rms > 0.003 {
+        *spec_agc_peak = (*spec_agc_peak * 0.996).max(frame_peak).max(0.05);
+        (0.85 / *spec_agc_peak).clamp(1.0, 4.0)
+    } else {
+        *spec_agc_peak = (*spec_agc_peak * 0.996).max(0.2);
+        0.0
+    };
+    for bar in 0..64 {
+        let v = (raw_spec[bar] * agc_gain).clamp(0.0, 1.0);
+        let alpha = if v > smooth_spec[bar] { 0.55 } else { 0.2 };
+        smooth_spec[bar] = smooth_spec[bar] * (1.0 - alpha) + v * alpha;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bass_spectrum_reaches_we_threshold_and_gates_silence() {
+        let mut window = [0.0f32; FFT_SIZE];
+        for (i, w) in window.iter_mut().enumerate() {
+            let phase = 2.0 * std::f32::consts::PI * (i as f32) / (FFT_SIZE as f32);
+            *w = 0.5 * (1.0 - phase.cos());
+        }
+
+        // Simulate moderate desktop bass kick (~65 Hz, amplitude 0.08).
+        let mut re = [0.0f32; FFT_SIZE];
+        let mut im = [0.0f32; FFT_SIZE];
+        let mut sq = 0.0f32;
+        for i in 0..FFT_SIZE {
+            let s = 0.08 * (2.0 * std::f32::consts::PI * 65.0 * (i as f32) / SAMPLE_RATE as f32).sin();
+            sq += s * s;
+            re[i] = s * window[i];
+        }
+        let rms = (sq / FFT_SIZE as f32).sqrt();
+        fft_in_place(&mut re, &mut im);
+        let half = FFT_SIZE / 2;
+        let mut mags = [0.0f32; FFT_SIZE / 2];
+        for i in 1..half {
+            mags[i] = (re[i] * re[i] + im[i] * im[i]).sqrt() / (half as f32);
+        }
+
+        let mut peak = 0.5f32;
+        let mut spec = [0.0f32; 64];
+        for _ in 0..5 {
+            compute_spectrum64(&mags, rms, &mut peak, &mut spec);
+        }
+        let bass_max = spec[..12].iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            bass_max > 0.6,
+            "expected bass bars to exceed 0.6 for WE audiobounds, got {bass_max}"
+        );
+
+        // Below noise gate (rms <= 0.003), AGC must gate down to zero.
+        for _ in 0..30 {
+            compute_spectrum64(&mags, 0.001, &mut peak, &mut spec);
+        }
+        assert!(spec[0] < 0.01, "expected gated spectrum near 0, got {}", spec[0]);
+    }
+}

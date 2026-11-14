@@ -38,6 +38,8 @@ pub struct FrameInfo {
     pub mouth: [f32; 4],
     /// Cursor position in physical pixels, relative to this output.
     pub mouse: [f32; 2],
+    /// Whether the primary mouse button is currently held down.
+    pub mouse_down: bool,
     /// Content scale (HiDPI factor).
     pub scale: f32,
 }

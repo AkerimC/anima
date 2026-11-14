@@ -29,6 +29,7 @@ in vec2 v_uv;
 uniform sampler2D u_tex;
 uniform vec2 u_uv_scale;
 uniform vec3 u_bcs; // brightness, contrast, saturation
+uniform float u_hue; // hue shift in radians
 out vec4 fragColor;
 void main() {
     vec2 uv = (v_uv - 0.5) * u_uv_scale + 0.5;
@@ -42,6 +43,13 @@ void main() {
     // Saturation
     float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
     rgb = mix(vec3(luma), rgb, u_bcs.z);
+    // Hue rotation around luma diagonal
+    if (abs(u_hue) > 1e-4) {
+        const vec3 k = vec3(0.577350269);
+        float cosA = cos(u_hue);
+        float sinA = sin(u_hue);
+        rgb = rgb * cosA + cross(k, rgb) * sinA + k * dot(k, rgb) * (1.0 - cosA);
+    }
     fragColor = vec4(clamp(rgb, 0.0, 1.0), col.a);
 }
 "#;
@@ -71,6 +79,7 @@ pub struct ImageRenderer {
     uv_scale: (f32, f32),
     fit: FitMode,
     bcs: [f32; 3],
+    hue: f32,
     width: i32,
     height: i32,
     path: PathBuf,
@@ -103,6 +112,7 @@ impl ImageRenderer {
             uv_scale: (1.0, 1.0),
             fit: FitMode::Cover,
             bcs: [0.0, 1.0, 1.0],
+            hue: 0.0,
             width,
             height,
             path: path.to_path_buf(),
@@ -169,6 +179,7 @@ impl Renderer for ImageRenderer {
                 .set_vec2(gl, "u_uv_scale", self.uv_scale.0, self.uv_scale.1);
             self.program
                 .set_vec3(gl, "u_bcs", self.bcs[0], self.bcs[1], self.bcs[2]);
+            self.program.set_f32(gl, "u_hue", self.hue);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
             self.program.set_i32(gl, "u_tex", 0);
@@ -203,19 +214,24 @@ impl Renderer for ImageRenderer {
                 self.fit = FitMode::from_str(value);
                 self.update_uv();
             }
-            "brightness" => {
+            "brightness" | "ui_brightness" => {
                 if let Ok(v) = value.parse::<f32>() {
                     self.bcs[0] = v.clamp(-1.0, 1.0);
                 }
             }
-            "contrast" => {
+            "contrast" | "ui_contrast" => {
                 if let Ok(v) = value.parse::<f32>() {
                     self.bcs[1] = v.clamp(0.0, 3.0);
                 }
             }
-            "saturation" => {
+            "saturation" | "ui_saturation" => {
                 if let Ok(v) = value.parse::<f32>() {
                     self.bcs[2] = v.clamp(0.0, 3.0);
+                }
+            }
+            "hue" | "hueshift" | "ui_hue" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.hue = v.clamp(-180.0, 180.0).to_radians();
                 }
             }
             _ => {}

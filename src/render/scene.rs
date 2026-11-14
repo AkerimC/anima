@@ -32,7 +32,7 @@ use crate::pkg::PackageFs;
 use super::gl::{bytemuck_cast, create_texture, Filter, Program};
 use super::text;
 use super::we_effect::{Canvas, EffectContext, EffectInstance, TextureCache};
-use super::we_model::{parse_mdl, Mesh, ParsedMdl, PuppetAnimLayer};
+use super::we_model::{parse_mdl, Mesh, MeshVertex, ParsedMdl, PuppetAnimLayer};
 use super::{FrameInfo, Renderer};
 
 // ---------------------------------------------------------------------------
@@ -318,29 +318,41 @@ const COPY_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_tex;
+uniform vec4 u_bcs_hue; // x=brightness(-1..1), y=contrast(1), z=saturation(1), w=hue(rad)
 out vec4 fragColor;
 void main() {
-    fragColor = texture(u_tex, v_uv);
+    vec4 c = texture(u_tex, v_uv);
+    c.rgb += u_bcs_hue.x;
+    c.rgb = (c.rgb - 0.5) * u_bcs_hue.y + 0.5;
+    float luma = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+    c.rgb = mix(vec3(luma), c.rgb, u_bcs_hue.z);
+    if (abs(u_bcs_hue.w) > 1e-4) {
+        const vec3 k = vec3(0.577350269);
+        float cosA = cos(u_bcs_hue.w);
+        float sinA = sin(u_bcs_hue.w);
+        c.rgb = c.rgb * cosA + cross(k, c.rgb) * sinA + k * dot(k, c.rgb) * (1.0 - cosA);
+    }
+    c.rgb = clamp(c.rgb, 0.0, 1.0);
+    fragColor = c;
 }
 "#;
 
 const PARTICLE_VS: &str = r#"#version 300 es
 precision highp float;
 layout(location = 0) in vec2 a_quad;
-layout(location = 1) in vec4 a_pos_size; // world x, y, half width, half height
-layout(location = 2) in vec4 a_color;
-layout(location = 3) in float a_rot;
+layout(location = 1) in vec2 a_center;  // world x, y
+layout(location = 2) in vec4 a_axes;    // right.x, right.y, up.x, up.y
+layout(location = 3) in vec4 a_color;
 layout(location = 4) in vec4 a_uv_rect; // u0, v0, u_size, v_size
 uniform vec2 u_ortho;
 out vec2 v_uv;
 out vec2 v_local_uv;
 out vec4 v_color;
+out vec2 v_screen_uv;
+out vec2 v_tangent_right;
+out vec2 v_tangent_up;
 void main() {
-    float c = cos(a_rot);
-    float s = sin(a_rot);
-    vec2 scaled = a_quad * a_pos_size.zw;
-    vec2 rot = vec2(scaled.x * c - scaled.y * s, scaled.x * s + scaled.y * c);
-    vec2 world = a_pos_size.xy + rot;
+    vec2 world = a_center + a_quad.x * a_axes.xy + a_quad.y * a_axes.zw;
     vec2 ndc = vec2(world.x / u_ortho.x * 2.0 - 1.0,
                     1.0 - world.y / u_ortho.y * 2.0);
     gl_Position = vec4(ndc, 0.0, 1.0);
@@ -348,6 +360,11 @@ void main() {
     v_local_uv = quad_uv;
     v_uv = a_uv_rect.xy + quad_uv * a_uv_rect.zw;
     v_color = a_color;
+    v_screen_uv = ndc * 0.5 + 0.5;
+    float lx = max(length(a_axes.xy), 1e-4);
+    float ly = max(length(a_axes.zw), 1e-4);
+    v_tangent_right = a_axes.xy / lx;
+    v_tangent_up = a_axes.zw / ly;
 }
 "#;
 
@@ -356,18 +373,45 @@ precision highp float;
 in vec2 v_uv;
 in vec2 v_local_uv;
 in vec4 v_color;
+in vec2 v_screen_uv;
+in vec2 v_tangent_right;
+in vec2 v_tangent_up;
 uniform int u_shape;
 uniform int u_has_tex;
 uniform int u_is_r8;
+uniform int u_refract;
+uniform int u_has_normal;
+uniform float u_refract_amount;
+uniform float u_overbright;
+uniform int u_premul;
 uniform sampler2D u_tex;
+uniform sampler2D u_scene;
+uniform sampler2D u_normal;
 out vec4 fragColor;
 void main() {
     if (u_has_tex == 1) {
-        vec4 t = texture(u_tex, v_uv);
+        vec4 color = texture(u_tex, v_uv);
         if (u_is_r8 == 1) {
-            t = vec4(1.0, 1.0, 1.0, t.r);
+            color = vec4(1.0, 1.0, 1.0, color.r);
         }
-        fragColor = t * v_color;
+        color *= v_color;
+        if (u_refract == 1) {
+            vec2 off = vec2(0.0);
+            if (u_has_normal == 1) {
+                vec4 n = texture(u_normal, v_uv);
+                n.xw = n.wx;
+                n.xy = n.xy * 2.0 - 1.0;
+                vec2 disp = v_tangent_right * n.x + v_tangent_up * n.y;
+                off = vec2(disp.x, -disp.y) * u_refract_amount * n.a * v_color.a;
+            }
+            vec2 ruv = clamp(v_screen_uv + off, vec2(0.001), vec2(0.999));
+            color.rgb *= texture(u_scene, ruv).rgb;
+        }
+        color.rgb *= u_overbright;
+        if (u_premul == 1) {
+            color.rgb *= color.a;
+        }
+        fragColor = color;
         return;
     }
     vec2 p = v_local_uv * 2.0 - 1.0;
@@ -383,7 +427,11 @@ void main() {
         float r = length(p);
         alpha = smoothstep(1.0, 0.05, r);
     }
-    fragColor = vec4(v_color.rgb, v_color.a * alpha);
+    vec4 out_c = vec4(v_color.rgb * u_overbright, v_color.a * alpha);
+    if (u_premul == 1) {
+        out_c.rgb *= out_c.a;
+    }
+    fragColor = out_c;
 }
 "#;
 
@@ -454,6 +502,31 @@ enum VisibleRule {
     All(Vec<VisibleRule>),
 }
 
+fn matches_condition(actual: &serde_json::Value, condition: &str) -> bool {
+    let s_actual = value_to_string(actual);
+    let a_trim = s_actual.trim();
+    let c_trim = condition.trim();
+    if a_trim == c_trim {
+        return true;
+    }
+    if let (Ok(na), Ok(nc)) = (a_trim.parse::<f64>(), c_trim.parse::<f64>()) {
+        return (na - nc).abs() < 1e-6;
+    }
+    false
+}
+
+fn prop_get<'a>(
+    props: &'a HashMap<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    props.get(name).or_else(|| {
+        props
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    })
+}
+
 impl VisibleRule {
     fn eval(&self, props: &HashMap<String, serde_json::Value>) -> bool {
         match self {
@@ -461,11 +534,11 @@ impl VisibleRule {
             VisibleRule::Script(v) => *v,
             VisibleRule::All(rules) => rules.iter().all(|r| r.eval(props)),
             VisibleRule::User { name, condition, value } => {
-                let Some(actual) = props.get(name) else {
+                let Some(actual) = prop_get(props, name) else {
                     return *value;
                 };
                 if let Some(condition) = condition {
-                    return value_to_string(actual).trim() == condition.trim();
+                    return matches_condition(actual, condition);
                 }
                 value_bool(actual).unwrap_or(*value)
             }
@@ -477,16 +550,210 @@ fn resolve_prop(
     v: &serde_json::Value,
     props: &HashMap<String, serde_json::Value>,
 ) -> serde_json::Value {
-    if let Some(user) = v
-        .as_object()
-        .and_then(|o| o.get("user"))
-        .and_then(|u| u.as_str())
-    {
-        if let Some(actual) = props.get(user) {
-            return actual.clone();
+    if let Some(obj) = v.as_object() {
+        if let Some(user) = obj.get("user") {
+            match user {
+                serde_json::Value::String(name) => {
+                    if let Some(actual) = prop_get(props, name) {
+                        return actual.clone();
+                    }
+                }
+                serde_json::Value::Object(uobj) => {
+                    if let Some(name) = uobj.get("name").and_then(|n| n.as_str()) {
+                        if let Some(actual) = prop_get(props, name) {
+                            if let Some(cond) = uobj.get("condition").and_then(|c| c.as_str()) {
+                                return serde_json::Value::Bool(matches_condition(actual, cond));
+                            }
+                            return actual.clone();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(inner) = obj.get("value") {
+            if inner.is_object() {
+                let resolved_inner = resolve_prop(inner, props);
+                let mut out = obj.clone();
+                out.insert("value".to_string(), resolved_inner);
+                return serde_json::Value::Object(out);
+            }
         }
     }
     v.clone()
+}
+
+fn sp_f32(
+    sp: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    props: &HashMap<String, serde_json::Value>,
+) -> Option<f32> {
+    sp?.get(key).and_then(|v| value_f32(&resolve_prop(v, props)))
+}
+
+fn sp_bool(
+    sp: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    props: &HashMap<String, serde_json::Value>,
+) -> Option<bool> {
+    sp?.get(key).and_then(|v| value_bool(&resolve_prop(v, props)))
+}
+
+fn strip_line_comments(script: &str) -> String {
+    script
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn const_number(s: &str, name: &str) -> Option<f32> {
+    let idx = s.find(name)? + name.len();
+    let rest = s[idx..].trim_start().strip_prefix('=')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let d = edge1 - edge0;
+    if d.abs() < 1e-6 {
+        return if x >= edge1 { 1.0 } else { 0.0 };
+    }
+    let t = ((x - edge0) / d).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn parse_sp_axis_assign<'a>(line: &'a str, lhs: &str, canvas_suffix: &str) -> Option<(&'a str, bool)> {
+    let code = line.split("//").next()?.trim();
+    let rhs = code.strip_prefix(lhs)?.trim_start().strip_prefix('=')?.trim();
+    let rhs = rhs.trim_end_matches(';').trim();
+    let after = rhs.strip_prefix("scriptProperties.")?;
+    let name_len = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(after.len());
+    if name_len == 0 {
+        return None;
+    }
+    let prop = &after[..name_len];
+    let rest = after[name_len..].trim();
+    if rest.is_empty() {
+        return Some((prop, false));
+    }
+    if let Some(mul_rhs) = rest.strip_prefix('*') {
+        if mul_rhs.trim() == canvas_suffix {
+            return Some((prop, true));
+        }
+    }
+    None
+}
+
+/// Resolves static `origin` properties, including user-bound `scriptProperties`
+/// assignments (`value.x = scriptProperties.x [* engine.canvasSize.x]`).
+fn eval_origin_field(
+    v: &serde_json::Value,
+    default: [f32; 3],
+    ortho: [f32; 2],
+    props: &HashMap<String, serde_json::Value>,
+) -> [f32; 3] {
+    let mut out = value_vec(&resolve_prop(v, props), 3, default);
+    let Some(script) = v.get("script").and_then(|s| s.as_str()) else {
+        return out;
+    };
+    let sp = v.get("scriptproperties").and_then(|s| s.as_object());
+    if sp.is_none() {
+        return out;
+    }
+    let clean = strip_line_comments(script);
+    let body = clean.split("function update").nth(1).unwrap_or(&clean);
+    for line in body.lines() {
+        if let Some((prop, mult_canvas)) = parse_sp_axis_assign(line, "value.x", "engine.canvasSize.x") {
+            if let Some(val) = sp_f32(sp, prop, props) {
+                out[0] = if mult_canvas { val * ortho[0] } else { val };
+            }
+        }
+        if let Some((prop, mult_canvas)) = parse_sp_axis_assign(line, "value.y", "engine.canvasSize.y") {
+            if let Some(val) = sp_f32(sp, prop, props) {
+                out[1] = if mult_canvas { val * ortho[1] } else { val };
+            }
+        }
+    }
+    out
+}
+
+/// Evaluates `alpha` properties, including time-of-day fade/brightness scripts.
+fn eval_alpha_field(
+    v: Option<&serde_json::Value>,
+    props: &HashMap<String, serde_json::Value>,
+    now: text::LocalTime,
+) -> f32 {
+    let Some(v) = v else {
+        return 1.0;
+    };
+    if let Some(script) = v.get("script").and_then(|s| s.as_str()) {
+        let clean = strip_line_comments(script);
+        let tod_hours = now.hour as f32 + now.minute as f32 / 60.0 + now.second as f32 / 3600.0;
+        let engine_tod = tod_hours / 24.0;
+        if let (Some(in_s), Some(in_e), Some(out_s), Some(out_e)) = (
+            const_number(&clean, "FADE_IN_START_HOUR"),
+            const_number(&clean, "FADE_IN_END_HOUR"),
+            const_number(&clean, "FADE_OUT_START_HOUR"),
+            const_number(&clean, "FADE_OUT_END_HOUR"),
+        ) {
+            let blend = const_number(&clean, "BLEND_DURATION").unwrap_or(0.3);
+            let fallback = if clean
+                .rsplit("return ")
+                .next()
+                .and_then(|r| r.trim_start().strip_prefix('1'))
+                .is_some()
+            {
+                1.0
+            } else {
+                0.0
+            };
+            let a = if tod_hours >= in_e && tod_hours < out_s {
+                1.0
+            } else if tod_hours >= out_e && tod_hours < in_s {
+                0.0
+            } else if tod_hours >= in_s && tod_hours <= in_e {
+                smoothstep((in_s - blend) / 24.0, in_e / 24.0, engine_tod)
+            } else if tod_hours >= out_s && tod_hours <= out_e {
+                1.0 - smoothstep((out_s - blend) / 24.0, out_e / 24.0, engine_tod)
+            } else {
+                fallback
+            };
+            return a.clamp(0.0, 1.0);
+        }
+        if let (Some(sr_s), Some(sr_e), Some(ss_s), Some(ss_e)) = (
+            const_number(&clean, "SUNRISE_START"),
+            const_number(&clean, "SUNRISE_END"),
+            const_number(&clean, "SUNSET_START"),
+            const_number(&clean, "SUNSET_END"),
+        ) {
+            let day_b = const_number(&clean, "DAY_BRIGHTNESS").unwrap_or(1.0);
+            let night_b = const_number(&clean, "NIGHT_BRIGHTNESS").unwrap_or(0.45);
+            let brightness = if tod_hours < sr_s {
+                night_b
+            } else if tod_hours < sr_e {
+                night_b + (day_b - night_b) * smoothstep(sr_s, sr_e, tod_hours)
+            } else if tod_hours < ss_s {
+                day_b
+            } else if tod_hours < ss_e {
+                day_b - (day_b - night_b) * smoothstep(ss_s, ss_e, tod_hours)
+            } else {
+                night_b
+            };
+            let alpha = if clean.contains("darkness") || clean.contains("1.0 - brightness") {
+                1.0 - brightness
+            } else {
+                brightness
+            };
+            return alpha.clamp(0.0, 1.0);
+        }
+    }
+    let resolved = resolve_prop(v, props);
+    value_f32(&resolved).unwrap_or(1.0).clamp(0.0, 1.0)
 }
 
 fn value_bool(v: &serde_json::Value) -> Option<bool> {
@@ -512,6 +779,17 @@ fn value_to_string(v: &serde_json::Value) -> String {
             .unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+/// Temporary verification hook: `ANIMA_MOUSE_NDC="x y"` pins the camera mouse
+/// position (NDC, -1..1) so parallax/attachment behaviour can be checked in a
+/// headless capture rig.
+fn debug_mouse_ndc() -> Option<(f32, f32)> {
+    let raw = std::env::var("ANIMA_MOUSE_NDC").ok()?;
+    let mut it = raw.split_whitespace();
+    let x = it.next()?.parse::<f32>().ok()?.clamp(-1.0, 1.0);
+    let y = it.next()?.parse::<f32>().ok()?.clamp(-1.0, 1.0);
+    Some((x, y))
 }
 
 fn value_f32(v: &serde_json::Value) -> Option<f32> {
@@ -561,6 +839,16 @@ fn parse_vec_str_n(s: &str, n: usize, default: [f32; 3]) -> [f32; 3] {
 }
 
 fn parse_color(v: &serde_json::Value, default: [f32; 3]) -> [f32; 3] {
+    if let serde_json::Value::String(s) = v {
+        if s.trim().starts_with('#') {
+            return parse_vec3_str(s, default);
+        }
+    }
+    if let serde_json::Value::Object(o) = v {
+        if let Some(inner) = o.get("value") {
+            return parse_color(inner, default);
+        }
+    }
     let mut c = value_vec(v, 3, default);
     if c.iter().any(|x| *x > 1.0) {
         for x in &mut c {
@@ -568,6 +856,39 @@ fn parse_color(v: &serde_json::Value, default: [f32; 3]) -> [f32; 3] {
         }
     }
     c
+}
+
+fn eval_color_field(
+    v: Option<&serde_json::Value>,
+    props: &HashMap<String, serde_json::Value>,
+    default: [f32; 3],
+) -> [f32; 3] {
+    match v {
+        Some(raw) => parse_color(&resolve_prop(raw, props), default),
+        None => default,
+    }
+}
+
+fn eval_brightness_field(
+    v: Option<&serde_json::Value>,
+    props: &HashMap<String, serde_json::Value>,
+    default: f32,
+) -> f32 {
+    match v {
+        Some(raw) => value_f32(&resolve_prop(raw, props)).unwrap_or(default),
+        None => default,
+    }
+}
+
+fn eval_parallax_field(
+    v: Option<&serde_json::Value>,
+    props: &HashMap<String, serde_json::Value>,
+) -> [f32; 2] {
+    let Some(raw) = v else {
+        return [0.0, 0.0];
+    };
+    let p = value_vec(&resolve_prop(raw, props), 3, [0.0, 0.0, 0.0]);
+    [p[0], p[1]]
 }
 
 /// Parse a `"r g b"` (or `#rrggbb`) colour string.  Values above 1.0 are
@@ -663,10 +984,13 @@ struct Particle {
     alpha: f32,
     phase: f32,
     rot: f32,
+    rot_x: f32,
+    rot_y: f32,
     ang_vel: f32,
     age: f32,
     lifetime: f32,
     frame_seed: u32,
+    base_color: [f32; 3],
     color: [f32; 3],
 }
 
@@ -687,8 +1011,8 @@ struct WeParticleSpec {
     color_mult: [f32; 3],
     alpha_min: f32,
     alpha_max: f32,
-    rot_min: f32,
-    rot_max: f32,
+    rot_min: [f32; 3],
+    rot_max: [f32; 3],
     ang_vel_min: f32,
     ang_vel_max: f32,
     gravity: [f32; 2],
@@ -728,14 +1052,21 @@ impl WeParticleSpec {
         let vy = self.vel_min[1] + self.next_f32() * (self.vel_max[1] - self.vel_min[1]);
         let size = self.size_min + self.next_f32() * (self.size_max - self.size_min);
         let alpha = self.alpha_min + self.next_f32() * (self.alpha_max - self.alpha_min);
-        let rot = self.rot_min + self.next_f32() * (self.rot_max - self.rot_min);
+        let rot_x = self.rot_min[0] + self.next_f32() * (self.rot_max[0] - self.rot_min[0]);
+        let rot_y = self.rot_min[1] + self.next_f32() * (self.rot_max[1] - self.rot_min[1]);
+        let rot = self.rot_min[2] + self.next_f32() * (self.rot_max[2] - self.rot_min[2]);
         let ang_vel = self.ang_vel_min + self.next_f32() * (self.ang_vel_max - self.ang_vel_min);
         let lifetime = (self.life_min + self.next_f32() * (self.life_max - self.life_min)).max(0.1);
         let tc = self.next_f32();
+        let base_color = [
+            self.color_min[0] + tc * (self.color_max[0] - self.color_min[0]),
+            self.color_min[1] + tc * (self.color_max[1] - self.color_min[1]),
+            self.color_min[2] + tc * (self.color_max[2] - self.color_min[2]),
+        ];
         let color = [
-            (self.color_min[0] + tc * (self.color_max[0] - self.color_min[0])) * self.color_mult[0],
-            (self.color_min[1] + tc * (self.color_max[1] - self.color_min[1])) * self.color_mult[1],
-            (self.color_min[2] + tc * (self.color_max[2] - self.color_min[2])) * self.color_mult[2],
+            base_color[0] * self.color_mult[0],
+            base_color[1] * self.color_mult[1],
+            base_color[2] * self.color_mult[2],
         ];
         let phase = self.next_f32() * std::f32::consts::TAU;
         let frame_seed = (self.next_f32() * 1024.0) as u32;
@@ -749,10 +1080,13 @@ impl WeParticleSpec {
             alpha,
             phase,
             rot: rot + ang_vel * age,
+            rot_x,
+            rot_y,
             ang_vel,
             age,
             lifetime,
             frame_seed,
+            base_color,
             color,
         }
     }
@@ -766,6 +1100,10 @@ struct Emitter {
     audio_reactive: bool,
     texture: Option<glow::Texture>,
     tex_is_r8: bool,
+    refract: bool,
+    normal_tex: Option<glow::Texture>,
+    refract_amount: f32,
+    overbright: f32,
     spritesheet: Option<crate::pkg::SpritesheetMeta>,
     we_spec: Option<WeParticleSpec>,
     particles: Vec<Particle>,
@@ -780,18 +1118,25 @@ impl Emitter {
         obj: &serde_json::Value,
         transform: Affine,
         hint_kind: ParticleKind,
+        props: &HashMap<String, serde_json::Value>,
     ) -> Self {
         let ov = obj.get("instanceoverride");
-        let ov_alpha = ov.and_then(|o| o.get("alpha")).and_then(value_f32).unwrap_or(1.0);
-        let ov_size = ov.and_then(|o| o.get("size")).and_then(value_f32).unwrap_or(1.0);
-        let ov_speed = ov.and_then(|o| o.get("speed")).and_then(value_f32).unwrap_or(1.0);
-        let ov_rate = ov.and_then(|o| o.get("rate")).and_then(value_f32).unwrap_or(1.0);
-        let ov_count = ov.and_then(|o| o.get("count")).and_then(value_f32).unwrap_or(1.0);
-        let ov_life = ov.and_then(|o| o.get("lifetime")).and_then(value_f32).unwrap_or(1.0);
+        let ov_val = |k: &str| {
+            ov.and_then(|o| o.get(k))
+                .map(|v| resolve_prop(v, props))
+                .and_then(|v| value_f32(&v))
+                .unwrap_or(1.0)
+        };
+        let ov_alpha = ov_val("alpha");
+        let ov_size = ov_val("size");
+        let ov_speed = ov_val("speed");
+        let ov_rate = ov_val("rate");
+        let ov_count = ov_val("count");
+        let ov_life = ov_val("lifetime");
         let color_mult = ov
             .and_then(|o| o.get("colorn").or_else(|| o.get("color")))
             .or_else(|| obj.get("color"))
-            .map(|c| parse_color(c, [1.0, 1.0, 1.0]))
+            .map(|c| parse_color(&resolve_prop(c, props), [1.0, 1.0, 1.0]))
             .unwrap_or([1.0, 1.0, 1.0]);
 
         let mut emitter_origin = [0.0f32, 0.0];
@@ -839,8 +1184,8 @@ impl Emitter {
         let mut color_max = [1.0f32, 1.0, 1.0];
         let mut alpha_min = 0.6f32;
         let mut alpha_max = 1.0f32;
-        let mut rot_min = 0.0f32;
-        let mut rot_max = 0.0f32;
+        let mut rot_min = [0.0f32; 3];
+        let mut rot_max = [0.0f32; 3];
         let mut ang_vel_min = 0.0f32;
         let mut ang_vel_max = 0.0f32;
 
@@ -900,13 +1245,19 @@ impl Emitter {
                         alpha_max = init.get("max").and_then(value_f32).unwrap_or(alpha_max);
                     }
                     "rotationrandom" => {
+                        let has_min = init.get("min").is_some();
+                        let has_max = init.get("max").is_some();
                         if let Some(rmin) = init.get("min") {
-                            rot_min = value_vec(rmin, 3, [0.0, 0.0, 0.0])[2];
+                            rot_min = value_vec(rmin, 3, [0.0, 0.0, 0.0]);
+                        } else if has_max {
+                            rot_min = [0.0, 0.0, 0.0];
                         }
                         if let Some(rmax) = init.get("max") {
-                            rot_max = value_vec(rmax, 3, [0.0, 0.0, std::f32::consts::TAU])[2];
+                            rot_max = value_vec(rmax, 3, [0.0, 0.0, std::f32::consts::TAU]);
+                        } else if !has_min {
+                            rot_max = [0.0, 0.0, std::f32::consts::TAU];
                         } else {
-                            rot_max = std::f32::consts::TAU;
+                            rot_max = rot_min;
                         }
                     }
                     "angularvelocityrandom" => {
@@ -1020,6 +1371,10 @@ impl Emitter {
 
         let mut texture = None;
         let mut tex_is_r8 = false;
+        let mut refract = false;
+        let mut normal_tex = None;
+        let mut refract_amount = 0.05f32;
+        let mut overbright = 1.0f32;
         let mut spritesheet = None;
         let mut blend = match hint_kind {
             ParticleKind::Embers | ParticleKind::Fireflies | ParticleKind::Stars => {
@@ -1038,18 +1393,47 @@ impl Emitter {
                         if let Some(b) = pass.get("blending").and_then(|v| v.as_str()) {
                             blend = LayerBlend::from_material(b);
                         }
-                        if let Some(tex_name) = pass
-                            .get("textures")
-                            .and_then(|t| t.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|v| v.as_str())
+                        if let Some(v) = pass
+                            .get("combos")
+                            .and_then(|c| c.get("REFRACT"))
+                            .and_then(value_f32)
                         {
-                            if let Some((tex, _w, _h, ss, is_r8)) =
-                                Self::load_particle_texture(gl, pkg, textures, tex_name)
+                            refract = v != 0.0;
+                        }
+                        if let Some(csv) = pass.get("constantshadervalues") {
+                            if let Some(ob) = csv
+                                .get("ui_editor_properties_overbright")
+                                .or_else(|| csv.get("overbright"))
+                                .and_then(value_f32)
                             {
-                                texture = Some(tex);
-                                spritesheet = ss;
-                                tex_is_r8 = is_r8;
+                                overbright = ob.max(0.0);
+                            }
+                            if let Some(ra) = csv
+                                .get("ui_editor_properties_refract_amount")
+                                .or_else(|| csv.get("refractamount"))
+                                .and_then(value_f32)
+                            {
+                                refract_amount = ra;
+                            }
+                        }
+                        if let Some(texs) = pass.get("textures").and_then(|t| t.as_array()) {
+                            if let Some(tex_name) = texs.first().and_then(|v| v.as_str()) {
+                                if let Some((tex, _w, _h, ss, is_r8)) =
+                                    Self::load_particle_texture(gl, pkg, textures, tex_name)
+                                {
+                                    texture = Some(tex);
+                                    spritesheet = ss;
+                                    tex_is_r8 = is_r8;
+                                }
+                            }
+                            if refract {
+                                if let Some(norm_name) = texs.get(1).and_then(|v| v.as_str()) {
+                                    if let Some((ntex, ..)) =
+                                        Self::load_particle_texture(gl, pkg, textures, norm_name)
+                                    {
+                                        normal_tex = Some(ntex);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1125,6 +1509,10 @@ impl Emitter {
             audio_reactive: false,
             texture,
             tex_is_r8,
+            refract,
+            normal_tex,
+            refract_amount,
+            overbright,
             spritesheet,
             we_spec: Some(spec),
             particles,
@@ -1242,10 +1630,13 @@ impl Emitter {
                 alpha,
                 phase,
                 rot,
+                rot_x: 0.0,
+                rot_y: 0.0,
                 ang_vel: 0.0,
                 age: 0.0,
                 lifetime: 1.0,
                 frame_seed: 0,
+                base_color: color.unwrap_or(default_col),
                 color: color.unwrap_or(default_col),
             });
         }
@@ -1263,9 +1654,30 @@ impl Emitter {
             audio_reactive,
             texture: None,
             tex_is_r8: false,
+            refract: false,
+            normal_tex: None,
+            refract_amount: 0.05,
+            overbright: 1.0,
             spritesheet: None,
             we_spec: None,
             particles,
+        }
+    }
+
+    fn update_color_mult(&mut self, color_mult: [f32; 3]) {
+        if let Some(spec) = &mut self.we_spec {
+            spec.color_mult = color_mult;
+            for p in &mut self.particles {
+                p.color = [
+                    p.base_color[0] * color_mult[0],
+                    p.base_color[1] * color_mult[1],
+                    p.base_color[2] * color_mult[2],
+                ];
+            }
+        } else {
+            for p in &mut self.particles {
+                p.color = color_mult;
+            }
         }
     }
 
@@ -1369,7 +1781,7 @@ impl Emitter {
                     ([0.0, 0.0, 1.0, 1.0], 1.0f32)
                 };
 
-                let (hw, hh, rot) = if let Some((t_len, t_max)) = spec.trail_length {
+                let (axis_x, axis_y) = if let Some((t_len, t_max)) = spec.trail_length {
                     let w_vel = spec.transform.apply_vec([p.vx, p.vy]);
                     let speed = w_vel[0].hypot(w_vel[1]);
                     let max_h = if t_max <= 10.0 {
@@ -1386,21 +1798,32 @@ impl Emitter {
                     } else {
                         t_rot
                     };
-                    (trail_w, trail_h, angle)
+                    let (s, c) = angle.sin_cos();
+                    ([c * trail_w, s * trail_w], [-s * trail_h, c * trail_h])
                 } else {
-                    (base_r * aspect, base_r, p.rot + t_rot)
+                    let unscaled_r = (p.size * size_mult * 0.5).max(0.5);
+                    let (sx, cx) = p.rot_x.sin_cos();
+                    let (sy, cy) = p.rot_y.sin_cos();
+                    let (sz, cz) = p.rot.sin_cos();
+                    let r_local = [(cz * cy - sz * sx * sy) * unscaled_r * aspect, -sz * cx * unscaled_r];
+                    let u_local = [(sz * cy + cz * sx * sy) * unscaled_r, cz * cx * unscaled_r];
+                    (
+                        spec.transform.apply_vec(r_local),
+                        spec.transform.apply_vec(u_local),
+                    )
                 };
 
                 out.extend_from_slice(&[
                     world_x,
                     world_y,
-                    hw,
-                    hh,
+                    axis_x[0],
+                    axis_x[1],
+                    axis_y[0],
+                    axis_y[1],
                     p.color[0],
                     p.color[1],
                     p.color[2],
                     alpha.clamp(0.0, 1.0),
-                    rot,
                     uv_rect[0],
                     uv_rect[1],
                     uv_rect[2],
@@ -1465,16 +1888,20 @@ impl Emitter {
                 ParticleKind::Fog => (p.size * ortho[0] * 0.5, p.size * ortho[1] * 0.5),
                 _ => (p.size * ortho[1], p.size * ortho[1]),
             };
+            let (s, c) = p.rot.sin_cos();
+            let hw = w * 0.5;
+            let hh = h * 0.5;
             out.extend_from_slice(&[
                 world_x,
                 world_y,
-                w * 0.5,
-                h * 0.5,
+                c * hw,
+                s * hw,
+                -s * hh,
+                c * hh,
                 p.color[0],
                 p.color[1],
                 p.color[2],
                 (p.alpha * twinkle).clamp(0.0, 1.0),
-                p.rot,
                 0.0,
                 0.0,
                 1.0,
@@ -1532,6 +1959,7 @@ fn object_blend(material: &str, color_blend: i32) -> LayerBlend {
 struct TextLayer {
     script: Option<String>,
     authored: String,
+    raw_text_def: serde_json::Value,
     props: HashMap<String, serde_json::Value>,
     font: Option<ab_glyph::FontVec>,
     point_size: f32,
@@ -1557,6 +1985,8 @@ enum ObjectKind {
         mdl: ParsedMdl,
         anim_layers: Vec<PuppetAnimLayer>,
         texture: glow::Texture,
+        tex_size: [u32; 2],
+        bounds: ([f32; 2], [f32; 2]),
     },
     Text(Box<TextLayer>),
     Solid,
@@ -1574,6 +2004,9 @@ struct SceneObject {
     transform: Affine,
     /// Local (unscaled) layer size in scene units.
     size: [f32; 2],
+    /// Normalized anchor shift (`-0.5..=0.5`) from Wallpaper Engine's
+    /// `alignment` field: non-zero shifts the quad relative to `origin`.
+    align: [f32; 2],
     color: [f32; 4],
     brightness: f32,
     blend: LayerBlend,
@@ -1593,6 +2026,10 @@ struct SceneObject {
     sprite: Option<crate::pkg::SpritesheetMeta>,
     /// Set when this layer is parented to a puppet bone (`attachment`).
     attach: Option<AttachPoint>,
+    /// Index into `SceneRenderer::raw_nodes` and raw `scene.json` object definition
+    /// so user property changes can re-evaluate transforms, colors, and text live.
+    raw_idx: Option<usize>,
+    raw_obj: serde_json::Value,
 }
 
 /// A layer that follows a bone of its parent puppet, possibly animated.
@@ -1702,13 +2139,17 @@ impl KeyTrack {
 }
 
 /// Tiny evaluator for common time-driven property scripts (clock hands,
-/// second progress bars).
+/// second progress bars, continuous spin, and wave oscillations).
 #[derive(Debug, Clone)]
 enum PropScript {
     /// `value.<c> = [Math.floor](engine.timeOfDay * mul) % modulo * factor`
     TimeOfDay { comp: usize, mul: f32, modulo: f32, factor: f32, floor: bool },
     /// `value.<c> = new Date().getSeconds() / div`
     Seconds { comp: usize, div: f32 },
+    /// `value.<c> = [0 -] (engine.runtime * speed)` (degrees/sec)
+    SpinZ { comp: usize, speed: f32 },
+    /// Horizontal sinusoidal / triangular oscillation (`WaveOriginX`).
+    WaveOriginX { intensity: f32, speed: f32, smoothness: f32, invert: bool },
 }
 
 fn number_after(s: &str, pat: &str) -> Option<f32> {
@@ -1721,8 +2162,27 @@ fn number_after(s: &str, pat: &str) -> Option<f32> {
 }
 
 impl PropScript {
-    fn parse(script: &str) -> Option<Self> {
-        let body = script.split("function update").nth(1).unwrap_or(script);
+    fn parse(field: &serde_json::Value, props: &HashMap<String, serde_json::Value>) -> Option<Self> {
+        let script = field.get("script").and_then(|s| s.as_str())?;
+        let clean = strip_line_comments(script);
+        let body = clean.split("function update").nth(1).unwrap_or(&clean);
+        let sp = field.get("scriptproperties").and_then(|s| s.as_object());
+        if body.contains("offsetX")
+            && body.contains("Math.sin")
+            && clean.contains("smoothness")
+            && clean.contains("intensity")
+        {
+            let intensity = sp_f32(sp, "intensity", props).unwrap_or(50.0);
+            let speed = sp_f32(sp, "speed", props).unwrap_or(1.0);
+            let smoothness = sp_f32(sp, "smoothness", props).unwrap_or(1.0).clamp(0.0, 1.0);
+            let invert = sp_bool(sp, "invert", props).unwrap_or(false);
+            return Some(PropScript::WaveOriginX {
+                intensity,
+                speed,
+                smoothness,
+                invert,
+            });
+        }
         let comp = if body.contains("value.x") {
             0
         } else if body.contains("value.y") {
@@ -1757,10 +2217,23 @@ impl PropScript {
             let div = number_after(body, "getSeconds() /").unwrap_or(1.0).max(1e-3);
             return Some(PropScript::Seconds { comp, div });
         }
+        if body.contains("engine.runtime *")
+            && !clean.contains("MediaPlaybackEvent")
+            && !clean.contains("mediaPlaybackChanged")
+            && !clean.contains("frametime")
+        {
+            let rt_pos = body.find("engine.runtime *")?;
+            let mut speed = number_after(&body[rt_pos..], "engine.runtime *")?;
+            let before = body[..rt_pos].trim_end().trim_end_matches('(').trim_end();
+            if before.ends_with('-') {
+                speed = -speed;
+            }
+            return Some(PropScript::SpinZ { comp, speed });
+        }
         None
     }
 
-    fn apply(&self, mut v: [f32; 3], daytime: f32, now: text::LocalTime) -> [f32; 3] {
+    fn apply(&self, mut v: [f32; 3], time: f32, daytime: f32, now: text::LocalTime) -> [f32; 3] {
         match *self {
             PropScript::TimeOfDay { comp, mul, modulo, factor, floor } => {
                 let mut x = daytime * mul + 1e-6;
@@ -1773,6 +2246,27 @@ impl PropScript {
                 v[comp] = x * factor;
             }
             PropScript::Seconds { comp, div } => v[comp] = now.second as f32 / div,
+            PropScript::SpinZ { comp, speed } => v[comp] = (speed * time).rem_euclid(360.0),
+            PropScript::WaveOriginX {
+                intensity,
+                speed,
+                smoothness,
+                invert,
+            } => {
+                let elapsed = time * speed;
+                let phase = (elapsed / std::f32::consts::TAU).rem_euclid(1.0);
+                let triangle = if phase < 0.5 {
+                    phase * 4.0 - 1.0
+                } else {
+                    3.0 - phase * 4.0
+                };
+                let sine = elapsed.sin();
+                let mut wave = triangle + (sine - triangle) * smoothness;
+                if invert {
+                    wave = -wave;
+                }
+                v[0] += wave * intensity;
+            }
         }
         v
     }
@@ -1800,14 +2294,11 @@ impl ObjAnim {
         origin: [f32; 3],
         scale: [f32; 3],
         angles: [f32; 3],
+        props: &HashMap<String, serde_json::Value>,
+        now: text::LocalTime,
     ) -> Option<Box<Self>> {
         let track = |k: &str| obj.get(k).and_then(KeyTrack::parse);
-        let script = |k: &str| {
-            obj.get(k)
-                .and_then(|v| v.get("script"))
-                .and_then(|s| s.as_str())
-                .and_then(PropScript::parse)
-        };
+        let script = |k: &str| obj.get(k).and_then(|v| PropScript::parse(v, props));
         let a = ObjAnim {
             parent,
             origin,
@@ -1817,7 +2308,7 @@ impl ObjAnim {
             scale_track: track("scale"),
             angles_track: track("angles"),
             alpha_track: track("alpha"),
-            base_alpha: obj.get("alpha").and_then(value_f32).unwrap_or(1.0),
+            base_alpha: eval_alpha_field(obj.get("alpha"), props, now),
             origin_script: script("origin"),
             scale_script: script("scale"),
             angles_script: script("angles"),
@@ -1846,14 +2337,14 @@ impl ObjAnim {
             angles = t.apply(angles, time);
         }
         if let Some(s) = &self.origin_script {
-            origin = s.apply(origin, daytime, now);
+            origin = s.apply(origin, time, daytime, now);
         }
         if let Some(s) = &self.scale_script {
-            scale = s.apply(scale, daytime, now);
+            scale = s.apply(scale, time, daytime, now);
         }
         if let Some(s) = &self.angles_script {
             // Scripts use degrees; scene.json stores radians.
-            let deg = s.apply([0.0; 3], daytime, now);
+            let deg = s.apply([0.0; 3], time, daytime, now);
             angles[2] = deg[2].to_radians();
         }
         let local = Affine::translate(origin[0], origin[1])
@@ -1877,10 +2368,44 @@ impl SceneObject {
         self.visible.eval(props)
     }
 
+    fn local_center(&self) -> [f32; 2] {
+        let mut cx = self.align[0] * self.size[0];
+        let mut cy = self.align[1] * self.size[1];
+        if let ObjectKind::Text(layer) = &self.kind {
+            if !layer.limit_width {
+                let dx = layer.world_size[0] - layer.box_size[0];
+                let dy = layer.world_size[1] - layer.box_size[1];
+                match layer.h_align {
+                    text::HAlign::Left => cx += dx * 0.5,
+                    text::HAlign::Right => cx -= dx * 0.5,
+                    text::HAlign::Center => {}
+                }
+                match layer.v_align {
+                    text::VAlign::Bottom => cy += dy * 0.5,
+                    text::VAlign::Top => cy -= dy * 0.5,
+                    text::VAlign::Center => {}
+                }
+            }
+        }
+        [cx, cy]
+    }
+
+    fn quad_transform(&self, mut world_t: Affine) -> Affine {
+        let [cx, cy] = self.local_center();
+        if cx != 0.0 || cy != 0.0 {
+            let [wx, wy] = world_t.apply_vec([cx, cy]);
+            world_t.tx += wx;
+            world_t.ty += wy;
+        }
+        world_t
+    }
+
     fn aabb(&self, offset: [f32; 2]) -> ([f32; 2], [f32; 2]) {
-        let mut transform = self.transform;
-        transform.tx += offset[0];
-        transform.ty += offset[1];
+        let transform = self.quad_transform(Affine {
+            tx: self.transform.tx + offset[0],
+            ty: self.transform.ty + offset[1],
+            ..self.transform
+        });
         let size = self.size;
         let hw = size[0].abs() * 0.5;
         let hh = size[1].abs() * 0.5;
@@ -2090,6 +2615,11 @@ pub struct SceneRenderer {
     sounds_started: bool,
     volume: f32,
     muted: bool,
+    bcs_hue: [f32; 4],
+    scene_general: Option<serde_json::Value>,
+    authored_ortho: [f32; 2],
+    authored_prop_keys: std::collections::HashSet<String>,
+    raw_nodes: Vec<(Option<usize>, serde_json::Value)>,
     properties: HashMap<String, serde_json::Value>,
     pkg: PackageFs,
 
@@ -2156,6 +2686,11 @@ impl SceneRenderer {
             sounds_started: false,
             volume: 1.0,
             muted: false,
+            bcs_hue: [0.0, 1.0, 1.0, 0.0],
+            scene_general: None,
+            authored_ortho: [1920.0, 1080.0],
+            authored_prop_keys: std::collections::HashSet::new(),
+            raw_nodes: Vec::new(),
             properties: HashMap::new(),
             pkg: PackageFs::default(),
             width,
@@ -2175,6 +2710,7 @@ impl SceneRenderer {
                 .and_then(|p| p.as_object())
             {
                 for (k, v) in props {
+                    this.authored_prop_keys.insert(k.to_ascii_lowercase());
                     let value = v.get("value").cloned().unwrap_or(serde_json::Value::Null);
                     this.properties.insert(k.clone(), value);
                 }
@@ -2256,6 +2792,8 @@ impl SceneRenderer {
         self.sounds.clear();
         self.sound_specs.clear();
         self.sounds_started = false;
+        self.scene_general = root.get("general").cloned();
+        self.raw_nodes.clear();
 
         if let Some(general) = root.get("general") {
             if let Some(ortho) = general.get("orthogonalprojection") {
@@ -2264,7 +2802,7 @@ impl SceneRenderer {
                 self.ortho_size = [w.max(1.0), h.max(1.0)];
             }
             if let Some(cc) = general.get("clearcolor") {
-                self.clear_color = parse_color(cc, [0.04, 0.05, 0.08]);
+                self.clear_color = eval_color_field(Some(cc), &self.properties, [0.04, 0.05, 0.08]);
             }
             if let Some(v) = general
                 .get("cameraparallax")
@@ -2332,17 +2870,22 @@ impl SceneRenderer {
                         .map(str::to_string)
                         .or_else(|| p.as_i64().map(|n| n.to_string()))
                 });
+            let default_origin = if parent.is_some() {
+                [0.0, 0.0, 0.0]
+            } else {
+                [self.ortho_size[0] * 0.5, self.ortho_size[1] * 0.5, 0.0]
+            };
             let origin = obj
                 .get("origin")
-                .map(|v| value_vec(v, 3, [self.ortho_size[0] * 0.5, self.ortho_size[1] * 0.5, 0.0]))
-                .unwrap_or([self.ortho_size[0] * 0.5, self.ortho_size[1] * 0.5, 0.0]);
+                .map(|v| eval_origin_field(v, default_origin, self.ortho_size, &self.properties))
+                .unwrap_or(default_origin);
             let scale = obj
                 .get("scale")
-                .map(|v| value_vec(v, 3, [1.0, 1.0, 1.0]))
+                .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [1.0, 1.0, 1.0]))
                 .unwrap_or([1.0, 1.0, 1.0]);
             let angles = obj
                 .get("angles")
-                .map(|v| value_vec(v, 3, [0.0, 0.0, 0.0]))
+                .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [0.0, 0.0, 0.0]))
                 .unwrap_or([0.0, 0.0, 0.0]);
             let local = Affine::translate(origin[0], origin[1])
                 .mul(Affine::rotate(angles[2]))
@@ -2411,6 +2954,7 @@ impl SceneRenderer {
         // camera around the scene centre.  Authors of such wallpapers often
         // place side backdrops / pillarbox layers outside `0..width` for this.
         let authored_ortho = self.ortho_size;
+        self.authored_ortho = authored_ortho;
         if authored_ortho[1] > authored_ortho[0] && self.width > self.height && self.height > 0 {
             let win_aspect = self.width as f32 / self.height as f32;
             let view_w = authored_ortho[1] * win_aspect;
@@ -2429,11 +2973,16 @@ impl SceneRenderer {
         let parent_index = |i: usize| -> Option<usize> {
             raws[i].parent.as_ref().and_then(|p| id_index.get(p).copied())
         };
+        self.raw_nodes = raws
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| (parent_index(idx), r.obj.clone()))
+            .collect();
         // Visibility is inherited: a hidden group hides all of its children
         // (WE groups are often empty "image": null containers).
         let own_visible: Vec<VisibleRule> = raws
             .iter()
-            .map(|r| parse_visible(r.obj.get("visible"), now))
+            .map(|r| parse_visible(r.obj.get("visible"), &self.properties, now))
             .collect();
         let inherited_visible = |i: usize| -> VisibleRule {
             let mut rules: Vec<VisibleRule> = Vec::new();
@@ -2463,7 +3012,15 @@ impl SceneRenderer {
                 .unwrap_or(root_transform);
             if let (Some(id), Some(a)) = (
                 raw.obj.get("id").and_then(|v| v.as_i64()),
-                ObjAnim::parse(&raw.obj, parent, raw.origin, raw.scale, raw.angles),
+                ObjAnim::parse(
+                    &raw.obj,
+                    parent,
+                    raw.origin,
+                    raw.scale,
+                    raw.angles,
+                    &self.properties,
+                    now,
+                ),
             ) {
                 anims.insert(id, a);
             }
@@ -2490,6 +3047,7 @@ impl SceneRenderer {
                 .to_string();
 
             let visible = inherited_visible(i);
+            let align = parse_alignment(obj);
 
             if let Some(particle_path) = obj
                 .get("particle")
@@ -2508,22 +3066,23 @@ impl SceneRenderer {
                         obj,
                         transform,
                         kind,
+                        &self.properties,
                     )
                 } else {
                     let size = obj
                         .get("size")
-                        .map(|v| value_vec(v, 3, [600.0, 600.0, 0.0]))
+                        .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [600.0, 600.0, 0.0]))
                         .unwrap_or([1200.0, 900.0, 0.0]);
                     let scale = obj
                         .get("scale")
-                        .map(|v| value_vec(v, 3, [1.0, 1.0, 1.0]))
+                        .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [1.0, 1.0, 1.0]))
                         .unwrap_or([1.0, 1.0, 1.0]);
                     let center = [transform.tx, transform.ty];
                     let spread = [
                         size[0].abs() * scale[0].abs() * 0.5,
                         size[1].abs() * scale[1].abs() * 0.5,
                     ];
-                    let color = obj.get("color").map(|c| parse_color(c, [1.0, 1.0, 1.0]));
+                    let color = Some(eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]));
                     let count = if kind == ParticleKind::Fog { 20 } else { 80 };
                     Emitter::new(kind, count, center, spread, color, true)
                 };
@@ -2534,16 +3093,11 @@ impl SceneRenderer {
                     name,
                     transform,
                     size: [1.0, 1.0],
+                    align: [0.0, 0.0],
                     color: [1.0, 1.0, 1.0, 0.0],
                     brightness: 1.0,
                     blend: LayerBlend::Normal,
-                    parallax: obj
-                        .get("parallaxDepth")
-                        .map(|v| {
-                            let p = value_vec(v, 3, [0.0, 0.0, 0.0]);
-                            [p[0], p[1]]
-                        })
-                        .unwrap_or([0.0, 0.0]),
+                    parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
                     dependencies,
                     capture_composite: false,
@@ -2553,47 +3107,36 @@ impl SceneRenderer {
                     anim: None,
                     sprite: None,
                     attach: None,
+                    raw_idx: Some(i),
+                    raw_obj: obj.clone(),
                 });
                 continue;
             }
 
             if let Some(text_def) = obj.get("text") {
-                if let Some(layer) = Self::load_text(pkg, obj, text_def, now) {
+                if let Some(layer) = Self::load_text(pkg, obj, text_def, &self.properties, now) {
                     let size = obj
                         .get("size")
-                        .map(|v| value_vec(v, 3, [layer.box_size[0], layer.box_size[1], 0.0]))
+                        .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [layer.box_size[0], layer.box_size[1], 0.0]))
                         .map(|v| [v[0], v[1]])
                         .unwrap_or(layer.box_size);
+                    let c = eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]);
                     self.objects.push(SceneObject {
                         id: obj_id,
                         name,
                         transform,
                         size,
+                        align,
                         color: [
-                            parse_color(
-                                obj.get("color").unwrap_or(&serde_json::Value::Null),
-                                [1.0, 1.0, 1.0],
-                            )[0],
-                            parse_color(
-                                obj.get("color").unwrap_or(&serde_json::Value::Null),
-                                [1.0, 1.0, 1.0],
-                            )[1],
-                            parse_color(
-                                obj.get("color").unwrap_or(&serde_json::Value::Null),
-                                [1.0, 1.0, 1.0],
-                            )[2],
-                            obj.get("alpha").and_then(value_f32).unwrap_or(1.0),
+                            c[0],
+                            c[1],
+                            c[2],
+                            eval_alpha_field(obj.get("alpha"), &self.properties, now),
                         ],
-                        brightness: obj.get("brightness").and_then(value_f32).unwrap_or(1.0),
+                        brightness: eval_brightness_field(obj.get("brightness"), &self.properties, 1.0),
                         blend: object_blend("normal", object_color_blend(obj)),
                         color_blend: object_color_blend(obj),
-                        parallax: obj
-                            .get("parallaxDepth")
-                            .map(|v| {
-                                let p = value_vec(v, 3, [0.0, 0.0, 0.0]);
-                                [p[0], p[1]]
-                            })
-                            .unwrap_or([0.0, 0.0]),
+                        parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                         visible,
                         dependencies,
                         capture_composite,
@@ -2602,6 +3145,8 @@ impl SceneRenderer {
                         anim: None,
                         sprite: None,
                         attach: None,
+                        raw_idx: Some(i),
+                        raw_obj: obj.clone(),
                     });
                 }
                 continue;
@@ -2624,6 +3169,7 @@ impl SceneRenderer {
                         self.ortho_size[1] * 0.5,
                     ),
                     size: [self.ortho_size[0], self.ortho_size[1]],
+                    align: [0.0, 0.0],
                     color: [1.0, 1.0, 1.0, 1.0],
                     brightness: 1.0,
                     blend: LayerBlend::Normal,
@@ -2637,6 +3183,8 @@ impl SceneRenderer {
                     anim: None,
                     sprite: None,
                     attach: None,
+                    raw_idx: Some(i),
+                    raw_obj: obj.clone(),
                 });
                 continue;
             }
@@ -2652,7 +3200,7 @@ impl SceneRenderer {
                 }
                 let size = obj
                     .get("size")
-                    .map(|v| value_vec(v, 3, [self.ortho_size[0], self.ortho_size[1], 0.0]))
+                    .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [self.ortho_size[0], self.ortho_size[1], 0.0]))
                     .map(|v| [v[0].abs().max(1.0), v[1].abs().max(1.0)])
                     .unwrap_or(self.ortho_size);
                 self.objects.push(SceneObject {
@@ -2660,22 +3208,17 @@ impl SceneRenderer {
                     name,
                     transform,
                     size,
+                    align,
                     color: [
                         1.0,
                         1.0,
                         1.0,
-                        obj.get("alpha").and_then(value_f32).unwrap_or(1.0),
+                        eval_alpha_field(obj.get("alpha"), &self.properties, now),
                     ],
-                    brightness: obj.get("brightness").and_then(value_f32).unwrap_or(1.0),
+                    brightness: eval_brightness_field(obj.get("brightness"), &self.properties, 1.0),
                     blend: object_blend("normal", object_color_blend(obj)),
                     color_blend: object_color_blend(obj),
-                    parallax: obj
-                        .get("parallaxDepth")
-                        .map(|v| {
-                            let p = value_vec(v, 3, [0.0, 0.0, 0.0]);
-                            [p[0], p[1]]
-                        })
-                        .unwrap_or([0.0, 0.0]),
+                    parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
                     dependencies,
                     capture_composite,
@@ -2684,44 +3227,33 @@ impl SceneRenderer {
                     anim: None,
                     sprite: None,
                     attach: None,
+                    raw_idx: Some(i),
+                    raw_obj: obj.clone(),
                 });
                 continue;
             }
             if lower.contains("util/solidlayer") {
                 let size = obj
                     .get("size")
-                    .map(|v| value_vec(v, 3, [100.0, 100.0, 0.0]))
+                    .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [100.0, 100.0, 0.0]))
                     .unwrap_or([self.ortho_size[0], self.ortho_size[1], 0.0]);
+                let c = eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]);
                 self.objects.push(SceneObject {
                     id: obj_id,
                     name,
                     transform,
                     size: [size[0], size[1]],
+                    align,
                     color: [
-                        parse_color(
-                            obj.get("color").unwrap_or(&serde_json::Value::Null),
-                            [1.0, 1.0, 1.0],
-                        )[0],
-                        parse_color(
-                            obj.get("color").unwrap_or(&serde_json::Value::Null),
-                            [1.0, 1.0, 1.0],
-                        )[1],
-                        parse_color(
-                            obj.get("color").unwrap_or(&serde_json::Value::Null),
-                            [1.0, 1.0, 1.0],
-                        )[2],
-                        obj.get("alpha").and_then(value_f32).unwrap_or(1.0),
+                        c[0],
+                        c[1],
+                        c[2],
+                        eval_alpha_field(obj.get("alpha"), &self.properties, now),
                     ],
-                    brightness: obj.get("brightness").and_then(value_f32).unwrap_or(1.0),
+                    brightness: eval_brightness_field(obj.get("brightness"), &self.properties, 1.0),
                     blend: object_blend("normal", object_color_blend(obj)),
                     color_blend: object_color_blend(obj),
-                    parallax: obj
-                        .get("parallaxDepth")
-                        .map(|v| {
-                            let p = value_vec(v, 3, [0.0, 0.0, 0.0]);
-                            [p[0], p[1]]
-                        })
-                        .unwrap_or([0.0, 0.0]),
+                    parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
                     dependencies,
                     capture_composite,
@@ -2730,6 +3262,8 @@ impl SceneRenderer {
                     anim: None,
                     sprite: None,
                     attach: None,
+                    raw_idx: Some(i),
+                    raw_obj: obj.clone(),
                 });
                 continue;
             }
@@ -2787,22 +3321,38 @@ impl SceneRenderer {
             }
 
             if solid_model {
-                let inst_composite_ref = obj
+                let inst_tex_ref = obj
                     .get("instance")
                     .or_else(|| obj.get("instanceoverride"))
                     .and_then(|inst| inst.get("textures"))
                     .and_then(|t| t.as_array())
                     .and_then(|a| a.first())
-                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.as_str());
+                let inst_composite_ref = inst_tex_ref
                     .and_then(parse_composite_tex_id)
                     .or_else(|| dependencies.first().copied());
+                let mut loaded_tex: Option<(glow::Texture, [f32; 2])> = None;
+                if inst_composite_ref.is_none() {
+                    if let Some(tex_name) = inst_tex_ref {
+                        if let Some((t, tw, th, _)) =
+                            Self::load_texture(gl, pkg, &mut self.textures, tex_name)
+                        {
+                            loaded_tex = Some((t, [tw as f32, th as f32]));
+                        }
+                    }
+                }
+                let default_size = loaded_tex
+                    .map(|(_, s)| [s[0], s[1], 0.0])
+                    .unwrap_or([self.ortho_size[0], self.ortho_size[1], 0.0]);
                 let size = obj
                     .get("size")
-                    .map(|v| value_vec(v, 3, [self.ortho_size[0], self.ortho_size[1], 0.0]))
-                    .unwrap_or([self.ortho_size[0], self.ortho_size[1], 0.0]);
+                    .map(|v| value_vec(v, 3, default_size))
+                    .unwrap_or(default_size);
                 let effects = load_effects(gl, pkg, obj, &self.properties, now);
                 let kind = if let Some(ref_id) = inst_composite_ref {
                     ObjectKind::CompositeRef(ref_id)
+                } else if let Some((tex, _)) = loaded_tex {
+                    ObjectKind::Image(tex)
                 } else if obj.get("copybackground").and_then(value_bool) == Some(true) {
                     if effects.is_empty() && !capture_composite {
                         continue;
@@ -2813,27 +3363,23 @@ impl SceneRenderer {
                 } else {
                     ObjectKind::Solid
                 };
+                let c = eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]);
                 self.objects.push(SceneObject {
                     id: obj_id,
                     name,
                     transform,
                     size: [size[0], size[1]],
+                    align,
                     color: [
-                        parse_color(obj.get("color").unwrap_or(&serde_json::Value::Null), [1.0, 1.0, 1.0])[0],
-                        parse_color(obj.get("color").unwrap_or(&serde_json::Value::Null), [1.0, 1.0, 1.0])[1],
-                        parse_color(obj.get("color").unwrap_or(&serde_json::Value::Null), [1.0, 1.0, 1.0])[2],
-                        obj.get("alpha").and_then(value_f32).unwrap_or(1.0),
+                        c[0],
+                        c[1],
+                        c[2],
+                        eval_alpha_field(obj.get("alpha"), &self.properties, now),
                     ],
-                    brightness: obj.get("brightness").and_then(value_f32).unwrap_or(1.0),
+                    brightness: eval_brightness_field(obj.get("brightness"), &self.properties, 1.0),
                     blend: object_blend("normal", object_color_blend(obj)),
                     color_blend: object_color_blend(obj),
-                    parallax: obj
-                        .get("parallaxDepth")
-                        .map(|v| {
-                            let p = value_vec(v, 3, [0.0, 0.0, 0.0]);
-                            [p[0], p[1]]
-                        })
-                        .unwrap_or([0.0, 0.0]),
+                    parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
                     dependencies,
                     capture_composite,
@@ -2842,6 +3388,8 @@ impl SceneRenderer {
                     anim: None,
                     sprite: None,
                     attach: None,
+                    raw_idx: Some(i),
+                    raw_obj: obj.clone(),
                 });
                 continue;
             }
@@ -2887,8 +3435,12 @@ impl SceneRenderer {
                             .map(|arr| {
                                 arr.iter()
                                     .filter_map(|layer| {
-                                        let vis = parse_visible(layer.get("visible"), now)
-                                            .eval(&self.properties);
+                                        let vis = parse_visible(
+                                            layer.get("visible"),
+                                            &self.properties,
+                                            now,
+                                        )
+                                        .eval(&self.properties);
                                         if !vis {
                                             return None;
                                         }
@@ -2918,9 +3470,11 @@ impl SceneRenderer {
                         match Mesh::new(gl, &parsed) {
                             Ok(mesh) => ObjectKind::Puppet {
                                 mesh,
+                                bounds: mdl_bounds(&parsed.vertices),
                                 mdl: parsed,
                                 anim_layers,
                                 texture,
+                                tex_size: [tex_w, tex_h],
                             },
                             Err(err) => {
                                 log::warn!("puppet {puppet_path}: {err}");
@@ -2943,27 +3497,35 @@ impl SceneRenderer {
                 .map(|v| [v[0].abs().max(1.0), v[1].abs().max(1.0)])
                 .unwrap_or(default_size);
 
+            if std::env::var_os("ANIMA_TRACE_SCENE").is_some() {
+                log::info!(
+                    "load obj {:?} '{}' image='{}' tex='{}' {}x{} sprite={:?}",
+                    obj_id,
+                    name,
+                    image_ref,
+                    texture_path,
+                    tex_w,
+                    tex_h,
+                    obj_id.and_then(|id| sprites.get(&id).copied())
+                );
+            }
+            let c = eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]);
             self.objects.push(SceneObject {
                 id: obj_id,
                 name,
                 transform,
                 size,
+                align,
                 color: [
-                    parse_color(obj.get("color").unwrap_or(&serde_json::Value::Null), [1.0, 1.0, 1.0])[0],
-                    parse_color(obj.get("color").unwrap_or(&serde_json::Value::Null), [1.0, 1.0, 1.0])[1],
-                    parse_color(obj.get("color").unwrap_or(&serde_json::Value::Null), [1.0, 1.0, 1.0])[2],
-                    obj.get("alpha").and_then(value_f32).unwrap_or(1.0),
+                    c[0],
+                    c[1],
+                    c[2],
+                    eval_alpha_field(obj.get("alpha"), &self.properties, now),
                 ],
-                brightness: obj.get("brightness").and_then(value_f32).unwrap_or(1.0),
+                brightness: eval_brightness_field(obj.get("brightness"), &self.properties, 1.0),
                 blend: object_blend(&material_blend, object_color_blend(obj)),
                 color_blend: object_color_blend(obj),
-                parallax: obj
-                    .get("parallaxDepth")
-                    .map(|v| {
-                        let p = value_vec(v, 3, [0.0, 0.0, 0.0]);
-                        [p[0], p[1]]
-                    })
-                    .unwrap_or([0.0, 0.0]),
+                parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                 visible,
                 dependencies,
                 capture_composite,
@@ -2972,6 +3534,8 @@ impl SceneRenderer {
                 anim: None,
                 sprite: None,
                 attach: None,
+                raw_idx: Some(i),
+                raw_obj: obj.clone(),
             });
         }
 
@@ -3069,14 +3633,15 @@ impl SceneRenderer {
                     ObjectKind::Post => "post",
                 };
                 log::info!(
-                    "obj {i}: '{}' kind={} size={:?} blend={:?} alpha={} pos=({:.1},{:.1})",
+                    "obj {i}: '{}' kind={} size={:?} blend={:?} alpha={} pos=({:.1},{:.1}) vis={}",
                     o.name,
                     kind,
                     o.size,
                     o.blend,
                     o.color[3],
                     o.transform.tx,
-                    o.transform.ty
+                    o.transform.ty,
+                    o.is_visible(&self.properties)
                 );
             }
         }
@@ -3219,16 +3784,24 @@ impl SceneRenderer {
         pkg: &PackageFs,
         obj: &serde_json::Value,
         text_def: &serde_json::Value,
+        props_map: &HashMap<String, serde_json::Value>,
         now: text::LocalTime,
     ) -> Option<TextLayer> {
         let (script, authored) = match text_def {
             serde_json::Value::String(s) => (None, s.clone()),
-            serde_json::Value::Object(o) => (
-                o.get("script").and_then(|v| v.as_str()).map(str::to_string),
-                o.get("value")
-                    .map(value_to_string)
-                    .unwrap_or_else(|| "Text".to_string()),
-            ),
+            serde_json::Value::Object(o) => {
+                let authored = if text_def.get("user").is_some() {
+                    value_to_string(&resolve_prop(text_def, props_map))
+                } else {
+                    o.get("value")
+                        .map(value_to_string)
+                        .unwrap_or_else(|| "Text".to_string())
+                };
+                (
+                    o.get("script").and_then(|v| v.as_str()).map(str::to_string),
+                    authored,
+                )
+            }
             _ => (None, String::new()),
         };
         let props = text_def
@@ -3239,7 +3812,8 @@ impl SceneRenderer {
 
         let mut point_size = obj
             .get("pointsize")
-            .and_then(value_f32)
+            .map(|v| resolve_prop(v, props_map))
+            .and_then(|v| value_f32(&v))
             .unwrap_or(32.0);
         if point_size <= 0.0 {
             point_size = 32.0;
@@ -3247,7 +3821,7 @@ impl SceneRenderer {
         let box_size = obj
             .get("size")
             .map(|v| {
-                let p = value_vec(v, 3, [512.0, 128.0, 0.0]);
+                let p = value_vec(&resolve_prop(v, props_map), 3, [512.0, 128.0, 0.0]);
                 [p[0].abs().max(1.0), p[1].abs().max(1.0)]
             })
             .unwrap_or([512.0, 128.0]);
@@ -3291,6 +3865,7 @@ impl SceneRenderer {
         let layer = TextLayer {
             script,
             authored,
+            raw_text_def: text_def.clone(),
             props,
             font,
             point_size,
@@ -3354,6 +3929,7 @@ impl SceneRenderer {
                 name: l.name.unwrap_or_else(|| "layer".into()),
                 transform,
                 size,
+                align: [0.0, 0.0],
                 color: [c[0], c[1], c[2], l.alpha.unwrap_or(1.0)],
                 brightness: 1.0,
                 blend: LayerBlend::from_material(l.blend.as_deref().unwrap_or("normal")),
@@ -3367,6 +3943,8 @@ impl SceneRenderer {
                 anim: None,
                 sprite: None,
                 attach: None,
+                raw_idx: None,
+                raw_obj: serde_json::Value::Null,
             });
         }
         for p in doc.particles {
@@ -3386,6 +3964,7 @@ impl SceneRenderer {
                 name: "particles".into(),
                 transform: Affine::identity(),
                 size: [1.0, 1.0],
+                align: [0.0, 0.0],
                 color: [1.0, 1.0, 1.0, 0.0],
                 brightness: 1.0,
                 blend: LayerBlend::Normal,
@@ -3399,25 +3978,118 @@ impl SceneRenderer {
                 anim: None,
                 sprite: None,
                 attach: None,
+                raw_idx: None,
+                raw_obj: serde_json::Value::Null,
             });
         }
         Ok(())
     }
+}
 
+fn recompute_raw_transforms(
+    raw_nodes: &[(Option<usize>, serde_json::Value)],
+    authored_ortho: [f32; 2],
+    view_shift: f32,
+    props: &HashMap<String, serde_json::Value>,
+) -> Vec<(Affine, Affine, [f32; 3], [f32; 3], [f32; 3])> {
+    let root_transform = Affine::translate(view_shift, 0.0);
+    let mut locals = Vec::with_capacity(raw_nodes.len());
+    let mut origins = Vec::with_capacity(raw_nodes.len());
+    let mut scales = Vec::with_capacity(raw_nodes.len());
+    let mut angles_vec = Vec::with_capacity(raw_nodes.len());
+    for (parent, obj) in raw_nodes {
+        let default_origin = if parent.is_some() {
+            [0.0, 0.0, 0.0]
+        } else {
+            [authored_ortho[0] * 0.5, authored_ortho[1] * 0.5, 0.0]
+        };
+        let origin = obj
+            .get("origin")
+            .map(|v| eval_origin_field(v, default_origin, authored_ortho, props))
+            .unwrap_or(default_origin);
+        let scale = obj
+            .get("scale")
+            .map(|v| value_vec(&resolve_prop(v, props), 3, [1.0, 1.0, 1.0]))
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let angles = obj
+            .get("angles")
+            .map(|v| value_vec(&resolve_prop(v, props), 3, [0.0, 0.0, 0.0]))
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let local = Affine::translate(origin[0], origin[1])
+            .mul(Affine::rotate(angles[2]))
+            .mul(Affine::scale(
+                if scale[0] == 0.0 { 1.0 } else { scale[0] },
+                if scale[1] == 0.0 { 1.0 } else { scale[1] },
+            ));
+        locals.push(local);
+        origins.push(origin);
+        scales.push(scale);
+        angles_vec.push(angles);
+    }
+    let mut worlds: Vec<Option<Affine>> = vec![None; raw_nodes.len()];
+    fn resolve_w(
+        i: usize,
+        raw_nodes: &[(Option<usize>, serde_json::Value)],
+        locals: &[Affine],
+        root: Affine,
+        out: &mut [Option<Affine>],
+        depth: usize,
+    ) -> Affine {
+        if let Some(t) = out[i] {
+            return t;
+        }
+        if depth > 32 {
+            return root;
+        }
+        let parent_t = raw_nodes[i]
+            .0
+            .map(|p| resolve_w(p, raw_nodes, locals, root, out, depth + 1))
+            .unwrap_or(root);
+        let w = parent_t.mul(locals[i]);
+        out[i] = Some(w);
+        w
+    }
+    (0..raw_nodes.len())
+        .map(|i| {
+            let world = resolve_w(i, raw_nodes, &locals, root_transform, &mut worlds, 0);
+            let parent_world = raw_nodes[i]
+                .0
+                .and_then(|p| worlds[p])
+                .unwrap_or(root_transform);
+            (world, parent_world, origins[i], scales[i], angles_vec[i])
+        })
+        .collect()
+}
+
+impl SceneRenderer {
     pub fn apply_property(&mut self, key: &str, value: &str) {
         let parsed = if value.eq_ignore_ascii_case("true") {
             serde_json::Value::Bool(true)
         } else if value.eq_ignore_ascii_case("false") {
             serde_json::Value::Bool(false)
+        } else if let Ok(i) = value.parse::<i64>() {
+            serde_json::Value::Number(serde_json::Number::from(i))
         } else if let Ok(n) = value.parse::<f64>() {
-            serde_json::Value::Number(serde_json::Number::from_f64(n).unwrap())
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(n).unwrap_or_else(|| serde_json::Number::from(0)),
+            )
         } else {
             serde_json::Value::String(value.to_string())
         };
-        self.properties.insert(key.to_string(), parsed);
-        match key.to_ascii_lowercase().as_str() {
+        let existing_key = self
+            .properties
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(key))
+            .cloned()
+            .unwrap_or_else(|| key.to_string());
+        self.properties.insert(existing_key, parsed);
+
+        let kl = key.to_ascii_lowercase();
+        let is_authored = self.authored_prop_keys.contains(&kl);
+        match kl.as_str() {
             "clearcolor" => {
-                self.clear_color = parse_color(&serde_json::Value::String(value.to_string()), self.clear_color);
+                self.clear_color =
+                    parse_color(&serde_json::Value::String(value.to_string()), self.clear_color);
             }
             "speed" => {
                 if let Ok(v) = value.parse::<f32>() {
@@ -3425,14 +4097,179 @@ impl SceneRenderer {
                 }
             }
             "parallax" | "cameraparallax" => {
-                if value == "true" || value == "false" {
-                    self.parallax_enabled = value == "true";
+                if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
+                    self.parallax_enabled = value.eq_ignore_ascii_case("true");
                 } else if let Ok(v) = value.parse::<f32>() {
                     self.parallax_enabled = v > 0.0;
                     self.parallax_amount = v;
                 }
             }
-            _ => {}
+            "ui_brightness" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[0] = v.clamp(-1.0, 1.0);
+                }
+            }
+            "brightness" if !is_authored => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[0] = v.clamp(-1.0, 1.0);
+                }
+            }
+            "ui_contrast" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[1] = v.clamp(0.0, 3.0);
+                }
+            }
+            "contrast" if !is_authored => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[1] = v.clamp(0.0, 3.0);
+                }
+            }
+            "ui_saturation" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[2] = v.clamp(0.0, 3.0);
+                }
+            }
+            "saturation" if !is_authored => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[2] = v.clamp(0.0, 3.0);
+                }
+            }
+            "ui_hue" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[3] = v.clamp(-180.0, 180.0).to_radians();
+                }
+            }
+            "hue" | "hueshift" if !is_authored => {
+                if let Ok(v) = value.parse::<f32>() {
+                    self.bcs_hue[3] = v.clamp(-180.0, 180.0).to_radians();
+                }
+            }
+            "schemecolor" | _ => {}
+        }
+        self.reapply_scene_properties();
+    }
+
+    fn reapply_scene_properties(&mut self) {
+        let now = text::local_time();
+        if let Some(general) = &self.scene_general {
+            if let Some(cc) = general.get("clearcolor").filter(|v| v.get("user").is_some()) {
+                self.clear_color = eval_color_field(Some(cc), &self.properties, self.clear_color);
+            }
+            if let Some(cp) = general.get("cameraparallax").filter(|v| v.get("user").is_some()) {
+                if let Some(b) = value_bool(&resolve_prop(cp, &self.properties)) {
+                    self.parallax_enabled = b;
+                }
+            }
+            if let Some(cpa) = general
+                .get("cameraparallaxamount")
+                .filter(|v| v.get("user").is_some())
+            {
+                if let Some(v) = value_f32(&resolve_prop(cpa, &self.properties)) {
+                    self.parallax_amount = v;
+                }
+            }
+            if let Some(cpmi) = general
+                .get("cameraparallaxmouseinfluence")
+                .filter(|v| v.get("user").is_some())
+            {
+                if let Some(v) = value_f32(&resolve_prop(cpmi, &self.properties)) {
+                    self.parallax_mouse_influence = v;
+                }
+            }
+        }
+
+        let transforms = if self.raw_nodes.is_empty() {
+            Vec::new()
+        } else {
+            recompute_raw_transforms(
+                &self.raw_nodes,
+                self.authored_ortho,
+                self.view_shift,
+                &self.properties,
+            )
+        };
+
+        for obj in &mut self.objects {
+            if obj.raw_obj.is_null() {
+                continue;
+            }
+            let raw = &obj.raw_obj;
+            let alpha = eval_alpha_field(raw.get("alpha"), &self.properties, now);
+            match &mut obj.kind {
+                ObjectKind::Post => {}
+                ObjectKind::Compose { .. } => {
+                    obj.color[3] = alpha;
+                    obj.brightness =
+                        eval_brightness_field(raw.get("brightness"), &self.properties, 1.0);
+                    obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
+                }
+                ObjectKind::Particle(idx) => {
+                    obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
+                    if let Some(color_mult) = raw
+                        .get("instanceoverride")
+                        .and_then(|o| o.get("colorn").or_else(|| o.get("color")))
+                        .or_else(|| raw.get("color"))
+                        .map(|c| parse_color(&resolve_prop(c, &self.properties), [1.0, 1.0, 1.0]))
+                    {
+                        if let Some(em) = self.emitters.get_mut(*idx) {
+                            em.update_color_mult(color_mult);
+                        }
+                    }
+                }
+                ObjectKind::Text(layer) => {
+                    let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
+                    obj.color = [c[0], c[1], c[2], alpha];
+                    obj.brightness =
+                        eval_brightness_field(raw.get("brightness"), &self.properties, 1.0);
+                    obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
+                    let ps = raw
+                        .get("pointsize")
+                        .map(|v| resolve_prop(v, &self.properties))
+                        .and_then(|v| value_f32(&v))
+                        .unwrap_or(layer.point_size)
+                        .max(1.0);
+                    if (ps - layer.point_size).abs() > 1e-3 {
+                        layer.point_size = ps;
+                        layer.raster_ppw = -1.0;
+                    }
+                }
+                ObjectKind::Image(_)
+                | ObjectKind::Puppet { .. }
+                | ObjectKind::Solid
+                | ObjectKind::CompositeRef(_) => {
+                    let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
+                    obj.color = [c[0], c[1], c[2], alpha];
+                    obj.brightness =
+                        eval_brightness_field(raw.get("brightness"), &self.properties, 1.0);
+                    obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
+                }
+            }
+
+            if let Some(ridx) = obj.raw_idx {
+                if let Some(&(world, parent_world, origin, scale, angles)) = transforms.get(ridx) {
+                    if let Some(att) = &mut obj.attach {
+                        att.local = Affine::translate(origin[0], origin[1])
+                            .mul(Affine::rotate(angles[2]))
+                            .mul(Affine::scale(
+                                if scale[0] == 0.0 { 1.0 } else { scale[0] },
+                                if scale[1] == 0.0 { 1.0 } else { scale[1] },
+                            ));
+                    } else if !matches!(obj.kind, ObjectKind::Post | ObjectKind::Particle(_)) {
+                        obj.anim = ObjAnim::parse(
+                            raw,
+                            parent_world,
+                            origin,
+                            scale,
+                            angles,
+                            &self.properties,
+                            now,
+                        );
+                        if obj.anim.is_none() {
+                            obj.transform = world;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3497,12 +4334,34 @@ impl SceneRenderer {
             p.set_vec2(gl, "u_uv_scale", uv_scale[0], uv_scale[1]);
             p.set_vec2(gl, "u_uv_offset", uv_offset[0], uv_offset[1]);
             p.set_f32(gl, "u_flip_y", -1.0);
+            p.set_vec4(gl, "u_bcs_hue", [0.0, 1.0, 1.0, 0.0]);
             p.set_i32(gl, "u_tex", 0);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
             gl.bind_vertex_array(Some(self.quad_vao));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
+    }
+
+    /// Parallax depth an object is actually drawn with.
+    ///
+    /// Bone-attached layers (eyes, bangs, ornaments) usually have no
+    /// `parallaxDepth` of their own: their transform is bone-relative, so they
+    /// belong to their parent's camera plane.  Using their own (zero) depth
+    /// would pin them to the camera while the body slides underneath, which
+    /// makes attached parts drift off the model when the camera moves.
+    fn effective_parallax(&self, index: usize) -> [f32; 2] {
+        let mut cur = index;
+        for _ in 0..64 {
+            let obj = &self.objects[cur];
+            match &obj.attach {
+                Some(att) if att.parent < self.objects.len() && att.parent != cur => {
+                    cur = att.parent;
+                }
+                _ => return obj.parallax,
+            }
+        }
+        self.objects[index].parallax
     }
 
     fn parallax_offset(&self, depth: [f32; 2], time: f32) -> [f32; 2] {
@@ -3615,12 +4474,33 @@ impl SceneRenderer {
         blend: LayerBlend,
         color_blend: i32,
     ) -> Result<()> {
-        if color_blend != 0 && color_blend != 31 {
-            return self.draw_layer_canvas_blended(gl, canvas, min, max, color_blend);
-        }
         let origin = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
         let axis_x = [(max[0] - min[0]) * 0.5, 0.0];
         let axis_y = [0.0, (max[1] - min[1]) * 0.5];
+        self.draw_layer_canvas_transformed(gl, canvas, origin, axis_x, axis_y, blend, color_blend)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layer_canvas_transformed(
+        &mut self,
+        gl: &glow::Context,
+        canvas: &Canvas,
+        origin: [f32; 2],
+        axis_x: [f32; 2],
+        axis_y: [f32; 2],
+        blend: LayerBlend,
+        color_blend: i32,
+    ) -> Result<()> {
+        if color_blend != 0 && color_blend != 31 {
+            return self.draw_layer_canvas_blended_transformed(
+                gl,
+                canvas,
+                origin,
+                axis_x,
+                axis_y,
+                color_blend,
+            );
+        }
         unsafe {
             apply_blend(gl, blend);
             let p = &mut self.composite_prog;
@@ -3639,21 +4519,7 @@ impl SceneRenderer {
         Ok(())
     }
 
-    /// Composite a finished layer canvas with a Wallpaper Engine
-    /// `colorBlendMode` (`common_blending.h` semantics).
-    ///
-    /// Those modes read the background they are blended onto, so the composed
-    /// scene is snapshotted into `scene_copy` first and both textures are fed
-    /// to the blending shader.  The quad covers exactly the layer's AABB, so
-    /// everything outside it is left untouched.
-    fn draw_layer_canvas_blended(
-        &mut self,
-        gl: &glow::Context,
-        canvas: &Canvas,
-        min: [f32; 2],
-        max: [f32; 2],
-        mode: i32,
-    ) -> Result<()> {
+    fn snapshot_scene_copy(&mut self, gl: &glow::Context) -> Result<glow::Texture> {
         let (scene_w, scene_h, scene_fbo) = {
             let scene = self.scene.as_ref().unwrap();
             (scene.w, scene.h, scene.fbo)
@@ -3672,7 +4538,7 @@ impl SceneRenderer {
         let copy_tex = self.scene_copy.as_ref().unwrap().tex;
         unsafe {
             // Snapshot the scene.  A framebuffer blit keeps the row order
-            // identical, which is what the shader's screen-derived UV expects.
+            // identical, which is what shader screen-derived UVs expect.
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(scene_fbo));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(copy_fbo));
             gl.blit_framebuffer(
@@ -3689,12 +4555,31 @@ impl SceneRenderer {
             );
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene_fbo));
             gl.viewport(0, 0, scene_w, scene_h);
+        }
+        Ok(copy_tex)
+    }
+
+    /// Composite a finished layer canvas with a Wallpaper Engine
+    /// `colorBlendMode` (`common_blending.h` semantics).
+    ///
+    /// Those modes read the background they are blended onto, so the composed
+    /// scene is snapshotted into `scene_copy` first and both textures are fed
+    /// to the blending shader.  The quad covers the layer's oriented bounds,
+    /// so everything outside it is left untouched.
+    fn draw_layer_canvas_blended_transformed(
+        &mut self,
+        gl: &glow::Context,
+        canvas: &Canvas,
+        origin: [f32; 2],
+        axis_x: [f32; 2],
+        axis_y: [f32; 2],
+        mode: i32,
+    ) -> Result<()> {
+        let copy_tex = self.snapshot_scene_copy(gl)?;
+        unsafe {
             gl.disable(glow::BLEND);
             gl.disable(glow::DEPTH_TEST);
 
-            let origin = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
-            let axis_x = [(max[0] - min[0]) * 0.5, 0.0];
-            let axis_y = [0.0, (max[1] - min[1]) * 0.5];
             let p = &mut self.blend_prog;
             p.bind(gl);
             p.set_vec2(gl, "u_origin", origin[0], origin[1]);
@@ -3714,6 +4599,77 @@ impl SceneRenderer {
         }
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_object_effects(
+        &mut self,
+        gl: &glow::Context,
+        obj_idx: usize,
+        canvas: &Canvas,
+        tmp: &Canvas,
+        time: f32,
+        frametime: f32,
+        daytime: f32,
+        now: text::LocalTime,
+        mouse: [f32; 2],
+        audio: [f32; 4],
+        spectrum: &[f32; 64],
+        projection_inverse: [f32; 16],
+        self_id: Option<i64>,
+    ) -> bool {
+        let mut effects = std::mem::take(&mut self.objects[obj_idx].effects);
+        let deps = std::mem::take(&mut self.objects[obj_idx].dependencies);
+        let mut flip = false;
+        {
+            let ctx = EffectContext {
+                time,
+                frametime,
+                daytime,
+                mouse,
+                audio,
+                spectrum,
+                projection_inverse,
+                composites: &self.composites,
+                self_id,
+                dependencies: &deps,
+                props: &self.properties,
+            };
+            for effect in effects.iter_mut() {
+                if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                    continue;
+                }
+                let (src, dst) = if flip { (tmp, canvas) } else { (canvas, tmp) };
+                if effect
+                    .apply(gl, &self.pkg, &mut self.textures, src, dst, &ctx)
+                    .is_ok()
+                {
+                    flip = !flip;
+                }
+            }
+        }
+        self.objects[obj_idx].effects = effects;
+        self.objects[obj_idx].dependencies = deps;
+        flip
+    }
+
+    fn capture_layer_composite(
+        &mut self,
+        gl: &glow::Context,
+        id: i64,
+        final_canvas: &Canvas,
+    ) -> Result<()> {
+        let snap = match self.composites.remove(&id) {
+            Some(c) if c.w == final_canvas.w && c.h == final_canvas.h => c,
+            Some(old) => {
+                old.destroy(gl);
+                Canvas::new(gl, final_canvas.w, final_canvas.h)?
+            }
+            None => Canvas::new(gl, final_canvas.w, final_canvas.h)?,
+        };
+        self.blit_subrect_to_canvas(gl, final_canvas.tex, &snap, [0.0, 0.0], [1.0, 1.0]);
+        self.composites.insert(id, snap);
+        Ok(())
+    }
 }
 
 impl TextLayer {
@@ -3724,12 +4680,14 @@ impl TextLayer {
     ) -> String {
         let mut merged: HashMap<String, serde_json::Value> = props.clone();
         for (k, v) in &self.props {
-            let value = if let Some(user) = v.get("user").and_then(|u| u.as_str()) {
-                props.get(user).cloned().unwrap_or_else(|| {
-                    v.get("value").cloned().unwrap_or(serde_json::Value::Null)
-                })
+            let resolved = resolve_prop(v, props);
+            let value = if resolved.is_object() {
+                resolved
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
             } else {
-                v.clone()
+                resolved
             };
             merged.insert(k.clone(), value);
         }
@@ -3737,6 +4695,9 @@ impl TextLayer {
             if let Some(value) = text::eval_script(script, &merged, now) {
                 return value;
             }
+        }
+        if self.raw_text_def.get("user").is_some() {
+            return value_to_string(&resolve_prop(&self.raw_text_def, props));
         }
         self.authored.clone()
     }
@@ -3794,7 +4755,7 @@ impl TextLayer {
             out.height,
             &out.pixels,
             Filter::Linear,
-            false,
+            true,
         )
         .ok();
         self.raster_size = [out.width as i32, out.height as i32];
@@ -3813,16 +4774,89 @@ impl TextLayer {
 // Loading helpers
 // ---------------------------------------------------------------------------
 
-fn parse_visible(v: Option<&serde_json::Value>, now: text::LocalTime) -> VisibleRule {
+fn parse_alignment(obj: &serde_json::Value) -> [f32; 2] {
+    let s = obj
+        .get("alignment")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let x = if s.contains("left") {
+        0.5
+    } else if s.contains("right") {
+        -0.5
+    } else {
+        0.0
+    };
+    let y = if s.contains("bottom") {
+        0.5
+    } else if s.contains("top") {
+        -0.5
+    } else {
+        0.0
+    };
+    [x, y]
+}
+
+fn eval_visible_script(
+    v: &serde_json::Value,
+    clean_script: &str,
+    props: &HashMap<String, serde_json::Value>,
+    now: text::LocalTime,
+) -> Option<bool> {
+    if clean_script.contains("mediaPlaybackChanged")
+        && clean_script.contains("PLAYBACK_STOPPED")
+        && clean_script.contains("thisLayer.visible")
+    {
+        return Some(false);
+    }
+    if clean_script.contains("cursorEnter")
+        && clean_script.contains("cursorLeave")
+        && clean_script.contains("thisLayer.visible")
+    {
+        return Some(false);
+    }
+    if clean_script.contains("isLayerVisible")
+        && clean_script.contains("visibleStart")
+        && clean_script.contains("visibleEnd")
+    {
+        let sp = v.get("scriptproperties").and_then(|s| s.as_object());
+        let is_enabled = sp_bool(sp, "isEnabled", props).unwrap_or(true);
+        let reverse_mode = sp_bool(sp, "reverseMode", props).unwrap_or(false);
+        if !is_enabled {
+            return Some(reverse_mode);
+        }
+        let start = sp_f32(sp, "visibleStart", props)?;
+        let end = sp_f32(sp, "visibleEnd", props)?;
+        let current_time =
+            now.hour as f32 + now.minute as f32 / 60.0 + now.second as f32 / 3600.0;
+        let visible = if start < end {
+            current_time >= start && current_time < end
+        } else {
+            current_time >= start || current_time < end
+        };
+        return Some(visible);
+    }
+    None
+}
+
+fn parse_visible(
+    v: Option<&serde_json::Value>,
+    props: &HashMap<String, serde_json::Value>,
+    now: text::LocalTime,
+) -> VisibleRule {
     let Some(v) = v else {
         return VisibleRule::Always;
     };
     if let Some(script) = v.get("script").and_then(|s| s.as_str()) {
-        // Only date-range (holiday) scripts decide visibility on their own;
-        // other visibility scripts are side-effect helpers (audio toggles,
-        // shared animation cores) and the authored user/value still applies.
-        if is_date_script(script) {
-            return VisibleRule::Script(script_is_currently_true(script, now));
+        let clean = strip_line_comments(script);
+        // Only date-range (holiday) or handled helper scripts decide visibility;
+        // other visibility scripts are side-effect helpers (shared animation
+        // cores) where the authored user/value still applies.
+        if is_date_script(&clean) {
+            return VisibleRule::Script(script_is_currently_true(&clean, now));
+        }
+        if let Some(b) = eval_visible_script(v, &clean, props, now) {
+            return VisibleRule::Script(b);
         }
     }
     if let Some(user) = v.get("user") {
@@ -3916,8 +4950,8 @@ fn load_effects(
     gl: &glow::Context,
     pkg: &PackageFs,
     obj: &serde_json::Value,
-    props: &HashMap<String, serde_json::Value>,
-    now: text::LocalTime,
+    _props: &HashMap<String, serde_json::Value>,
+    _now: text::LocalTime,
 ) -> Vec<EffectInstance> {
     if std::env::var_os("ANIMA_NO_EFFECTS").is_some() {
         return Vec::new();
@@ -3927,48 +4961,15 @@ fn load_effects(
     };
     let mut out = Vec::new();
     for effect in effects {
-        if !parse_visible(effect.get("visible"), now).eval(props) {
+        // Keep effects whose visibility is script- or user-property-driven so toggling
+        // properties live in the inspector enables/disables them without reloading.
+        if effect.get("visible").and_then(|v| v.as_bool()) == Some(false) {
             continue;
         }
         let Some(file) = effect.get("file").and_then(|v| v.as_str()) else {
             continue;
         };
-        let mut resolved_effect = effect.clone();
-        if let Some(passes) = resolved_effect
-            .get_mut("passes")
-            .and_then(|p| p.as_array_mut())
-        {
-            for pass in passes {
-                if let Some(csv) = pass
-                    .get_mut("constantshadervalues")
-                    .and_then(|c| c.as_object_mut())
-                {
-                    for val in csv.values_mut() {
-                        if let Some(user_prop) = val
-                            .as_object()
-                            .and_then(|o| o.get("user"))
-                            .and_then(|u| u.as_str())
-                            .map(str::to_string)
-                        {
-                            if let Some(user_val) = props.get(&user_prop) {
-                                let has_dynamic = val
-                                    .as_object()
-                                    .map(|o| o.contains_key("script") || o.contains_key("animation"))
-                                    .unwrap_or(false);
-                                if has_dynamic {
-                                    if let Some(obj_map) = val.as_object_mut() {
-                                        obj_map.insert("value".to_string(), user_val.clone());
-                                    }
-                                } else {
-                                    *val = user_val.clone();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(instance) = EffectInstance::load(gl, pkg, file, &resolved_effect) {
+        if let Some(instance) = EffectInstance::load(gl, pkg, file, effect) {
             out.push(instance);
         }
     }
@@ -3992,6 +4993,7 @@ impl Renderer for SceneRenderer {
         } else {
             0.0
         };
+        let (target_mx, target_my) = debug_mouse_ndc().unwrap_or((target_mx, target_my));
         let lerp = (dt * 8.0).clamp(0.02, 1.0);
         self.smooth_mouse[0] += (target_mx - self.smooth_mouse[0]) * lerp;
         self.smooth_mouse[1] += (target_my - self.smooth_mouse[1]) * lerp;
@@ -4043,17 +5045,28 @@ impl Renderer for SceneRenderer {
                 match &mut obj.kind {
                     ObjectKind::Text(layer) => {
                         let value = layer.evaluate(props, now);
-                        layer.update(gl, value, px_per_world);
+                        // Wallpaper Engine rasterises text at the layer's
+                        // authored scale, so a group that is scaled up (e.g. a
+                        // 20pt headline stretched 1.5x) keeps full glyph
+                        // density.  Our output density therefore has to
+                        // include the object's world scale as well, otherwise
+                        // large text is rasterised at half resolution and gets
+                        // upscaled (soft, blurry edges).
+                        let t = &obj.transform;
+                        let world_scale = t.a.hypot(t.b).max(t.c.hypot(t.d)).clamp(0.01, 64.0);
+                        layer.update(gl, value, (px_per_world * world_scale).max(1.0));
                         obj.size = layer.world_size;
                     }
                     ObjectKind::Puppet {
                         mesh,
                         mdl,
                         anim_layers,
+                        bounds,
                         ..
                     } => {
                         if mdl.has_animations() {
                             let verts = mdl.evaluate_vertices(time, anim_layers);
+                            *bounds = mdl_bounds(&verts);
                             mesh.update_vertices(gl, &verts);
                         }
                     }
@@ -4118,7 +5131,7 @@ impl Renderer for SceneRenderer {
                 continue;
             }
             let obj_id = self.objects[i].id;
-            let depth = self.objects[i].parallax;
+            let depth = self.effective_parallax(i);
             let offset = self.parallax_offset(depth, time);
             let blend = self.objects[i].blend;
             let color_blend = self.objects[i].color_blend;
@@ -4127,11 +5140,16 @@ impl Renderer for SceneRenderer {
                 if !is_vis {
                     continue;
                 }
-                let scene = self.scene.as_ref().unwrap();
-                unsafe {
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene.fbo));
-                    gl.viewport(0, 0, scene.w, scene.h);
-                }
+                let scene_copy_tex = if self.emitters[idx].refract {
+                    Some(self.snapshot_scene_copy(gl)?)
+                } else {
+                    let scene = self.scene.as_ref().unwrap();
+                    unsafe {
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene.fbo));
+                        gl.viewport(0, 0, scene.w, scene.h);
+                    }
+                    None
+                };
                 let emitter = &mut self.emitters[idx];
                 apply_blend(gl, emitter.blend);
                 emitter.update_and_pack(
@@ -4152,6 +5170,9 @@ impl Renderer for SceneRenderer {
                     p.set_vec2(gl, "u_ortho", ortho_w, ortho_h);
                     p.set_i32(gl, "u_shape", emitter.kind.shape_id());
                     p.set_i32(gl, "u_is_r8", i32::from(emitter.tex_is_r8));
+                    p.set_i32(gl, "u_premul", i32::from(is_premul_blend(emitter.blend)));
+                    p.set_f32(gl, "u_refract_amount", emitter.refract_amount);
+                    p.set_f32(gl, "u_overbright", emitter.overbright);
                     if let Some(tex) = emitter.texture {
                         p.set_i32(gl, "u_has_tex", 1);
                         p.set_i32(gl, "u_tex", 0);
@@ -4160,6 +5181,24 @@ impl Renderer for SceneRenderer {
                     } else {
                         p.set_i32(gl, "u_has_tex", 0);
                     }
+                    if let Some(sc_tex) = scene_copy_tex {
+                        p.set_i32(gl, "u_refract", 1);
+                        p.set_i32(gl, "u_scene", 1);
+                        gl.active_texture(glow::TEXTURE1);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(sc_tex));
+                        if let Some(ntex) = emitter.normal_tex {
+                            p.set_i32(gl, "u_has_normal", 1);
+                            p.set_i32(gl, "u_normal", 2);
+                            gl.active_texture(glow::TEXTURE2);
+                            gl.bind_texture(glow::TEXTURE_2D, Some(ntex));
+                        } else {
+                            p.set_i32(gl, "u_has_normal", 0);
+                        }
+                        gl.active_texture(glow::TEXTURE0);
+                    } else {
+                        p.set_i32(gl, "u_refract", 0);
+                        p.set_i32(gl, "u_has_normal", 0);
+                    }
                     gl.bind_vertex_array(Some(self.particle_vao));
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.particle_inst_vbo));
                     gl.buffer_data_u8_slice(
@@ -4167,7 +5206,7 @@ impl Renderer for SceneRenderer {
                         bytemuck_cast(&self.instance_scratch),
                         glow::STREAM_DRAW,
                     );
-                    let count = (self.instance_scratch.len() / 13) as i32;
+                    let count = (self.instance_scratch.len() / 14) as i32;
                     gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, count);
                 }
                 continue;
@@ -4205,8 +5244,12 @@ impl Renderer for SceneRenderer {
                         composites: &self.composites,
                         self_id: obj_id,
                         dependencies: &deps,
+                        props: &self.properties,
                     };
                     for effect in effects.iter_mut() {
+                        if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                            continue;
+                        }
                         let (src, dst) = if flip { (&tmp, &canvas) } else { (&canvas, &tmp) };
                         if effect
                             .apply(gl, &self.pkg, &mut self.textures, src, dst, &ctx)
@@ -4272,8 +5315,12 @@ impl Renderer for SceneRenderer {
                         composites: &self.composites,
                         self_id: obj_id,
                         dependencies: &deps,
+                        props: &self.properties,
                     };
                     for effect in effects.iter_mut() {
+                        if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                            continue;
+                        }
                         let (src, dst) = if flip { (&tmp, &canvas) } else { (&canvas, &tmp) };
                         if effect
                             .apply(gl, &self.pkg, &mut self.textures, src, dst, &ctx)
@@ -4339,6 +5386,7 @@ impl Renderer for SceneRenderer {
                         let mut transform = self.objects[i].transform;
                         transform.tx += offset[0];
                         transform.ty += offset[1];
+                        let transform = self.objects[i].quad_transform(transform);
                         let draw = DrawInfo {
                             kind: DrawKind::Image(ref_tex),
                             size: self.objects[i].size,
@@ -4374,8 +5422,12 @@ impl Renderer for SceneRenderer {
                         composites: &self.composites,
                         self_id: obj_id,
                         dependencies: &deps,
+                        props: &self.properties,
                     };
                     for effect in effects.iter_mut() {
+                        if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                            continue;
+                        }
                         let (src, dst) = if flip { (&tmp, &canvas) } else { (&canvas, &tmp) };
                         if effect
                             .apply(gl, &self.pkg, &mut self.textures, src, dst, &ctx)
@@ -4405,12 +5457,149 @@ impl Renderer for SceneRenderer {
             let mut transform = self.objects[i].transform;
             transform.tx += offset[0];
             transform.ty += offset[1];
-            let (min, max) = self.objects[i].aabb(offset);
-            let aabb_size = [(max[0] - min[0]).max(1.0), (max[1] - min[1]).max(1.0)];
+            let quad_transform = self.objects[i].quad_transform(transform);
             let has_effects = !self.objects[i].effects.is_empty();
             let mut draw = self.objects[i].draw_info();
             draw.uv_rect = self.objects[i].sprite_rect(time);
-            let is_puppet = matches!(self.objects[i].kind, ObjectKind::Puppet { .. });
+            if std::env::var_os("ANIMA_TRACE_SPRITE").is_some()
+                && self.objects[i].sprite.is_some()
+            {
+                log::info!(
+                    "sprite '{}' t={:.3} uv={:?}",
+                    self.objects[i].name,
+                    time,
+                    draw.uv_rect
+                );
+            }
+            let puppet_info = match &self.objects[i].kind {
+                ObjectKind::Puppet {
+                    texture,
+                    tex_size,
+                    bounds,
+                    ..
+                } => Some((*texture, *tex_size, *bounds)),
+                _ => None,
+            };
+
+            if let Some((raw_tex, tex_size, bounds)) = puppet_info {
+                let mut effect_canvases: Option<(Canvas, Canvas, bool)> = None;
+                if has_effects {
+                    let tex_world = [tex_size[0].max(1) as f32, tex_size[1].max(1) as f32];
+                    let eff_sx = (transform.a * transform.a + transform.b * transform.b)
+                        .sqrt()
+                        .max(1.0);
+                    let eff_sy = (transform.c * transform.c + transform.d * transform.d)
+                        .sqrt()
+                        .max(1.0);
+                    let cw = (tex_world[0] * eff_sx * px_per_world)
+                        .ceil()
+                        .clamp(1.0, 4096.0) as i32;
+                    let ch = (tex_world[1] * eff_sy * px_per_world)
+                        .ceil()
+                        .clamp(1.0, 4096.0) as i32;
+                    let canvas = self.pool.take(gl, cw, ch)?;
+                    let tmp = self.pool.take(gl, cw, ch)?;
+                    unsafe {
+                        canvas.bind(gl);
+                        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                        gl.clear(glow::COLOR_BUFFER_BIT);
+                        gl.disable(glow::BLEND);
+                    }
+                    let raw_draw = DrawInfo {
+                        kind: DrawKind::Image(raw_tex),
+                        size: tex_world,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        brightness: 1.0,
+                        uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        premul: false,
+                    };
+                    self.draw_content(
+                        gl,
+                        &raw_draw,
+                        Affine::identity(),
+                        [-tex_world[0] * 0.5, -tex_world[1] * 0.5],
+                        tex_world,
+                    );
+                    let flip = self.run_object_effects(
+                        gl,
+                        i,
+                        &canvas,
+                        &tmp,
+                        time,
+                        dt,
+                        daytime,
+                        now,
+                        mouse_uv,
+                        info.audio,
+                        &info.spectrum,
+                        layer_projection_inverse(ortho, tex_world),
+                        obj_id,
+                    );
+                    let eff_tex = if flip { tmp.tex } else { canvas.tex };
+                    if let DrawKind::Puppet {
+                        ref mut texture, ..
+                    } = draw.kind
+                    {
+                        *texture = eff_tex;
+                    }
+                    effect_canvases = Some((canvas, tmp, flip));
+                }
+
+                if !capture_comp && (color_blend == 0 || color_blend == 31) {
+                    if is_vis {
+                        let scene = self.scene.as_ref().unwrap();
+                        unsafe {
+                            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene.fbo));
+                            gl.viewport(0, 0, scene.w, scene.h);
+                        }
+                        apply_blend(gl, blend);
+                        draw.premul = is_premul_blend(blend);
+                        self.draw_content(gl, &draw, transform, [0.0, 0.0], ortho);
+                    }
+                } else {
+                    let (pmin_raw, pmax_raw) = transformed_aabb(transform, bounds.0, bounds.1);
+                    let pmin = [pmin_raw[0] - 2.0, pmin_raw[1] - 2.0];
+                    let pmax = [pmax_raw[0] + 2.0, pmax_raw[1] + 2.0];
+                    let psize = [(pmax[0] - pmin[0]).max(1.0), (pmax[1] - pmin[1]).max(1.0)];
+                    let cw = (psize[0] * px_per_world).ceil().clamp(1.0, 4096.0) as i32;
+                    let ch = (psize[1] * px_per_world).ceil().clamp(1.0, 4096.0) as i32;
+                    let out_canvas = self.pool.take(gl, cw, ch)?;
+                    unsafe {
+                        out_canvas.bind(gl);
+                        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                        gl.clear(glow::COLOR_BUFFER_BIT);
+                        gl.enable(glow::BLEND);
+                        gl.blend_func_separate(
+                            glow::SRC_ALPHA,
+                            glow::ONE_MINUS_SRC_ALPHA,
+                            glow::ONE,
+                            glow::ONE_MINUS_SRC_ALPHA,
+                        );
+                    }
+                    draw.premul = false;
+                    self.draw_content(gl, &draw, transform, pmin, psize);
+                    if capture_comp {
+                        if let Some(id) = obj_id {
+                            self.capture_layer_composite(gl, id, &out_canvas)?;
+                        }
+                    }
+                    if is_vis {
+                        let scene = self.scene.as_ref().unwrap();
+                        unsafe {
+                            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene.fbo));
+                            gl.viewport(0, 0, scene.w, scene.h);
+                        }
+                        self.draw_layer_canvas(gl, &out_canvas, pmin, pmax, blend, color_blend)?;
+                    }
+                    self.pool.put(gl, out_canvas);
+                }
+
+                if let Some((canvas, tmp, _)) = effect_canvases {
+                    self.pool.put(gl, canvas);
+                    self.pool.put(gl, tmp);
+                }
+                continue;
+            }
 
             if !has_effects && !capture_comp && color_blend == 0 {
                 if is_vis {
@@ -4421,13 +5610,29 @@ impl Renderer for SceneRenderer {
                     }
                     apply_blend(gl, blend);
                     draw.premul = is_premul_blend(blend);
-                    self.draw_content(gl, &draw, transform, [0.0, 0.0], ortho);
+                    self.draw_content(gl, &draw, quad_transform, [0.0, 0.0], ortho);
                 }
                 continue;
             }
 
-            let cw = (aabb_size[0] * px_per_world).ceil().clamp(1.0, 4096.0) as i32;
-            let ch = (aabb_size[1] * px_per_world).ceil().clamp(1.0, 4096.0) as i32;
+            let local_size = [
+                self.objects[i].size[0].abs().max(1.0),
+                self.objects[i].size[1].abs().max(1.0),
+            ];
+            // Layer effects run at the layer's own (texture) resolution in
+            // Wallpaper Engine.  Our canvas is sized in world units, so the
+            // output density must also include the object's world scale, or a
+            // scaled-up layer gets an undersized effect buffer and every blur
+            // radius ends up twice as soft as authored.
+            let t = &self.objects[i].transform;
+            let density_x = (t.a.hypot(t.b) * px_per_world).clamp(1.0, 64.0);
+            let density_y = (t.c.hypot(t.d) * px_per_world).clamp(1.0, 64.0);
+            let cw = (local_size[0] * density_x)
+                .ceil()
+                .clamp(1.0, 4096.0) as i32;
+            let ch = (local_size[1] * density_y)
+                .ceil()
+                .clamp(1.0, 4096.0) as i32;
             let canvas = self.pool.take(gl, cw, ch)?;
             let tmp = self.pool.take(gl, cw, ch)?;
 
@@ -4435,76 +5640,40 @@ impl Renderer for SceneRenderer {
                 canvas.bind(gl);
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
-                // The layer canvas holds straight (non-premultiplied) alpha,
-                // which is what effect shaders and the final composite expect.
-                // A single quad is copied verbatim: blending it over the
-                // transparent canvas would premultiply the colour (and apply
-                // the layer blend twice), leaving dark fringes around soft
-                // edges.  Puppet meshes overlap themselves (an eyelid ring over
-                // the body), so they blend "over" with correct alpha
-                // accumulation instead of overwriting each other.
-                if is_puppet {
-                    gl.enable(glow::BLEND);
-                    gl.blend_func_separate(
-                        glow::SRC_ALPHA,
-                        glow::ONE_MINUS_SRC_ALPHA,
-                        glow::ONE,
-                        glow::ONE_MINUS_SRC_ALPHA,
-                    );
-                } else {
-                    gl.disable(glow::BLEND);
-                }
+                gl.disable(glow::BLEND);
             }
-            self.draw_content(gl, &draw, transform, min, aabb_size);
+            self.draw_content(
+                gl,
+                &draw,
+                Affine::identity(),
+                [-local_size[0] * 0.5, -local_size[1] * 0.5],
+                local_size,
+            );
 
-            let mut effects = std::mem::take(&mut self.objects[i].effects);
-            let deps = std::mem::take(&mut self.objects[i].dependencies);
-            let mut flip = false;
-            {
-                let ctx = EffectContext {
+            let flip = if has_effects {
+                self.run_object_effects(
+                    gl,
+                    i,
+                    &canvas,
+                    &tmp,
                     time,
-                    frametime: dt,
+                    dt,
                     daytime,
-                    mouse: mouse_uv,
-                    audio: info.audio,
-                    spectrum: &info.spectrum,
-                    projection_inverse: layer_projection_inverse(ortho, aabb_size),
-                    composites: &self.composites,
-                    self_id: obj_id,
-                    dependencies: &deps,
-                };
-                for effect in effects.iter_mut() {
-                    let (src, dst) = if flip { (&tmp, &canvas) } else { (&canvas, &tmp) };
-                    if effect
-                        .apply(gl, &self.pkg, &mut self.textures, src, dst, &ctx)
-                        .is_ok()
-                    {
-                        flip = !flip;
-                    }
-                }
-            }
-            self.objects[i].effects = effects;
-            self.objects[i].dependencies = deps;
+                    now,
+                    mouse_uv,
+                    info.audio,
+                    &info.spectrum,
+                    layer_projection_inverse(ortho, local_size),
+                    obj_id,
+                )
+            } else {
+                false
+            };
 
             let final_canvas: &Canvas = if flip { &tmp } else { &canvas };
             if capture_comp {
                 if let Some(id) = obj_id {
-                    let snap = match self.composites.remove(&id) {
-                        Some(c) if c.w == final_canvas.w && c.h == final_canvas.h => c,
-                        Some(old) => {
-                            old.destroy(gl);
-                            Canvas::new(gl, final_canvas.w, final_canvas.h)?
-                        }
-                        None => Canvas::new(gl, final_canvas.w, final_canvas.h)?,
-                    };
-                    self.blit_subrect_to_canvas(
-                        gl,
-                        final_canvas.tex,
-                        &snap,
-                        [0.0, 0.0],
-                        [1.0, 1.0],
-                    );
-                    self.composites.insert(id, snap);
+                    self.capture_layer_composite(gl, id, final_canvas)?;
                 }
             }
 
@@ -4514,7 +5683,18 @@ impl Renderer for SceneRenderer {
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene.fbo));
                     gl.viewport(0, 0, scene.w, scene.h);
                 }
-                self.draw_layer_canvas(gl, final_canvas, min, max, blend, color_blend)?;
+                let origin = [quad_transform.tx, quad_transform.ty];
+                let axis_x = quad_transform.apply_vec([local_size[0] * 0.5, 0.0]);
+                let axis_y = quad_transform.apply_vec([0.0, local_size[1] * 0.5]);
+                self.draw_layer_canvas_transformed(
+                    gl,
+                    final_canvas,
+                    origin,
+                    axis_x,
+                    axis_y,
+                    blend,
+                    color_blend,
+                )?;
             }
             self.pool.put(gl, canvas);
             self.pool.put(gl, tmp);
@@ -4533,6 +5713,7 @@ impl Renderer for SceneRenderer {
                 p.set_vec2(gl, "u_uv_scale", cover_scale[0], cover_scale[1]);
                 p.set_vec2(gl, "u_uv_offset", cover_offset[0], cover_offset[1]);
                 p.set_f32(gl, "u_flip_y", 1.0);
+                p.set_vec4(gl, "u_bcs_hue", self.bcs_hue);
                 p.set_i32(gl, "u_tex", 0);
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(scene.tex));
@@ -4662,10 +5843,27 @@ fn apply_blend(gl: &glow::Context, mode: LayerBlend) {
     unsafe {
         gl.enable(glow::BLEND);
         match mode {
-            LayerBlend::Normal => gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA),
-            LayerBlend::Additive => gl.blend_func(glow::SRC_ALPHA, glow::ONE),
-            LayerBlend::Multiply => gl.blend_func(glow::DST_COLOR, glow::ONE_MINUS_SRC_ALPHA),
-            LayerBlend::Screen => gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_COLOR),
+            LayerBlend::Normal => gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            ),
+            LayerBlend::Additive => {
+                gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE, glow::ZERO, glow::ONE)
+            }
+            LayerBlend::Multiply => gl.blend_func_separate(
+                glow::DST_COLOR,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ZERO,
+                glow::ONE,
+            ),
+            LayerBlend::Screen => gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_COLOR,
+                glow::ZERO,
+                glow::ONE,
+            ),
         }
     }
 }
@@ -4715,18 +5913,18 @@ fn create_particle_buffers(
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(i_vbo));
-        let stride = 13 * 4;
+        let stride = 14 * 4;
         gl.enable_vertex_attrib_array(1);
-        gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 0);
+        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 0);
         gl.vertex_attrib_divisor(1, 1);
         gl.enable_vertex_attrib_array(2);
-        gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 16);
+        gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 8);
         gl.vertex_attrib_divisor(2, 1);
         gl.enable_vertex_attrib_array(3);
-        gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 32);
+        gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 24);
         gl.vertex_attrib_divisor(3, 1);
         gl.enable_vertex_attrib_array(4);
-        gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 36);
+        gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 40);
         gl.vertex_attrib_divisor(4, 1);
         gl.bind_vertex_array(None);
         Ok((vao, q_vbo, i_vbo))
@@ -4751,6 +5949,39 @@ fn layer_projection_inverse(ortho: [f32; 2], layer_size: [f32; 2]) -> [f32; 16] 
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
     ]
+}
+
+fn mdl_bounds(verts: &[MeshVertex]) -> ([f32; 2], [f32; 2]) {
+    let Some(first) = verts.first() else {
+        return ([0.0, 0.0], [0.0, 0.0]);
+    };
+    let mut bmin = first.pos;
+    let mut bmax = first.pos;
+    for v in &verts[1..] {
+        bmin[0] = bmin[0].min(v.pos[0]);
+        bmin[1] = bmin[1].min(v.pos[1]);
+        bmax[0] = bmax[0].max(v.pos[0]);
+        bmax[1] = bmax[1].max(v.pos[1]);
+    }
+    (bmin, bmax)
+}
+
+fn transformed_aabb(transform: Affine, bmin: [f32; 2], bmax: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+    let corners = [
+        transform.apply([bmin[0], bmin[1]]),
+        transform.apply([bmax[0], bmin[1]]),
+        transform.apply([bmin[0], bmax[1]]),
+        transform.apply([bmax[0], bmax[1]]),
+    ];
+    let mut min = corners[0];
+    let mut max = corners[0];
+    for c in &corners[1..] {
+        min[0] = min[0].min(c[0]);
+        min[1] = min[1].min(c[1]);
+        max[0] = max[0].max(c[0]);
+        max[1] = max[1].max(c[1]);
+    }
+    (min, max)
 }
 
 impl Drop for SceneRenderer {
@@ -4808,4 +6039,220 @@ struct NativeParticleDef {
     color: Option<[f32; 3]>,
     parallax_depth: Option<[f32; 2]>,
     audio_reactive: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_time(hour: u32, minute: u32) -> text::LocalTime {
+        text::LocalTime {
+            year: 2026,
+            month: 11,
+            day: 14,
+            weekday: 6,
+            hour,
+            minute,
+            second: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_prop_handles_string_conditional_and_nested_value() {
+        let mut props = HashMap::new();
+        props.insert("color".to_string(), json!("0 1 0"));
+        props.insert("format".to_string(), json!("2"));
+        props.insert("inner_speed".to_string(), json!(4.5));
+
+        // Plain user string binding
+        assert_eq!(
+            resolve_prop(&json!({"user": "color", "value": "1 1 1"}), &props),
+            json!("0 1 0")
+        );
+
+        // Conditional user object binding
+        let cond_prop = json!({"user": {"condition": "1", "name": "format"}, "value": true});
+        assert_eq!(resolve_prop(&cond_prop, &props), json!(false));
+        props.insert("format".to_string(), json!("1"));
+        assert_eq!(resolve_prop(&cond_prop, &props), json!(true));
+
+        // Nested value object with inner user binding
+        let nested = json!({"value": {"user": "inner_speed", "value": 1.0}});
+        let resolved = resolve_prop(&nested, &props);
+        assert_eq!(resolved.get("value"), Some(&json!(4.5)));
+    }
+
+    #[test]
+    fn eval_origin_field_resolves_canvas_normalized_and_slider_scripts() {
+        let mut props = HashMap::new();
+        props.insert("x8".to_string(), json!(0.279));
+        props.insert("y6".to_string(), json!(0.623));
+        props.insert("x1".to_string(), json!(2045.0));
+        props.insert("y".to_string(), json!(1794.0));
+        props.insert("xfps".to_string(), json!(1170.0));
+        props.insert("fps".to_string(), json!(280.0));
+
+        // Canvas-normalized origin (e.g. 3243449890)
+        let norm = json!({
+            "script": "export function update(value) {\n  value.x = scriptProperties.x * engine.canvasSize.x;\n  value.y = scriptProperties.y * engine.canvasSize.y;\n  return value;\n}",
+            "scriptproperties": {
+                "x": {"user": "x8", "value": 0.5},
+                "y": {"user": "y6", "value": 0.5}
+            },
+            "value": "0 0 0"
+        });
+        let p = eval_origin_field(&norm, [0.0; 3], [3840.0, 2160.0], &props);
+        assert!((p[0] - 0.279 * 3840.0).abs() < 0.01);
+        assert!((p[1] - 0.623 * 2160.0).abs() < 0.01);
+
+        // Direct pixel sliders (e.g. 2802243144 & 3432999904)
+        let slider = json!({
+            "script": "export function update(value) {\n  value.x = scriptProperties.newSlider\n  value.y = scriptProperties.newSlider2\n  return value;\n}",
+            "scriptproperties": {
+                "newSlider": {"user": "x1", "value": 2157},
+                "newSlider2": {"user": "y", "value": 50}
+            },
+            "value": "2045 1794 0"
+        });
+        let p2 = eval_origin_field(&slider, [0.0; 3], [3840.0, 2160.0], &props);
+        assert!((p2[0] - 2045.0).abs() < 0.01);
+        assert!((p2[1] - 1794.0).abs() < 0.01);
+
+        let direct_xy = json!({
+            "script": "export function update(value) {\n  value.x = scriptProperties.x\n  value.y = scriptProperties.y\n  return value;\n}",
+            "scriptproperties": {
+                "x": {"user": "xfps", "value": 50},
+                "y": {"user": "fps", "value": 50}
+            },
+            "value": "1170 300 0"
+        });
+        let p3 = eval_origin_field(&direct_xy, [0.0; 3], [2340.0, 1080.0], &props);
+        assert!((p3[0] - 1170.0).abs() < 0.01);
+        assert!((p3[1] - 280.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn eval_alpha_field_handles_fade_hours_and_sunrise_darkness() {
+        let props = HashMap::new();
+        // 3340707146 night background: wraps around midnight (18..19 fade in, 6..7 fade out)
+        let night_fade = json!({
+            "script": "'use strict';\nconst FADE_IN_START_HOUR = 18;\nconst FADE_IN_END_HOUR = 19;\nconst FADE_OUT_START_HOUR = 6;\nconst FADE_OUT_END_HOUR = 7;\nconst BLEND_DURATION = 0.3;\nexport function update(value) { return 1.0; }\n",
+            "value": 1.0
+        });
+        assert!((eval_alpha_field(Some(&night_fade), &props, sample_time(12, 0)) - 0.0).abs() < 1e-4);
+        assert!((eval_alpha_field(Some(&night_fade), &props, sample_time(22, 0)) - 1.0).abs() < 1e-4);
+        assert!((eval_alpha_field(Some(&night_fade), &props, sample_time(2, 0)) - 1.0).abs() < 1e-4);
+        let dusk = eval_alpha_field(Some(&night_fade), &props, sample_time(18, 30));
+        assert!(dusk > 0.1 && dusk < 0.99);
+
+        // 3806256988 night darkness overlay
+        let sunrise_dark = json!({
+            "script": "const DAY_BRIGHTNESS = 1.00;\nconst NIGHT_BRIGHTNESS = 0.45;\nconst SUNRISE_START = 6.0;\nconst SUNRISE_END   = 8.0;\nconst SUNSET_START = 18.0;\nconst SUNSET_END   = 22.0;\nconst darkness = 1.0 - brightness;",
+            "value": 0.0
+        });
+        assert!((eval_alpha_field(Some(&sunrise_dark), &props, sample_time(13, 0)) - 0.0).abs() < 1e-4);
+        assert!((eval_alpha_field(Some(&sunrise_dark), &props, sample_time(23, 0)) - 0.55).abs() < 1e-4);
+    }
+
+    #[test]
+    fn parse_visible_handles_time_range_media_hover_and_comments() {
+        let mut props = HashMap::new();
+        props.insert("time_ctrl".to_string(), json!(true));
+
+        let day_layer = json!({
+            "script": "function isLayerVisible(currentTime, startTime, endTime) { return true; }\nlet visibleStart = scriptProperties.visibleStart;\nlet visibleEnd = scriptProperties.visibleEnd;",
+            "scriptproperties": {
+                "isEnabled": {"user": "time_ctrl", "value": true},
+                "reverseMode": true,
+                "visibleStart": 9.0,
+                "visibleEnd": 18.0
+            },
+            "value": true
+        });
+        assert!(parse_visible(Some(&day_layer), &props, sample_time(12, 0)).eval(&props));
+        assert!(!parse_visible(Some(&day_layer), &props, sample_time(21, 0)).eval(&props));
+        // When isEnabled=false, falls back to reverseMode (true)
+        props.insert("time_ctrl".to_string(), json!(false));
+        assert!(parse_visible(Some(&day_layer), &props, sample_time(21, 0)).eval(&props));
+
+        // Active media handler hides layer when no session is playing
+        let media_active = json!({
+            "script": "export function mediaPlaybackChanged(event) {\n  thisLayer.visible = event.state !== MediaPlaybackEvent.PLAYBACK_STOPPED;\n}",
+            "value": true
+        });
+        assert!(!parse_visible(Some(&media_active), &props, sample_time(12, 0)).eval(&props));
+
+        // Commented-out handler (e.g. 3243449890 Album Cover) preserves authored value
+        let media_commented = json!({
+            "script": "// 'use strict';\n// export function mediaPlaybackChanged(event) {\n//   thisLayer.visible = event.state !== MediaPlaybackEvent.PLAYBACK_STOPPED;\n// }",
+            "value": true
+        });
+        assert!(parse_visible(Some(&media_commented), &props, sample_time(12, 0)).eval(&props));
+
+        // Hover-only UI button stays hidden when cursor isn't hovering
+        let hover_btn = json!({
+            "script": "export function init() { thisLayer.visible = false; }\nexport function cursorEnter(e) { thisLayer.visible = true; }\nexport function cursorLeave(e) { thisLayer.visible = false; }",
+            "value": true
+        });
+        assert!(!parse_visible(Some(&hover_btn), &props, sample_time(12, 0)).eval(&props));
+    }
+
+    #[test]
+    fn prop_script_parses_and_evals_spin_z_and_wave_origin_x() {
+        let props = HashMap::new();
+        let now = sample_time(12, 0);
+
+        let spin = json!({
+            "script": "'use strict';\nexport function update(value) {\n  value.z = 0 - (engine.runtime * 20);\n  value.z = value.z % 360;\n  return value;\n}"
+        });
+        let ps_spin = PropScript::parse(&spin, &props).expect("SpinZ parsed");
+        let a = ps_spin.apply([0.0; 3], 1.5, 0.5, now);
+        assert!((a[2] - 330.0).abs() < 0.01);
+
+        let wave = json!({
+            "script": "export function update(value) {\n  let sine = Math.sin(elapsed);\n  let wave = triangle + (sine - triangle) * scriptProperties.smoothness;\n  if (scriptProperties.invert) wave = -wave;\n  const offsetX = wave * scriptProperties.intensity;\n  return new Vec3(baseOrigin.x + offsetX, baseOrigin.y, baseOrigin.z);\n}",
+            "scriptproperties": {
+                "intensity": 60.0,
+                "speed": 1.0,
+                "smoothness": 1.0,
+                "invert": true
+            }
+        });
+        let ps_wave = PropScript::parse(&wave, &props).expect("WaveOriginX parsed");
+        let o0 = ps_wave.apply([1920.0, 1000.0, 0.0], 0.0, 0.5, now);
+        let oq = ps_wave.apply([1920.0, 1000.0, 0.0], std::f32::consts::FRAC_PI_2, 0.5, now);
+        assert!((o0[0] - 1920.0).abs() < 0.01);
+        assert!((oq[0] - 1860.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn user_bound_color_and_text_evaluate_dynamically() {
+        let color_def = json!({
+            "user": "accent_color",
+            "value": "0.1 0.2 0.3"
+        });
+        let mut props = HashMap::new();
+        let c_default = eval_color_field(Some(&color_def), &props, [1.0, 1.0, 1.0]);
+        assert!((c_default[0] - 0.1).abs() < 1e-4);
+
+        props.insert("accent_color".into(), json!("#ff8000"));
+        let c_override = eval_color_field(Some(&color_def), &props, [1.0, 1.0, 1.0]);
+        assert!((c_override[0] - 1.0).abs() < 1e-3);
+        assert!((c_override[1] - 128.0 / 255.0).abs() < 1e-2);
+        assert!((c_override[2] - 0.0).abs() < 1e-4);
+
+        let text_def = json!({
+            "user": "greeting",
+            "value": "Default Text"
+        });
+        let obj = json!({ "text": text_def });
+        let pkg = PackageFs::default();
+        let now = sample_time(12, 0);
+        let layer = SceneRenderer::load_text(&pkg, &obj, &text_def, &props, now).unwrap();
+        assert_eq!(layer.evaluate(&props, now), "Default Text");
+
+        props.insert("greeting".into(), json!("Updated Label"));
+        assert_eq!(layer.evaluate(&props, now), "Updated Label");
+    }
 }
