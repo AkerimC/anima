@@ -334,6 +334,9 @@ impl WalkState {
     }
 
     pub(super) fn start_jump(&mut self, amp: f32) {
+        if self.act == Act::Jump && self.jump > 0.0 {
+            return;
+        }
         self.catch_jump = false;
         self.act = Act::Jump;
         self.jump_amp = amp;
@@ -563,5 +566,23 @@ mod tests {
             wk.step_in(1.0 / 60.0, -1.0, 1.0, None, 0.0, 0.35, 1.0);
         }
         assert!((wk.park_y - 0.28).abs() < 1e-3, "stuck at {}", wk.park_y);
+    }
+
+    #[test]
+    fn mid_air_bob_does_not_snap_jump_to_ground() {
+        let mut wk = WalkState { act: Act::Idle, ..Default::default() };
+        wk.start_jump(2.0);
+        let dur = wk.jump_dur;
+        // Advance halfway through the jump near peak height
+        let (_, _, peak_h) = wk.step(dur * 0.5, -1.0, 1.0, None, 0.0);
+        assert!(peak_h > 0.9, "expected near-peak height, got {peak_h}");
+
+        // Losing/passing the carrot calls start_bob (or start_jump); height must not snap to 0
+        wk.start_bob(0.2);
+        wk.start_jump(0.5);
+        assert_eq!(wk.act, Act::Jump);
+        assert_eq!(wk.jump_dur, dur);
+        let (_, _, next_h) = wk.step(1.0 / 60.0, -1.0, 1.0, None, 0.0);
+        assert!(next_h > 0.7, "jump snapped to ground unexpectedly: {next_h}");
     }
 }

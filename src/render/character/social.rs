@@ -770,6 +770,9 @@ impl WalkState {
 
     /// A short quick bob, for talking and laughing.
     pub(super) fn start_bob(&mut self, amp: f32) {
+        if !grounded(self) {
+            return;
+        }
         self.start_jump(amp);
         self.jump_dur = 0.32;
         self.jump = 0.32;
@@ -3692,10 +3695,8 @@ impl CharacterOverlay {
         let half = all.len() / 2;
         let teams = [all[..half].to_vec(), all[half..].to_vec()];
         let unit = self.width_of(c.members[0]);
-        let (raw_lo, raw_hi) = self.big_window();
-        let lo = (raw_lo + unit * 0.5).min(raw_hi);
-        let hi = (raw_hi - unit * 0.5).max(lo);
-        let mid = (lo + hi) * 0.5;
+        let (x, cw) = self.big_window();
+        let (lo, hi, mid) = wrestle_arena(x, cw, unit);
         let win = tn().wrestle_win.min(((hi - lo) * 0.25).max(unit * 0.75));
         let ring = (win + unit * 0.95).min(((hi - lo) * 0.42).max(unit * 0.9));
         let gap = unit * 0.42;
@@ -6631,9 +6632,27 @@ impl CharacterOverlay {
     }
 }
 
+/// Computes `(lo, hi, mid)` bounds in strip pixels from `big_window()`'s `(x, cw)` width tuple.
+fn wrestle_arena(x: f32, cw: f32, unit: f32) -> (f32, f32, f32) {
+    let pad = (unit * 0.5).min(cw * 0.2);
+    let lo = x + pad;
+    let hi = (x + cw - pad).max(lo + unit);
+    (lo, hi, (lo + hi) * 0.5)
+}
+
 #[cfg(test)]
 mod game_pick_tests {
     use super::*;
+
+    #[test]
+    fn wrestle_arena_uses_window_width_not_right_edge() {
+        // Rightmost desktop window starting past its own width (e.g. x=1200, width=720)
+        // previously collapsed lo == hi because `cw` was treated as `raw_hi`.
+        let (lo, hi, mid) = wrestle_arena(1200.0, 720.0, 90.0);
+        assert_eq!(lo, 1245.0);
+        assert_eq!(hi, 1875.0);
+        assert_eq!(mid, 1560.0);
+    }
 
     #[test]
     fn volley_waits_for_large_groups_while_tag_and_carrot_stay_small() {
