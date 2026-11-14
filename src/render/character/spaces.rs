@@ -33,6 +33,8 @@ pub(super) struct Trip {
 
 #[derive(Default)]
 pub(super) struct Spaces {
+    // seconds until anyone may set off again
+    quiet: f32,
     list: Vec<Space>,
     pub(super) active: u64,
     // scroll position of each workspace when last looked at
@@ -183,7 +185,7 @@ fn holds(s: &Space, p: [f32; 2]) -> bool {
 }
 
 impl CharacterOverlay {
-    fn actor_ref(&self, i: usize) -> &CharacterOverlay {
+    pub(super) fn actor_ref(&self, i: usize) -> &CharacterOverlay {
         if i == 0 { self } else { &self.extras[i - 1] }
     }
 
@@ -236,6 +238,13 @@ impl CharacterOverlay {
         if !list.is_empty() && !locked {
             for i in 0..n {
                 if !list.iter().any(|s| s.id == self.walk_ref(i).ws) {
+                    // the park (cafe, farm) is home while it's open
+                    let homes: Vec<u64> = place_homes().into_iter().filter(|p| list.iter().any(|s| s.id == *p)).collect();
+                    if !homes.is_empty() {
+                        let k = (self.walk_of(i).rand() * homes.len() as f32) as usize % homes.len();
+                        self.walk_of(i).ws = homes[k];
+                        continue;
+                    }
                     // back where it was last time, or with its team
                     if let Some(ws) = self.home_for(i, &list, n) {
                         self.walk_of(i).ws = ws;
@@ -414,13 +423,19 @@ impl CharacterOverlay {
     }
 
     /// A race on the workspace in view: some from the others come over.
-    pub(super) fn call_to_race(&mut self, n: usize) {
-        let here = self.spaces.active;
+    /// Asked again and again while a race gathers on `here`: whoever is
+    /// free on another workspace makes up its mind once (`stay`: not coming).
+    pub(super) fn call_to_race(&mut self, n: usize, here: u64, stay: &mut Vec<usize>) {
         let order: Vec<u64> = self.spaces.list.iter().map(|s| s.id).collect();
         let Some(at) = order.iter().position(|&w| w == here) else { return };
         for i in 0..n {
             let ws = self.walk_ref(i).ws;
-            if ws == here || !self.walk_ref(i).at_leisure() || self.walk_of(i).rand() >= tn().race_travel {
+            let wk = self.walk_ref(i);
+            if ws == here || stay.contains(&i) || !wk.at_leisure() || wk.backstage || wk.visiting {
+                continue;
+            }
+            if self.walk_of(i).rand() >= tn().race_travel {
+                stay.push(i);
                 continue;
             }
             if let Some(from) = order.iter().position(|&w| w == ws) {
@@ -428,6 +443,22 @@ impl CharacterOverlay {
                 self.walk_of(i).set_off(here, at > from);
             }
         }
+    }
+
+    /// Sets `i` off for workspace `to`; false if there's no such way.
+    pub(super) fn send_to(&mut self, i: usize, to: u64) -> bool {
+        let order: Vec<u64> = self.spaces.list.iter().map(|s| s.id).collect();
+        let from = self.walk_ref(i).ws;
+        let (Some(a), Some(b)) = (order.iter().position(|&w| w == from), order.iter().position(|&w| w == to)) else { return false };
+        if a != b {
+            self.walk_of(i).set_off(to, b > a);
+        }
+        a != b
+    }
+
+    /// The workspace `i` is on its way to.
+    pub(super) fn heading_to(&self, i: usize) -> Option<u64> {
+        self.walk_ref(i).trip.map(|t| t.to)
     }
 
     /// Let go of in the overview over another workspace: lands there.
@@ -453,16 +484,29 @@ impl CharacterOverlay {
         }
     }
 
-    /// Once a second: does anyone feel like seeing the neighbours?
+    /// Once a second: is anyone where it isn't needed? Characters gather
+    /// where the windows and the work are; an empty workspace is left, a
+    /// crowded one for how little it's used gives one up now and then.
     fn roam(&mut self, n: usize) {
-        let hosts: Vec<u64> = self.spaces.list.iter().filter(|s| s.active || s.has_windows).map(|s| s.id).collect();
         for i in 0..n {
             self.walk_of(i).here_t += 1.0;
         }
-        if hosts.len() < 2 {
+        let homes: Vec<u64> = place_homes().into_iter().filter(|p| self.spaces.list.iter().any(|s| s.id == *p)).collect();
+        if !homes.is_empty() {
+            self.park_roam(n, &homes);
             return;
         }
-        let count = |this: &Self, ws: u64| (0..n).filter(|&i| this.walk_ref(i).ws == ws).count();
+        // workspaces with windows on them; the one in use only if it has some too.
+        // Not the park's (cafe's, farm's): they're only visited, for a reason
+        let windows = place_windows();
+        let mut hosts: Vec<u64> = self.spaces.list.iter().filter(|s| s.has_windows && !windows.contains(&s.id)).map(|s| s.id).collect();
+        if hosts.is_empty() {
+            hosts = self.spaces.list.iter().filter(|s| s.active && !windows.contains(&s.id)).map(|s| s.id).collect();
+        }
+        if hosts.is_empty() {
+            return;
+        }
+        let count = |this: &Self, ws: u64| (0..n).filter(|&i| this.walk_ref(i).ws == ws || this.heading_to(i) == Some(ws)).count();
         // older use counts for less and less
         let fade = 0.5f32.powf(1.0 / tn().ws_use_half.max(1.0));
         self.spaces.used.iter_mut().for_each(|u| u.1 *= fade);
@@ -472,64 +516,167 @@ impl CharacterOverlay {
             None => self.spaces.used.push((active, 1.0)),
         }
         let seats = self.seats(&hosts, n);
-        // positive: more characters there than its fair share
-        let surplus = |this: &Self, at: usize| count(this, hosts[at]) as f32 - seats[at] as f32;
-        let mut moving = (0..n).filter(|&i| self.walk_ref(i).trip.is_some()).count();
-        for i in 0..n {
-            if moving >= tn().ws_max as usize {
-                break;
-            }
+        // how many more each workspace should have (negative: too many)
+        let short = |this: &Self, at: usize| seats[at] as f32 - count(this, hosts[at]) as f32;
+        let moving = (0..n).filter(|&i| self.walk_ref(i).trip.is_some()).count();
+        if moving >= tn().ws_max as usize {
+            return;
+        }
+        self.spaces.quiet -= 1.0;
+        // the neediest workspace
+        let Some(to) = (0..hosts.len()).max_by(|&a, &b| short(self, a).total_cmp(&short(self, b))) else { return };
+        let empty_spot = (0..n).find(|&i| {
             let wk = self.walk_ref(i);
-            let (ws, here) = (wk.ws, wk.here_t);
-            if !wk.at_leisure() || count(self, ws) <= 1 {
-                continue;
+            wk.at_leisure() && wk.trip.is_none() && !hosts.contains(&wk.ws) && !wk.visiting && !wk.backstage && wk.visit_for == 0 && !windows.contains(&wk.ws)
+        });
+        // on an empty workspace: off to where the work is, no waiting about
+        let leaver = if let Some(i) = empty_spot.filter(|&i| self.walk_ref(i).here_t >= 20.0) {
+            Some(i)
+        } else {
+            if self.spaces.quiet > 0.0 || short(self, to) < 1.0 {
+                return;
             }
-            let Some(pos) = hosts.iter().position(|&h| h == ws) else { continue };
-            let mates: Vec<usize> = (0..n).filter(|&j| j != i && self.walk_ref(j).ws == ws).collect();
-            let known = mates.iter().map(|&j| self.bond(i, j).0).sum::<f32>() / mates.len().max(1) as f32;
-            // with its team or close friends here it's happy to stay
-            let stay = if mates.iter().any(|&j| self.close(i, j)) { 0.4 } else { 1.0 };
-            // crowded for how little it's used: time to go; thin already: stay
-            let spare = surplus(self, pos);
-            let balance = if spare > 0.0 { 1.0 + spare * tn().ws_balance } else { 0.25 };
-            let urge = (1.0 + here / tn().ws_bored.max(1.0)) * (1.0 + known * tn().ws_familiar) * balance * stay;
-            let roll = self.walk_of(i).rand();
-            if roll >= urge / tn().ws_every.max(1.0) {
-                continue;
+            // from the most overcrowded one, someone who's been there a while
+            let Some(from) = (0..hosts.len()).filter(|&k| k != to).min_by(|&a, &b| short(self, a).total_cmp(&short(self, b))) else { return };
+            if short(self, from) > -1.0 {
+                return;
             }
-            // up or down: towards the faces it knows least
-            let mut choices: Vec<(usize, f32)> = Vec::new();
-            for to in [pos.wrapping_sub(1), pos + 1] {
-                let Some(&h) = hosts.get(to) else { continue };
-                let there: Vec<usize> = (0..n).filter(|&j| self.walk_ref(j).ws == h).collect();
-                let news = there.iter().map(|&j| 1.0 / (1.0 + self.bond(i, j).0)).sum::<f32>();
-                let spare = surplus(self, to);
-                let score = news + 0.5 + (-spare).max(0.0) * 2.0;
-                choices.push((to, if spare > 0.0 { score * 0.3 } else { score }));
+            let pool: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let wk = self.walk_ref(i);
+                    wk.ws == hosts[from] && wk.at_leisure() && wk.trip.is_none() && wk.here_t >= tn().ws_stay && !wk.visiting && !wk.backstage && wk.visit_for == 0
+                })
+                .collect();
+            if pool.is_empty() || self.walk.rand() >= 1.0 / tn().ws_every.max(1.0) * pool.len() as f32 * 4.0 {
+                return;
             }
-            let mut pick = self.walk_of(i).rand() * choices.iter().map(|c| c.1).sum::<f32>();
-            let mut to = pos;
-            for c in &choices {
-                to = c.0;
-                pick -= c.1;
-                if pick <= 0.0 {
-                    break;
-                }
+            pool.into_iter().max_by(|&a, &b| self.walk_ref(a).here_t.total_cmp(&self.walk_ref(b).here_t))
+        };
+        let Some(i) = leaver else { return };
+        let ws = self.walk_ref(i).ws;
+        log::debug!("workspaces: {i} goes from {ws} to {}", hosts[to]);
+        self.send_to(i, hosts[to]);
+        self.spaces.quiet = tn().ws_gap;
+        // a close friend may tag along, rarely
+        if tn().ws_friends < 1.0 {
+            return;
+        }
+        let pal = (0..n)
+            .filter(|&j| j != i && self.close(i, j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure())
+            .max_by(|&a, &b| self.bond(i, a).0.total_cmp(&self.bond(i, b).0));
+        if let Some(j) = pal.filter(|_| self.walk.rand() < tn().close_follow * 0.3) {
+            log::debug!("workspaces: {j} goes along with {i}");
+            self.send_to(j, hosts[to]);
+        }
+    }
+}
+
+/// The workspaces of the park, cafe and farm windows, when the characters
+/// only visit them (modes 0 and 3): not somewhere to roam to.
+fn place_windows() -> Vec<u64> {
+    if (0.5..2.5).contains(&tn().park_mode) {
+        return Vec::new();
+    }
+    governor::places().into_iter().map(|p| p.ws).collect()
+}
+
+impl CharacterOverlay {
+    /// Back to the desktop after a visit: where it came from if that's still
+    /// there, else the busiest workspace with windows. None: nowhere else.
+    pub(super) fn desktop_home(&self, from: u64) -> Option<u64> {
+        let windows: Vec<u64> = governor::places().into_iter().map(|p| p.ws).collect();
+        let ok = |id: u64| self.spaces.list.iter().any(|s| s.id == id) && !windows.contains(&id);
+        if ok(from) {
+            return Some(from);
+        }
+        self.spaces
+            .list
+            .iter()
+            .filter(|s| s.has_windows && !windows.contains(&s.id))
+            .max_by_key(|s| governor::window_count(s.id))
+            .map(|s| s.id)
+            .or_else(|| self.spaces.list.iter().find(|s| s.active && !windows.contains(&s.id)).map(|s| s.id))
+    }
+}
+
+/// The workspaces of the open park, cafe and farm windows, when the
+/// characters should live there.
+fn place_homes() -> Vec<u64> {
+    // 0: the desktop only; 3: the desktop, visiting the windows (play.rs)
+    if tn().park_mode < 0.5 || tn().park_mode > 2.5 {
+        return Vec::new();
+    }
+    let mut v: Vec<u64> = governor::places().into_iter().map(|p| p.ws).collect();
+    v.dedup();
+    v
+}
+
+impl CharacterOverlay {
+    /// Off on foot to somewhere in `p` (it's on the same workspace).
+    pub(super) fn walk_into(&mut self, i: usize, p: &governor::Place) {
+        let size = self.width_of(i);
+        let r = self.walk_of(i).rand();
+        let px = p.x + size + r * (p.w - size * 2.0).max(0.0);
+        let here = self.strip_px(i);
+        let surface = self.actor_ref(i).surface[0].max(1.0);
+        let wk = self.walk_of(i);
+        wk.target = wk.x + (px - here) * 2.0 / surface;
+        wk.park_target_y = wk.rand() * super::park::MEADOW;
+        wk.act = Act::Walk;
+        wk.timer = 3.0;
+    }
+
+    /// Anima Park is open and home: everyone lives there (or travelling, if one
+    /// is on another workspace); in mode 2 a few go out to the other workspaces
+    /// and come back after a while.
+    fn park_roam(&mut self, n: usize, homes: &[u64]) {
+        let places = governor::places();
+        if places.is_empty() {
+            return;
+        }
+        let moving = (0..n).filter(|&i| self.walk_ref(i).trip.is_some()).count();
+        let free = |this: &Self, i: usize| {
+            let wk = this.walk_ref(i);
+            wk.at_leisure() && wk.trip.is_none() && !wk.visiting && !wk.backstage
+        };
+        let in_place = |this: &Self, i: usize| governor::place_at(this.walk_ref(i).ws, this.strip_px(i)).map(|p| p.place);
+        let only = tn().park_mode < 1.5;
+        // out long enough (or not allowed out at all): back to the park
+        let back = (0..n).find(|&i| free(self, i) && !homes.contains(&self.walk_ref(i).ws) && (only || self.walk_ref(i).here_t >= tn().park_out_stay));
+        if let Some(i) = back {
+            if moving < tn().ws_max as usize {
+                let to = &places[0];
+                log::debug!("park: {i} goes back to the {}", to.place);
+                self.send_to(i, to.ws);
             }
-            if to != pos {
-                log::debug!("workspaces: {i} goes from {ws} to {}", hosts[to]);
-                self.walk_of(i).set_off(hosts[to], to > pos);
-                moving += 1;
-                // close friends and teammates come along
-                for j in 0..n {
-                    if self.close(i, j) && self.walk_ref(j).ws == ws && self.walk_ref(j).at_leisure() && self.walk_of(j).rand() < tn().close_follow {
-                        log::debug!("workspaces: {j} goes along with {i}");
-                        self.walk_of(j).set_off(hosts[to], to > pos);
-                        moving += 1;
-                    }
-                }
+            return;
+        }
+        // on the right workspace but not in the park (beside another window): in it goes
+        if let Some(i) = (0..n).find(|&i| free(self, i) && homes.contains(&self.walk_ref(i).ws) && in_place(self, i).is_none() && self.walk_ref(i).act == Act::Idle) {
+            if let Some(p) = places.iter().find(|p| p.ws == self.walk_ref(i).ws).cloned() {
+                self.walk_into(i, &p);
             }
         }
+        if only || moving >= tn().ws_max as usize {
+            return;
+        }
+        let out = (0..n).filter(|&i| !homes.contains(&self.walk_ref(i).ws) || self.heading_to(i).is_some_and(|t| !homes.contains(&t))).count();
+        if out as f32 >= tn().park_out || self.walk.rand() >= 1.0 / tn().park_out_every.max(1.0) {
+            return;
+        }
+        // somewhere with windows, or the workspace in view
+        let away: Vec<u64> = self.spaces.list.iter().filter(|s| !homes.contains(&s.id) && (s.has_windows || s.active)).map(|s| s.id).collect();
+        if away.is_empty() {
+            return;
+        }
+        let pool: Vec<usize> = (0..n).filter(|&i| free(self, i) && homes.contains(&self.walk_ref(i).ws) && self.walk_ref(i).here_t >= 30.0).collect();
+        if pool.is_empty() {
+            return;
+        }
+        let i = pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()];
+        let to = away[(self.walk.rand() * away.len() as f32) as usize % away.len()];
+        log::debug!("park: {i} goes out to workspace {to}");
+        self.send_to(i, to);
     }
 }
 

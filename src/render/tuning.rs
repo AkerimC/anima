@@ -39,19 +39,23 @@ tuning! {
     "Games", "Fishing" {
         fish_min: "Fewest players" = 2.0, 1.0, 12.0, 1.0, 0;
         fish_time: "Longest time (s)" = 1500.0, 10.0, 7200.0, 5.0, 0;
-        fish_bored: "Bored enough to fish alone after (s)" = 90.0, 5.0, 1800.0, 5.0, 0;
-        fish_bored_every: "Then goes fishing within about (s)" = 60.0, 1.0, 1800.0, 5.0, 0;
+        fish_bored: "Bored enough to fish alone after (s)" = 240.0, 5.0, 1800.0, 5.0, 0;
+        fish_bored_every: "Then goes fishing within about (s)" = 180.0, 1.0, 1800.0, 5.0, 0;
+        fish_glee: "Anglers have a happy moment while waiting (per s)" = 0.06, 0.0, 1.0, 0.01, 2;
         fish_join: "Passers-by join in (per s)" = 0.08, 0.0, 2.0, 0.01, 2;
         fish_most: "Most fishing together" = 5.0, 1.0, 12.0, 1.0, 0;
+        fish_real: "A good catch is a real fish (share)" = 0.75, 0.0, 1.0, 0.05, 2;
+        fish_creature: "Of those, a rare sea creature (share)" = 0.15, 0.0, 1.0, 0.05, 2;
+        fish_find: "Something to wear on the line (share of catches)" = 0.12, 0.0, 1.0, 0.01, 2;
         fish_boom: "Confetti goes off with a bang" = 0.25, 0.0, 1.0, 0.05, 2;
         fish_boom_reach: "Explosion reach (widths)" = 3.0, 0.5, 15.0, 0.5, 1;
-        fish_beast: "Something comes up to scare them (per s)" = 0.02, 0.0, 2.0, 0.01, 2;
-        fish_beast_cool: "Quiet after a scare (s)" = 15.0, 0.0, 300.0, 5.0, 0;
+        fish_beast: "Something comes up to scare them (per s)" = 0.004, 0.0, 2.0, 0.01, 2;
+        fish_beast_cool: "Quiet after a scare (s)" = 120.0, 0.0, 300.0, 5.0, 0;
         fish_beast_reach: "Scares anglers within (widths)" = 5.0, 1.0, 30.0, 0.5, 1;
         fish_reel: "Reeling in takes (s)" = 2.5, 0.3, 15.0, 0.1, 1;
-        fish_stay_min: "Stays interested, at least (s)" = 180.0, 10.0, 3600.0, 10.0, 0;
-        fish_stay_rand: "Random extra interest (s)" = 300.0, 0.0, 3600.0, 10.0, 0;
-        fish_catch_keeps: "A good catch keeps it going (s)" = 60.0, 0.0, 600.0, 5.0, 0;
+        fish_stay_min: "Stays interested, at least (s)" = 90.0, 10.0, 3600.0, 10.0, 0;
+        fish_stay_rand: "Random extra interest (s)" = 150.0, 0.0, 3600.0, 10.0, 0;
+        fish_catch_keeps: "A good catch keeps it going (s)" = 20.0, 0.0, 600.0, 5.0, 0;
         fish_lost_cost: "A lost fish or junk costs (s)" = 15.0, 0.0, 300.0, 5.0, 0;
         fish_again: "Won't fish again for (s)" = 300.0, 0.0, 3600.0, 10.0, 0;
         fish_throw_far: "Thrown this far outside the window, gives up (widths)" = 6.0, 1.0, 40.0, 0.5, 1;
@@ -61,6 +65,15 @@ tuning! {
     "Games", "Getting better" {
         skill_rate: "Learning per game played" = 0.1, 0.0, 1.0, 0.01, 2;
         skill_teach: "Learning from a better friend" = 0.15, 0.0, 1.0, 0.01, 2;
+        train_energy: "Energy to go and train alone" = 0.6, 0.0, 1.0, 0.05, 2;
+        train_bored: "Idle before training (s)" = 40.0, 0.0, 1800.0, 5.0, 0;
+        train_every: "Goes to train within about (s)" = 120.0, 1.0, 3600.0, 5.0, 0;
+        train_reps: "Moves per session" = 6.0, 1.0, 30.0, 1.0, 0;
+        train_cost: "Energy a session costs" = 0.3, 0.0, 1.0, 0.05, 2;
+        train_again: "Rest before training again (s)" = 600.0, 0.0, 7200.0, 30.0, 0;
+        mentor_chance: "A better one comes to teach" = 0.6, 0.0, 1.0, 0.05, 2;
+        mentor_gap: "Teacher at least this much better" = 0.25, 0.0, 1.0, 0.05, 2;
+        mentor_boost: "Learning from a teacher" = 0.5, 0.0, 2.0, 0.05, 2;
         skill_volley: "Beginners miss the ball" = 0.3, 0.0, 1.0, 0.05, 2;
     }
     "Games", "Blind man's buff" {
@@ -71,11 +84,12 @@ tuning! {
         blind_sneak: "Sneaking to another hiding place (per s)" = 0.06, 0.0, 1.0, 0.01, 2;
     }
     "Roaming", "Liveliness" {
+        land_laugh: "Laughing after being thrown (s)" = 0.5, 0.0, 5.0, 0.1, 1;
         laugh_time: "Laughing it off after a tumble (s)" = 1.6, 0.0, 10.0, 0.1, 1;
         laugh_spread: "Friends nearby laugh along" = 0.6, 0.0, 1.0, 0.05, 2;
         look_around: "Looking around while standing (per s)" = 0.12, 0.0, 2.0, 0.01, 2;
         greet_cool: "Between waves at the same friend (s)" = 90.0, 5.0, 900.0, 5.0, 0;
-        pat_distract: "Happy moment when petted mid-game (s)" = 1.6, 0.2, 10.0, 0.1, 1;
+        pat_distract: "Happy moment when petted mid-game (s)" = 0.7, 0.2, 10.0, 0.1, 1;
     }
     "Social", "Parting" {
         part_stay: "Stay where they are" = 0.25, 0.0, 1.0, 0.05, 2;
@@ -98,7 +112,7 @@ tuning! {
     }
     "Games", "Concert after a race" {
         concert_chance: "Chance of a concert" = 0.8, 0.0, 1.0, 0.05, 2;
-        race_travel: "Come from other workspaces to race" = 0.6, 0.0, 1.0, 0.05, 2;
+        race_travel: "Come from other workspaces to race" = 0.85, 0.0, 1.0, 0.05, 2;
         concert_time: "Concert length (s)" = 20.0, 3.0, 120.0, 1.0, 0;
     }
     "Roaming", "Visiting fullscreen apps" {
@@ -112,14 +126,39 @@ tuning! {
     }
     "Roaming", "Moving between workspaces" {
         ws_every: "Moving interval per character (s)" = 240.0, 10.0, 3600.0, 10.0, 0;
-        ws_bored: "Gets bored after (s)" = 300.0, 10.0, 3600.0, 10.0, 0;
-        ws_familiar: "Bored of familiar faces" = 1.0, 0.0, 10.0, 0.5, 1;
-        ws_floor: "Smallest share per workspace" = 0.15, 0.0, 0.5, 0.05, 2;
+        ws_floor: "Smallest share per workspace" = 0.05, 0.0, 0.5, 0.05, 2;
         ws_use_weight: "Use vs window count (1 = use)" = 0.5, 0.0, 1.0, 0.05, 2;
         ws_use_half: "Use halves every (s)" = 900.0, 30.0, 14400.0, 30.0, 0;
-        ws_balance: "Urge to leave a crowded one" = 1.0, 0.0, 10.0, 0.5, 1;
+        ws_stay: "Stays at least (s)" = 120.0, 0.0, 3600.0, 10.0, 0;
+        ws_gap: "Quiet after someone leaves (s)" = 45.0, 0.0, 1800.0, 5.0, 0;
+        ws_friends: "Friends who may come along, at most" = 0.0, 0.0, 6.0, 1.0, 0;
         ws_max: "On the way at once" = 2.0, 1.0, 12.0, 1.0, 0;
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
+    }
+    "Roaming", "Park" {
+        park_mode: "With Anima Park open: 0 desktop, 1 only park, 2 park and out now and then, 3 the desktop, visiting park" = 3.0, 0.0, 3.0, 1.0, 0;
+        park_play: "Someone free in the park goes to play (chance each look)" = 0.25, 0.0, 1.0, 0.05, 2;
+        park_game_every: "Game time in the park about every (s)" = 150.0, 20.0, 3600.0, 10.0, 0;
+        park_busy_most: "At most this share of them off on their own things at once" = 0.5, 0.1, 1.0, 0.05, 2;
+        park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
+        park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
+        park_out_stay: "Stays out (s)" = 180.0, 10.0, 7200.0, 10.0, 0;
+    }
+    "Roaming", "Weather" {
+        carry_keepsake: "Carries its favourite keepsake on its back (share of the time)" = 0.4, 0.0, 1.0, 0.05, 2;
+        weather_show: "Weather shown: 0 off, 1 around them, 2 whole screen" = 1.0, 0.0, 2.0, 1.0, 0;
+        jolt_drop: "A tumble knocks the umbrella out of the hand" = 0.7, 0.0, 1.0, 0.05, 2;
+        parasol_drag: "Open umbrella on the back slows games (speed share)" = 0.85, 0.3, 1.0, 0.05, 2;
+        parasol_hang: "Jumps under an open umbrella last (times)" = 1.8, 1.0, 4.0, 0.1, 1;
+        parasol_peak: "Under an umbrella, the top of a jump comes at (share of it)" = 0.3, 0.1, 0.5, 0.05, 2;
+        parasol_fall: "Gravity under an open umbrella (share)" = 0.22, 0.05, 1.0, 0.05, 2;
+        parasol_speed: "Fastest fall under an open umbrella" = 2.0, 0.2, 20.0, 0.1, 1;
+        drop_speed: "Shaken or carried this fast (px/s), items fly off" = 1500.0, 200.0, 10000.0, 100.0, 0;
+        drop_swing: "Spun this fast (turns), the umbrella flies off" = 10.0, 0.5, 30.0, 0.5, 1;
+        snow_settle: "Snow piles up on heads over (s)" = 45.0, 1.0, 600.0, 5.0, 0;
+        snow_hop: "Hop after snowflakes (per s)" = 0.06, 0.0, 2.0, 0.01, 2;
+        night_sleep: "Go to bed at night (share)" = 0.5, 0.0, 1.0, 0.05, 2;
+        night_spread: "Going to bed one by one (s)" = 90.0, 0.0, 1800.0, 5.0, 0;
     }
     "Roaming", "Sleep" {
         sleep_after: "Untouched for (s)" = 300.0, 25.0, 3600.0, 15.0, 0;
@@ -142,13 +181,6 @@ tuning! {
         sit_min: "Shortest sit (s)" = 8.0, 1.0, 120.0, 1.0, 0;
         sit_rand: "Random extra sit (s)" = 12.0, 0.0, 120.0, 1.0, 0;
         sit_sink: "Lowering when sitting" = 0.2, 0.0, 1.0, 0.05, 2;
-    }
-    "Roaming", "Busy processor panic" {
-        cpu_hot: "Load to start" = 0.75, 0.1, 1.0, 0.05, 2;
-        cpu_calm: "Load to calm down" = 0.55, 0.0, 1.0, 0.05, 2;
-        cpu_for: "Lasting for (s)" = 4.0, 0.0, 60.0, 1.0, 0;
-        cpu_share: "Share who panic" = 1.0, 0.0, 1.0, 0.05, 2;
-        cpu_run: "Speed while panicking" = 4.0, 1.0, 6.0, 0.1, 1;
     }
     "Social", "Friendship and rivalry" {
         close_friend: "Counts as a close friend" = 1.5, 0.1, 3.0, 0.1, 1;
@@ -208,7 +240,7 @@ tuning! {
         land_hop: "Bounce on landing" = 0.3, 0.0, 2.0, 0.05, 2;
     }
     "Touch", "Petting" {
-        pat_keep: "Each click adds (s)" = 0.6, 0.1, 5.0, 0.1, 1;
+        pat_keep: "Each click adds (s)" = 0.3, 0.1, 5.0, 0.1, 1;
         pat_fan: "Spread out while petted (widths)" = 0.5, 0.2, 2.0, 0.05, 2;
         pat_gather: "Call those nearby (screens)" = 0.45, 0.0, 2.0, 0.05, 2;
         pat_gather_chance: "Chance nearby ones come" = 0.35, 0.0, 1.0, 0.05, 2;
@@ -292,10 +324,16 @@ tuning! {
         energy_game_cost: "Cost of a game" = 0.5, 0.0, 1.0, 0.05, 2;
     }
     "Games", "Starting games" {
+        carry_chase: "Chat mates walk after a carried one (speed)" = 0.25, 0.1, 3.0, 0.05, 2;
+        carry_follow: "They follow it this far (screens)" = 0.35, 0.0, 2.0, 0.05, 2;
+        throw_far: "Thrown this far from a game, out of it (widths)" = 6.0, 1.0, 40.0, 0.5, 1;
         game_after: "Start if nobody joins (s)" = 7.0, 0.5, 120.0, 0.5, 1;
         game_chance: "Chat turns into a game" = 0.35, 0.0, 1.0, 0.05, 2;
         game_min: "Fewest players" = 3.0, 2.0, 12.0, 1.0, 0;
         crowd_games: "Fewest for games in a row" = 4.0, 2.0, 12.0, 1.0, 0;
+        encore_keen: "Stays for another game, whatever its energy" = 0.25, 0.0, 1.0, 0.05, 2;
+        encore_energy: "Extra chance from energy" = 0.65, 0.0, 1.0, 0.05, 2;
+        encore_show: "Holds up the next game for (s)" = 2.5, 0.5, 10.0, 0.5, 1;
         max_games: "Most games per group" = 2.0, 1.0, 7.0, 1.0, 0;
         party_min: "Fewest for domino and tag" = 4.0, 2.0, 12.0, 1.0, 0;
         after_game_min: "Chat after a game (s)" = 6.0, 0.0, 60.0, 1.0, 0;
@@ -337,13 +375,17 @@ tuning! {
         see_range: "Notice from (widths)" = 6.0, 0.5, 40.0, 0.5, 1;
         see_chance: "Chance to notice" = 0.15, 0.0, 1.0, 0.01, 2;
         watch_join: "Join when the game ends" = 0.35, 0.0, 1.0, 0.05, 2;
+        watch_stay_min: "Watches at least (s)" = 25.0, 5.0, 600.0, 5.0, 0;
+        watch_stay_rand: "Random extra watching (s)" = 35.0, 0.0, 600.0, 5.0, 0;
+        chat_max: "Longest any game lasts (s)" = 360.0, 60.0, 3600.0, 10.0, 0;
     }
     "Games", "Splitting a crowd" {
         split_min: "Group big enough to split" = 6.0, 2.0, 20.0, 1.0, 0;
         mood_min: "Group that splits into chat and game" = 6.0, 4.0, 30.0, 1.0, 0;
         mood_after: "Chat before splitting (s)" = 8.0, 0.0, 120.0, 1.0, 0;
         mood_game: "Someone wants a game" = 0.3, 0.0, 1.0, 0.05, 2;
-        game_fit: "Pick games that fit the group" = 2.0, 0.0, 6.0, 0.5, 1;
+        game_fit: "Pick games that fit the group" = 0.85, 0.0, 6.0, 0.05, 2;
+        game_reward: "Win an accessory in games (chance)" = 0.78, 0.0, 1.0, 0.05, 2;
         split_chance: "Split in two after a game" = 0.5, 0.0, 1.0, 0.05, 2;
     }
     "Games", "Jumping contest" {
@@ -351,7 +393,7 @@ tuning! {
         contest_rand: "Random extra height" = 1.6, 0.0, 5.0, 0.1, 1;
     }
     "Games", "Cursor game" {
-        cursor_game: "Chance" = 0.07, 0.0, 1.0, 0.01, 2;
+        cursor_game: "Chance" = 0.04, 0.0, 1.0, 0.01, 2;
         cursor_time_min: "Longest time (s)" = 12.0, 3.0, 180.0, 1.0, 0;
         cursor_time_rand: "Random extra (s)" = 6.0, 0.0, 180.0, 1.0, 0;
         cursor_win: "Win by hanging on for (s)" = 3.0, 0.5, 60.0, 0.5, 1;
@@ -376,13 +418,15 @@ tuning! {
         domino_rest: "Lying down for (s)" = 1.8, 0.0, 15.0, 0.5, 1;
     }
     "Games", "Volleyball" {
-        volley_min: "Fewest characters (even)" = 6.0, 6.0, 12.0, 2.0, 0;
+        volley_min: "Fewest players" = 7.0, 6.0, 12.0, 1.0, 0;
+        volley_weight: "Pick weight" = 0.65, 0.0, 3.0, 0.05, 2;
+        volley_hold: "Ball held this long, someone knocks it out (s)" = 1.5, 0.5, 30.0, 0.5, 1;
         volley_reach: "Hit reach (px)" = 55.0, 10.0, 300.0, 5.0, 0;
         volley_big: "Fewest for a net of 4" = 11.0, 7.0, 30.0, 1.0, 0;
         volley_fumble: "Miss the ball (more in a crowd)" = 0.04, 0.0, 1.0, 0.01, 2;
         volley_time_min: "Shortest hit flight (s)" = 0.7, 0.3, 3.0, 0.05, 2;
         volley_time_rand: "Random extra (s)" = 1.0, 0.0, 3.0, 0.05, 2;
-        volley_win: "Points to win" = 5.0, 1.0, 21.0, 1.0, 0;
+        volley_win: "Points to win" = 3.0, 1.0, 21.0, 1.0, 0;
         volley_speed: "Top player speed" = 0.7, 0.1, 2.0, 0.05, 2;
         volley_net: "Hits that can catch the net" = 0.25, 0.0, 1.0, 0.01, 2;
         volley_gather: "Walking to positions" = 0.18, 0.05, 1.0, 0.01, 2;
@@ -391,8 +435,8 @@ tuning! {
     "Games", "Samba" {
         samba_min: "Fewest characters" = 3.0, 2.0, 12.0, 1.0, 0;
         samba_big: "Characters for full chance" = 7.0, 3.0, 30.0, 1.0, 0;
-        samba_weight_small: "Pick weight with few" = 0.12, 0.0, 3.0, 0.01, 2;
-        samba_weight_big: "Pick weight with many" = 0.3, 0.0, 3.0, 0.01, 2;
+        samba_weight_small: "Pick weight with few" = 0.3, 0.0, 3.0, 0.01, 2;
+        samba_weight_big: "Pick weight with many" = 0.75, 0.0, 3.0, 0.01, 2;
         samba_join: "Onlooker joins" = 0.5, 0.0, 1.0, 0.05, 2;
         samba_join_gap: "Between joins (s)" = 4.0, 0.5, 60.0, 0.5, 1;
         samba_time: "Length (s)" = 45.0, 2.0, 120.0, 1.0, 0;
@@ -416,7 +460,17 @@ tuning! {
         tug_fling_min: "Losers fly (px)" = 400.0, 0.0, 3000.0, 50.0, 0;
         tug_fling_rand: "Random extra (px)" = 350.0, 0.0, 3000.0, 50.0, 0;
     }
+    "Games", "Wrestling" {
+        wrestle_min: "Fewest for wrestling" = 4.0, 2.0, 12.0, 1.0, 0;
+        wrestle_win: "Ring out distance (px)" = 110.0, 20.0, 600.0, 10.0, 0;
+        wrestle_round: "Longest bout (s)" = 8.0, 2.0, 30.0, 0.5, 1;
+        wrestle_push: "Push strength" = 52.0, 10.0, 400.0, 5.0, 0;
+        wrestle_lean: "Leaning in" = 0.24, 0.0, 0.7, 0.02, 2;
+        wrestle_fling_min: "Losers fly (px)" = 220.0, 50.0, 1500.0, 25.0, 0;
+        wrestle_fling_rand: "Random extra (px)" = 160.0, 0.0, 1500.0, 25.0, 0;
+    }
     "Games", "Tag" {
+        tag_min: "Fewest players" = 3.0, 2.0, 12.0, 1.0, 0;
         tag_time_min: "Length (s)" = 18.0, 3.0, 180.0, 1.0, 0;
         tag_time_rand: "Random extra (s)" = 7.0, 0.0, 180.0, 1.0, 0;
         tag_pace: "Speeding up and slowing down" = 0.45, 0.0, 0.9, 0.05, 2;

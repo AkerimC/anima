@@ -79,6 +79,10 @@ pub fn game(name: &str) {
     let _ = Command::new(bin("anima")).args(["game", name]).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
+pub fn weather(name: &str) {
+    let _ = Command::new(bin("anima")).args(["weather", name]).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
 pub fn race() {
     let _ = Command::new(bin("anima")).arg("race").stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }

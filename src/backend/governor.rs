@@ -249,6 +249,43 @@ pub fn focused_app() -> Option<String> {
 static WORKSPACES: std::sync::Mutex<Option<Vec<Space>>> = std::sync::Mutex::new(None);
 static WINDOW_COUNTS: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// An open park, cafe or farm window: its workspace, and its column there
+/// (x on the workspace's strip, width), logical px.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Place {
+    pub place: String,
+    pub ws: u64,
+    pub x: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+static PLACE_WS: std::sync::Mutex<Vec<Place>> = std::sync::Mutex::new(Vec::new());
+
+/// The workspace the park window is on, if it's open.
+pub fn park_workspace() -> Option<u64> {
+    place_workspace("park")
+}
+
+/// Where the park, cafe or farm window is, if it's open.
+pub fn place_workspace(place: &str) -> Option<u64> {
+    place_rect(place).map(|p| p.ws)
+}
+
+pub fn place_rect(place: &str) -> Option<Place> {
+    PLACE_WS.lock().unwrap().iter().find(|p| p.place == place).cloned()
+}
+
+/// Which of them is at `x` on workspace `ws`.
+pub fn place_at(ws: u64, x: f32) -> Option<Place> {
+    PLACE_WS.lock().unwrap().iter().find(|p| p.ws == ws && x >= p.x && x <= p.x + p.w).cloned()
+}
+
+/// All the open ones.
+pub fn places() -> Vec<Place> {
+    PLACE_WS.lock().unwrap().clone()
+}
+
 /// How many windows a workspace has.
 pub fn window_count(id: u64) -> usize {
     WINDOW_COUNTS.lock().unwrap().iter().find(|c| c.0 == id).map_or(0, |c| c.1)
@@ -358,6 +395,42 @@ fn update_niri_strip(sock: &Path) {
     }
     let screen_w = niri_output_rect(sock).map(|r| r.2).unwrap_or(1920.0);
     let gap = niri_gaps();
+    {
+        // the park, cafe and farm windows (told apart by their titles), and
+        // where on their workspace's strip each one's column is
+        let places: Vec<Place> = windows
+            .iter()
+            .filter(|w| w.get("app_id").and_then(|a| a.as_str()) == Some(crate::render::character::park::APP_ID))
+            .filter_map(|w| {
+                let title = w.get("title")?.as_str()?;
+                let place = crate::render::character::park::PLACES.iter().find(|p| p.1 == title)?.0;
+                let ws = w.get("workspace_id")?.as_u64()?;
+                let col = w["layout"]["pos_in_scrolling_layout"].get(0).and_then(|v| v.as_u64());
+                // the columns of that workspace, left to right
+                let mut cols: Vec<(u64, f32)> = Vec::new();
+                for o in windows.iter().filter(|o| o.get("workspace_id").and_then(|v| v.as_u64()) == Some(ws)) {
+                    let Some(c) = o["layout"]["pos_in_scrolling_layout"].get(0).and_then(|v| v.as_u64()) else { continue };
+                    let width = o["layout"]["tile_size"].get(0).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    match cols.iter_mut().find(|x| x.0 == c) {
+                        Some(x) => x.1 = x.1.max(width),
+                        None => cols.push((c, width)),
+                    }
+                }
+                cols.sort_by_key(|c| c.0);
+                let mut x = gap;
+                let mut at = (0.0, screen_w);
+                let height = w["layout"]["tile_size"].get(1).and_then(|v| v.as_f64()).unwrap_or(1000.0) as f32;
+                for (c, width) in &cols {
+                    if Some(*c) == col {
+                        at = (x, *width);
+                    }
+                    x += width + gap;
+                }
+                Some(Place { place: place.to_string(), ws, x: at.0, w: at.1, h: height })
+            })
+            .collect();
+        *PLACE_WS.lock().unwrap() = places;
+    }
     // column index -> width, and the focused column
     let mut cols: Vec<(u64, f32)> = Vec::new();
     let mut focused_col = None;

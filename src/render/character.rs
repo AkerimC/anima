@@ -30,12 +30,16 @@ use crate::pkg::decode_tex;
 mod interact;
 mod moods;
 mod pat;
+pub mod park;
 mod race;
 mod rope;
+mod sign;
 mod social;
 mod spaces;
 mod uma;
 mod walk;
+pub mod wear;
+pub mod weather;
 
 use race::Race;
 use social::Chat;
@@ -247,6 +251,9 @@ pub struct CharacterConfig {
     pub flip_x: bool,
     /// Track mouse cursor with head/eyes/tilt.
     pub look_at_mouse: bool,
+    /// Where the weather is looked up for (a town); empty: wherever the
+    /// internet connection seems to be.
+    pub weather_place: String,
     /// Bounce and lip-sync to desktop audio / music.
     pub audio_reactive: bool,
     /// Legacy alias: when `true` and `placement == Wallpaper`, upgrades to `ScreenFront`.
@@ -308,6 +315,7 @@ impl Default for CharacterConfig {
             opacity: 1.0,
             flip_x: false,
             look_at_mouse: true,
+            weather_place: String::new(),
             audio_reactive: true,
             always_on_top: false,
             fps: 30,
@@ -342,6 +350,7 @@ uniform float u_rot;      // turned about its centre (tumbling, planted)
 uniform float u_sink;     // pushed down into the ground
 uniform float u_aspect;   // output width / height
 uniform vec2 u_pivot;     // the point it turns about, clip offset from its centre
+uniform float u_xscale;   // narrowed while turning round
 
 void main() {
     vec2 uv = a_pos * 0.5 + 0.5;
@@ -357,6 +366,7 @@ void main() {
     p.x += height_factor * u_tilt.x * 0.055;
     p.y += height_factor * u_tilt.y * 0.025;
 
+    p.x *= u_xscale;
     vec2 d = p * u_half_size;
     d.x *= u_aspect;
     float c = cos(u_rot), s = sin(u_rot);
@@ -376,6 +386,10 @@ precision highp float;
 in vec2 v_uv;
 
 uniform sampler2D u_tex;
+uniform float u_sleep;   // asleep: the mask on (0..1)
+uniform vec4 u_eye_l;
+uniform vec4 u_eye_r;
+uniform float u_tex_aspect; // sprite width / height
 // 0 = custom texture/sprite, 1 = reze, 2 = neko, 3 = cyber, 4 = spirit
 uniform int u_mode;
 // u_tex is already premultiplied (3D model render target)
@@ -956,6 +970,55 @@ void main() {
         vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
         c = texture(u_tex, clamp(uv, 0.0, 1.0));
         if (u_premul == 1 && c.a > 0.0) c.rgb /= c.a;
+        // asleep: a sleep mask over both eyes, polka dots, a bow on one side
+        // and a closed eye stitched over each eye
+        if (u_sleep > 0.0) {
+            vec2 P = vec2(uv.x * u_tex_aspect, uv.y);
+            vec2 a = vec2((u_eye_l.x + u_eye_l.z) * 0.5 * u_tex_aspect, (u_eye_l.y + u_eye_l.w) * 0.5);
+            vec2 b = vec2((u_eye_r.x + u_eye_r.z) * 0.5 * u_tex_aspect, (u_eye_r.y + u_eye_r.w) * 0.5);
+            float eh = max(max(u_eye_l.w - u_eye_l.y, u_eye_r.w - u_eye_r.y), 0.01);
+            float ew = max(max(u_eye_l.z - u_eye_l.x, u_eye_r.z - u_eye_r.x) * u_tex_aspect, eh);
+            vec2 dir = normalize(b - a);
+            vec2 nrm = vec2(-dir.y, dir.x);
+            vec2 mid = (a + b) * 0.5;
+            float along = dot(P - mid, dir);
+            float across = dot(P - mid, nrm);
+            float half_len = length(b - a) * 0.5 + ew * 0.95;
+            float half_h = eh * 1.4;
+            // the mask itself: a soft rounded band
+            vec2 m = vec2(max(abs(along) - half_len + half_h, 0.0), across);
+            float mask = 1.0 - smoothstep(half_h - 0.003, half_h + 0.002, length(m));
+            // the elastic round the head, only over the drawn hair
+            float strap = step(abs(across + eh * 0.1), eh * 0.22) * step(abs(along), half_len + ew * 1.6) * step(0.5, c.a);
+            vec3 cloth = vec3(0.98, 0.72, 0.82);
+            // polka dots
+            vec2 g = vec2(along, across) / (eh * 0.7);
+            vec2 cell = fract(g) - 0.5;
+            float dot_ = 1.0 - smoothstep(0.16, 0.22, length(cell));
+            vec3 col = mix(cloth, vec3(1.0, 0.95, 0.97), dot_ * 0.85);
+            // a closed eye stitched over each eye
+            for (int k = 0; k < 2; k++) {
+                vec2 e = k == 0 ? a : b;
+                vec2 q = vec2(dot(P - e, dir), dot(P - e, nrm)) / vec2(ew * 0.55, eh * 0.6);
+                float curve = q.y - (0.05 - 0.45 * q.x * q.x);
+                float stitch = smoothstep(0.2, 0.08, abs(curve)) * step(abs(q.x), 0.85);
+                col = mix(col, vec3(0.45, 0.2, 0.32), stitch);
+            }
+            col = mix(col, vec3(0.86, 0.5, 0.64), smoothstep(half_h * 0.75, half_h, length(m)) * 0.6);
+            // the bow, at the outer corner of one eye
+            vec2 bow = b + dir * (ew * 1.05) - nrm * (half_h * 0.9);
+            vec2 r = vec2(dot(P - bow, dir), dot(P - bow, nrm)) / (eh * 2.0);
+            float loops = 1.0 - smoothstep(0.95, 1.05, length(vec2(abs(r.x) - 0.55, r.y * 1.5) / vec2(0.5, 0.42)));
+            loops *= step(0.08, abs(r.x));
+            float knot = 1.0 - smoothstep(0.17, 0.23, length(r));
+            float bow_a = max(loops, knot);
+            vec3 bow_col = mix(vec3(0.93, 0.38, 0.55), vec3(0.78, 0.25, 0.42), knot);
+            float on = max(mask, strap);
+            vec3 out_col = mix(c.rgb, strap > mask ? vec3(0.9, 0.55, 0.68) : col, on);
+            out_col = mix(out_col, bow_col, bow_a);
+            float alpha = max(c.a, max(mask, bow_a));
+            c = vec4(mix(c.rgb, out_col, u_sleep), mix(c.a, alpha, u_sleep));
+        }
         c.a *= u_opacity;
     } else if (u_mode == 1) {
         c = render_reze(v_uv);
@@ -966,6 +1029,26 @@ void main() {
     fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
+
+/// What the vertex shader does to the sprite this frame, beyond its box:
+/// stretched by breathing from the feet up, sheared by leaning, lifted.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SpritePose {
+    breath: f32,
+    tilt: [f32; 2],
+    half: [f32; 2],
+    size: [f32; 2],
+    // the rest of CHAR_VS's inputs, for drawing worn things the same way
+    pub(super) center: [f32; 2],
+    pub(super) rot: f32,
+    pub(super) sink: f32,
+    pub(super) aspect: f32,
+    pub(super) pivot: [f32; 2],
+    pub(super) bounce: f32,
+    pub(super) xscale: f32,
+    pub(super) flip: bool,
+}
+
 
 pub struct CharacterOverlay {
     pub config: CharacterConfig,
@@ -980,6 +1063,8 @@ pub struct CharacterOverlay {
     sprite_happy: Option<glow::Texture>,
     // sprite artwork looks to the right (Uma Musume chibis do)
     faces_right: bool,
+    // happy artwork faces opposite of the calm sprite (Uma [B] sprites do)
+    happy_opposite: bool,
     // rigged 3D character drawn into `sprite_tex` every frame
     model: Option<super::model3d::Model3d>,
     // index of this character; extras are drawn after the main one
@@ -1018,6 +1103,10 @@ pub struct CharacterOverlay {
     // who starts the race a big chat set off
     // the group that decided to race together, in the order they set off
     race_crew: Vec<usize>,
+    // `anima game train`: who's been sent to practise
+    forced_train: Option<usize>,
+    // a game asked for by hand, still waiting for players: name, seconds left, to the next try
+    game_wait: Option<(String, f32, f32)>,
     // seconds before another race can start by itself
     race_quiet: f32,
     // seconds since the characters appeared
@@ -1057,6 +1146,26 @@ pub struct CharacterOverlay {
     active: Option<WindowRect>,
     // this frame's sprite, drawn once everyone is updated, frontmost last
     pending: Option<glow::Texture>,
+    // what's drawn: the side it faces and the pose, each changed half way
+    // through a short turn or squash so nothing snaps from one frame to the next
+    // where the sleep mask goes on the calm sprite (off for now)
+    eyes: Option<([f32; 4], [f32; 4], [f32; 3])>,
+    // its head on the calm sprite (left, crown, right, neck), for hats and snow
+    pub(super) head: Option<[f32; 4]>,
+    // where things are worn and held on it (calm sprite)
+    pub(super) anchors: Option<crate::render::anchors::Anchors>,
+    // the same on the happy pose, a picture of its own
+    pub(super) anchors_happy: Option<crate::render::anchors::Anchors>,
+    // the mask, 0 off .. 1 on
+    lids: f32,
+    // how the sprite is drawn this frame: breathing, leaning, hopping
+    pub(super) pose: SpritePose,
+    drawn_left: bool,
+    drawn_happy: bool,
+    // occasional playful opposite happy pose rolled once per happy bout
+    happy_peek: bool,
+    turn_t: f32,
+    swap_t: f32,
     // where it stands among those level with it; reshuffled when it sets off
     layer: f32,
     layer_act: Act,
@@ -1164,6 +1273,7 @@ impl CharacterOverlay {
             sprite_tex: None,
             sprite_happy: None,
             faces_right: false,
+            happy_opposite: false,
             model: None,
             actor,
             extras: Vec::new(),
@@ -1186,6 +1296,8 @@ impl CharacterOverlay {
             carrot_gl: None,
             new_chats: Vec::new(),
             race_crew: Vec::new(),
+            forced_train: None,
+            game_wait: None,
             race_quiet: 0.0,
             social_age: 0.0,
             view_w: 1.0,
@@ -1208,6 +1320,17 @@ impl CharacterOverlay {
             last_act: Act::Idle,
             spawned: false,
             pending: None,
+            eyes: None,
+            head: None,
+            anchors: None,
+            anchors_happy: None,
+            lids: 0.0,
+            pose: SpritePose::default(),
+            drawn_left: false,
+            drawn_happy: false,
+            happy_peek: false,
+            turn_t: 0.0,
+            swap_t: 0.0,
             active: None,
             layer: actor as f32 * 0.37 % 1.0,
             layer_act: Act::Idle,
@@ -1221,6 +1344,17 @@ impl CharacterOverlay {
     }
 
     /// Swap the extra characters without touching the ones that stay.
+    /// Walk and Follow mouse, switched without reloading anyone.
+    pub fn set_switches(&mut self, walk: bool, look_at_mouse: bool) {
+        weather::set_place(&self.config.weather_place);
+        self.config.walk = walk;
+        self.config.look_at_mouse = look_at_mouse;
+        for e in &mut self.extras {
+            e.config.walk = walk;
+            e.config.look_at_mouse = look_at_mouse;
+        }
+    }
+
     pub fn update_extras(&mut self, gl: &glow::Context, extra: &[String], width: i32, height: i32) {
         // only new ones at the end: everyone keeps their place, chats and games go on
         let appended = extra.len() >= self.config.extra.len() && extra[..self.config.extra.len()] == self.config.extra[..];
@@ -1274,13 +1408,15 @@ impl CharacterOverlay {
         if let Some(rope) = self.rope.take() {
             rope.destroy(gl);
         }
-        if let Some(carrot) = self.carrot_gl.take() {
+        if let Some(mut carrot) = self.carrot_gl.take() {
             carrot.destroy(gl);
         }
         for mut extra in self.extras.drain(..) {
             extra.destroy(gl);
         }
         self.faces_right = false;
+        self.happy_opposite = false;
+        self.happy_peek = false;
     }
 
     /// Delete every GL object owned by this character and its team.  Requires
@@ -1360,6 +1496,8 @@ impl CharacterOverlay {
             if bottom > top {
                 self.opaque = [half / w as f32, top as f32 / h as f32, bottom as f32 / h as f32];
             }
+            self.head = uma::head_box(&img);
+            self.anchors = crate::render::anchors::find(&img);
             let tex = create_texture(gl, w, h, img.as_raw(), Filter::Linear, true)?;
             self.sprite_tex = Some((tex, w, h));
 
@@ -1375,10 +1513,13 @@ impl CharacterOverlay {
                     if let Ok(img) = img.decode() {
                         let mut img = img.to_rgba8();
                         let folder = hp.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        if self.config.happy_flip.contains(&folder) {
+                        let flip_on_load = self.config.happy_flip.contains(&folder);
+                        if flip_on_load {
                             img = image::imageops::flip_horizontal(&img);
                         }
+                        self.happy_opposite = uma::happy_opposite(&path) && !flip_on_load;
                         let (hw, hh) = img.dimensions();
+                        self.anchors_happy = crate::render::anchors::find(&img);
                         self.sprite_happy =
                             create_texture(gl, hw, hh, img.as_raw(), Filter::Linear, true).ok();
                     }
@@ -1408,8 +1549,36 @@ impl CharacterOverlay {
                 a.zoom.map_or(r, |z| z.to_screen(r))
             })
             .chain(self.props().into_iter().filter_map(|p| shown(p.1, p.3)))
+            // worn and held things reach outside the sprite's box (an umbrella
+            // above the head, wings to the sides): they change too
+            .chain(std::iter::once(self).chain(self.extras.iter()).filter(|a| a.visible).flat_map(|a| {
+                let [x0, y0, x1, y1] = a.hit_rect;
+                let (w, h) = (x1 - x0, y1 - y0);
+                // turned or tumbling: anywhere round it
+                let pad = if a.walk.rot.abs() > 0.01 { h * 1.5 } else { h * 0.08 };
+                let pad_turned = h * 0.5;
+                a.worn()
+                    .into_iter()
+                    .map(move |t| {
+                        let [sx0, sy0, sx1, sy1] = t.rect;
+                        let pad = if t.turn != 0.0 { pad.max(pad_turned) } else { pad };
+                        let r = [x0 + (sx0 + 1.0) * 0.5 * w - pad, y0 + (1.0 - sy1) * 0.5 * h - pad, x0 + (sx1 + 1.0) * 0.5 * w + pad, y0 + (1.0 - sy0) * 0.5 * h + pad];
+                        a.zoom.map_or(r, |z| z.to_screen(r))
+                    })
+                    .collect::<Vec<_>>()
+            }))
+            // dropped things, tumbling
+            .chain(self.moods.loose.iter().filter_map(|l| {
+                let a = if l.owner == 0 { self } else { self.extras.get(l.owner - 1)? };
+                let x = l.x - a.own_view[0] * self.view_w * 0.5;
+                let r = l.size[0].max(l.size[1]) * 0.75;
+                shown([x - r, l.y - r, x + r, l.y + r], l.owner)
+            }))
+            // rain or snow over everything: all of it changes
+            .chain(self.weather_sheet().map(|_| [0.0, 0.0, self.surface[0].max(1.0) * 4.0, self.surface[1].max(1.0) * 4.0]))
             // the rope spans the gap between the two sides
             .chain(self.ropes_owned().into_iter().filter_map(|([x0, y0, x1, y1], o)| shown([x0, y0.min(y1) - 40.0, x1, y0.max(y1) + 40.0], o)))
+            .chain(self.park_ropes().into_iter().filter_map(|([x0, y0, x1, y1], o, half, _)| shown([x0.min(x1) - 20.0 - half, y0.min(y1) - 20.0 - half, x0.max(x1) + 20.0 + half, y0.max(y1) + 20.0 + half], o)))
             .collect()
     }
 
@@ -1474,10 +1643,17 @@ impl CharacterOverlay {
             self.program.set_i32(gl, "u_tex", 0);
             if target.begin(gl, self.actor, self.hit_rect) {
                 let clip = self.zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform());
+                // worn and held things: those behind it first, then it, then the rest
+                let worn = self.worn();
+                self.draw_worn(gl, &worn, clip, true);
+                self.program.bind(gl);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 self.program.set_vec4(gl, "u_clip", clip);
                 gl.bind_vertex_array(Some(self.vao));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_vertex_array(None);
+                self.draw_worn(gl, &worn, clip, false);
                 target.end(gl, self.actor);
             }
             gl.bind_texture(glow::TEXTURE_2D, None);
@@ -1496,6 +1672,8 @@ impl CharacterOverlay {
         std::mem::swap(&mut self.sprite_tex, &mut o.sprite_tex);
         std::mem::swap(&mut self.sprite_happy, &mut o.sprite_happy);
         std::mem::swap(&mut self.faces_right, &mut o.faces_right);
+        std::mem::swap(&mut self.happy_opposite, &mut o.happy_opposite);
+        std::mem::swap(&mut self.happy_peek, &mut o.happy_peek);
         std::mem::swap(&mut self.model, &mut o.model);
         std::mem::swap(&mut self.hit_rect, &mut o.hit_rect);
         std::mem::swap(&mut self.opaque, &mut o.opaque);
@@ -1769,7 +1947,7 @@ impl CharacterOverlay {
                 e.view = view;
             }
             self.share_views(view, strip.map(|st| st.ws));
-            if self.config.walk {
+            {
                 self.run_race(dt, w);
                 self.run_social(dt, info.mouse);
             }
@@ -1791,8 +1969,28 @@ impl CharacterOverlay {
 
         let cx_px = pos[0] + pw * 0.5;
         let cy_px = h - (pos[1] + ph * 0.5);
-        let center_clip = [(cx_px / w) * 2.0 - 1.0, (cy_px / h) * 2.0 - 1.0];
-        let half_clip = [pw / w, ph / h];
+        let base_center = [(cx_px / w) * 2.0 - 1.0, (cy_px / h) * 2.0 - 1.0];
+        let base_half = [pw / w, ph / h];
+        let mut center_clip = base_center;
+        let mut half_clip = base_half;
+        let park_win = crate::backend::governor::place_rect("park");
+        let strip_px = (center_clip[0] + self.walk.x + 1.0) * 0.5 * w;
+        let in_park = park_win.filter(|p| {
+            p.ws == self.walk.ws && (!self.walk.placed || (strip_px >= p.x - 16.0 && strip_px <= p.x + p.w + 16.0))
+        });
+        let (park_max_y, y_per_clip, park_h) = if let Some(ref p) = in_park {
+            (center_clip, half_clip) = project_park_clip(
+                base_center,
+                base_half,
+                self.walk.park_y,
+                self.walk.park_crowd,
+                p.h,
+                h,
+            );
+            (park::MEADOW, (0.5 * w / p.h.max(1.0)) * 0.75, p.h)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
 
         let target_look = if self.config.look_at_mouse {
             let seen = self.scene_mouse();
@@ -1891,7 +2089,7 @@ impl CharacterOverlay {
                 (y0 + y1) * 0.5,
             )
             ).flatten().unwrap_or_default();
-            let mirrored = self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right);
+            let mirrored = self.config.flip_x ^ (self.walk.left == self.faces_right);
             // moving to music: lean the upper body, nod the head
             let (lean, nod) = if self.walk.act == Act::Idle { (self.vibe.sway * 0.35, self.vibe.nod * -0.6) } else { (0.0, 0.0) };
             model.set_groove(lean, nod);
@@ -1911,7 +2109,7 @@ impl CharacterOverlay {
             // the anchor when the strip isn't scrolled); `view` converts to screen
             let [view, extra] = self.own_view;
             self.top_air = (1.0 - center_clip[1]) / half_clip[1] + 1.2;
-            let (walk_x, moving, jump) = if self.config.walk {
+            let (walk_x, moving, jump) = if true {
                 let left_room = -(center_clip[0] - half_clip[0] + 1.0);
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + extra;
                 // visiting a fullscreen app: only the screen itself
@@ -1926,11 +2124,15 @@ impl CharacterOverlay {
                     self.walk.target = self.walk.x;
                 }
                 if !self.walk.placed {
-                    // everyone at once, anywhere along the strip
+                    // everyone at once, anywhere along the strip (and depth in the park)
                     self.walk.placed = true;
                     self.walk.energy = self.walk.rand();
                     self.walk.x = left_room + self.walk.rand() * (right_room - left_room);
                     self.walk.target = self.walk.x;
+                    if park_max_y > 0.0 {
+                        self.walk.park_y = self.walk.rand() * park_max_y;
+                        self.walk.park_target_y = self.walk.park_y;
+                    }
                     self.walk.timer = self.walk.rand() * 1.5;
                 }
                 // a drawn circle: aim for its centre, otherwise for the cursor
@@ -1974,7 +2176,7 @@ impl CharacterOverlay {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
                 let mouse = if self.walk.visiting { None } else { mouse };
-                let r = self.walk.step(dt, left_room, right_room, mouse, reach);
+                let r = self.walk.step_in(dt, left_room, right_room, mouse, reach, park_max_y, y_per_clip);
                 if std::mem::take(&mut self.walk.gesture) {
                     if let Some(m) = self.model.as_mut() {
                         m.gesture_now();
@@ -1996,8 +2198,18 @@ impl CharacterOverlay {
                 (0.0, false, 0.0)
             };
             // held: follow the cursor; released: fall back down
-            let walk_x = if self.config.walk || self.walk.act == Act::Held {
-                self.carry(info, dt, center_clip, half_clip);
+            let walk_x = if true {
+                self.carry(info, dt, center_clip, half_clip, park_h);
+                if let Some(p) = in_park {
+                    (center_clip, half_clip) = project_park_clip(
+                        base_center,
+                        base_half,
+                        self.walk.park_y,
+                        self.walk.park_crowd,
+                        p.h,
+                        h,
+                    );
+                }
                 self.walk.x - view
             } else {
                 walk_x
@@ -2005,6 +2217,8 @@ impl CharacterOverlay {
             let air = self.walk.air * half_clip[1];
             self.program
                 .set_vec2(gl, "u_center", center_clip[0] + walk_x, center_clip[1]);
+            self.program
+                .set_vec2(gl, "u_half_size", half_clip[0], half_clip[1]);
             {
                 self.catch_cling(info);
                 // sprite box for click hit-testing (surface pixels)
@@ -2019,12 +2233,18 @@ impl CharacterOverlay {
                 self.pat_leaves(info);
             }
             // sprites have no rig: idle sway + hop, quicker hops while walking
-            let petted = self.walk.petted > 0.0 && self.walk.act != Act::Pat;
-            let (sway, hop, squash) = if mode == 0 && (self.walk.act == Act::Pat || petted) {
-                // pat pat: quick downward squashes, no sway
+            let petted = self.walk.petted > 0.0 && !matches!(self.walk.act, Act::Pat | Act::Held | Act::Fall);
+            let (sway, hop, squash) = if mode == 0 && self.walk.act == Act::Pat && self.walk.hug > 0.0 {
+                // warm torso squeeze toward its hugger before the happy hop
+                let prog = (1.0 - self.walk.timer / 0.72).clamp(0.0, 1.0);
+                let squeeze = (prog * std::f32::consts::PI).sin();
+                let lean = if self.walk.left { -0.45 } else { 0.45 } * squeeze;
+                (lean, air, squeeze * 3.8)
+            } else if mode == 0 && (self.walk.act == Act::Pat || petted) {
+                // pat pat: quick downward squashes, no sway (still preserve vertical lift if airborne)
                 let t = if petted { self.walk.petted } else { self.walk.timer };
                 let p = (t / PAT_DUR * std::f32::consts::PI * 5.0).sin().abs();
-                (0.0, 0.0, p * 5.0)
+                (0.0, jump * self.walk.jump_amp * half_clip[1] + air, p * 5.0)
             } else if mode == 0 && self.model.is_some() {
                 // the rig animates itself: only lift for jumps and drags,
                 // and sway and bob to the music
@@ -2048,6 +2268,22 @@ impl CharacterOverlay {
             self.program.set_f32(gl, "u_bounce", self.smooth_bounce + hop);
             self.program.set_f32(gl, "u_rot", self.walk.rot);
             self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
+            // how the sprite is bent and lifted this frame, so things worn or held
+            // can follow any point of it exactly (see `shift_at`)
+            self.pose = SpritePose {
+                breath: breath - squash,
+                tilt: [self.smooth_look[0] + sway, self.smooth_look[1]],
+                half: half_clip,
+                size: [w, h],
+                center: [center_clip[0] + walk_x, center_clip[1]],
+                rot: self.walk.rot,
+                sink: self.walk.sink * half_clip[1],
+                aspect: w / h,
+                pivot: [0.0, 0.0],
+                bounce: self.smooth_bounce + hop,
+                xscale: 1.0,
+                flip: false,
+            };
             self.program.set_f32(gl, "u_aspect", w / h);
             let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
                 (true, _, Some(g)) => g,
@@ -2055,8 +2291,28 @@ impl CharacterOverlay {
                 _ => [0.0, 0.0],
             };
             self.program.set_vec2(gl, "u_pivot", pivot[0], pivot[1]);
-            self.program
-                .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.config.walk && self.walk.left == self.faces_right)));
+            self.pose.pivot = pivot;
+            // turning round: narrows to a sliver, flips, opens out again
+            const TURN: f32 = 0.16;
+            let airborne = matches!(self.walk.act, Act::Held | Act::Fall | Act::Planted | Act::Travel) || self.walk.rot.abs() > 0.05;
+            if self.walk.left != self.drawn_left && self.turn_t <= 0.0 {
+                if airborne {
+                    self.drawn_left = self.walk.left;
+                } else {
+                    self.turn_t = TURN;
+                }
+            }
+            let mut xscale = 1.0;
+            if self.turn_t > 0.0 {
+                self.turn_t -= dt;
+                if self.turn_t <= TURN * 0.5 {
+                    self.drawn_left = self.walk.left;
+                }
+                let k = (self.turn_t.max(0.0) / TURN * 2.0 - 1.0).abs();
+                xscale = 0.2 + 0.8 * k;
+            }
+            self.program.set_f32(gl, "u_xscale", xscale);
+            self.pose.xscale = xscale;
             self.program.set_i32(gl, "u_mode", mode);
             self.program.set_i32(gl, "u_premul", i32::from(self.model.is_some()));
             self.program.set_f32(gl, "u_time", time);
@@ -2068,14 +2324,66 @@ impl CharacterOverlay {
             self.program.set_vec4(gl, "u_mouth", mouth);
 
             gl.active_texture(glow::TEXTURE0);
-            let happy = matches!(self.walk.act, Act::Jump | Act::Pat | Act::Held | Act::Fall)
-                || self.walk.giggle > 0.0
-                || self.walk.petted > 0.0
-                || self.walk.social.is_some_and(|s| s.happy);
-            let tex = match (happy, self.sprite_happy) {
+            // walking or running along the ground is always the calm pose: the
+            // happy one is drawn facing the other way for many characters.
+            // Hopping along (samba, leaps) isn't walking.
+            let afoot = moving
+                && matches!(self.walk.act, Act::Idle | Act::Walk | Act::Chase)
+                && self.walk.air <= 0.0
+                && !self.walk.social.is_some_and(|s| s.leaping);
+            let happy = !afoot
+                && (matches!(self.walk.act, Act::Jump | Act::Pat | Act::Held | Act::Fall)
+                    || self.walk.giggle > 0.0
+                    || self.walk.petted > 0.0
+                    || self.walk.social.is_some_and(|s| s.happy));
+            // a change of pose: a quick squash, swapped at the bottom of it
+            const SWAP: f32 = 0.14;
+            if happy != self.drawn_happy && self.swap_t <= 0.0 {
+                self.swap_t = SWAP;
+                if happy {
+                    let chance = happy_peek_chance(&self.walk);
+                    self.happy_peek = chance > 0.0 && self.walk.rand() < chance;
+                } else {
+                    self.happy_peek = false;
+                }
+            }
+            if self.swap_t > 0.0 {
+                self.swap_t -= dt;
+                if self.swap_t <= SWAP * 0.5 {
+                    self.drawn_happy = happy;
+                }
+                let k = (std::f32::consts::PI * (1.0 - self.swap_t.max(0.0) / SWAP)).sin();
+                self.program.set_f32(gl, "u_breath", breath - squash - k * 4.0);
+                self.pose.breath = breath - squash - k * 4.0;
+            }
+            let flip = self.config.flip_x ^ (self.drawn_left == self.faces_right) ^ should_align_happy(self.drawn_happy, self.happy_opposite, self.happy_peek, &self.walk);
+            self.pose.flip = flip;
+            self.program.set_i32(gl, "u_flip_x", i32::from(flip));
+            let tex = match (self.drawn_happy, self.sprite_happy) {
                 (true, Some(h)) => h,
                 _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),
             };
+            // asleep in the calm pose: the mask goes on, slowly
+            let asleep = !self.drawn_happy && self.walk.rest.is_some_and(|r| r.kind == moods::RestKind::Sleep) && self.walk.act == Act::Rest;
+            let goal = if asleep && self.eyes.is_some() { 1.0 } else { 0.0 };
+            self.lids += (goal - self.lids) * (dt * 3.0).min(1.0);
+            let lids = if self.lids < 0.02 { 0.0 } else { self.lids };
+            self.program.set_f32(gl, "u_sleep", lids);
+            // put right by hand in the settings: the mask centred on that spot
+            let fixed = self.eyes.map(|(l, r, s)| match uma::eye_fix(&self.config.source) {
+                Some([x, y]) => {
+                    let (mx, my) = ((l[0] + r[2]) * 0.5, (l[1] + l[3] + r[1] + r[3]) * 0.25);
+                    let (dx, dy) = (x - mx, y - my);
+                    ([l[0] + dx, l[1] + dy, l[2] + dx, l[3] + dy], [r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy], s)
+                }
+                None => (l, r, s),
+            });
+            if let Some((l, r, _)) = fixed {
+                let aspect = self.sprite_tex.map_or(1.0, |(_, w, h)| w as f32 / h.max(1) as f32);
+                self.program.set_f32(gl, "u_tex_aspect", aspect);
+                self.program.set_vec4(gl, "u_eye_l", l);
+                self.program.set_vec4(gl, "u_eye_r", r);
+            }
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             self.program.set_i32(gl, "u_tex", 0);
 
@@ -2098,6 +2406,8 @@ impl CharacterOverlay {
         }
         if self.actor == 0 {
             let n = self.extras.len() + 1;
+            // the park's swing ropes and seesaw board go behind everyone
+            self.draw_ropes(gl, info, target, true);
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal));
             for i in order {
@@ -2107,11 +2417,70 @@ impl CharacterOverlay {
                     self.extras[i - 1].draw_pending(gl, target);
                 }
             }
-            self.draw_ropes(gl, info, target);
+            self.draw_ropes(gl, info, target, false);
             self.draw_carrot(gl, info, target);
         }
         Ok(())
     }
+}
+
+fn project_park_clip(
+    base_center: [f32; 2],
+    base_half: [f32; 2],
+    park_y: f32,
+    park_crowd: f32,
+    park_h: f32,
+    surface_h: f32,
+) -> ([f32; 2], [f32; 2]) {
+    let crowd = if park_crowd > 0.0 { park_crowd } else { 1.0 };
+    let scale = crowd * park::depth_scale(park_y);
+    let feet_base = base_center[1] - base_half[1];
+    let half = [base_half[0] * scale, base_half[1] * scale];
+    let center_y = feet_base + (park_y * park_h) * 2.0 / surface_h + half[1];
+    ([base_center[0], center_y], half)
+}
+
+fn is_petting(walk: &walk::WalkState) -> bool {
+    matches!(walk.act, Act::Pat) || walk.petted > 0.0 || walk.crowd.is_some_and(|c| c.is_pat())
+}
+
+fn lock_happy_facing(walk: &walk::WalkState) -> bool {
+    is_petting(walk)
+        || walk
+            .social
+            .is_some_and(|s| s.perched || s.face_lock || (s.in_talk && !s.crowd))
+}
+
+/// Odds that a happy bout playfully peeks the opposite way: never during petting,
+/// 2-person chats, perched rides or face-locked synchronized poses; occasionally
+/// during jumps, games and 3+ crowds.
+fn happy_peek_chance(walk: &walk::WalkState) -> f32 {
+    if lock_happy_facing(walk) {
+        return 0.0;
+    }
+    if walk.in_game
+        || walk.race.is_some()
+        || matches!(walk.act, Act::Chase)
+        || walk.social.is_some_and(|s| s.leaping || s.chasing)
+    {
+        0.40
+    } else if walk.social.is_some_and(|s| s.crowd) || matches!(walk.act, Act::Jump) {
+        0.30
+    } else {
+        0.0
+    }
+}
+
+/// Aligns opposite-facing happy poses (Uma `[B]`) across every mode by default,
+/// unless `happy_peek` playfully flips a jump, game moment or 3+ crowd bout.
+fn should_align_happy(drawn_happy: bool, happy_opposite: bool, happy_peek: bool, walk: &walk::WalkState) -> bool {
+    if !drawn_happy || !happy_opposite {
+        return false;
+    }
+    if lock_happy_facing(walk) {
+        return true;
+    }
+    !happy_peek
 }
 
 fn create_quad(gl: &glow::Context) -> Result<(glow::VertexArray, glow::Buffer)> {
@@ -2149,5 +2518,51 @@ mod zoom_tests {
         let px = |c: f32, size: f32| (c + 1.0) * 0.5 * size;
         assert_eq!((px(left, 1920.0), px(right, 1920.0)), (480.0, 1440.0));
         assert_eq!((1080.0 - px(top, 1080.0), 1080.0 - px(bottom, 1080.0)), (135.0, 675.0));
+    }
+
+    #[test]
+    fn align_happy_everywhere_with_playful_peek() {
+        let mut wk = walk::WalkState::default();
+        // Straight across all modes by default when happy_peek is false
+        assert!(should_align_happy(true, true, false, &wk));
+        assert!(!should_align_happy(false, true, false, &wk));
+        assert!(!should_align_happy(true, false, false, &wk));
+
+        // Petting stays straight even if happy_peek were true
+        wk.act = Act::Pat;
+        assert!(should_align_happy(true, true, true, &wk));
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+
+        // Random jump or crowded/fast game can peek when happy_peek is rolled
+        wk.act = Act::Jump;
+        assert!(!should_align_happy(true, true, true, &wk));
+        assert!(happy_peek_chance(&wk) > 0.0);
+
+        wk.in_game = true;
+        assert!(happy_peek_chance(&wk) >= 0.40);
+
+        // Petted while mid-game still forces straight alignment
+        wk.petted = 0.5;
+        assert!(should_align_happy(true, true, true, &wk));
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+        wk.petted = 0.0;
+        wk.in_game = false;
+
+        // Window curiosity aligns straight without peek unless jumping
+        wk.crowd = Some(pat::PatCrowd::curious(0.5, 0.0, 1.0, false));
+        wk.act = Act::Idle;
+        assert!(should_align_happy(true, true, false, &wk));
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+
+        // Synchronized face-locked poses (e.g. Samba, Tug, Wrestle) stay aligned
+        // even when `in_game` and `leaping` are true
+        wk.crowd = None;
+        wk.in_game = true;
+        let mut s = social::Social::default();
+        s.leaping = true;
+        s.face_lock = true;
+        wk.social = Some(s);
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+        assert!(should_align_happy(true, true, true, &wk));
     }
 }

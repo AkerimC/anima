@@ -65,33 +65,70 @@ pub(super) struct Crumb {
 // crumbs move in little steps, like hand-drawn frames
 const CRUMB_FPS: f32 = 12.0;
 
+/// Something that fell out of a character's hand: tumbling down, bouncing,
+/// lying on the floor till its owner comes for it.
+#[derive(Clone, Debug)]
+pub(super) struct Loose {
+    // what it was, to have it back, and whose: by name, since places in the
+    // team move when characters are added or taken off
+    pub(super) id: String,
+    owner_name: String,
+    helper_name: Option<String>,
+    pub(super) kind: i32,
+    // a picture of its own (a wardrobe picture), else the props folder's for its kind
+    pub(super) image: Option<std::path::PathBuf>,
+    pub(super) owner: usize,
+    // strip x and screen y of its middle, px; speed px/s
+    pub(super) x: f32,
+    pub(super) y: f32,
+    vx: f32,
+    vy: f32,
+    pub(super) rot: f32,
+    spin: f32,
+    floor: f32,
+    pub(super) size: [f32; 2],
+    // seconds lying still
+    still: f32,
+    // a friend fetching it for its owner, and whether it has it in hand yet
+    helper: Option<usize>,
+    carried: bool,
+}
+
 #[derive(Default)]
 pub(super) struct Moods {
     pub(super) protests: Vec<Protest>,
     crumbs: Vec<Crumb>,
     // one-off flashes: kind, owner, strip x, screen y, size, seconds left
     pub(super) effects: Vec<(i32, usize, f32, f32, f32, f32)>,
+    // things dropped: an umbrella shaken out of the hand
+    pub(super) loose: Vec<Loose>,
     crumb_tick: f32,
     idle_t: f32,
-    hot_t: f32,
     pub(super) fretting: bool,
     seen_opened: u32,
     seen_closed: u32,
     started: bool,
+    // the weather as last seen, to notice the night coming and going
+    pub(super) weather: super::weather::Weather,
     // a new window, and how long until its place is known
     pending: Option<(Option<u64>, f32)>,
     pub(super) bonds: Bonds,
     pub(super) skills: Skills,
+    pub(super) keepsakes: Keepsakes,
     pub(super) bond_tick: f32,
 }
 
 impl WalkState {
-    pub(super) fn at_leisure(&self) -> bool {
+    pub(super) fn can_hold_sign(&self) -> bool {
         !self.fret && matches!(self.act, Act::Idle | Act::Walk) && self.social.is_none() && self.race.is_none() && self.crowd.is_none() && !self.circle
     }
 
+    pub(super) fn at_leisure(&self) -> bool {
+        self.can_hold_sign() && self.sign.is_none()
+    }
+
     /// `until`: a nap of that many seconds; 0 sleeps until someone's back.
-    fn lie_down(&mut self, until: f32) {
+    pub(super) fn lie_down(&mut self, until: f32) {
         let turn = if self.rand() < 0.5 { FRAC_PI_2 } else { -FRAC_PI_2 };
         self.rest = Some(Rest { kind: RestKind::Sleep, t: 0.0, until, wake: None, turn });
         self.act = Act::Rest;
@@ -105,7 +142,8 @@ impl WalkState {
         self.target = self.x;
     }
 
-    fn get_up(&mut self) {
+    pub(super) fn get_up(&mut self) {
+        self.night_sleep = false;
         self.rest = None;
         self.act = Act::Idle;
         self.timer = 0.5 + self.rand();
@@ -171,6 +209,8 @@ impl WalkState {
             (RestKind::Sleep, None) if r.until > 0.0 && r.t < r.until => {
                 self.energy = (self.energy + dt / r.until).min(1.0);
             }
+            // gone to bed for the night: up when the night is over, not before
+            (RestKind::Sleep, None) if self.night_sleep => {}
             (RestKind::Sleep, None) if r.until > 0.0 || !idle => {
                 // some jump up with a start, the rest take their time
                 if self.rand() < tn().wake_jump {
@@ -299,7 +339,8 @@ impl CharacterOverlay {
                     continue;
                 }
                 let wk = self.walk_ref(j);
-                let along = wk.at_leisure() || (chat.is_some() && wk.social.map(|s| s.chat) == chat);
+                // only those it's with: a passer-by doesn't laugh along
+                let along = chat.is_some() && wk.social.map(|s| s.chat) == chat;
                 if !along || self.bond(i, j).0 < tn().meet_friend || wk.giggle > 0.0 {
                     continue;
                 }
@@ -313,32 +354,6 @@ impl CharacterOverlay {
         }
     }
 
-    /// Friends walking past each other stop for a happy little wave.
-    pub(super) fn wave_at_friends(&mut self, n: usize) {
-        for i in 0..n {
-            for j in i + 1..n {
-                let (a, b) = (self.walk_ref(i), self.walk_ref(j));
-                let free = |w: &WalkState| w.act == Act::Walk && w.social.is_none() && w.race.is_none() && w.crowd.is_none() && w.greet_cool <= 0.0 && !w.fret;
-                if !free(a) || !free(b) || a.ws != b.ws {
-                    continue;
-                }
-                let (xi, xj) = (self.strip_px(i), self.strip_px(j));
-                if (xi - xj).abs() > self.width_of(i) * 1.3 || self.bond(i, j).0 < tn().bond_friend {
-                    continue;
-                }
-                log::debug!("{i} and {j} wave at each other");
-                for (k, other_x, me_x) in [(i, xj, xi), (j, xi, xj)] {
-                    let wk = self.walk_of(k);
-                    wk.left = other_x < me_x;
-                    wk.act = Act::Idle;
-                    wk.timer = 1.0 + wk.rand() * 0.6;
-                    wk.target = wk.x;
-                    wk.greet_cool = tn().greet_cool;
-                    wk.start_jump(tn().jump_height * 0.35);
-                }
-            }
-        }
-    }
 
     fn run_protests(&mut self, dt: f32, n: usize) {
         let mut list = std::mem::take(&mut self.moods.protests);
@@ -377,6 +392,8 @@ impl CharacterOverlay {
         if !self.moods.started {
             self.moods.started = true;
             desktop::spawn();
+            super::weather::set_place(&self.config.weather_place);
+            super::weather::spawn();
             self.moods.seen_opened = desktop::OPENED.load(Relaxed);
             self.moods.seen_closed = desktop::CLOSED.load(Relaxed);
         }
@@ -389,30 +406,8 @@ impl CharacterOverlay {
         for i in 0..n {
             self.walk_of(i).rest_tick(dt, idle, drowsy, crowded);
         }
-
-        let load = desktop::CPU.load(Relaxed) as f32 / 1000.0;
-        if self.moods.fretting {
-            if load < tn().cpu_calm {
-                self.moods.fretting = false;
-                self.moods.hot_t = 0.0;
-                for i in 0..n {
-                    self.walk_of(i).fret = false;
-                }
-            }
-        } else if load >= tn().cpu_hot {
-            self.moods.hot_t += dt;
-            if self.moods.hot_t >= tn().cpu_for {
-                self.moods.fretting = true;
-                // those in a game or a race carry on with it
-                for i in 0..n {
-                    let wk = self.walk_of(i);
-                    wk.crowd = None;
-                    wk.fret = wk.rand() < tn().cpu_share;
-                }
-            }
-        } else {
-            self.moods.hot_t = 0.0;
-        }
+        self.run_weather(dt, n);
+        self.run_loose(dt, n);
 
         let opened = desktop::OPENED.load(Relaxed);
         if opened != self.moods.seen_opened {
@@ -473,14 +468,400 @@ impl CharacterOverlay {
     }
 
     /// Zs over those asleep, sweat on those fretting.
+    /// Night: about half of them go to bed one by one and get up again in
+    /// the morning. Snow: they hop after the flakes now and then.
+    fn run_weather(&mut self, dt: f32, n: usize) {
+        let w = super::weather::now();
+        let was = self.moods.weather;
+        self.moods.weather = w;
+        if w.night && !was.night {
+            // who's sleepy tonight
+            let now = super::weather::BEDTIME.load(Relaxed);
+            let (share, spread) = if now { (1.0, 4.0) } else { (tn().night_sleep, tn().night_spread) };
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                wk.night_wait = if wk.rand() < share { Some(wk.rand() * spread) } else { None };
+            }
+        }
+        // rain coming on: a drop on the face and up they get, umbrella in hand
+        // (not those in bed for the night)
+        if w.rain && !was.rain {
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                if wk.act == Act::Rest && !wk.night_sleep {
+                    wk.rain_wake = Some(wk.rand() * 1.5);
+                }
+            }
+        }
+        if !w.night && was.night {
+            for i in 0..n {
+                let wk = self.walk_of(i);
+                wk.night_wait = None;
+                if wk.night_sleep {
+                    // morning: up they get, one by one
+                    wk.night_sleep = false;
+                    let wake = 1.0 + wk.rand() * tn().night_spread * 0.3;
+                    if let Some(r) = wk.rest.as_mut() {
+                        r.wake = Some(wake);
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            let wk = self.walk_of(i);
+            if let Some(t) = wk.rain_wake {
+                if t - dt <= 0.0 {
+                    wk.rain_wake = None;
+                    if wk.act == Act::Rest {
+                        wk.get_up();
+                        wk.start_jump(tn().jump_height * 0.7);
+                    }
+                } else {
+                    wk.rain_wake = Some(t - dt);
+                }
+            }
+            if let Some(t) = wk.night_wait {
+                if !wk.at_leisure() {
+                    continue;
+                }
+                if t - dt <= 0.0 {
+                    wk.night_wait = None;
+                    wk.lie_down(0.0);
+                    wk.night_sleep = true;
+                } else {
+                    wk.night_wait = Some(t - dt);
+                }
+            }
+            // its favourite keepsake, looked up now and then; some days it
+            // carries it about on its back
+            wk.fav_t -= dt;
+            if wk.fav_t <= 0.0 {
+                wk.fav_t = 20.0;
+                let name = self.character_name(i);
+                let fav = self.moods.keepsakes.favourite(&name);
+                self.walk_of(i).keepsake = fav;
+            }
+            let wk = self.walk_of(i);
+            wk.carry_t -= dt;
+            if wk.carry_t <= 0.0 {
+                wk.carry_t = 60.0 + wk.rand() * 120.0;
+                wk.carry = wk.keepsake.is_some() && wk.rand() < tn().carry_keepsake;
+            }
+            // now and then it stands still and holds up a sign
+            let here = self.spaces.active;
+            let wk = self.walk_of(i);
+            let seen = here == 0 || wk.ws == here;
+            wk.sign_t -= dt;
+            if wk.sign.is_some() {
+                wk.sign_left -= dt;
+                if wk.sign_left <= 0.0 || !wk.can_hold_sign() {
+                    wk.sign = None;
+                } else {
+                    wk.act = Act::Idle;
+                    wk.timer = wk.timer.max(0.5);
+                    wk.target = wk.x;
+                }
+            } else if wk.sign_t <= 0.0 {
+                wk.sign_t = 120.0 + wk.rand() * 300.0;
+                if seen && wk.act == Act::Idle && wk.at_leisure() && wk.rand() < 0.6 {
+                    wk.sign = Some((wk.rand() * super::sign::SIGNS.len() as f32) as usize);
+                    wk.sign_left = 20.0 + wk.rand() * 10.0;
+                }
+            }
+            // carried fast or shaken hard while held: items fly off mid-hold once
+            // momentum builds, and a brief whip still triggers on landing impact
+            let wk = self.walk_ref(i);
+            if wk.act == Act::Held {
+                let speed = (wk.swing_vel[0] * wk.swing_vel[0] + wk.swing_vel[1] * wk.swing_vel[1]).sqrt();
+                let whipped = speed > tn().drop_speed || wk.swing_v.abs() > tn().drop_swing;
+                let dir = if wk.swing_v.abs() > 1.0 {
+                    Some(-wk.swing_v.signum())
+                } else if wk.swing_vel[0].abs() > 100.0 {
+                    Some(-wk.swing_vel[0].signum())
+                } else {
+                    None
+                };
+                let wk = self.walk_of(i);
+                if step_hold_shake(&mut wk.shake, &mut wk.shaken, whipped, dt) {
+                    self.knock_off(i, 1.0, tn().jolt_drop, dir);
+                }
+            }
+            // interaction finished on impact (or race knockdown): headgear, eyewear, and held items fly off
+            let impact_dir = self.walk_of(i).impact_dir.take();
+            let wk = self.walk_ref(i);
+            let tumbling = impact_dir.is_some() || wk.act == Act::Planted || wk.race_down;
+            if tumbling && !wk.jolted {
+                self.walk_of(i).jolted = true;
+                self.knock_off(i, tn().jolt_drop, tn().jolt_drop * 0.85, impact_dir);
+            } else if !tumbling && matches!(wk.act, Act::Idle | Act::Walk) {
+                let wk = self.walk_of(i);
+                wk.jolted = false;
+                wk.shaken = false;
+            }
+            let wk = self.walk_of(i);
+            // snow settles on its head while it stands about, and comes off when it jumps or runs
+            let shaken = matches!(wk.act, Act::Jump | Act::Fall | Act::Held | Act::Chase | Act::Planted) || wk.rot.abs() > 0.3;
+            wk.snow_pile = if shaken {
+                (wk.snow_pile - dt * 3.0).max(0.0)
+            } else if w.snow {
+                (wk.snow_pile + dt / tn().snow_settle.max(1.0)).min(1.0)
+            } else {
+                (wk.snow_pile - dt / 40.0).max(0.0)
+            };
+            if w.snow && wk.at_leisure() && wk.rand() < dt * tn().snow_hop {
+                let h = tn().jump_height * (0.5 + wk.rand() * 0.5);
+                wk.start_jump(h);
+                wk.gesture = true;
+            }
+        }
+    }
+
+    /// Things go flying: the umbrella/handheld items (with `hand` chance),
+    /// hats & eyewear (`head` chance), from where they're drawn on impact.
+    fn knock_off(&mut self, i: usize, hand: f32, head: f32, impact_dir: Option<f32>) {
+        let a = self.actor_ref(i);
+        let (r, pose) = (a.hit_rect, a.pose);
+        let (w, h) = (r[2] - r[0], r[3] - r[1]);
+        if h <= 0.0 {
+            return;
+        }
+        let worn = a.worn();
+        let owner_name = self.character_name(i);
+        let view = a.own_view[0] * self.view_w * 0.5;
+        // where it would stand: the bottom of its box on the ground, less the empty margin
+        let ground = (1.0 - (pose.center[1] - pose.half[1])) * 0.5 * pose.size[1];
+        let floor = ground - h * (1.0 - a.opaque[2]);
+        let mut gone: Vec<(String, i32, [f32; 4], Option<std::path::PathBuf>)> = Vec::new();
+        for t in &worn {
+            if t.id.is_empty() || gone.iter().any(|g| g.0 == t.id) {
+                continue;
+            }
+            let [x0, y0, x1, y1] = t.rect;
+            let px = [r[0] + (x0 + 1.0) * 0.5 * w, r[1] + (1.0 - y1) * 0.5 * h, r[0] + (x1 + 1.0) * 0.5 * w, r[1] + (1.0 - y0) * 0.5 * h];
+            // the umbrella flies as a whole, top and stick together
+            let (kind, px) = if t.id == "umbrella" {
+                (22, [px[0], px[1], px[2], r[1] + h * 0.75])
+            } else {
+                (t.kind, px)
+            };
+            gone.push((t.id.clone(), kind, px, t.image.clone()));
+        }
+        let wk = self.walk_of(i);
+        let dir = if let Some(d) = impact_dir.filter(|d| d.abs() > 0.05) {
+            d.signum()
+        } else if wk.swing_v.abs() > 0.5 {
+            -wk.swing_v.signum()
+        } else if wk.vx.abs() > 0.01 {
+            wk.vx.signum()
+        } else if wk.rand() < 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
+        let mut flying = Vec::new();
+        for (idx, (id, kind, px, image)) in gone.into_iter().enumerate() {
+            let chance = if id == "umbrella" || kind == 100 { hand.max(head) } else { head };
+            if wk.rand() >= chance {
+                continue;
+            }
+            // fan multiple dropped items apart so they don't stack in one spot
+            let spread = if idx % 2 == 0 { dir } else { -dir * (0.4 + wk.rand() * 0.6) };
+            let (vx, spin) = (spread * (180.0 + wk.rand() * 280.0), -spread * (5.0 + wk.rand() * 7.0));
+            let size = [px[2] - px[0], px[3] - px[1]];
+            let (x, y) = ((px[0] + px[2]) * 0.5 + view, (px[1] + px[3]) * 0.5);
+            let lie = size[0].min(size[1]) * 0.5;
+            log::debug!("{i} loses its {id}");
+            wk.lost.push(id.clone());
+            flying.push(Loose { id, image, owner_name: owner_name.clone(), helper_name: None, kind, owner: i, x, y, vx, vy: -290.0 - wk.rand() * 220.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
+        }
+        self.moods.loose.extend(flying);
+    }
+
+    /// Dropped things fall and bounce; their owner, once on its feet, goes
+    /// and picks them up again.
+    pub(super) fn run_loose(&mut self, dt: f32, n: usize) {
+        let raining = super::weather::now().rain;
+        let mut keep = Vec::new();
+        let names: Vec<String> = (0..n).map(|i| self.character_name(i)).collect();
+        for mut l in std::mem::take(&mut self.moods.loose) {
+            // find its owner (and helper) again: the team may have changed
+            let Some(o) = names.iter().position(|x| x == &l.owner_name) else { continue };
+            l.owner = o;
+            l.helper = l.helper_name.as_ref().and_then(|h| names.iter().position(|x| x == h));
+            if l.helper.is_none() {
+                l.helper_name = None;
+                l.carried = false;
+            }
+            if l.still <= 0.0 || l.y < l.floor - 1.0 {
+                l.vy += 2600.0 * dt;
+                l.x += l.vx * dt;
+                l.y += l.vy * dt;
+                l.rot += l.spin * dt;
+                if l.y >= l.floor {
+                    l.y = l.floor;
+                    l.vy = -l.vy * 0.35;
+                    l.vx *= 0.6;
+                    l.spin *= 0.5;
+                    if l.vy.abs() < 120.0 {
+                        l.vy = 0.0;
+                        l.vx = 0.0;
+                        l.spin = 0.0;
+                        // lies flat, on its side
+                        l.rot = if (l.rot.rem_euclid(std::f32::consts::TAU)) < std::f32::consts::PI { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
+                        l.still = 0.001;
+                    }
+                }
+            } else {
+                l.still += dt;
+            }
+            let wk = self.walk_ref(o);
+            // not raining any more, or left too long: it's gone, and so is the loss
+            if (l.id == "umbrella" && !raining && l.still > 8.0) || l.still > 120.0 {
+                self.walk_of(o).lost.retain(|x| x != &l.id);
+                continue;
+            }
+            let free = matches!(wk.act, Act::Idle | Act::Walk) && wk.social.is_none() && wk.race.is_none();
+            let ready = |this: &Self, j: usize| {
+                let w = this.walk_ref(j);
+                matches!(w.act, Act::Idle | Act::Walk) && w.social.is_none() && w.race.is_none() && w.crowd.is_none()
+            };
+            // the owner's busy: a friend at a loose end fetches it and brings it over
+            if l.still > 0.6 && !free {
+                if l.helper.is_some_and(|h| h >= n || !ready(self, h)) {
+                    // the helper got caught up in something: down it goes where it is
+                    if let Some(h) = l.helper.filter(|_| l.carried) {
+                        l.x = self.strip_px(h);
+                        l.y = l.floor;
+                        l.rot = std::f32::consts::FRAC_PI_2;
+                    }
+                    l.helper = None;
+                    l.helper_name = None;
+                    l.carried = false;
+                }
+                if l.helper.is_none() && l.still > 3.0 {
+                    let ws = wk.ws;
+                    let x = l.x;
+                    l.helper = (0..n)
+                        .filter(|&j| j != o && self.walk_ref(j).ws == ws && ready(self, j) && (self.strip_px(j) - x).abs() < self.view_w * 0.6)
+                        .max_by(|&a, &b| {
+                            let score = |j: usize| self.bond(o, j).0 * 400.0 - (self.strip_px(j) - x).abs();
+                            score(a).total_cmp(&score(b))
+                        });
+                    if let Some(h) = l.helper {
+                        log::debug!("{h} goes to fetch {o}'s {}", l.id);
+                        l.helper_name = Some(names[h].clone());
+                    }
+                }
+                if let Some(h) = l.helper {
+                    let reach = (self.actor_ref(h).hit_rect[3] - self.actor_ref(h).hit_rect[1]) * 0.35;
+                    let hx = self.strip_px(h);
+                    if !l.carried {
+                        if (hx - l.x).abs() < reach {
+                            l.carried = true;
+                            self.walk_of(h).start_bob(tn().jump_height * 0.2);
+                        } else {
+                            self.walk_toward(h, l.x);
+                        }
+                    }
+                    if l.carried {
+                        // held up in its hand on the way over
+                        let r = self.actor_ref(h).hit_rect;
+                        let side = if self.walk_ref(h).left { -1.0 } else { 1.0 };
+                        l.x = hx + side * (r[2] - r[0]) * 0.25;
+                        l.y = r[1] + (r[3] - r[1]) * 0.45;
+                        l.rot = 0.0;
+                        let ox = self.strip_px(o);
+                        if (hx - ox).abs() < reach * 2.0 {
+                            // here you are
+                            self.walk_of(o).lost.retain(|x| x != &l.id);
+                            self.walk_of(h).start_bob(tn().jump_height * 0.3);
+                            let secs = tn().laugh_time * 0.6;
+                            self.walk_of(o).laugh(secs);
+                            self.add_bond(o, h, tn().bond_game, 0.0);
+                            log::debug!("{h} brings {o} its {}", l.id);
+                            continue;
+                        }
+                        self.walk_toward(h, ox);
+                    }
+                }
+            }
+            if l.still > 0.6 && free {
+                l.helper = None;
+                l.helper_name = None;
+                l.carried = false;
+                let here = self.strip_px(o);
+                let reach = (self.actor_ref(o).hit_rect[3] - self.actor_ref(o).hit_rect[1]) * 0.35;
+                if (here - l.x).abs() < reach {
+                    // got it back
+                    let wk = self.walk_of(o);
+                    wk.lost.retain(|x| x != &l.id);
+                    wk.start_bob(tn().jump_height * 0.3);
+                    log::debug!("{o} picks its {} up again", l.id);
+                    continue;
+                }
+                // over to it
+                let pose = self.actor_ref(o).pose;
+                let to_clip = (l.x - self.actor_ref(o).own_view[0] * self.view_w * 0.5) * 2.0 / self.view_w.max(1.0) - 1.0;
+                let wk = self.walk_of(o);
+                wk.target = wk.x + (to_clip - pose.center[0]);
+                wk.act = Act::Walk;
+            }
+            keep.push(l);
+        }
+        self.moods.loose = keep;
+    }
+
+    /// Sends `i` walking (on its own, not in a chat) to strip x `x`.
+    fn walk_toward(&mut self, i: usize, x: f32) {
+        let a = self.actor_ref(i);
+        let (pose, view) = (a.pose, a.own_view[0]);
+        let to_clip = (x - view * self.view_w * 0.5) * 2.0 / self.view_w.max(1.0) - 1.0;
+        let wk = self.walk_of(i);
+        wk.target = wk.x + (to_clip - pose.center[0]);
+        wk.act = Act::Walk;
+    }
+
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
+        let time = self.start.elapsed().as_secs_f32();
+        // rain: an umbrella over everyone not busy in a game; snow: flakes about them
+        let w = self.moods.weather;
+        if (w.rain || w.snow) && (0.5..1.5).contains(&tn().weather_show) {
+            let actors = std::iter::once((&self.walk, self.hit_rect, self.visible, self.opaque)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible, e.opaque)));
+            for (k, (wk, r, seen, _)) in actors.enumerate() {
+                let h = r[3] - r[1];
+                if h <= 0.0 || !seen || matches!(wk.act, Act::Held | Act::Fall | Act::Travel | Act::Planted) {
+                    continue;
+                }
+                let cx = (r[0] + r[2]) * 0.5;
+                if !w.rain {
+                    for f in 0..3 {
+                        let seed = k as f32 * 7.31 + f as f32 * 2.17;
+                        let t = (time * 0.18 + seed * 0.37).fract();
+                        let x = cx + ((seed * 3.7).sin() * 0.9 + (time * 1.3 + seed).sin() * 0.15) * h * 0.6;
+                        let y = r[1] - h * 0.5 + t * h * 1.4;
+                        let s = h * 0.09;
+                        v.push((23, [x - s, y - s, x + s, y + s], false, k));
+                    }
+                }
+            }
+        }
         for &(kind, owner, x, y, size, left) in &self.moods.effects {
             let a = if owner == 0 { self } else if let Some(e) = self.extras.get(owner - 1) { e } else { continue };
             // grows quickly, then fades by shrinking
             let k = if left > 0.3 { 1.0 } else { left / 0.3 };
-            let s = size * (0.6 + 0.4 * k);
-            let sx = x - a.own_view[0] * self.view_w * 0.5;
-            v.push((kind, [sx - s * 0.5, y - s * 0.5, sx + s * 0.5, y + s * 0.5], false, owner));
+            let (cx, cy, s) = if kind >= super::social::FOUND {
+                let r = a.hit_rect;
+                let h = r[3] - r[1];
+                if h <= 0.0 {
+                    continue;
+                }
+                let s = h * 0.46 * (0.6 + 0.4 * k);
+                let bob = (time * 6.0).sin() * h * 0.04;
+                ((r[0] + r[2]) * 0.5, r[1] + h * a.opaque[1] - s * 0.58 + bob, s)
+            } else {
+                (x - a.own_view[0] * self.view_w * 0.5, y, size * (0.6 + 0.4 * k))
+            };
+            v.push((kind, [cx - s * 0.5, cy - s * 0.5, cx + s * 0.5, cy + s * 0.5], false, owner));
         }
         for c in &self.moods.crumbs {
             let a = if c.owner == 0 { self } else { &self.extras[c.owner - 1] };
@@ -543,47 +924,6 @@ impl CharacterOverlay {
         a != b && self.bond(a, b).0 >= tn().close_friend
     }
 
-    /// Few on this workspace: they go looking for company instead of
-    /// waiting to bump into someone. Called a few times a second.
-    pub(super) fn seek_company(&mut self, n: usize, every: f32) {
-        for i in 0..n {
-            let wk = self.walk_ref(i);
-            if wk.act != Act::Idle || !wk.at_leisure() || wk.climb_like() {
-                continue;
-            }
-            let ws = wk.ws;
-            let here: Vec<usize> = (0..n).filter(|&j| j != i && self.walk_ref(j).ws == ws && self.walk_ref(j).act != Act::Travel).collect();
-            if here.is_empty() {
-                continue;
-            }
-            // the fewer around, the keener; a friend in sight is worth going to anyway
-            let few = (tn().seek_few / (here.len() + 1) as f32).clamp(0.0, 3.0);
-            let x0 = self.strip_px(i);
-            let friend_near = here.iter().any(|&j| self.bond(i, j).0 >= tn().meet_friend && (self.strip_px(j) - x0).abs() < self.view_w * 0.7);
-            let keen = if friend_near { few.max(1.5) } else { few };
-            if keen < 1.0 || self.walk_of(i).rand() >= every * keen / tn().seek_every.max(1.0) {
-                continue;
-            }
-            let x = self.strip_px(i);
-            // the best friend there, else whoever is nearest
-            let pick = here
-                .iter()
-                .copied()
-                .max_by(|a, b| {
-                    let score = |j: usize| self.bond(i, j).0 * 600.0 - (self.strip_px(j) - x).abs();
-                    score(*a).total_cmp(&score(*b))
-                })
-                .unwrap_or(here[0]);
-            let to = self.strip_px(pick);
-            let side = if x < to { -1.0 } else { 1.0 };
-            let goal = to + side * self.width_of(pick) * 0.9;
-            let view = self.view_w.max(1.0);
-            let wk = self.walk_of(i);
-            wk.target = wk.x + (goal - x) * 2.0 / view;
-            wk.act = Act::Walk;
-            log::debug!("{i} goes to find {pick}");
-        }
-    }
 
     /// How good `i` is at `game`, 0 (first tries) to 1 (a master).
     pub(super) fn skill(&mut self, i: usize, game: &str) -> f32 {
@@ -621,6 +961,64 @@ impl CharacterOverlay {
 
 /// How good each character is at each game (0 to 1), by name, kept in
 /// `skills.json` in the data folder. Everyone starts clumsy.
+/// Little things each character found and keeps: prop kinds, newest last.
+#[derive(Default)]
+pub(super) struct Keepsakes {
+    map: HashMap<String, Vec<i32>>,
+    loaded: bool,
+    dirty: bool,
+    save_in: f32,
+}
+
+impl Keepsakes {
+    fn path() -> std::path::PathBuf {
+        crate::util::data_dir().join("keepsakes.json")
+    }
+
+    fn load(&mut self) {
+        if !self.loaded {
+            self.loaded = true;
+            if let Ok(text) = std::fs::read_to_string(Self::path()) {
+                self.map = serde_json::from_str(&text).unwrap_or_default();
+            }
+        }
+    }
+
+    pub(super) fn add(&mut self, name: &str, kind: i32) {
+        self.load();
+        let v = self.map.entry(name.to_string()).or_default();
+        v.push(kind);
+        // a pocketful at most: the oldest goes
+        if v.len() > 12 {
+            v.remove(0);
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn of(&mut self, name: &str) -> Vec<i32> {
+        self.load();
+        self.map.get(name).cloned().unwrap_or_default()
+    }
+
+    /// The one it's fondest of: whatever it has most of, the newest on a tie.
+    pub(super) fn favourite(&mut self, name: &str) -> Option<i32> {
+        let v = self.of(name);
+        let count = |k: i32| v.iter().filter(|&&x| x == k).count();
+        v.iter().rev().copied().max_by_key(|&k| count(k))
+    }
+
+    pub(super) fn tick(&mut self, dt: f32) {
+        self.save_in -= dt;
+        if self.dirty && self.save_in <= 0.0 {
+            self.save_in = 60.0;
+            self.dirty = false;
+            if let Ok(text) = serde_json::to_string(&self.map) {
+                let _ = crate::util::atomic_write(&Self::path(), text.as_bytes());
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Skills {
     map: HashMap<String, HashMap<String, f32>>,
@@ -742,6 +1140,21 @@ impl Bonds {
             }
         }
     }
+}
+
+/// Tracks fast carrying or shaking while held. Returns `true` when items should
+/// scatter immediately mid-hold, and marks `shaken` for brief whips released into a throw.
+fn step_hold_shake(shake: &mut f32, shaken: &mut bool, whipped: bool, dt: f32) -> bool {
+    *shake = if whipped { *shake + dt } else { (*shake - dt * 1.2).max(0.0) };
+    if *shake > 0.18 {
+        *shake = 0.0;
+        *shaken = false;
+        return true;
+    }
+    if *shake > 0.08 {
+        *shaken = true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -866,5 +1279,52 @@ mod tests {
         assert_eq!(b.get("Suzuka", "Rice"), (0.5, 0.25));
         b.add("Suzuka", "Rice", 10.0, 0.0);
         assert_eq!(b.get("Rice", "Suzuka").0, 3.0);
+    }
+
+    #[test]
+    fn hold_shake_drops_mid_hold_and_remembers_brief_whip() {
+        let mut shake = 0.0;
+        let mut shaken = false;
+
+        // Gentle carry never triggers either mid-hold drop or landing shaken flag
+        for _ in 0..20 {
+            assert!(!step_hold_shake(&mut shake, &mut shaken, false, DT));
+        }
+        assert!(!shaken);
+
+        // Brief whip sets shaken (for landing impact) before hitting mid-hold drop
+        for _ in 0..6 {
+            assert!(!step_hold_shake(&mut shake, &mut shaken, true, DT));
+        }
+        assert!(shaken);
+
+        // Sustained fast carry or shake triggers immediate mid-hold drop and clears shaken
+        let mut dropped = false;
+        for _ in 0..10 {
+            if step_hold_shake(&mut shake, &mut shaken, true, DT) {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped);
+        assert!(!shaken);
+        assert_eq!(shake, 0.0);
+    }
+
+    #[test]
+    fn sign_holder_ignores_notify_jump_and_leisure_interrupts() {
+        let mut wk = idler();
+        assert!(wk.at_leisure());
+
+        wk.sign = Some(super::super::sign::HUG);
+        assert!(wk.can_hold_sign());
+        assert!(!wk.at_leisure(), "sign holders must not be picked as idle for notifications/curiosity");
+
+        // Even if a notify_jump was pending, stepping while holding a sign clears it without jumping
+        wk.notify_jump = Some(0.0);
+        wk.step(DT, -1.0, 1.0, None, 0.0);
+        assert_eq!(wk.act, Act::Idle);
+        assert!(wk.notify_jump.is_none());
+        assert!(wk.sign.is_some());
     }
 }

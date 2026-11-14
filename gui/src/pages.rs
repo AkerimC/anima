@@ -7,7 +7,7 @@ use anima::render::tuning::{FIELDS, Field};
 use gtk::{gdk, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// Runs the last call only, after things have been quiet for a moment.
@@ -66,7 +66,7 @@ impl Ui {
         }
     }
 
-    fn reload_soon(&self) {
+    pub(crate) fn reload_soon(&self) {
         if self.is_on() {
             self.reload.call(250, daemon::reload);
         }
@@ -77,8 +77,32 @@ impl Ui {
 /// the character fills it, scaled down smoothly at twice the size so it stays
 /// sharp.
 pub(crate) fn load_texture(path: &Path, size: i32) -> Option<gdk::Texture> {
+    let (w, h, px) = thumb_pixels(path, size)?;
+    Some(texture(w, h, px))
+}
+
+/// RGBA pixels into a texture (on the main thread).
+pub(crate) fn texture(w: u32, h: u32, px: Vec<u8>) -> gdk::Texture {
+    let bytes = glib::Bytes::from_owned(px);
+    gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &bytes, w as usize * 4).upcast()
+}
+
+/// The trimmed, scaled pixels for `load_texture`: safe to make on any thread,
+/// and kept on disk so the next time is only a small read.
+pub(crate) fn thumb_pixels(path: &Path, size: i32) -> Option<(u32, u32, Vec<u8>)> {
+    use std::hash::{Hash, Hasher};
     if path.extension().is_some_and(|e| e == "glb") {
         return None;
+    }
+    let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (path, size, stamp).hash(&mut hasher);
+    let cache = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/anima/thumbs"));
+    let file = cache.as_ref().map(|c| c.join(format!("{:016x}.png", hasher.finish())));
+    if let Some(img) = file.as_ref().and_then(|f| image::open(f).ok()) {
+        let img = img.into_rgba8();
+        let (w, h) = img.dimensions();
+        return Some((w, h, img.into_raw()));
     }
     let img = image::open(path).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
@@ -103,17 +127,11 @@ pub(crate) fn load_texture(path: &Path, size: i32) -> Option<gdk::Texture> {
         ((ch as f32 * k).round() as u32).max(1),
     );
     let small = image::imageops::resize(&crop, nw, nh, image::imageops::FilterType::Lanczos3);
-    let bytes = glib::Bytes::from_owned(small.into_raw());
-    Some(
-        gdk::MemoryTexture::new(
-            nw as i32,
-            nh as i32,
-            gdk::MemoryFormat::R8g8b8a8,
-            &bytes,
-            nw as usize * 4,
-        )
-        .upcast(),
-    )
+    if let (Some(c), Some(f)) = (cache, file) {
+        let _ = std::fs::create_dir_all(c);
+        let _ = small.save(f);
+    }
+    Some((nw, nh, small.into_raw()))
 }
 
 /// A sprite preview, or an icon for 3D models and unreadable files.
@@ -208,17 +226,13 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         .column_spacing(10)
         .homogeneous(true)
         .build();
-    let games: [(&str, &str, &'static str, &'static str); 12] = [
+    let games: [(&str, &str, &'static str, &'static str); 13] = [
         ("Jumping contest", "go-up-symbolic", "contest", "game_min"),
         ("Cursor game", "input-mouse-symbolic", "cursor", "game_min"),
         ("Long jump", "go-next-symbolic", "long", "long_min"),
         ("Domino", "view-dual-symbolic", "domino", "party_min"),
-        (
-            "Tug of war",
-            "object-flip-horizontal-symbolic",
-            "tug",
-            "tug_min",
-        ),
+        ("Tug of war", "object-flip-horizontal-symbolic", "tug", "tug_min"),
+        ("Wrestling", "applications-games-symbolic", "wrestle", "wrestle_min"),
         ("Tag", "find-location-symbolic", "tag", "party_min"),
         ("Samba", "audio-x-generic-symbolic", "samba", "samba_min"),
         (
@@ -283,6 +297,46 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
     race.add_css_class("suggested-action");
     race.connect_clicked(|_| daemon::race());
     flow.insert(&race, -1);
+    // trying things out: weather, bedtime, training
+    let tries = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(3)
+        .min_children_per_line(2)
+        .row_spacing(10)
+        .column_spacing(10)
+        .homogeneous(true)
+        .build();
+    let actions: [(&str, &str, &'static str, &'static str); 8] = [
+        ("Train", "applications-science-symbolic", "game", "train"),
+        ("Sign", "starred-symbolic", "game", "sign"),
+        ("Rain", "weather-showers-symbolic", "weather", "rain"),
+        ("Snow", "weather-snow-symbolic", "weather", "snow"),
+        ("Night", "weather-clear-night-symbolic", "weather", "night"),
+        ("Bedtime now", "night-light-symbolic", "weather", "bedtime"),
+        ("Clear sky", "weather-clear-symbolic", "weather", "clear"),
+        ("Real weather", "find-location-symbolic", "weather", "auto"),
+    ];
+    for (label, icon, cmd, arg) in actions {
+        let inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).margin_top(10).margin_bottom(10).build();
+        inner.append(&gtk::Image::builder().icon_name(icon).pixel_size(28).build());
+        inner.append(&gtk::Label::new(Some(label)));
+        let b = gtk::Button::builder().child(&inner).build();
+        b.add_css_class("tile");
+        let u = ui.clone();
+        b.connect_clicked(move |_| {
+            if !daemon::running() {
+                u.say("Anima is off");
+                return;
+            }
+            if cmd == "game" {
+                daemon::game(arg);
+            } else {
+                daemon::weather(arg);
+            }
+            u.say(&format!("{label}"));
+        });
+        tries.insert(&b, -1);
+    }
     let page = adw::PreferencesPage::new();
     let group = adw::PreferencesGroup::builder()
         .title("Play now")
@@ -292,6 +346,38 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         .build();
     group.add(&flow);
     page.add(&group);
+    // whose weather: a town, or empty for wherever the connection is
+    let doc = config::read();
+    let place = adw::EntryRow::builder().title("Weather for (town, empty: guess from the connection)").text(config::text(&doc, "character", "weather_place", "")).show_apply_button(true).build();
+    let u = ui.clone();
+    place.connect_apply(move |e| {
+        config::set("character", "weather_place", e.text().trim().to_string());
+        u.reload_soon();
+        u.say("Weather place set");
+    });
+    let try_group = adw::PreferencesGroup::builder().title("Try it out").description("Weather stays as set until you pick Real weather. Bedtime sends everyone to bed at once.").build();
+    try_group.add(&place);
+    try_group.add(&tries);
+    page.add(&try_group);
+    // the park: a window of its own they can live in
+    let park_group = adw::PreferencesGroup::builder()
+        .title("Anima Park")
+        .description("A park window of their own on an empty workspace, with a slide, swings, seesaw and sandbox. Everything can be placed freely anywhere on the lawn.")
+        .build();
+    let open = gtk::Button::builder().label("Open").valign(gtk::Align::Center).build();
+    open.add_css_class("suggested-action");
+    open.connect_clicked(move |_| {
+        if let Ok(me) = std::env::current_exe() {
+            let _ = std::process::Command::new(me).arg("--park").spawn();
+        }
+    });
+    let row = adw::ActionRow::builder()
+        .title("Anima Park")
+        .subtitle("Slide, swings, seesaw, sandbox")
+        .build();
+    row.add_suffix(&open);
+    park_group.add(&row);
+    page.add(&park_group);
     page.upcast()
 }
 
@@ -796,10 +882,17 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             daemon::stop();
         }
     });
-    // keep the switch honest if the daemon dies or is started elsewhere
+    // keep the switch honest if the daemon dies or is started elsewhere,
+    // without scanning /proc on the GTK main thread
+    let latest_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(ui.power.is_active()));
+    let latest_w = latest_running.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        latest_w.store(daemon::running(), std::sync::atomic::Ordering::Relaxed);
+    });
     let u = ui.clone();
-    glib::timeout_add_seconds_local(2, move || {
-        let running = daemon::running();
+    glib::timeout_add_seconds_local(3, move || {
+        let running = latest_running.load(std::sync::atomic::Ordering::Relaxed);
         if running != u.power.is_active() {
             u.syncing.set(true);
             u.power.set_active(running);
@@ -857,11 +950,17 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     view.add_top_bar(&header);
     ui.toast.set_child(Some(&view));
 
-    adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Anima")
-        .default_width(1120)
-        .default_height(740)
-        .content(&ui.toast)
-        .build()
+    let win = adw::ApplicationWindow::builder().application(app).title("Anima").default_width(1120).default_height(740).content(&ui.toast).build();
+    // Esc closes the window (a menu or dialog open inside closes first)
+    let keys = gtk::EventControllerKey::new();
+    let w = win.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            w.close();
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    win.add_controller(keys);
+    win
 }

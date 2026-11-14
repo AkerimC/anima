@@ -5,6 +5,7 @@ mod config;
 mod daemon;
 mod library;
 mod pages;
+mod park;
 mod roster;
 mod team;
 
@@ -23,6 +24,10 @@ fn main() -> glib::ExitCode {
     if std::env::var_os("GSK_RENDERER").is_none() {
         // SAFETY: before any thread exists
         unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
+    }
+    // `anima-gui --park`: the park window, on its own
+    if std::env::args().any(|a| a == "--park") {
+        return park::run();
     }
     let app = adw::Application::builder()
         .application_id(APP_ID)
