@@ -48,6 +48,8 @@ pub(super) struct WalkState {
     pub(super) vy: f32,
     // sideways speed after a throw (clip units/s)
     pub(super) vx: f32,
+    // horizontal coasting speed after exiting a slide (clip units/s)
+    pub(super) glide_vx: f32,
     // last held position, for the throw speed
     pub(super) held_prev: Option<(f32, f32)>,
     // where the cursor grabbed the sprite, relative to its centre (clip)
@@ -375,6 +377,49 @@ impl WalkState {
         }
     }
 
+    /// Applies and damps slide-exit horizontal momentum, syncing `target` and
+    /// `social.goal` so `social_step` does not snap back to the pre-glide spot.
+    fn step_glide(&mut self, dt: f32, min: f32, max: f32) {
+        if self.glide_vx == 0.0 {
+            return;
+        }
+        if self.crowd.is_some()
+            || self.race.is_some()
+            || matches!(self.act, Act::Chase | Act::Pat)
+            || self.social.as_ref().is_some_and(|r| r.moving)
+        {
+            self.glide_vx = 0.0;
+            return;
+        }
+        let next = self.x + self.glide_vx * dt;
+        if (next <= min && self.glide_vx < 0.0) || (next >= max && self.glide_vx > 0.0) {
+            self.x = next.clamp(min, max);
+            self.glide_vx = 0.0;
+        } else {
+            self.x = next.clamp(min, max);
+            if self.act == Act::Jump {
+                self.glide_vx *= (1.0 - 0.8 * dt).max(0.0);
+            } else {
+                let decel = 0.35 * dt;
+                if self.glide_vx.abs() <= decel {
+                    self.glide_vx = 0.0;
+                } else {
+                    self.glide_vx -= self.glide_vx.signum() * decel;
+                }
+            }
+        }
+        self.target = self.x;
+        if self.act == Act::Walk {
+            self.act = Act::Idle;
+        }
+        if self.act == Act::Idle && self.glide_vx != 0.0 {
+            self.timer = self.timer.max(0.05);
+        }
+        if let Some(r) = self.social.as_mut().filter(|r| !r.moving) {
+            r.goal = self.x;
+        }
+    }
+
     /// Advance one frame, including 2.5D depth when inside Anima Park
     /// (`max_y > 0.0`, `y_per_clip` converting clip-width units to height share).
     pub(super) fn step_in(&mut self, dt: f32, min: f32, max: f32, mouse: Option<f32>, reach: f32, max_y: f32, y_per_clip: f32) -> (f32, bool, f32) {
@@ -384,6 +429,7 @@ impl WalkState {
             self.park_target_y = 0.0;
         }
         if matches!(self.act, Act::Held | Act::Fall | Act::Planted | Act::Rest | Act::Travel) {
+            self.glide_vx = 0.0;
             return (self.x, false, 0.0);
         }
         if self.fret || self.sign.is_some() {
@@ -398,6 +444,7 @@ impl WalkState {
                 }
             }
         }
+        self.step_glide(dt, min, max);
         if self.giggle > 0.0 && self.social.is_none() && self.race.is_none() && matches!(self.act, Act::Idle | Act::Walk) {
             return self.giggle_step(dt);
         }
@@ -584,5 +631,72 @@ mod tests {
         assert_eq!(wk.jump_dur, dur);
         let (_, _, next_h) = wk.step(1.0 / 60.0, -1.0, 1.0, None, 0.0);
         assert!(next_h > 0.7, "jump snapped to ground unexpectedly: {next_h}");
+    }
+
+    #[test]
+    fn glide_vx_coasts_during_exit_hop_and_decelerates_on_grass() {
+        let mut social = Social::default();
+        social.goal = 0.0;
+        social.moving = false;
+        let mut wk = WalkState {
+            x: 0.0,
+            target: 0.0,
+            act: Act::Idle,
+            social: Some(social),
+            ..Default::default()
+        };
+        wk.start_jump(tn().jump_height * 0.45);
+        wk.glide_vx = 0.36;
+
+        let dt = 1.0 / 60.0;
+        while wk.act == Act::Jump {
+            wk.step(dt, -1.0, 1.0, None, 0.0);
+        }
+        let landed_x = wk.x;
+        assert!(landed_x > 0.05, "expected forward progress during exit hop, got {landed_x}");
+        assert!(wk.glide_vx > 0.0 && wk.glide_vx < 0.36, "expected light air drag, got {}", wk.glide_vx);
+        assert_eq!(wk.social.unwrap().goal, landed_x);
+
+        for _ in 0..120 {
+            wk.step(dt, -1.0, 1.0, None, 0.0);
+        }
+        let stopped_x = wk.x;
+        assert_eq!(wk.glide_vx, 0.0);
+        assert!(stopped_x > landed_x, "expected grass coasting past {landed_x}, got {stopped_x}");
+        assert_eq!(wk.target, stopped_x);
+        assert_eq!(wk.social.unwrap().goal, stopped_x);
+
+        // Must not snap back toward pre-glide goal
+        for _ in 0..30 {
+            wk.step(dt, -1.0, 1.0, None, 0.0);
+        }
+        assert_eq!(wk.x, stopped_x);
+    }
+
+    #[test]
+    fn glide_vx_stops_at_boundary_and_clears_on_interrupts() {
+        let mut wk = WalkState { x: 0.98, target: 0.98, act: Act::Idle, glide_vx: 0.5, ..Default::default() };
+        wk.step(0.1, -1.0, 1.0, None, 0.0);
+        assert_eq!(wk.x, 1.0);
+        assert_eq!(wk.glide_vx, 0.0);
+
+        for act in [Act::Held, Act::Fall, Act::Rest, Act::Travel] {
+            let mut w = WalkState { act, glide_vx: 0.4, ..Default::default() };
+            w.step(1.0 / 60.0, -1.0, 1.0, None, 0.0);
+            assert_eq!(w.glide_vx, 0.0, "expected glide_vx cleared for {act:?}");
+        }
+
+        let mut moving_social = Social::default();
+        moving_social.moving = true;
+        moving_social.goal = -0.5;
+        moving_social.speed = 0.2;
+        let mut w = WalkState {
+            act: Act::Idle,
+            glide_vx: 0.4,
+            social: Some(moving_social),
+            ..Default::default()
+        };
+        w.step(1.0 / 60.0, -1.0, 1.0, None, 0.0);
+        assert_eq!(w.glide_vx, 0.0);
     }
 }

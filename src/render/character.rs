@@ -1047,6 +1047,7 @@ pub(super) struct SpritePose {
     pub(super) bounce: f32,
     pub(super) xscale: f32,
     pub(super) flip: bool,
+    pub(super) opacity: f32,
 }
 
 
@@ -2172,7 +2173,7 @@ impl CharacterOverlay {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
                 self.walk.reach = reach;
-                if let Some(r) = self.walk.social.as_mut() {
+                if let Some(r) = self.walk.social.as_mut().filter(|r| r.moving || self.walk.glide_vx == 0.0) {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
                 let mouse = if self.walk.visiting { None } else { mouse };
@@ -2268,6 +2269,8 @@ impl CharacterOverlay {
             self.program.set_f32(gl, "u_bounce", self.smooth_bounce + hop);
             self.program.set_f32(gl, "u_rot", self.walk.rot);
             self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
+            let slide_alpha = self.walk.social.and_then(|s| s.alpha).unwrap_or(1.0).clamp(0.0, 1.0);
+            let eff_opacity = self.config.opacity * slide_alpha;
             // how the sprite is bent and lifted this frame, so things worn or held
             // can follow any point of it exactly (see `shift_at`)
             self.pose = SpritePose {
@@ -2283,6 +2286,7 @@ impl CharacterOverlay {
                 bounce: self.smooth_bounce + hop,
                 xscale: 1.0,
                 flip: false,
+                opacity: eff_opacity,
             };
             self.program.set_f32(gl, "u_aspect", w / h);
             let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
@@ -2316,7 +2320,7 @@ impl CharacterOverlay {
             self.program.set_i32(gl, "u_mode", mode);
             self.program.set_i32(gl, "u_premul", i32::from(self.model.is_some()));
             self.program.set_f32(gl, "u_time", time);
-            self.program.set_f32(gl, "u_opacity", self.config.opacity);
+            self.program.set_f32(gl, "u_opacity", eff_opacity);
             self.program
                 .set_vec2(gl, "u_look", self.smooth_look[0], self.smooth_look[1]);
             self.program.set_vec4(gl, "u_audio", audio);
@@ -2388,7 +2392,7 @@ impl CharacterOverlay {
             self.program.set_i32(gl, "u_tex", 0);
 
             // drawn after everyone has moved, so the order can be by depth
-            self.pending = self.visible.then_some(tex);
+            self.pending = (self.visible && slide_alpha > 0.005).then_some(tex);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.disable(glow::BLEND);
         }

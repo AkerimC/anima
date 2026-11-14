@@ -80,14 +80,59 @@ pub fn run() -> glib::ExitCode {
     app.run()
 }
 
-/// Window selection, active drag start coordinates, and pending tube snap target.
+/// Window selection, active slide segment, drag start coordinates, and pending snap target.
 struct Win {
     sel: Option<usize>,
+    piece: Option<usize>,
     drag_from: Option<f32>,
     drag_y: f32,
     drag_moved: bool,
     cycle_pt: Option<(f64, f64)>,
+    click_pt: Option<(f64, f64)>,
     snap: Option<(usize, park::TubeSeg)>,
+}
+
+fn ensure_slide_vecs(t: &mut park::Thing) {
+    if t.tubes.is_empty() {
+        t.tubes = park::slide_segments(t);
+    }
+    if t.covers.len() != t.tubes.len() {
+        t.covers = park::slide_covers(t);
+    }
+}
+
+fn active_piece_idx(len: usize, piece: Option<usize>) -> usize {
+    piece.unwrap_or(0).min(len.saturating_sub(1))
+}
+
+fn hit_slide_piece(t: &park::Thing, tx_px: f64, gy: f64, u: f64, x: f64, y: f64) -> Option<usize> {
+    if t.kind != "slide" {
+        return None;
+    }
+    let layout = park::slide_layout(t);
+    let max_dist = (park::TUBE_RADIUS as f64 + 0.08) * u;
+    let mut best: Option<(usize, f64)> = None;
+    for (si, curve) in layout.curves.iter().enumerate() {
+        for k in 0..=16 {
+            let (p, _) = park::eval_cubic(curve.pts, k as f32 / 16.0);
+            let px = tx_px + p.0 as f64 * u;
+            let py = gy - (p.1 as f64 + park::TUBE_RADIUS as f64) * u;
+            let dist = (x - px).hypot(y - py);
+            if dist <= max_dist && best.is_none_or(|(_, bd)| dist < bd) {
+                best = Some((si, dist));
+            }
+        }
+    }
+    best.map(|(si, _)| si)
+}
+
+fn hit_slide_piece_at(sh: &Shared, idx: usize, x: f64, y: f64, w: f64, h: f64) -> Option<usize> {
+    let t = sh.park.things.get(idx)?;
+    let unit = unit_px(sh, w);
+    let u = unit * park::depth_scale(t.y) as f64;
+    let tx_px = t.x as f64 * w;
+    let gy = h - 3.0 - t.y as f64 * h;
+    hit_slide_piece(t, tx_px, gy, u, x, y)
 }
 
 fn thing_hits(t: &park::Thing, tx_px: f64, gy: f64, u: f64, x: f64, y: f64) -> bool {
@@ -211,10 +256,12 @@ fn build(app: &adw::Application) {
     let sh = shared();
     let me = Rc::new(RefCell::new(Win {
         sel: None,
+        piece: None,
         drag_from: None,
         drag_y: 0.0,
         drag_moved: false,
         cycle_pt: None,
+        click_pt: None,
         snap: None,
     }));
 
@@ -248,7 +295,8 @@ fn build(app: &adw::Application) {
             let x = t.x as f64 * w;
             let gy = h - 3.0 - t.y as f64 * h;
             let u = unit * park::depth_scale(t.y) as f64;
-            draw_thing(cr, t, x, gy, u, busy, me.sel == Some(*k));
+            let picked = me.sel == Some(*k);
+            draw_thing(cr, t, x, gy, u, busy, picked, if picked { me.piece } else { None });
         }
         // Highlight slide snap nozzles and ghost preview when dragging a loose tube piece
         if me.drag_from.is_some()
@@ -296,12 +344,20 @@ fn build(app: &adw::Application) {
         let hits = hits_at(&sh, x, y, w, h);
         if hits.is_empty() {
             me.sel = None;
+            me.piece = None;
             me.cycle_pt = None;
+            me.click_pt = None;
         } else if me.sel.is_some_and(|s| hits.contains(&s)) && hits.len() > 1 {
             me.cycle_pt = Some((x, y));
+            me.click_pt = None;
+        } else if me.sel == Some(hits[0]) {
+            me.cycle_pt = None;
+            me.click_pt = Some((x, y));
         } else {
             me.sel = Some(hits[0]);
+            me.piece = hit_slide_piece_at(&sh, hits[0], x, y, w, h);
             me.cycle_pt = None;
+            me.click_pt = None;
         }
         me.drag_from = me.sel.map(|k| sh.park.things[k].x);
         me.drag_y = me.sel.map_or(0.0, |k| sh.park.things[k].y);
@@ -319,6 +375,7 @@ fn build(app: &adw::Application) {
         }
         me.drag_moved = true;
         me.cycle_pt = None;
+        me.click_pt = None;
         let w = g2.width().max(1) as f64;
         let h = g2.height().max(1) as f64;
         let new_y = (me.drag_y - (dy / h) as f32).clamp(0.0, park::MEADOW);
@@ -329,13 +386,15 @@ fn build(app: &adw::Application) {
         me.snap = find_snap_target(&sh, k, w, h);
         g2.queue_draw();
     });
-    // what's picked: turn it round, grow/shrink a tube slide, take it down
+    // what's picked: turn it round, grow/shrink a tube slide, style segment covers, take it down
     let bar = gtk::Box::builder().spacing(8).halign(gtk::Align::Center).valign(gtk::Align::Start).margin_top(18).visible(false).build();
     bar.add_css_class("card");
     bar.add_css_class("park-bar");
     let name = gtk::Label::builder().build();
     name.add_css_class("heading");
     let turn = gtk::Button::builder().icon_name("object-flip-horizontal-symbolic").tooltip_text("Turn round").build();
+    let piece_btn = gtk::Button::builder().tooltip_text("Target next slide segment (or click a segment directly)").build();
+    let cover_btn = gtk::Button::builder().tooltip_text("Cycle cover style (Open / Glass / Closed)").build();
     let add_straight = gtk::Button::builder().label("+ Straight").tooltip_text("Add a straight tube segment").build();
     let add_turn = gtk::Button::builder().label("+ Turn").tooltip_text("Add a U-turn tube segment").build();
     let pop_piece = gtk::Button::builder().label("- Piece").tooltip_text("Remove last tube segment").build();
@@ -345,6 +404,8 @@ fn build(app: &adw::Application) {
     for w in [
         name.upcast_ref::<gtk::Widget>(),
         turn.upcast_ref(),
+        piece_btn.upcast_ref(),
+        cover_btn.upcast_ref(),
         add_straight.upcast_ref(),
         add_turn.upcast_ref(),
         pop_piece.upcast_ref(),
@@ -354,8 +415,17 @@ fn build(app: &adw::Application) {
         bar.append(w);
     }
     let sync_bar = {
-        let (sh, me, bar, name, add_straight, add_turn, pop_piece) =
-            (sh.clone(), me.clone(), bar.clone(), name.clone(), add_straight.clone(), add_turn.clone(), pop_piece.clone());
+        let (sh, me, bar, name, piece_btn, cover_btn, add_straight, add_turn, pop_piece) = (
+            sh.clone(),
+            me.clone(),
+            bar.clone(),
+            name.clone(),
+            piece_btn.clone(),
+            cover_btn.clone(),
+            add_straight.clone(),
+            add_turn.clone(),
+            pop_piece.clone(),
+        );
         Rc::new(move || {
             let sh = sh.borrow();
             let me = me.borrow();
@@ -363,8 +433,25 @@ fn build(app: &adw::Application) {
                 Some(t) => {
                     let label = park::recipe(&t.kind).map_or(t.kind.as_str(), |r| r.1);
                     let is_slide = t.kind == "slide";
+                    let tube_seg = tube_kind_of(&t.kind);
                     let n_segs = if is_slide { park::slide_segments(t).len() } else { 0 };
+                    let active_idx = if is_slide { active_piece_idx(n_segs, me.piece) } else { 0 };
+                    let active_cover = if is_slide {
+                        park::slide_covers(t).get(active_idx).copied().unwrap_or(park::TubeCover::Opaque)
+                    } else if let Some(seg) = tube_seg {
+                        t.covers.first().copied().unwrap_or_else(|| park::default_tube_cover(0, seg))
+                    } else {
+                        park::TubeCover::Opaque
+                    };
                     name.set_label(&if is_slide { format!("{label} ({n_segs} pcs)") } else { label.to_string() });
+                    piece_btn.set_visible(is_slide && n_segs > 1);
+                    if is_slide && n_segs > 1 {
+                        piece_btn.set_label(&format!("Piece #{}", active_idx + 1));
+                    }
+                    cover_btn.set_visible(is_slide || tube_seg.is_some());
+                    if is_slide || tube_seg.is_some() {
+                        cover_btn.set_label(&format!("Cover: {}", active_cover.label()));
+                    }
                     add_straight.set_visible(is_slide && n_segs < park::MAX_TUBE_PIECES);
                     add_turn.set_visible(is_slide && n_segs < park::MAX_TUBE_PIECES);
                     pop_piece.set_visible(is_slide && n_segs > 1);
@@ -382,29 +469,48 @@ fn build(app: &adw::Application) {
             let moved = me.drag_moved;
             me.drag_moved = false;
             let cycle_pt = me.cycle_pt.take();
+            let click_pt = me.click_pt.take();
             let snap = me.snap.take();
             if was_dragging {
                 let mut sh = s2.borrow_mut();
+                let (w, h) = (g2.width() as f64, g2.height() as f64);
                 if !moved && let Some((cx, cy)) = cycle_pt {
-                    let hits = hits_at(&sh, cx, cy, g2.width() as f64, g2.height() as f64);
+                    let hits = hits_at(&sh, cx, cy, w, h);
                     if let Some(cur) = me.sel
                         && let Some(pos) = hits.iter().position(|&k| k == cur)
                         && hits.len() > 1
                     {
-                        me.sel = Some(hits[(pos + 1) % hits.len()]);
+                        let next = hits[(pos + 1) % hits.len()];
+                        me.sel = Some(next);
+                        me.piece = hit_slide_piece_at(&sh, next, cx, cy, w, h);
+                    }
+                } else if !moved && let Some((cx, cy)) = click_pt {
+                    if let Some(cur) = me.sel
+                        && let Some(si) = hit_slide_piece_at(&sh, cur, cx, cy, w, h)
+                    {
+                        let t = &mut sh.park.things[cur];
+                        ensure_slide_vecs(t);
+                        if let Some(c) = t.covers.get_mut(si) {
+                            *c = c.next();
+                        }
+                        me.piece = Some(si);
+                        save(&sh);
                     }
                 } else if moved {
                     if let (Some(k), Some((target, seg))) = (me.sel, snap)
                         && target < sh.park.things.len()
                         && sh.park.things[target].kind == "slide"
                     {
-                        if sh.park.things[target].tubes.is_empty() {
-                            sh.park.things[target].tubes = park::slide_segments(&sh.park.things[target]);
-                        }
-                        if sh.park.things[target].tubes.len() < park::MAX_TUBE_PIECES {
-                            sh.park.things[target].tubes.push(seg);
+                        let piece_cover = sh.park.things[k].covers.first().copied();
+                        let target_t = &mut sh.park.things[target];
+                        ensure_slide_vecs(target_t);
+                        if target_t.tubes.len() < park::MAX_TUBE_PIECES {
+                            let idx = target_t.tubes.len();
+                            target_t.tubes.push(seg);
+                            target_t.covers.push(piece_cover.unwrap_or_else(|| park::default_tube_cover(idx, seg)));
                             sh.park.things.remove(k);
                             me.sel = Some(if k < target { target - 1 } else { target });
+                            me.piece = Some(idx);
                         }
                     }
                     save(&sh);
@@ -433,20 +539,74 @@ fn build(app: &adw::Application) {
         g2.queue_draw();
         sb();
     });
+    let (s2, m2, g2, sb) = (sh.clone(), me.clone(), ground.clone(), sync_bar.clone());
+    piece_btn.connect_clicked(move |_| {
+        let len = {
+            let sh = s2.borrow();
+            let Some(k) = m2.borrow().sel else { return };
+            let Some(t) = sh.park.things.get(k) else { return };
+            if t.kind != "slide" {
+                return;
+            }
+            park::slide_segments(t).len()
+        };
+        if len > 1 {
+            let mut me = m2.borrow_mut();
+            let cur = active_piece_idx(len, me.piece);
+            me.piece = Some((cur + 1) % len);
+        }
+        g2.queue_draw();
+        sb();
+    });
+    let (s2, m2, g2, sb) = (sh.clone(), me.clone(), ground.clone(), sync_bar.clone());
+    cover_btn.connect_clicked(move |_| {
+        let (sel, piece) = {
+            let me = m2.borrow();
+            (me.sel, me.piece)
+        };
+        let Some(k) = sel else { return };
+        let mut sh = s2.borrow_mut();
+        let Some(t) = sh.park.things.get_mut(k) else { return };
+        if t.kind == "slide" {
+            ensure_slide_vecs(t);
+            let idx = active_piece_idx(t.tubes.len(), piece);
+            if let Some(c) = t.covers.get_mut(idx) {
+                *c = c.next();
+            }
+        } else if let Some(seg) = tube_kind_of(&t.kind) {
+            let cur = t.covers.first().copied().unwrap_or_else(|| park::default_tube_cover(0, seg));
+            if t.covers.is_empty() {
+                t.covers.push(cur.next());
+            } else {
+                t.covers[0] = cur.next();
+            }
+        } else {
+            return;
+        }
+        save(&sh);
+        drop(sh);
+        g2.queue_draw();
+        sb();
+    });
     for (btn, seg) in [(add_straight, park::TubeSeg::Straight), (add_turn, park::TubeSeg::Turn)] {
         let (s2, m2, g2, sb) = (sh.clone(), me.clone(), ground.clone(), sync_bar.clone());
         btn.connect_clicked(move |_| {
             let Some(k) = m2.borrow().sel else { return };
             let mut sh = s2.borrow_mut();
             let t = &mut sh.park.things[k];
-            if t.tubes.is_empty() {
-                t.tubes = park::slide_segments(t);
-            }
+            ensure_slide_vecs(t);
+            let mut new_piece = None;
             if t.tubes.len() < park::MAX_TUBE_PIECES {
+                let idx = t.tubes.len();
                 t.tubes.push(seg);
+                t.covers.push(park::default_tube_cover(idx, seg));
+                new_piece = Some(idx);
             }
             save(&sh);
             drop(sh);
+            if let Some(idx) = new_piece {
+                m2.borrow_mut().piece = Some(idx);
+            }
             g2.queue_draw();
             sb();
         });
@@ -456,20 +616,29 @@ fn build(app: &adw::Application) {
         let Some(k) = m2.borrow().sel else { return };
         let mut sh = s2.borrow_mut();
         let t = &mut sh.park.things[k];
-        if t.tubes.is_empty() {
-            t.tubes = park::slide_segments(t);
-        }
+        ensure_slide_vecs(t);
         if t.tubes.len() > 1 {
             t.tubes.pop();
+            t.covers.truncate(t.tubes.len());
         }
+        let len = t.tubes.len();
         save(&sh);
         drop(sh);
+        {
+            let mut me = m2.borrow_mut();
+            if let Some(p) = me.piece {
+                me.piece = Some(p.min(len.saturating_sub(1)));
+            }
+        }
         g2.queue_draw();
         sb();
     });
     let (s2, m2, g2, sb) = (sh.clone(), me.clone(), ground.clone(), sync_bar.clone());
     remove.connect_clicked(move |_| {
-        let Some(k) = m2.borrow_mut().sel.take() else { return };
+        let mut me = m2.borrow_mut();
+        let Some(k) = me.sel.take() else { return };
+        me.piece = None;
+        drop(me);
         let mut sh = s2.borrow_mut();
         sh.park.things.remove(k);
         save(&sh);
@@ -479,7 +648,10 @@ fn build(app: &adw::Application) {
     });
     let (m2, g2, sb) = (me.clone(), ground.clone(), sync_bar.clone());
     done.connect_clicked(move |_| {
-        m2.borrow_mut().sel = None;
+        let mut me = m2.borrow_mut();
+        me.sel = None;
+        me.piece = None;
+        drop(me);
         g2.queue_draw();
         sb();
     });
@@ -517,6 +689,7 @@ fn build(app: &adw::Application) {
                 flip: false,
                 pieces: 1,
                 tubes: Vec::new(),
+                covers: Vec::new(),
             };
             // Spawn loose tube pieces right beside the selected (or latest) slide's exit ready to drag-snap
             let near_slide = tube_kind_of(id).and_then(|_| {
@@ -560,7 +733,11 @@ fn build(app: &adw::Application) {
             let k = sh.park.things.len() - 1;
             save(&sh);
             drop(sh);
-            m2.borrow_mut().sel = Some(k);
+            {
+                let mut me = m2.borrow_mut();
+                me.sel = Some(k);
+                me.piece = None;
+            }
             pop.popdown();
             g2.queue_draw();
             sbar();
@@ -658,15 +835,41 @@ fn stroke_bezier(cr: &gtk::cairo::Context, p0: (f64, f64), p1: (f64, f64), p2: (
     cr.stroke().ok();
 }
 
-fn stroke_tube(cr: &gtk::cairo::Context, p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), u: f64, c: (f64, f64, f64)) {
-    cr.set_source_rgb(c.0 * 0.6, c.1 * 0.6, c.2 * 0.6);
-    stroke_bezier(cr, p0, p1, p2, p3, 0.0, 0.58 * u);
-    cr.set_source_rgb(c.0, c.1, c.2);
-    stroke_bezier(cr, p0, p1, p2, p3, 0.0, 0.50 * u);
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.18);
-    stroke_bezier(cr, p0, p1, p2, p3, 0.10 * u, 0.14 * u);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.42);
-    stroke_bezier(cr, p0, p1, p2, p3, -0.12 * u, 0.11 * u);
+/// Strokes one modular tube segment using its `TubeCover` style (solid opaque,
+/// frosted translucent polycarbonate, or open half-pipe U-trough).
+fn stroke_tube_styled(cr: &gtk::cairo::Context, pts: [(f64, f64); 4], u: f64, c: (f64, f64, f64), cover: park::TubeCover) {
+    let layer = |rgba: (f64, f64, f64, f64), dy: f64, width: f64| {
+        cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
+        stroke_bezier(cr, pts[0], pts[1], pts[2], pts[3], dy * u, width * u);
+    };
+    match cover {
+        park::TubeCover::Opaque => {
+            layer((c.0 * 0.6, c.1 * 0.6, c.2 * 0.6, 1.0), 0.0, 0.58);
+            layer((c.0, c.1, c.2, 1.0), 0.0, 0.50);
+            layer((0.0, 0.0, 0.0, 0.18), 0.10, 0.14);
+            layer((1.0, 1.0, 1.0, 0.42), -0.12, 0.11);
+        }
+        park::TubeCover::Translucent => {
+            // Isolate rim + body in a group with Source replacement so the interior stays ~0.42 alpha
+            cr.push_group();
+            layer((c.0 * 0.52, c.1 * 0.52, c.2 * 0.52, 0.48), 0.0, 0.58);
+            cr.set_operator(gtk::cairo::Operator::Source);
+            layer((c.0 * 0.72 + 0.28, c.1 * 0.72 + 0.28, c.2 * 0.72 + 0.28, 0.42), 0.0, 0.50);
+            cr.set_operator(gtk::cairo::Operator::Over);
+            layer((0.0, 0.0, 0.0, 0.14), 0.10, 0.12);
+            layer((1.0, 1.0, 1.0, 0.55), -0.12, 0.10);
+            cr.pop_group_to_source().ok();
+            cr.paint().ok();
+        }
+        park::TubeCover::Open => {
+            layer((c.0 * 0.52, c.1 * 0.52, c.2 * 0.52, 1.0), 0.10, 0.38);
+            layer((c.0 * 0.74, c.1 * 0.74, c.2 * 0.74, 1.0), 0.08, 0.30);
+            layer((0.0, 0.0, 0.0, 0.16), 0.09, 0.12);
+            layer((c.0, c.1, c.2, 1.0), 0.17, 0.20);
+            layer((1.0, 1.0, 1.0, 0.55), 0.07, 0.055);
+            layer((0.0, 0.0, 0.0, 0.14), 0.24, 0.05);
+        }
+    }
 }
 
 fn stroke_tube_ghost(cr: &gtk::cairo::Context, p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), u: f64) {
@@ -678,31 +881,83 @@ fn stroke_tube_ghost(cr: &gtk::cairo::Context, p0: (f64, f64), p1: (f64, f64), p
     cr.set_dash(&[], 0.0);
 }
 
-fn draw_flange(cr: &gtk::cairo::Context, cx: f64, cy: f64, tx: f64, ty: f64, u: f64, c: (f64, f64, f64)) {
+/// Draws a segment joint collar adapted for solid, glass, and open chute joints.
+fn draw_flange_styled(
+    cr: &gtk::cairo::Context,
+    cx: f64,
+    cy: f64,
+    tx: f64,
+    ty: f64,
+    u: f64,
+    c: (f64, f64, f64),
+    prev: park::TubeCover,
+    next: park::TubeCover,
+) {
     let (nx, ny) = (-ty, tx);
     let r = 0.29 * u;
-    let a = (cx - nx * r, cy - ny * r);
-    let b = (cx + nx * r, cy + ny * r);
-    cr.set_source_rgb(c.0 * 0.55, c.1 * 0.55, c.2 * 0.55);
+    let (a, b) = if prev == park::TubeCover::Open && next == park::TubeCover::Open {
+        let (dnx, dny) = if ny < 0.0 { (-nx, -ny) } else { (nx, ny) };
+        ((cx - dnx * 0.05 * u, cy - dny * 0.05 * u), (cx + dnx * r, cy + dny * r))
+    } else {
+        ((cx - nx * r, cy - ny * r), (cx + nx * r, cy + ny * r))
+    };
+    let alpha = if prev != park::TubeCover::Opaque && next != park::TubeCover::Opaque && !(prev == park::TubeCover::Open && next == park::TubeCover::Open) {
+        0.58
+    } else {
+        1.0
+    };
+    cr.set_source_rgba(c.0 * 0.55, c.1 * 0.55, c.2 * 0.55, alpha);
     bar(cr, a, b, 0.095 * u);
-    cr.set_source_rgb((c.0 + 0.14).min(1.0), (c.1 + 0.14).min(1.0), (c.2 + 0.14).min(1.0));
+    cr.set_source_rgba((c.0 + 0.14).min(1.0), (c.1 + 0.14).min(1.0), (c.2 + 0.14).min(1.0), alpha);
     bar(cr, a, b, 0.055 * u);
 }
 
-fn draw_mouth(cr: &gtk::cairo::Context, cx: f64, cy: f64, u: f64, c: (f64, f64, f64)) {
+/// Draws an entry or exit mouth matching the segment's `TubeCover` style.
+fn draw_mouth_styled(cr: &gtk::cairo::Context, cx: f64, cy: f64, u: f64, c: (f64, f64, f64), cover: park::TubeCover) {
     let _ = cr.save();
     cr.translate(cx, cy);
     cr.scale(0.45, 1.0);
-    cr.set_source_rgb(c.0 * 0.6, c.1 * 0.6, c.2 * 0.6);
-    cr.arc(0.0, 0.0, 0.28 * u, 0.0, std::f64::consts::TAU);
-    cr.fill().ok();
-    cr.set_source_rgb(0.14, 0.12, 0.20);
-    cr.arc(0.0, 0.0, 0.21 * u, 0.0, std::f64::consts::TAU);
-    cr.fill().ok();
-    cr.set_source_rgb(c.0, c.1, c.2);
-    cr.set_line_width(0.06 * u);
-    cr.arc(0.0, 0.0, 0.24 * u, 0.0, std::f64::consts::TAU);
-    cr.stroke().ok();
+    match cover {
+        park::TubeCover::Opaque => {
+            cr.set_source_rgb(c.0 * 0.6, c.1 * 0.6, c.2 * 0.6);
+            cr.arc(0.0, 0.0, 0.28 * u, 0.0, std::f64::consts::TAU);
+            cr.fill().ok();
+            cr.set_source_rgb(0.14, 0.12, 0.20);
+            cr.arc(0.0, 0.0, 0.21 * u, 0.0, std::f64::consts::TAU);
+            cr.fill().ok();
+            cr.set_source_rgb(c.0, c.1, c.2);
+            cr.set_line_width(0.06 * u);
+            cr.arc(0.0, 0.0, 0.24 * u, 0.0, std::f64::consts::TAU);
+            cr.stroke().ok();
+        }
+        park::TubeCover::Translucent => {
+            cr.set_source_rgba(0.14, 0.16, 0.24, 0.24);
+            cr.arc(0.0, 0.0, 0.22 * u, 0.0, std::f64::consts::TAU);
+            cr.fill().ok();
+            cr.set_source_rgba(c.0 * 0.62, c.1 * 0.62, c.2 * 0.62, 0.55);
+            cr.set_line_width(0.08 * u);
+            cr.arc(0.0, 0.0, 0.25 * u, 0.0, std::f64::consts::TAU);
+            cr.stroke().ok();
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.55);
+            cr.set_line_width(0.035 * u);
+            cr.arc(0.0, 0.0, 0.25 * u, std::f64::consts::PI, std::f64::consts::TAU);
+            cr.stroke().ok();
+        }
+        park::TubeCover::Open => {
+            cr.set_line_cap(gtk::cairo::LineCap::Round);
+            cr.set_source_rgb(c.0 * 0.55, c.1 * 0.55, c.2 * 0.55);
+            cr.set_line_width(0.09 * u);
+            cr.arc(0.0, 0.0, 0.25 * u, -0.1, std::f64::consts::PI + 0.1);
+            cr.stroke().ok();
+            cr.set_source_rgb(c.0 * 0.74, c.1 * 0.74, c.2 * 0.74);
+            cr.arc(0.0, 0.0, 0.21 * u, 0.0, std::f64::consts::PI);
+            cr.fill().ok();
+            cr.set_source_rgb(c.0, c.1, c.2);
+            cr.set_line_width(0.05 * u);
+            cr.arc(0.0, 0.0, 0.24 * u, -0.1, std::f64::consts::PI + 0.1);
+            cr.stroke().ok();
+        }
+    }
     let _ = cr.restore();
 }
 
@@ -728,7 +983,7 @@ fn rgb(cr: &gtk::cairo::Context, c: (f64, f64, f64)) {
 
 /// One built thing, standing on `gy` with its middle at `x`; `u` is a
 /// character's height in pixels.
-fn draw_thing(cr: &gtk::cairo::Context, t: &park::Thing, x: f64, gy: f64, u: f64, busy: bool, picked: bool) {
+fn draw_thing(cr: &gtk::cairo::Context, t: &park::Thing, x: f64, gy: f64, u: f64, busy: bool, picked: bool, picked_piece: Option<usize>) {
     let dir = if t.flip { -1.0 } else { 1.0 };
     let seat = park::SEAT as f64 * u;
     match t.kind.as_str() {
@@ -839,29 +1094,45 @@ fn draw_thing(cr: &gtk::cairo::Context, t: &park::Thing, x: f64, gy: f64, u: f64
             // pipe segments (top-to-bottom order so lower turns stay clean)
             for (si, curve) in layout.curves.iter().enumerate() {
                 let c = TUBE_COLORS[si % TUBE_COLORS.len()];
-                stroke_tube(cr, pt(curve.pts[0]), pt(curve.pts[1]), pt(curve.pts[2]), pt(curve.pts[3]), u, c);
+                stroke_tube_styled(cr, [pt(curve.pts[0]), pt(curve.pts[1]), pt(curve.pts[2]), pt(curve.pts[3])], u, c, curve.cover);
+            }
+            // subtle dashed centerline on the currently targeted segment when editing a multi-piece slide
+            if picked && layout.curves.len() > 1 {
+                let active = active_piece_idx(layout.curves.len(), picked_piece);
+                let curve = &layout.curves[active];
+                let dy = if curve.cover == park::TubeCover::Open { 0.14 * u } else { 0.0 };
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.78);
+                cr.set_dash(&[5.0, 4.0], 0.0);
+                stroke_bezier(cr, pt(curve.pts[0]), pt(curve.pts[1]), pt(curve.pts[2]), pt(curve.pts[3]), dy, 0.04 * u);
+                cr.set_dash(&[], 0.0);
             }
             // entrance mouth on platform + bolted flange collars between pieces + open exit mouth
             if let Some(&(jx, jh, _, _)) = layout.joints.first() {
-                draw_mouth(cr, x + jx as f64 * u, center_h(jh), u, TUBE_COLORS[0]);
+                let cover = layout.curves.first().map_or(park::TubeCover::Opaque, |c| c.cover);
+                draw_mouth_styled(cr, x + jx as f64 * u, center_h(jh), u, TUBE_COLORS[0], cover);
             }
             for (ji, &(jx, jh, jtx, jth)) in layout.joints.iter().enumerate().skip(1) {
                 if ji + 1 < layout.joints.len() {
                     let c = TUBE_COLORS[(ji - 1) % TUBE_COLORS.len()];
-                    draw_flange(cr, x + jx as f64 * u, center_h(jh), jtx as f64, -(jth as f64), u, c);
+                    let prev_cover = layout.curves[ji - 1].cover;
+                    let next_cover = layout.curves[ji].cover;
+                    draw_flange_styled(cr, x + jx as f64 * u, center_h(jh), jtx as f64, -(jth as f64), u, c, prev_cover, next_cover);
                 }
             }
             if let Some(&(jx, jh, _, _)) = layout.joints.last() {
                 let c = TUBE_COLORS[(layout.curves.len().saturating_sub(1)) % TUBE_COLORS.len()];
-                draw_mouth(cr, x + jx as f64 * u, center_h(jh), u, c);
+                let cover = layout.curves.last().map_or(park::TubeCover::Opaque, |c| c.cover);
+                draw_mouth_styled(cr, x + jx as f64 * u, center_h(jh), u, c, cover);
             }
         }
         "tube_straight" | "tube_turn" => {
+            let seg = tube_kind_of(&t.kind).unwrap_or(park::TubeSeg::Straight);
+            let cover = t.covers.first().copied().unwrap_or_else(|| park::default_tube_cover(0, seg));
             let (pts, _) = loose_tube_curve(t, x, gy, u);
             let c = if t.kind == "tube_turn" { TUBE_COLORS[1] } else { TUBE_COLORS[2] };
-            stroke_tube(cr, pts[0], pts[1], pts[2], pts[3], u, c);
-            draw_mouth(cr, pts[0].0, pts[0].1, u, c);
-            draw_mouth(cr, pts[3].0, pts[3].1, u, c);
+            stroke_tube_styled(cr, pts, u, c, cover);
+            draw_mouth_styled(cr, pts[0].0, pts[0].1, u, c, cover);
+            draw_mouth_styled(cr, pts[3].0, pts[3].1, u, c, cover);
             // glowing inlet connector indicator so it's clear which end snaps
             cr.set_source_rgba(0.3, 0.95, 0.8, 0.9);
             cr.set_line_width(2.0);

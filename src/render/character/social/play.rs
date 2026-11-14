@@ -25,6 +25,7 @@ struct Rider {
     // goes down the slide this many times / swings this long
     n: u8,
     want: u8,
+    fell: bool,
 }
 
 struct Cache {
@@ -244,16 +245,14 @@ impl CharacterOverlay {
         }
     }
 
+    fn actor_surface_w(&self, i: usize) -> f32 {
+        let s = self.actor_ref(i).surface[0];
+        if s > 1.0 { s } else { self.view_w.max(1.0) }
+    }
+
     /// Off the ride onto the grass right where it is (`park_y` stays untouched).
     fn let_down(&mut self, i: usize) {
-        let wk = self.walk_of(i);
-        wk.air = 0.0;
-        wk.sink = 0.0;
-        if let Some(r) = wk.social.as_mut() {
-            r.perched = false;
-            r.happy = false;
-            r.lean = 0.0;
-        }
+        clear_ride_state(self.walk_of(i));
     }
 
     fn set_happy(&mut self, i: usize, on: bool) {
@@ -459,7 +458,7 @@ impl CharacterOverlay {
         for &i in &c.members {
             if !p.riders.iter().any(|r| r.i == i) {
                 let want = 2 + (self.walk.rand() * 3.0) as u8;
-                p.riders.push(Rider { i, phase: 0, t: 0.0, n: 0, want });
+                p.riders.push(Rider { i, phase: 0, t: 0.0, n: 0, want, fell: false });
             }
         }
         if p.riders.is_empty() {
@@ -549,28 +548,22 @@ impl CharacterOverlay {
                         self.set_face(r.i, tx < 0.0);
                     }
                     self.hold_at(r.i, x, t.y, y);
-                    if let Some(sr) = self.walk_of(r.i).social.as_mut() {
-                        sr.lean = (tx * 0.26).clamp(-0.26, 0.26);
-                    }
-                    if u >= 1.0 {
-                        r.phase = 4;
-                        r.t = 0.0;
-                        r.n += 1;
-                        self.let_down(r.i);
-                        self.set_face(r.i, layout.exit_dir < 0.0);
-                        let wk = self.walk_of(r.i);
-                        wk.start_jump(tn().jump_height * 0.65);
-                        let secs = tn().laugh_time * 0.8;
-                        wk.laugh(secs);
-                    }
+                    let h = self.height_of(r.i);
+                    let surface = self.actor_surface_w(r.i);
+                    slide_phase3_step(self.walk_of(r.i), &mut r, &layout, s, u, sh, tx, unit, h, surface, dt);
                 }
                 _ => {
-                    if r.t > 1.0 && self.arrived(r.i) {
+                    let wk = self.walk_ref(r.i);
+                    let settled = !matches!(wk.act, Act::Fall | Act::Planted)
+                        && !wk.rolling
+                        && wk.glide_vx.abs() <= 0.001;
+                    if r.t > 1.0 && settled && self.arrived(r.i) {
                         if r.n >= r.want {
                             off.push(r.i);
                         } else {
                             r.phase = 0;
                             r.t = 0.0;
+                            r.fell = false;
                         }
                     }
                 }
@@ -636,7 +629,7 @@ impl CharacterOverlay {
                     p.riders[0] = r;
                     if let Some(q) = pusher.filter(|_| r.n == 0) {
                         p.riders.swap(0, 1);
-                        p.riders[0] = Rider { i: q, phase: 0, t: 0.0, n: 1, want: 0 };
+                        p.riders[0] = Rider { i: q, phase: 0, t: 0.0, n: 1, want: 0, fell: false };
                         p.riders[1].n = 1;
                         return false;
                     }
@@ -1008,6 +1001,95 @@ fn tell(text: &str) {
         .map(|mut c| std::thread::spawn(move || c.wait()));
 }
 
+/// Clears ride-specific pose and visibility overrides while keeping `park_y` intact.
+fn clear_ride_state(wk: &mut WalkState) {
+    wk.air = 0.0;
+    wk.sink = 0.0;
+    if let Some(r) = wk.social.as_mut() {
+        r.perched = false;
+        r.happy = false;
+        r.lean = 0.0;
+        r.alpha = None;
+    }
+}
+
+/// Per-second probability of losing balance on a slide segment at `s`.
+fn slide_fall_rate(cover: park::TubeCover, seg: park::TubeSeg) -> f32 {
+    match cover {
+        park::TubeCover::Open => match seg {
+            park::TubeSeg::Turn => 0.42,
+            park::TubeSeg::Straight => 0.24,
+        },
+        park::TubeCover::Translucent | park::TubeCover::Opaque => 0.0,
+    }
+}
+
+/// Launches a rider who slipped off an open slide into an airborne `Act::Fall` tumble.
+fn launch_slide_fall(wk: &mut WalkState, h: f32, surface: f32, sh: f32, tx: f32, exit_dir: f32, unit: f32) {
+    clear_ride_state(wk);
+    let dir = if tx.abs() > 0.05 { tx.signum() } else { exit_dir };
+    let speed_scale = (0.55 + sh.max(0.0) * 0.25).clamp(0.45, 1.35);
+    wk.act = Act::Fall;
+    wk.glide_vx = 0.0;
+    wk.air = (sh * unit / (h.max(1.0) * 0.5)).max(0.2);
+    wk.vx = dir * speed_scale * unit * 2.0 / surface.max(1.0);
+    wk.vy = 0.8 + wk.rand() * 0.6;
+    wk.tumble = -dir * (3.5 + wk.rand() * 3.0);
+    wk.feet = false;
+    wk.grip = false;
+}
+
+/// Launches a rider off the bottom of the slide with preserved horizontal exit momentum.
+fn launch_slide_exit(wk: &mut WalkState, layout: &park::SlideLayout, unit: f32, surface: f32) {
+    clear_ride_state(wk);
+    if let Some(sr) = wk.social.as_mut() {
+        sr.face_left = layout.exit_dir < 0.0;
+    }
+    let exit_vx = (1.25 + layout.top * 0.55).clamp(1.35, 3.0) * unit * 2.0 / surface.max(1.0);
+    wk.start_jump(tn().jump_height * 0.45);
+    wk.glide_vx = layout.exit_dir * exit_vx;
+    let secs = tn().laugh_time * 0.8;
+    wk.laugh(secs);
+}
+
+/// Updates slide lean, tube visibility (`Social::alpha`), mid-slide fall checks, and exit launch.
+#[allow(clippy::too_many_arguments)]
+fn slide_phase3_step(
+    wk: &mut WalkState,
+    r: &mut Rider,
+    layout: &park::SlideLayout,
+    s: f32,
+    u: f32,
+    sh: f32,
+    tx: f32,
+    unit: f32,
+    h: f32,
+    surface: f32,
+    dt: f32,
+) {
+    if let Some(sr) = wk.social.as_mut() {
+        sr.lean = (tx * 0.26).clamp(-0.26, 0.26);
+        sr.alpha = Some(layout.opacity_at(s));
+    }
+    let fall_rate = if !r.fell && (0.20..=0.88).contains(&s) {
+        slide_fall_rate(layout.cover_at(s), layout.seg_kind_at(s))
+    } else {
+        0.0
+    };
+    if fall_rate > 0.0 && wk.rand() < fall_rate * dt {
+        r.fell = true;
+        r.phase = 4;
+        r.t = 0.0;
+        r.n += 1;
+        launch_slide_fall(wk, h, surface, sh, tx, layout.exit_dir, unit);
+    } else if u >= 1.0 {
+        r.phase = 4;
+        r.t = 0.0;
+        r.n += 1;
+        launch_slide_exit(wk, layout, unit, surface);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,5 +1105,71 @@ mod tests {
     #[test]
     fn stage_play_allows_slope_lean() {
         assert!(super::super::life::allows(Stage::Play).lean);
+    }
+
+    #[test]
+    fn mid_slide_fall_sets_fall_tumble_and_clears_alpha() {
+        let mut wk = WalkState {
+            seed: 4242,
+            park_y: 0.25,
+            social: Some(Social { chat: 1, perched: true, happy: true, alpha: Some(0.36), ..Default::default() }),
+            ..Default::default()
+        };
+        launch_slide_fall(&mut wk, 180.0, 1920.0, 1.2, 0.8, 1.0, 120.0);
+        assert_eq!(wk.act, Act::Fall);
+        assert_eq!(wk.park_y, 0.25);
+        assert!(wk.air > 0.2);
+        assert!(wk.vx > 0.0);
+        assert!((0.8..=1.4).contains(&wk.vy));
+        assert!((3.5..=6.5).contains(&wk.tumble.abs()));
+        assert!(!wk.feet && !wk.grip);
+        let sr = wk.social.unwrap();
+        assert!(sr.alpha.is_none());
+        assert!(!sr.perched);
+        assert!(!sr.happy);
+    }
+
+    #[test]
+    fn slide_fall_rate_depends_on_cover_and_segment() {
+        let open_straight = slide_fall_rate(park::TubeCover::Open, park::TubeSeg::Straight);
+        let open_turn = slide_fall_rate(park::TubeCover::Open, park::TubeSeg::Turn);
+        assert!(open_straight > 0.0);
+        assert!(open_turn > open_straight);
+        assert_eq!(slide_fall_rate(park::TubeCover::Translucent, park::TubeSeg::Turn), 0.0);
+        assert_eq!(slide_fall_rate(park::TubeCover::Opaque, park::TubeSeg::Straight), 0.0);
+    }
+
+    #[test]
+    fn slide_phase3_updates_social_alpha_and_exit_glide() {
+        let thing: Thing = serde_json::from_str(r#"{"kind":"slide","x":0.5,"pieces":3}"#).unwrap();
+        let layout = park::slide_layout(&thing);
+        let mut wk = WalkState {
+            seed: 7,
+            social: Some(Social { chat: 1, perched: true, ..Default::default() }),
+            ..Default::default()
+        };
+        let mut r = Rider { i: 0, phase: 3, t: 0.0, n: 0, want: 2, fell: false };
+
+        for s in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let (_, sh, tx, _) = layout.at(s);
+            slide_phase3_step(&mut wk, &mut r, &layout, s, s, sh, tx, 120.0, 180.0, 1920.0, 0.0);
+            let expected = layout.opacity_at(s);
+            assert_eq!(wk.social.unwrap().alpha, Some(expected));
+            match layout.cover_at(s) {
+                park::TubeCover::Open => assert!(expected > 0.5, "Open cover opacity {expected}"),
+                park::TubeCover::Translucent => assert!(expected > 0.0 && expected < 0.5, "Translucent cover opacity {expected}"),
+                park::TubeCover::Opaque => assert!(expected < 0.05, "Opaque cover opacity {expected}"),
+            }
+        }
+
+        // Reaching exit sets Jump + glide_vx + clears alpha
+        let (_, sh, tx, _) = layout.at(1.0);
+        slide_phase3_step(&mut wk, &mut r, &layout, 1.0, 1.0, sh, tx, 120.0, 180.0, 1920.0, 1.0 / 60.0);
+        assert_eq!(r.phase, 4);
+        assert_eq!(r.n, 1);
+        assert_eq!(wk.act, Act::Jump);
+        assert!(wk.glide_vx * layout.exit_dir > 0.0);
+        assert!(wk.giggle > 0.0);
+        assert!(wk.social.unwrap().alpha.is_none());
     }
 }
