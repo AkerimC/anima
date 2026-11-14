@@ -1062,6 +1062,8 @@ pub struct CharacterOverlay {
     sprite_happy: Option<glow::Texture>,
     // sprite artwork looks to the right (Uma Musume chibis do)
     faces_right: bool,
+    // happy artwork faces opposite of the calm sprite (Uma [B] sprites do)
+    happy_opposite: bool,
     // rigged 3D character drawn into `sprite_tex` every frame
     model: Option<super::model3d::Model3d>,
     // index of this character; extras are drawn after the main one
@@ -1159,6 +1161,8 @@ pub struct CharacterOverlay {
     pub(super) pose: SpritePose,
     drawn_left: bool,
     drawn_happy: bool,
+    // occasional playful opposite happy pose rolled once per happy bout
+    happy_peek: bool,
     turn_t: f32,
     swap_t: f32,
     // where it stands among those level with it; reshuffled when it sets off
@@ -1268,6 +1272,7 @@ impl CharacterOverlay {
             sprite_tex: None,
             sprite_happy: None,
             faces_right: false,
+            happy_opposite: false,
             model: None,
             actor,
             extras: Vec::new(),
@@ -1322,6 +1327,7 @@ impl CharacterOverlay {
             pose: SpritePose::default(),
             drawn_left: false,
             drawn_happy: false,
+            happy_peek: false,
             turn_t: 0.0,
             swap_t: 0.0,
             active: None,
@@ -1383,6 +1389,8 @@ impl CharacterOverlay {
         self.sprite_happy = None;
         self.sprite_renderer = None;
         self.faces_right = false;
+        self.happy_opposite = false;
+        self.happy_peek = false;
         self.model = None;
 
         if self.actor == 0 {
@@ -1465,9 +1473,11 @@ impl CharacterOverlay {
                     if let Ok(img) = img.decode() {
                         let mut img = img.to_rgba8();
                         let folder = hp.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        if self.config.happy_flip.contains(&folder) {
+                        let flip_on_load = self.config.happy_flip.contains(&folder);
+                        if flip_on_load {
                             img = image::imageops::flip_horizontal(&img);
                         }
+                        self.happy_opposite = uma::happy_opposite(&path) && !flip_on_load;
                         let (hw, hh) = img.dimensions();
                         self.anchors_happy = crate::render::anchors::find(&img);
                         self.sprite_happy =
@@ -1622,6 +1632,8 @@ impl CharacterOverlay {
         std::mem::swap(&mut self.sprite_tex, &mut o.sprite_tex);
         std::mem::swap(&mut self.sprite_happy, &mut o.sprite_happy);
         std::mem::swap(&mut self.faces_right, &mut o.faces_right);
+        std::mem::swap(&mut self.happy_opposite, &mut o.happy_opposite);
+        std::mem::swap(&mut self.happy_peek, &mut o.happy_peek);
         std::mem::swap(&mut self.model, &mut o.model);
         std::mem::swap(&mut self.hit_rect, &mut o.hit_rect);
         std::mem::swap(&mut self.opaque, &mut o.opaque);
@@ -1917,8 +1929,28 @@ impl CharacterOverlay {
 
         let cx_px = pos[0] + pw * 0.5;
         let cy_px = h - (pos[1] + ph * 0.5);
-        let center_clip = [(cx_px / w) * 2.0 - 1.0, (cy_px / h) * 2.0 - 1.0];
-        let half_clip = [pw / w, ph / h];
+        let base_center = [(cx_px / w) * 2.0 - 1.0, (cy_px / h) * 2.0 - 1.0];
+        let base_half = [pw / w, ph / h];
+        let mut center_clip = base_center;
+        let mut half_clip = base_half;
+        let park_win = crate::backend::governor::place_rect("park");
+        let strip_px = (center_clip[0] + self.walk.x + 1.0) * 0.5 * w;
+        let in_park = park_win.filter(|p| {
+            p.ws == self.walk.ws && (!self.walk.placed || (strip_px >= p.x - 16.0 && strip_px <= p.x + p.w + 16.0))
+        });
+        let (park_max_y, y_per_clip, park_h) = if let Some(ref p) = in_park {
+            (center_clip, half_clip) = project_park_clip(
+                base_center,
+                base_half,
+                self.walk.park_y,
+                self.walk.park_crowd,
+                p.h,
+                h,
+            );
+            (park::MEADOW, (0.5 * w / p.h.max(1.0)) * 0.75, p.h)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
 
         let target_look = if self.config.look_at_mouse {
             let seen = self.scene_mouse();
@@ -2052,11 +2084,15 @@ impl CharacterOverlay {
                     self.walk.target = self.walk.x;
                 }
                 if !self.walk.placed {
-                    // everyone at once, anywhere along the strip
+                    // everyone at once, anywhere along the strip (and depth in the park)
                     self.walk.placed = true;
                     self.walk.energy = self.walk.rand();
                     self.walk.x = left_room + self.walk.rand() * (right_room - left_room);
                     self.walk.target = self.walk.x;
+                    if park_max_y > 0.0 {
+                        self.walk.park_y = self.walk.rand() * park_max_y;
+                        self.walk.park_target_y = self.walk.park_y;
+                    }
                     self.walk.timer = self.walk.rand() * 1.5;
                 }
                 // a drawn circle: aim for its centre, otherwise for the cursor
@@ -2100,7 +2136,7 @@ impl CharacterOverlay {
                     r.goal = (r.goal_px * 2.0 / w - 1.0 - center_clip[0]).clamp(left_room, right_room);
                 }
                 let mouse = if self.walk.visiting { None } else { mouse };
-                let r = self.walk.step(dt, left_room, right_room, mouse, reach);
+                let r = self.walk.step_in(dt, left_room, right_room, mouse, reach, park_max_y, y_per_clip);
                 if std::mem::take(&mut self.walk.gesture) {
                     if let Some(m) = self.model.as_mut() {
                         m.gesture_now();
@@ -2123,7 +2159,17 @@ impl CharacterOverlay {
             };
             // held: follow the cursor; released: fall back down
             let walk_x = if true {
-                self.carry(info, dt, center_clip, half_clip);
+                self.carry(info, dt, center_clip, half_clip, park_h);
+                if let Some(p) = in_park {
+                    (center_clip, half_clip) = project_park_clip(
+                        base_center,
+                        base_half,
+                        self.walk.park_y,
+                        self.walk.park_crowd,
+                        p.h,
+                        h,
+                    );
+                }
                 self.walk.x - view
             } else {
                 walk_x
@@ -2131,6 +2177,8 @@ impl CharacterOverlay {
             let air = self.walk.air * half_clip[1];
             self.program
                 .set_vec2(gl, "u_center", center_clip[0] + walk_x, center_clip[1]);
+            self.program
+                .set_vec2(gl, "u_half_size", half_clip[0], half_clip[1]);
             {
                 self.catch_cling(info);
                 // sprite box for click hit-testing (surface pixels)
@@ -2145,12 +2193,18 @@ impl CharacterOverlay {
                 self.pat_leaves(info);
             }
             // sprites have no rig: idle sway + hop, quicker hops while walking
-            let petted = self.walk.petted > 0.0 && self.walk.act != Act::Pat;
-            let (sway, hop, squash) = if mode == 0 && (self.walk.act == Act::Pat || petted) {
-                // pat pat: quick downward squashes, no sway
+            let petted = self.walk.petted > 0.0 && !matches!(self.walk.act, Act::Pat | Act::Held | Act::Fall);
+            let (sway, hop, squash) = if mode == 0 && self.walk.act == Act::Pat && self.walk.hug > 0.0 {
+                // warm torso squeeze toward its hugger before the happy hop
+                let prog = (1.0 - self.walk.timer / 0.72).clamp(0.0, 1.0);
+                let squeeze = (prog * std::f32::consts::PI).sin();
+                let lean = if self.walk.left { -0.45 } else { 0.45 } * squeeze;
+                (lean, air, squeeze * 3.8)
+            } else if mode == 0 && (self.walk.act == Act::Pat || petted) {
+                // pat pat: quick downward squashes, no sway (still preserve vertical lift if airborne)
                 let t = if petted { self.walk.petted } else { self.walk.timer };
                 let p = (t / PAT_DUR * std::f32::consts::PI * 5.0).sin().abs();
-                (0.0, 0.0, p * 5.0)
+                (0.0, jump * self.walk.jump_amp * half_clip[1] + air, p * 5.0)
             } else if mode == 0 && self.model.is_some() {
                 // the rig animates itself: only lift for jumps and drags,
                 // and sway and bob to the music
@@ -2219,9 +2273,6 @@ impl CharacterOverlay {
             }
             self.program.set_f32(gl, "u_xscale", xscale);
             self.pose.xscale = xscale;
-            self.pose.flip = self.config.flip_x ^ (self.drawn_left == self.faces_right);
-            self.program
-                .set_i32(gl, "u_flip_x", i32::from(self.config.flip_x ^ (self.drawn_left == self.faces_right)));
             self.program.set_i32(gl, "u_mode", mode);
             self.program.set_i32(gl, "u_premul", i32::from(self.model.is_some()));
             self.program.set_f32(gl, "u_time", time);
@@ -2249,6 +2300,12 @@ impl CharacterOverlay {
             const SWAP: f32 = 0.14;
             if happy != self.drawn_happy && self.swap_t <= 0.0 {
                 self.swap_t = SWAP;
+                if happy {
+                    let chance = happy_peek_chance(&self.walk);
+                    self.happy_peek = chance > 0.0 && self.walk.rand() < chance;
+                } else {
+                    self.happy_peek = false;
+                }
             }
             if self.swap_t > 0.0 {
                 self.swap_t -= dt;
@@ -2259,6 +2316,9 @@ impl CharacterOverlay {
                 self.program.set_f32(gl, "u_breath", breath - squash - k * 4.0);
                 self.pose.breath = breath - squash - k * 4.0;
             }
+            let flip = self.config.flip_x ^ (self.drawn_left == self.faces_right) ^ should_align_happy(self.drawn_happy, self.happy_opposite, self.happy_peek, &self.walk);
+            self.pose.flip = flip;
+            self.program.set_i32(gl, "u_flip_x", i32::from(flip));
             let tex = match (self.drawn_happy, self.sprite_happy) {
                 (true, Some(h)) => h,
                 _ => self.sprite_tex.map(|(t, _, _)| t).unwrap_or(self.dummy_tex),
@@ -2324,6 +2384,65 @@ impl CharacterOverlay {
     }
 }
 
+fn project_park_clip(
+    base_center: [f32; 2],
+    base_half: [f32; 2],
+    park_y: f32,
+    park_crowd: f32,
+    park_h: f32,
+    surface_h: f32,
+) -> ([f32; 2], [f32; 2]) {
+    let crowd = if park_crowd > 0.0 { park_crowd } else { 1.0 };
+    let scale = crowd * park::depth_scale(park_y);
+    let feet_base = base_center[1] - base_half[1];
+    let half = [base_half[0] * scale, base_half[1] * scale];
+    let center_y = feet_base + (park_y * park_h) * 2.0 / surface_h + half[1];
+    ([base_center[0], center_y], half)
+}
+
+fn is_petting(walk: &walk::WalkState) -> bool {
+    matches!(walk.act, Act::Pat) || walk.petted > 0.0 || walk.crowd.is_some_and(|c| c.is_pat())
+}
+
+fn lock_happy_facing(walk: &walk::WalkState) -> bool {
+    is_petting(walk)
+        || walk
+            .social
+            .is_some_and(|s| s.perched || s.face_lock || (s.in_talk && !s.crowd))
+}
+
+/// Odds that a happy bout playfully peeks the opposite way: never during petting,
+/// 2-person chats, perched rides or face-locked synchronized poses; occasionally
+/// during jumps, games and 3+ crowds.
+fn happy_peek_chance(walk: &walk::WalkState) -> f32 {
+    if lock_happy_facing(walk) {
+        return 0.0;
+    }
+    if walk.in_game
+        || walk.race.is_some()
+        || matches!(walk.act, Act::Chase)
+        || walk.social.is_some_and(|s| s.leaping || s.chasing)
+    {
+        0.40
+    } else if walk.social.is_some_and(|s| s.crowd) || matches!(walk.act, Act::Jump) {
+        0.30
+    } else {
+        0.0
+    }
+}
+
+/// Aligns opposite-facing happy poses (Uma `[B]`) across every mode by default,
+/// unless `happy_peek` playfully flips a jump, game moment or 3+ crowd bout.
+fn should_align_happy(drawn_happy: bool, happy_opposite: bool, happy_peek: bool, walk: &walk::WalkState) -> bool {
+    if !drawn_happy || !happy_opposite {
+        return false;
+    }
+    if lock_happy_facing(walk) {
+        return true;
+    }
+    !happy_peek
+}
+
 fn create_quad(gl: &glow::Context) -> Result<(glow::VertexArray, glow::Buffer)> {
     const VERTS: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
     unsafe {
@@ -2359,5 +2478,51 @@ mod zoom_tests {
         let px = |c: f32, size: f32| (c + 1.0) * 0.5 * size;
         assert_eq!((px(left, 1920.0), px(right, 1920.0)), (480.0, 1440.0));
         assert_eq!((1080.0 - px(top, 1080.0), 1080.0 - px(bottom, 1080.0)), (135.0, 675.0));
+    }
+
+    #[test]
+    fn align_happy_everywhere_with_playful_peek() {
+        let mut wk = walk::WalkState::default();
+        // Straight across all modes by default when happy_peek is false
+        assert!(should_align_happy(true, true, false, &wk));
+        assert!(!should_align_happy(false, true, false, &wk));
+        assert!(!should_align_happy(true, false, false, &wk));
+
+        // Petting stays straight even if happy_peek were true
+        wk.act = Act::Pat;
+        assert!(should_align_happy(true, true, true, &wk));
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+
+        // Random jump or crowded/fast game can peek when happy_peek is rolled
+        wk.act = Act::Jump;
+        assert!(!should_align_happy(true, true, true, &wk));
+        assert!(happy_peek_chance(&wk) > 0.0);
+
+        wk.in_game = true;
+        assert!(happy_peek_chance(&wk) >= 0.40);
+
+        // Petted while mid-game still forces straight alignment
+        wk.petted = 0.5;
+        assert!(should_align_happy(true, true, true, &wk));
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+        wk.petted = 0.0;
+        wk.in_game = false;
+
+        // Window curiosity aligns straight without peek unless jumping
+        wk.crowd = Some(pat::PatCrowd::curious(0.5, 0.0, 1.0, false));
+        wk.act = Act::Idle;
+        assert!(should_align_happy(true, true, false, &wk));
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+
+        // Synchronized face-locked poses (e.g. Samba, Tug, Wrestle) stay aligned
+        // even when `in_game` and `leaping` are true
+        wk.crowd = None;
+        wk.in_game = true;
+        let mut s = social::Social::default();
+        s.leaping = true;
+        s.face_lock = true;
+        wk.social = Some(s);
+        assert_eq!(happy_peek_chance(&wk), 0.0);
+        assert!(should_align_happy(true, true, true, &wk));
     }
 }

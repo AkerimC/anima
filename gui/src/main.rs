@@ -24,8 +24,8 @@ fn main() -> glib::ExitCode {
         // SAFETY: before any thread exists
         unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
     }
-    // `anima-gui --park` (--cafe, --farm, --world): the places, on their own
-    if std::env::args().any(|a| matches!(a.as_str(), "--park" | "--cafe" | "--farm" | "--world")) {
+    // `anima-gui --park`: the park window, on its own
+    if std::env::args().any(|a| a == "--park") {
         return park::run();
     }
     let app = adw::Application::builder()

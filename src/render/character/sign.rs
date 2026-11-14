@@ -5,6 +5,44 @@
 use std::path::PathBuf;
 
 pub const SIGNS: [&str; 8] = ["Pet me!", "Pat pat?", "Headpats\nplease", "Hi there!", "Play with\nme!", "Cheer\nup!", "Snack\ntime?", "Hug?"];
+pub const HUG: usize = 7;
+
+pub fn is_hug(k: usize) -> bool {
+    k % SIGNS.len() == HUG
+}
+
+/// A soft pink heart picture for hug reactions, made once on first use.
+pub fn hug_heart() -> Option<PathBuf> {
+    let path = crate::util::data_dir().join("props/signs/hug_heart_v1.png");
+    if !path.is_file() {
+        let _ = std::fs::create_dir_all(path.parent()?);
+        let (w, h) = (96u32, 96u32);
+        let mut img = image::RgbaImage::new(w, h);
+        let (cx, cy, s) = (w as f32 * 0.5, h as f32 * 0.52, 24.0f32);
+        for y in 0..h {
+            for x in 0..w {
+                let (u, v) = ((x as f32 + 0.5 - cx) / s, -(y as f32 + 0.5 - cy) / s + 0.2);
+                let f = (u * u + v * v - 1.0).powi(3) - u * u * v * v * v;
+                if f <= 0.08 {
+                    let a = ((0.08 - f) / 0.16).clamp(0.0, 1.0);
+                    let shine = ((0.5 - u).hypot(0.6 - v) < 0.5) as u8 as f32 * 25.0;
+                    img.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([
+                            (245.0 + shine * 0.4).min(255.0) as u8,
+                            (105.0 + shine).min(255.0) as u8,
+                            (145.0 + shine * 0.8).min(255.0) as u8,
+                            (a * 255.0) as u8,
+                        ]),
+                    );
+                }
+            }
+        }
+        img.save(&path).ok()?;
+    }
+    Some(path)
+}
 
 fn font() -> Option<ab_glyph::FontVec> {
     let out = std::process::Command::new("fc-match").args(["-f", "%{file}", "sans:bold"]).output().ok()?;

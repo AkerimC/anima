@@ -7,7 +7,6 @@
 use crate::render::tuning::get as tn;
 use super::CharacterOverlay;
 use super::walk::{Act, WalkState};
-use crate::backend::governor;
 
 mod desktop;
 mod free;
@@ -22,13 +21,13 @@ pub static GAME_NOW: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(No
 
 /// One character's part in a chat. Goals are strip positions in logical px,
 /// like a race's.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Social {
     pub(super) chat: u32,
     pub(super) goal_px: f32,
     pub(super) goal: f32,
-    speed: f32,
-    moving: bool,
+    pub(super) speed: f32,
+    pub(super) moving: bool,
     pub(super) face_left: bool,
     // in the happy pose (talking, laughing)
     pub(super) happy: bool,
@@ -65,14 +64,17 @@ pub(super) struct Social {
     // long jump: has had its go (or was thrown by hand instead)
     jumped: bool,
     // samba: looks where it's told while stepping somewhere else
-    face_lock: bool,
+    pub(super) face_lock: bool,
     // volleyball: standing on the other half of the net
-    perched: bool,
+    pub(super) perched: bool,
     // picked up by hand mid-game, and where it was (or was heading) then
     grabbed: bool,
     grab_px: f32,
     // knocked flying: times it comes back off the ground
     pub(super) bounces: u8,
+    // display-only: currently in pure chat (`Stage::Talk`) or a crowded group (3+)
+    pub(super) in_talk: bool,
+    pub(super) crowd: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -89,6 +91,7 @@ enum Stage {
     Long,
     Domino,
     Tug,
+    Wrestle,
     Tag,
     Carrot,
     Gift,
@@ -222,8 +225,6 @@ struct Angler {
     thrown: bool,
     // seconds left of a happy moment while it waits for a bite
     glee: f32,
-    // on a jetty up the farm pond's shore: how high (strip px)
-    up: f32,
     // times it set off back to its place and got nowhere
     tries: u8,
 }
@@ -274,6 +275,27 @@ struct Gift {
     t: f32,
 }
 
+/// Tag-team 1v1 wrestling: two teams wait on either side while front fighters push head-to-head in the middle.
+struct Wrestle {
+    mid: f32,
+    lo: f32,
+    hi: f32,
+    gap: f32,
+    ring: f32,
+    unit: f32,
+    teams: [Vec<usize>; 2],
+    out: [Vec<usize>; 2],
+    pair: Option<(usize, usize)>,
+    // 0: send front pair to ring, 1: pair walks to center, 2: clash, 3: loser thrown & tumble
+    phase: u8,
+    t: f32,
+    push: f32,
+    push_target: f32,
+    offset: f32,
+    cheer_t: f32,
+    arena_y: f32,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Game {
     Carrot,
@@ -283,6 +305,7 @@ enum Game {
     Long,
     Domino,
     Tug,
+    Wrestle,
     Tag,
     Samba,
     Volley,
@@ -293,7 +316,7 @@ enum Game {
 impl Chat {
     fn new(id: u32, members: Vec<usize>, stage: Stage, timer: f32) -> Self {
         let talker = members[0];
-        Chat { by_hand: false, host: None, host_called: false, host_paid: false, world: None, watch_left: Vec::new(), stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
+        Chat { by_hand: false, world: None, watch_left: Vec::new(), stage_t: 0.0, last_stage: stage, practice: None, encore_due: false, leavers: Vec::new(), offer: None, hold: 0.0, fishing: None, blind: None, part_queue: Vec::new(), bribe: None, cheated: None, cheat_t: -1.0, cheater: None, cheat_side: 0.0, cheat_on: false, id, members, stage, timer, talker, turn: 0.0, bob: 0.0, strolls: 0, joined_walking: false, quiet: 0.0, games: 0, played: Vec::new(), watchers: Vec::new(), spots: Vec::new(), base: Vec::new(), offset: 0.0, pull: 0.0, pull_target: 0.0, it: 0, chase: 0, teams: (Vec::new(), Vec::new()), queue: Vec::new(), step: 0, wait: 0.0, scores: Vec::new(), winner: None, rewarded: false, long: None, regroup: false, forced: None, recent: Vec::new(), tag_free: 0.0, tag_turn: 0.0, tug_grab: None, tug_held: 0.0, tug_clicks: 0, cuts: 0, cut_timer: 0.0, all_cheer: false, volley: None, wrestle: None, mood: 0.0, carrot: None, samba_new: Vec::new(), gift: None, play: None }
     }
 }
 
@@ -354,15 +377,10 @@ pub(super) struct Chat {
     // seconds in this stage, and which stage that was (see life.rs)
     stage_t: f32,
     last_stage: Stage,
-    // in the park, cafe or farm (true) or out on the desktop
+    // in the park (true) or out on the desktop
     world: Option<bool>,
-    // the park attendant looking after this game, whether it called time,
-    // whether the winner has had its prize
-    host: Option<usize>,
     // started from the settings window
     by_hand: bool,
-    host_called: bool,
-    host_paid: bool,
     timer: f32,
     // whose turn to talk, seconds left of it, seconds to the next nod
     talker: usize,
@@ -398,6 +416,7 @@ pub(super) struct Chat {
     // best so far: jump height or seconds on the cursor, per member
     scores: Vec<(usize, f32)>,
     winner: Option<usize>,
+    rewarded: bool,
     long: Option<Long>,
     // scattered by a game: get back together before talking
     regroup: bool,
@@ -440,6 +459,7 @@ pub(super) struct Chat {
     // a game that ends with everyone hopping, no winner
     all_cheer: bool,
     volley: Option<Volley>,
+    wrestle: Option<Wrestle>,
     // seconds talking, towards splitting into talkers and players
     mood: f32,
     carrot: Option<Carrot>,
@@ -515,7 +535,7 @@ fn keepsake_name(kind: i32) -> String {
         16 => "a rubber duck".into(),
         0 => "a carrot".into(),
         // sea creatures are rare enough to keep
-        k if (CREATURE..MATERIAL).contains(&k) => super::rope::sea_name(k).map(|n| format!("a {n}")).unwrap_or_default(),
+        k if k >= CREATURE => super::rope::sea_name(k).map(|n| format!("a {n}")).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -565,12 +585,6 @@ pub(super) const FOUND: i32 = 30000;
 /// A fish (props/fish) or a sea creature (props/creatures): this plus its place there.
 pub(super) const FISH: i32 = 40000;
 pub(super) const CREATURE: i32 = 41000;
-/// Something for the park chest: this plus its place in park::MATERIALS.
-pub(super) const MATERIAL: i32 = 42000;
-/// A dish being carried: this plus its place in park::DISHES.
-pub(super) const FOOD: i32 = 44000;
-/// A carrot coin changing hands.
-pub(super) const COIN: i32 = 45000;
 
 fn grounded(wk: &WalkState) -> bool {
     matches!(wk.act, Act::Idle | Act::Walk)
@@ -776,6 +790,14 @@ impl CharacterOverlay {
     pub(super) fn run_social(&mut self, dt: f32, mouse: [f32; 2]) {
         self.social_age += dt;
         let n = self.extras.len() + 1;
+        let park_crowd = if let Some(p) = crate::backend::governor::place_rect("park") {
+            let n_park = (0..n).filter(|&i| self.walk_ref(i).ws == p.ws).count();
+            let base_h = (360.0 * self.config.scale.clamp(0.2, 4.0)).max(64.0);
+            let fit = p.w / ((n_park.max(1) as f32).sqrt() * 2.2);
+            (fit / base_h).clamp(0.42, 1.0)
+        } else {
+            1.0
+        };
         for i in 0..n {
             let wk = self.walk_of(i);
             wk.social_cool = (wk.social_cool - dt).max(0.0);
@@ -787,6 +809,7 @@ impl CharacterOverlay {
             wk.petted = (wk.petted - dt).max(0.0);
             wk.dropped = (wk.dropped - dt).max(0.0);
             wk.team = n as f32;
+            wk.park_crowd = park_crowd;
             wk.crowd_rest = (wk.crowd_rest - dt).max(0.0);
             wk.update_pose(dt);
         }
@@ -798,13 +821,6 @@ impl CharacterOverlay {
                 self.walk_of(i).fish_on_arrival = false;
                 let c = self.fish_alone(i, true);
                 self.new_chats.push(c);
-            }
-            let wk = self.walk_ref(i);
-            if wk.nap_on_arrival && wk.act == Act::Idle && wk.trip.is_none() && wk.social.is_none() {
-                let wk = self.walk_of(i);
-                wk.nap_on_arrival = false;
-                let secs = tn().hungry_nap;
-                wk.lie_down(secs);
             }
         }
         self.run_spaces(dt, n);
@@ -831,7 +847,6 @@ impl CharacterOverlay {
         }
         chats.retain_mut(|c| {
             self.watch_tick(c, dt);
-            self.host_tick(c);
             let keep = self.prune(c, n) && self.within_limit(c, dt) && self.advance(c, dt, mouse);
             if !keep {
                 self.finish(c, n);
@@ -841,18 +856,18 @@ impl CharacterOverlay {
 
         chats.append(&mut self.new_chats);
         self.right_orders(&mut chats, n);
-        self.farm_tick(&mut chats, dt, n);
+        self.park_tick(&mut chats, dt, n);
 
         self.social_tick -= dt;
         if self.social_tick <= 0.0 {
             self.social_tick = tn().look_every;
             if self.race.is_none() && self.social_age >= tn().warm_alone && !self.moods.fretting && !self.spaces.fs_on {
-                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Fishing | Stage::Blind | Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Volley | Stage::Cheer)) {
+                for c in chats.iter_mut().filter(|c| matches!(c.stage, Stage::Fishing | Stage::Blind | Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Wrestle | Stage::Tag | Stage::Carrot | Stage::Volley | Stage::Cheer)) {
                     self.try_watch(c, n);
                 }
                 for c in chats.iter_mut() {
                     let full = c.members.len() >= self.group_cap();
-                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Concert | Stage::Blind | Stage::Fishing | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part | Stage::Play | Stage::Practice) && self.overlap_join(c, n, full) {
+                    if !matches!(c.stage, Stage::Notice | Stage::Stroll | Stage::Concert | Stage::Blind | Stage::Fishing | Stage::Long | Stage::Domino | Stage::Tug | Stage::Wrestle | Stage::Tag | Stage::Carrot | Stage::Samba | Stage::Volley | Stage::Part | Stage::Play | Stage::Practice) && self.overlap_join(c, n, full) {
                         continue;
                     }
                     if !full && matches!(c.stage, Stage::Talk | Stage::Stroll) {
@@ -892,7 +907,7 @@ impl CharacterOverlay {
     /// may hang in a state it can't leave. Whatever doesn't fit is put right
     /// gently (back to standing, flags cleared), never by jumping it about.
     pub(super) fn settle_states(&mut self, dt: f32, n: usize) {
-        let ids: Vec<(u32, Stage)> = self.chats.iter().chain(self.new_chats.iter()).map(|c| (c.id, c.stage)).collect();
+        let ids: Vec<(u32, Stage, usize)> = self.chats.iter().chain(self.new_chats.iter()).map(|c| (c.id, c.stage, c.members.len())).collect();
         let racing = self.race.is_some();
         for i in 0..n {
             let playing = self.in_game(i);
@@ -913,7 +928,12 @@ impl CharacterOverlay {
             }
             let mut fixed: Vec<&str> = Vec::new();
             // part of a chat or a game that's gone
-            let stage = wk.social.and_then(|s| ids.iter().find(|c| c.0 == s.chat).map(|c| c.1));
+            let info = wk.social.and_then(|s| ids.iter().find(|c| c.0 == s.chat).map(|c| (c.1, c.2)));
+            let stage = info.map(|i| i.0);
+            if let Some(s) = wk.social.as_mut() {
+                s.in_talk = stage == Some(Stage::Talk);
+                s.crowd = info.is_some_and(|i| i.1 >= 3);
+            }
             if wk.social.is_some() && stage.is_none() {
                 wk.social = None;
                 fixed.push("chat gone");
@@ -1064,6 +1084,7 @@ impl CharacterOverlay {
                 Stage::Long => "long jump",
                 Stage::Domino => "domino",
                 Stage::Tug => "tug of war",
+                Stage::Wrestle => "wrestling",
                 Stage::Tag => "tag",
                 Stage::Carrot => "carrot grab",
                 Stage::Gift => "gift",
@@ -1189,7 +1210,7 @@ impl CharacterOverlay {
     fn prune(&mut self, c: &mut Chat, n: usize) -> bool {
         let id = c.id;
         self.keep_world(c, n);
-        let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Volley | Stage::Cheer);
+        let game = matches!(c.stage, Stage::Cursor | Stage::Long | Stage::Tug | Stage::Wrestle | Stage::Volley | Stage::Cheer);
         // tag: you can carry someone off and they're still in it when put down
         let tag = matches!(c.stage, Stage::Fishing | Stage::Blind | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Long);
         let mut left = Vec::new();
@@ -1198,7 +1219,7 @@ impl CharacterOverlay {
         // near the others it carries on, thrown far off it's out
         let by_hand = matches!(
             c.stage,
-            Stage::Contest | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Volley | Stage::Blind | Stage::Concert | Stage::Cheer
+            Stage::Contest | Stage::Domino | Stage::Tug | Stage::Wrestle | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Volley | Stage::Blind | Stage::Concert | Stage::Cheer
         );
         // a chat isn't broken off either: the others run after whoever's carried away
         let talk = matches!(c.stage, Stage::Approach | Stage::Talk | Stage::Stroll);
@@ -1414,7 +1435,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0 });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0, in_talk: false, crowd: false });
     }
 
 
@@ -1511,6 +1532,82 @@ impl CharacterOverlay {
         tn().talk_min + self.walk.rand() * tn().talk_rand
     }
 
+    /// Mean park depth of the members currently in Anima Park.
+    fn park_row_y(&self, members: &[usize]) -> Option<f32> {
+        let mut sum = 0.0f32;
+        let mut count = 0usize;
+        for &m in members {
+            if self.place_here(m).is_some() {
+                sum += self.walk_ref(m).park_y;
+                count += 1;
+            }
+        }
+        (count > 0).then(|| sum / count as f32)
+    }
+
+    /// Brings `i` to the same park depth as `members` when both are in the park.
+    pub(super) fn match_park_y(&mut self, i: usize, members: &[usize]) {
+        if self.place_here(i).is_some() {
+            if let Some(y) = self.park_row_y(members) {
+                self.walk_of(i).park_target_y = y;
+            }
+        }
+    }
+
+    /// Brings every member in Anima Park to the row's average depth.
+    fn align_park_y(&mut self, members: &[usize]) {
+        let Some(y) = self.park_row_y(members) else { return };
+        for &i in members {
+            if self.place_here(i).is_some() {
+                self.walk_of(i).park_target_y = y;
+            }
+        }
+    }
+
+    /// Spreads each in-park member across shuffled depth lanes so wide or
+    /// free-moving games don't stack horizontally on one line.
+    fn spread_park_y(&mut self, members: &[usize]) {
+        let mut in_park: Vec<usize> = members.iter().copied().filter(|&i| self.place_here(i).is_some()).collect();
+        if in_park.is_empty() {
+            return;
+        }
+        for k in (1..in_park.len()).rev() {
+            let j = (self.walk.rand() * (k + 1) as f32) as usize % (k + 1);
+            in_park.swap(k, j);
+        }
+        let lo = 0.06f32;
+        let hi = super::park::MEADOW * 0.86;
+        let lane = (hi - lo) / in_park.len() as f32;
+        for (k, &i) in in_park.iter().enumerate() {
+            let center = lo + (k as f32 + 0.5) * lane;
+            let jitter = (self.walk.rand() - 0.5) * lane * 0.4;
+            self.walk_of(i).park_target_y = (center + jitter).clamp(lo, hi);
+        }
+    }
+
+    /// Picks a random Anima Park depth for `i` when chasing or wandering.
+    fn pick_park_y(&mut self, i: usize, near: Option<(f32, f32)>) {
+        if self.place_here(i).is_none() {
+            return;
+        }
+        let lo = 0.06f32;
+        let hi = super::park::MEADOW * 0.85;
+        let y = match near {
+            Some((center, span)) => center + (self.walk.rand() - 0.5) * span,
+            None => lo + self.walk.rand() * (hi - lo),
+        };
+        self.walk_of(i).park_target_y = y.clamp(lo, hi);
+    }
+
+    /// Clears lingering happy poses across a group (e.g. when a gather ends).
+    fn clear_happy(&mut self, members: &[usize]) {
+        for &i in members {
+            if let Some(r) = self.walk_of(i).social.as_mut() {
+                r.happy = false;
+            }
+        }
+    }
+
     /// Joining a group on the move: head for the end of its row, a little
     /// faster than it walks.
     fn catch_up(&mut self, c: &Chat, i: usize) {
@@ -1524,6 +1621,7 @@ impl CharacterOverlay {
             goals.iter().copied().fold(f32::MIN, f32::max) + gap
         };
         self.go(i, goal.clamp(0.0, self.strip_width_of(i)), 0.18);
+        self.match_park_y(i, &others);
     }
 
     /// Side by side in a row around their middle, in the order they stand.
@@ -1533,12 +1631,18 @@ impl CharacterOverlay {
         row.sort_by(|a, b| a.1.total_cmp(&b.1));
         let count = row.len() as f32;
         let mid = row.iter().map(|r| r.1).sum::<f32>() / count;
+        let mid_y = self.park_row_y(&c.members);
         let size = row.iter().map(|r| self.width_of(r.0)).sum::<f32>() / count;
         let gap = size * 0.72;
         for (k, &(i, _)) in row.iter().enumerate() {
             let happy = self.walk_ref(i).social.is_some_and(|r| r.happy);
             let slot = mid + (k as f32 - (count - 1.0) * 0.5) * gap;
             self.go(i, slot, 0.16);
+            if let Some(y) = mid_y {
+                if self.place_here(i).is_some() {
+                    self.walk_of(i).park_target_y = y;
+                }
+            }
             if let Some(r) = self.walk_of(i).social.as_mut() {
                 r.happy = happy;
                 // waiting for the others: towards the middle of the row
@@ -1620,7 +1724,7 @@ impl CharacterOverlay {
                     wk.start_bob(tn().jump_height * 0.15);
                 }
             }
-            if !laugh && roll < 0.45 {
+            if !laugh && roll < 0.45 && self.arrived(c.talker) {
                 self.walk_of(c.talker).gesture = true;
             }
         }
@@ -1663,39 +1767,47 @@ impl CharacterOverlay {
         wk.energy = (wk.energy - amount).max(0.0);
     }
 
-    /// A game for this many that they haven't played yet: the closer its
-    /// minimum is to their number, the likelier.
-    fn choose_game(&mut self, played: &[Game], len: usize, rivalry: f32) -> Option<Game> {
-        if len >= tn().game_min as usize && !played.contains(&Game::Cursor) && self.walk.rand() < tn().cursor_game {
-            return Some(Game::Cursor);
-        }
-        let pool: Vec<(Game, f32)> = [
-            (Game::Contest, tn().game_min as usize),
-            (Game::Long, tn().long_min as usize),
-            (Game::Domino, tn().party_min as usize),
-            (Game::Tug, tn().tug_min as usize),
-            (Game::Tag, tn().party_min as usize),
-            (Game::Carrot, tn().carrot_min as usize),
-            (Game::Samba, tn().samba_min as usize),
-            (Game::Volley, tn().volley_min as usize),
-            (Game::Blind, tn().blind_min as usize),
-            (Game::Fishing, tn().fish_min as usize),
+    /// Eligible games and pick weights for a group of `len` players.
+    fn game_pool(played: &[Game], len: usize, rivalry: f32) -> Vec<(Game, f32)> {
+        let t = tn();
+        [
+            (Game::Contest, t.game_min as usize),
+            (Game::Long, t.long_min as usize),
+            (Game::Domino, t.party_min as usize),
+            (Game::Tug, t.tug_min as usize),
+            (Game::Wrestle, t.wrestle_min as usize),
+            (Game::Tag, t.tag_min as usize),
+            (Game::Carrot, t.carrot_min as usize),
+            (Game::Samba, t.samba_min as usize),
+            (Game::Volley, t.volley_min as usize),
+            (Game::Blind, t.blind_min as usize),
+            (Game::Fishing, t.fish_min as usize),
         ]
         .iter()
         .filter(|g| len >= g.1 && !played.contains(&g.0))
         .map(|g| {
             // samba isn't for a handful: the more there are the likelier
             let weight = if g.0 == Game::Samba {
-                let t = ((len - g.1) as f32 / (tn().samba_big - g.1 as f32).max(1.0)).clamp(0.0, 1.0);
-                tn().samba_weight_small + (tn().samba_weight_big - tn().samba_weight_small) * t
+                let k = ((len - g.1) as f32 / (t.samba_big - g.1 as f32).max(1.0)).clamp(0.0, 1.0);
+                t.samba_weight_small + (t.samba_weight_big - t.samba_weight_small) * k
             } else {
-                (1.0 + (len - g.1) as f32).powf(-tn().game_fit)
+                let base = (1.0 + (len - g.1) as f32).powf(-t.game_fit);
+                if g.0 == Game::Volley { base * t.volley_weight } else { base }
             };
             // rivals would rather settle it
-            let settles = matches!(g.0, Game::Contest | Game::Tug | Game::Volley | Game::Carrot);
-            (g.0, if settles { weight * (1.0 + rivalry * tn().bond_rival) } else { weight })
+            let settles = matches!(g.0, Game::Contest | Game::Tug | Game::Wrestle | Game::Volley | Game::Carrot);
+            (g.0, if settles { weight * (1.0 + rivalry * t.bond_rival) } else { weight })
         })
-        .collect();
+        .collect()
+    }
+
+    /// A game for this many that they haven't played yet: the closer its
+    /// minimum is to their number, the likelier.
+    fn choose_game(&mut self, played: &[Game], len: usize, rivalry: f32) -> Option<Game> {
+        if len >= tn().game_min as usize && !played.contains(&Game::Cursor) && self.walk.rand() < tn().cursor_game {
+            return Some(Game::Cursor);
+        }
+        let pool = Self::game_pool(played, len, rivalry);
         let mut roll = self.walk.rand() * pool.iter().map(|g| g.1).sum::<f32>();
         for &(game, weight) in &pool {
             roll -= weight;
@@ -1706,36 +1818,8 @@ impl CharacterOverlay {
         pool.last().map(|g| g.0)
     }
 
-    /// In the cafe or on the farm and up for a game: they agree to go over to
-    /// the park and play there (not those at work or hungry).
-    fn to_park(&mut self, c: &mut Chat) -> bool {
-        if !c.members.iter().any(|&i| self.no_games_here(i)) {
-            return false;
-        }
-        let Some(park) = crate::backend::governor::place_rect("park") else { return false };
-        let mean = c.members.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / c.members.len() as f32;
-        if mean < tn().energy_game_need || c.members.iter().any(|&i| self.on_shift(i) || self.hungry(i)) {
-            return false;
-        }
-        let who = c.members.clone();
-        log::debug!("chat {}: off to the park to play", c.id);
-        self.part(c);
-        for i in who {
-            if self.walk_ref(i).ws == park.ws {
-                self.walk_into(i, &park);
-            } else {
-                self.send_to(i, park.ws);
-            }
-        }
-        true
-    }
-
     /// Start a game this group hasn't played yet, if it has the energy.
     fn next_game(&mut self, c: &mut Chat) -> bool {
-        // in the cafe or on the farm they talk; games are for the park and the desktop
-        if c.members.iter().any(|&i| self.no_games_here(i)) {
-            return false;
-        }
         let mean = c.members.iter().map(|&i| self.walk_ref(i).energy).sum::<f32>() / c.members.len() as f32;
         if mean < tn().energy_game_need || self.social_age < tn().warm_small {
             return false;
@@ -1820,19 +1904,26 @@ impl CharacterOverlay {
     }
 
     fn start_game(&mut self, c: &mut Chat, game: Game) {
-        // played in the park when that's where they are
-        let park = crate::backend::governor::place_rect("park").filter(|_| c.by_hand && c.members.iter().all(|&i| self.place_here(i).is_some_and(|q| q.place == "park")));
-        GAME_AREA.with(|a| a.set(park.map(|p| (p.x + p.w * 0.05, p.w * 0.9))));
+        // played in the park when that's where the players are (whether asked by hand or automatic)
+        let lives_there = matches!(tn().park_mode.round() as i32, 1 | 2);
+        let park = crate::backend::governor::place_rect("park").filter(|p| {
+            c.members.iter().all(|&i| self.walk_ref(i).ws == p.ws)
+                && (c.by_hand || lives_there || c.members.iter().all(|&i| self.place_here(i).is_some_and(|q| q.place == "park")))
+        });
+        GAME_AREA.with(|a| a.set(park.map(|p| (p.x + p.w * 0.05, (p.w * 0.9).max(80.0)))));
         self.start_game_here(c, game);
         GAME_AREA.with(|a| a.set(None));
     }
 
     fn start_game_here(&mut self, c: &mut Chat, game: Game) {
+        c.rewarded = false;
+        c.step = 0;
         for k in 0..c.members.len() {
             let wk = self.walk_of(c.members[k]);
             wk.notify_jump = None;
             if let Some(r) = wk.social.as_mut() {
                 r.no_pat = true;
+                r.happy = false;
             }
         }
         match game {
@@ -1841,6 +1932,7 @@ impl CharacterOverlay {
             Game::Long => self.start_long(c),
             Game::Domino => self.start_domino(c),
             Game::Tug => self.start_tug(c),
+            Game::Wrestle => self.start_wrestle(c),
             Game::Tag => self.start_tag(c),
             Game::Carrot => self.start_carrot(c),
             Game::Gift => self.start_gift(c),
@@ -1849,12 +1941,42 @@ impl CharacterOverlay {
             Game::Blind => self.start_blind(c),
             Game::Fishing => self.start_fishing(c),
         }
+        if matches!(game, Game::Tag | Game::Carrot | Game::Blind | Game::Cursor | Game::Volley | Game::Contest) {
+            self.spread_park_y(&c.members);
+        }
     }
 
     /// A game asked for by hand: whoever is nearest the middle of the
     /// screen plays right now, whatever they were up to and however tired.
     /// True once the game is under way (or can't ever be).
     fn force_game(&mut self, chats: &mut Vec<Chat>, name: &str, n: usize) -> bool {
+        // hold up a hug (or random) sign right away on a free character
+        if name == "hug" || name == "sign" {
+            let busy: Vec<usize> = chats.iter().flat_map(|c| c.members.iter().copied()).collect();
+            let middle = self.view[0] * self.view_w * 0.5 + self.view_w * 0.5;
+            let eligible = |this: &Self, i: usize| {
+                let wk = this.walk_ref(i);
+                !busy.contains(&i) && wk.at_leisure() && wk.rest.is_none() && !wk.night_sleep
+            };
+            let pick = (0..n)
+                .filter(|&i| eligible(self, i) && self.on_screen(i))
+                .min_by(|&a, &b| (self.strip_px(a) - middle).abs().total_cmp(&(self.strip_px(b) - middle).abs()))
+                .or_else(|| (0..n).find(|&i| eligible(self, i)));
+            if let Some(i) = pick {
+                let kind = if name == "hug" {
+                    super::sign::HUG
+                } else {
+                    (self.walk.rand() * super::sign::SIGNS.len() as f32) as usize
+                };
+                let wk = self.walk_of(i);
+                wk.act = Act::Idle;
+                wk.target = wk.x;
+                wk.timer = wk.timer.max(25.0);
+                wk.sign = Some(kind);
+                wk.sign_left = 25.0;
+            }
+            return true;
+        }
         // training on request: whoever is free right now, with a teacher if there is one
         if name == "train" {
             let busy: Vec<usize> = chats.iter().flat_map(|c| c.members.iter().copied()).collect();
@@ -1889,7 +2011,8 @@ impl CharacterOverlay {
             "long" => (Game::Long, t.long_min),
             "domino" => (Game::Domino, t.party_min),
             "tug" => (Game::Tug, t.tug_min),
-            "tag" => (Game::Tag, t.party_min),
+            "wrestle" => (Game::Wrestle, t.wrestle_min),
+            "tag" => (Game::Tag, t.tag_min),
             "carrot" => (Game::Carrot, t.carrot_min),
             "gift" => (Game::Gift, t.gift_min),
             "samba" => (Game::Samba, t.samba_min),
@@ -1908,7 +2031,7 @@ impl CharacterOverlay {
             .iter()
             .filter(|c| {
                 c.forced.is_some()
-                    || matches!(c.stage, Stage::Fishing | Stage::Blind | Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Volley | Stage::Cheer | Stage::RaceCall | Stage::RaceWait)
+                    || matches!(c.stage, Stage::Fishing | Stage::Blind | Stage::Contest | Stage::Cursor | Stage::Long | Stage::Domino | Stage::Tug | Stage::Wrestle | Stage::Tag | Stage::Carrot | Stage::Gift | Stage::Samba | Stage::Volley | Stage::Cheer | Stage::RaceCall | Stage::RaceWait)
             })
             .flat_map(|c| c.members.iter().copied())
             .collect();
@@ -2069,8 +2192,11 @@ impl CharacterOverlay {
         match c.step {
             9 => {
                 if self.all_arrived(c) {
+                    self.clear_happy(&c.members);
                     c.wait = 0.6;
                     c.step = 0;
+                } else {
+                    self.chatter(c, dt);
                 }
             }
             0 => {
@@ -2157,6 +2283,7 @@ impl CharacterOverlay {
             self.go_facing(row[half], mid, 0.14);
         }
         // the only way into this game is the rope
+        self.align_park_y(&c.members);
         for k in 0..c.members.len() {
             let i = c.members[k];
             let wk = self.walk_of(i);
@@ -2204,6 +2331,7 @@ impl CharacterOverlay {
                 let right = c.cheat_side > 0.0;
                 let losers = if right { c.teams.0.clone() } else { c.teams.1.clone() };
                 let x = self.tug_end(c, right) - c.offset;
+                self.match_park_y(i, &c.members);
                 c.members.push(i);
                 c.base.push((i, x));
                 if right { c.teams.1.push(i) } else { c.teams.0.push(i) }
@@ -2311,6 +2439,10 @@ impl CharacterOverlay {
                 return false;
             }
             self.run_to(t, hx, tn().carrot_sprint * 1.15);
+            if self.place_here(t).is_some() {
+                let hy = self.walk_ref(h).park_y.clamp(0.06, super::park::MEADOW * 0.85);
+                self.walk_of(t).park_target_y = hy;
+            }
             if (self.strip_px(t) - hx).abs() >= size * 0.45 || !grounded(self.walk_ref(t)) {
                 return false;
             }
@@ -2485,6 +2617,8 @@ impl CharacterOverlay {
             let slot = (k / 2) as f32;
             self.go(i, centre + side * (gap * 2.6 + slot * gap * 0.9), 0.2);
         }
+        let all: Vec<usize> = top.iter().chain(&crowd).copied().collect();
+        self.align_park_y(&all);
         log::debug!("chat {id}: concert by {top:?}");
         let mut chat = Chat::new(id, top.clone(), Stage::Concert, tn().concert_time);
         chat.watchers = crowd;
@@ -2492,6 +2626,7 @@ impl CharacterOverlay {
         chat.games = 1;
         chat.talker = top[0];
         chat.winner = Some(top[0]);
+        chat.rewarded = true;
         self.new_chats.push(chat);
     }
 
@@ -2539,32 +2674,12 @@ impl CharacterOverlay {
         }
         let i = (0..n).find(|&i| {
             let wk = self.walk_ref(i);
-            // a fisher by trade doesn't need to be as bored
-            let keen = if self.is_job(i, "fisher") { 0.4 } else { 1.0 };
-            wk.bored >= tn().fish_bored * keen && wk.fish_cool <= 0.0 && wk.act == Act::Idle && self.on_screen(i)
+            wk.bored >= tn().fish_bored && wk.fish_cool <= 0.0 && wk.act == Act::Idle && self.on_screen(i)
         })?;
         if self.walk_of(i).rand() >= every / tn().fish_bored_every.max(1.0) {
             return None;
         }
         self.walk_of(i).bored = 0.0;
-        // living in the park, cafe or farm (not out on the desktop): off to
-        // the farm's pier to fish; on the desktop, by the windows as always
-        if let Some(farm) = crate::backend::governor::place_workspace("farm") {
-            let home = crate::backend::governor::places().iter().any(|p| p.ws == self.walk_ref(i).ws);
-            // only playing: no fishing in the windows
-            if home && play::playing_only() {
-                return None;
-            }
-            if home && self.walk_ref(i).ws == farm {
-                log::debug!("{i} walks to the pier to fish");
-                return Some(self.fish_alone(i, false));
-            }
-            if home && self.send_to(i, farm) {
-                self.walk_of(i).fish_on_arrival = true;
-                log::debug!("{i} goes to the farm to fish");
-                return None;
-            }
-        }
         Some(self.fish_alone(i, false))
     }
 
@@ -2575,14 +2690,7 @@ impl CharacterOverlay {
         let id = self.chat_id;
         self.enlist(i, id);
         let size = self.width_of(i);
-        // on the farm's workspace and not told to stay put: out on the pier
-        // the farm on this workspace: always at its pond, never where it stands
-        let _ = here;
-        let pier = self.pier_near(i);
-        let x = if let Some((lo, hi)) = pier {
-            let r = self.walk.rand();
-            lo + size * 0.4 + r * (hi - lo - size * 0.8).max(0.0)
-        } else if here {
+        let x = if here {
             self.strip_px(i)
         } else {
             let view = self.view[0] * self.view_w * 0.5;
@@ -2592,11 +2700,10 @@ impl CharacterOverlay {
             };
             wx + size + self.walk.rand() * (ww - size * 2.0).max(0.0)
         };
-        let (x, up) = if pier.is_some() { self.farm_spot(i).unwrap_or((x, 0.0)) } else { (x, 0.0) };
         self.go(i, x, 0.14);
         log::debug!("chat {id}: {i} goes fishing");
         let mut c = Chat::new(id, vec![i], Stage::Fishing, 0.0);
-        c.fishing = Some(Fishing { anglers: vec![Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: x, blown: false, thrown: false, glee: 0.0, up, tries: 0 }], beast: None, beast_cool: 8.0, idle: Vec::new() });
+        c.fishing = Some(Fishing { anglers: vec![Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: x, blown: false, thrown: false, glee: 0.0, tries: 0 }], beast: None, beast_cool: 8.0, idle: Vec::new() });
         c.scores = vec![(i, 0.0)];
         c.step = 9;
         c.timer = 30.0;
@@ -2609,9 +2716,6 @@ impl CharacterOverlay {
     /// The stretch of floor `i` is fishing on: its window, or the screen
     /// around it when that window isn't known.
     fn fishing_window(&self, i: usize, at: f32) -> (f32, f32) {
-        if let Some(pier) = self.pier_near(i).filter(|p| at >= p.0 - 40.0 && at <= p.1 + 40.0) {
-            return pier;
-        }
         let active = self.spaces.active;
         let here = active == 0 || self.walk_ref(i).ws == active;
         let cols = if here { crate::backend::governor::niri_columns() } else { Vec::new() };
@@ -2631,7 +2735,7 @@ impl CharacterOverlay {
         let i = forced.or_else(|| {
             (0..n).find(|&i| {
                 let wk = self.walk_ref(i);
-                wk.at_leisure() && wk.act == Act::Idle && wk.energy >= tn().train_energy && wk.bored >= tn().train_bored && wk.train_cool <= 0.0 && self.on_screen(i) && !self.no_games_here(i)
+                wk.at_leisure() && wk.act == Act::Idle && wk.energy >= tn().train_energy && wk.bored >= tn().train_bored && wk.train_cool <= 0.0 && self.on_screen(i)
             })
         })?;
         if forced.is_none() && self.walk_of(i).rand() >= every / tn().train_every.max(1.0) {
@@ -2842,7 +2946,7 @@ impl CharacterOverlay {
             return;
         }
         *LAST.lock().unwrap() = Some(std::time::Instant::now());
-        let ready: Vec<usize> = (0..f.anglers.len()).filter(|&k| (1..=5).contains(&f.anglers[k].phase) && !f.anglers[k].blown && f.anglers[k].up <= 0.0).collect();
+        let ready: Vec<usize> = (0..f.anglers.len()).filter(|&k| (1..=5).contains(&f.anglers[k].phase) && !f.anglers[k].blown).collect();
         if ready.is_empty() {
             return;
         }
@@ -2858,7 +2962,7 @@ impl CharacterOverlay {
         let reach = size * tn().fish_beast_reach;
         for a in &mut f.anglers {
             let at = self.strip_px(a.i);
-            if (at - x).abs() > reach || a.up > 0.0 {
+            if (at - x).abs() > reach {
                 continue;
             }
             a.blown = true;
@@ -2963,16 +3067,13 @@ impl CharacterOverlay {
         // the nearer end of the row, one place along
         let spot = if (x - lo).abs() < (x - hi).abs() { lo - size * 1.1 } else { hi + size * 1.1 };
         let spot = spot.clamp(size, (width - size).max(size));
-        let (spot, up) = match self.pier_near(j).and_then(|_| self.farm_spot(j)) {
-            Some(s) => s,
-            None => (spot, 0.0),
-        };
         self.enlist(j, c.id);
+        self.match_park_y(j, &c.members);
         c.members.push(j);
         c.scores.push((j, 0.0));
         self.go(j, spot, 0.14);
         if let Some(f) = c.fishing.as_mut() {
-            f.anglers.push(Angler { i: j, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: spot, blown: false, thrown: false, glee: 0.0, up, tries: 0 });
+            f.anglers.push(Angler { i: j, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at: spot, blown: false, thrown: false, glee: 0.0, tries: 0 });
         }
         log::debug!("chat {}: {j} sees them fishing and joins", c.id);
     }
@@ -2981,22 +3082,16 @@ impl CharacterOverlay {
     /// bite, reel in whatever it is.
     fn start_fishing(&mut self, c: &mut Chat) {
         let (x, cw) = self.big_window();
-        let (lo, hi) = match self.pier_near(c.members[0]) {
-            // on the farm: everyone out on the pier, close together
-            Some((a, b)) => (a + 20.0, b - 20.0),
-            None => (x + 80.0, x + cw - 80.0),
-        };
+        let (lo, hi) = (x + 80.0, x + cw - 80.0);
         let slot = (hi - lo).max(1.0) / c.members.len() as f32;
         let mut anglers = Vec::new();
-        let farm = self.pier_near(c.members[0]).is_some();
         for (k, &i) in c.members.clone().iter().enumerate() {
             let at = lo + (k as f32 + 0.5) * slot;
-            // on the farm: the pier first, then the jetties up the shore
-            let (at, up) = if farm { self.farm_spot(i).unwrap_or((at, 0.0)) } else { (at, 0.0) };
             self.go(i, at, 0.16);
-            anglers.push(Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at, blown: false, thrown: false, glee: 0.0, up, tries: 0 });
+            anglers.push(Angler { i, phase: 0, t: 0.0, wait: 0.0, item: 0, patience: f32::MAX, at, blown: false, thrown: false, glee: 0.0, tries: 0 });
         }
         log::debug!("chat {}: fishing, {} rods", c.id, anglers.len());
+        self.align_park_y(&c.members);
         c.fishing = Some(Fishing { anglers, beast: None, beast_cool: 8.0, idle: Vec::new() });
         c.scores = c.members.iter().map(|&i| (i, 0.0)).collect();
         c.step = 9;
@@ -3012,39 +3107,22 @@ impl CharacterOverlay {
             self.end_game(c);
             return;
         }
-        // keeping their places on the pier and the jetties, facing the water
-        for a in &f.anglers {
-            if a.up > 0.0 || self.pier_of(a.i).is_some() {
-                self.hold_spot(a.i, a.at, a.up);
-                if a.phase >= 1 && !a.blown && self.arrived(a.i) {
-                    if let Some(r) = self.walk_of(a.i).social.as_mut() {
-                        r.face_left = false;
-                    }
-                }
-            }
-        }
         if c.step == 9 {
-            // up the shore to the jetties first
-            let mut up_there = true;
-            for a in f.anglers.clone() {
-                if a.up > 0.0 && !self.walk_up_to(a.i, a.at, a.up, dt) {
-                    up_there = false;
-                }
-            }
-            if up_there && self.all_arrived(c) {
+            if self.all_arrived(c) {
+                self.clear_happy(&c.members);
                 c.step = 0;
                 c.timer = tn().fish_time;
                 for a in &mut f.anglers {
                     a.phase = 1;
                     a.t = 0.0;
                 }
-                // half look one way, half the other; at the pond, all at the water
-                let pond = self.pier_near(c.members[0]).is_some();
                 for (k, a) in f.anglers.iter().enumerate() {
                     if let Some(r) = self.walk_of(a.i).social.as_mut() {
-                        r.face_left = !pond && k % 2 == 1;
+                        r.face_left = k % 2 == 1;
                     }
                 }
+            } else {
+                self.chatter(c, dt);
             }
             c.fishing = Some(f);
             return;
@@ -3058,7 +3136,6 @@ impl CharacterOverlay {
             if self.walk_ref(a.i).act == Act::Held {
                 a.blown = true;
                 a.thrown = true;
-                a.up = 0.0;
             }
             // thrown a long way: that's the end of fishing for this one
             if a.thrown && grounded(self.walk_ref(a.i)) {
@@ -3071,14 +3148,7 @@ impl CharacterOverlay {
                     f.anglers[k] = a;
                     continue;
                 }
-                // at the farm's pond: a free place on the pier or a jetty again
-                match self.pier_near(a.i).and_then(|_| self.farm_spot(a.i)) {
-                    Some((at, up)) => {
-                        a.at = at;
-                        a.up = up;
-                    }
-                    None => a.at = free_fishing_spot(&f, a.i, x, lo, hi, size),
-                }
+                a.at = free_fishing_spot(&f, a.i, x, lo, hi, size);
                 self.go(a.i, a.at, 0.16);
             }
             // blown off its spot: lands, laughs, walks back, casts again
@@ -3087,14 +3157,7 @@ impl CharacterOverlay {
                 // nobody goes back while the thing is still out
                 let settled = grounded(wk) && wk.giggle <= 0.0 && f.beast.is_none();
                 if settled {
-                    if a.up > 0.0 {
-                        // back up its jetty, on foot
-                        if self.walk_up_to(a.i, a.at, a.up, dt) {
-                            a.blown = false;
-                            a.phase = 1;
-                            a.t = 0.0;
-                        }
-                    } else if (self.strip_px(a.i) - a.at).abs() > 12.0 {
+                    if (self.strip_px(a.i) - a.at).abs() > 12.0 {
                         if !wk.social.is_some_and(|s| s.moving) {
                             a.tries += 1;
                             if a.tries > 3 {
@@ -3116,12 +3179,11 @@ impl CharacterOverlay {
             }
             a.t += dt;
             // came along later: rod out once it's in place, facing the way the others do
-            let there = if a.up > 0.0 { self.walk_up_to(a.i, a.at, a.up, dt) } else { self.arrived(a.i) };
-            if a.phase == 0 && there {
+            if a.phase == 0 && self.arrived(a.i) {
                 a.phase = 1;
                 a.t = 0.0;
                 let first = f.anglers[0].i;
-                let left = if a.up > 0.0 || self.pier_of(a.i).is_some() { Some(false) } else if first != a.i { self.walk_ref(first).social.map(|s| s.face_left) } else { None };
+                let left = if first != a.i { self.walk_ref(first).social.map(|s| s.face_left) } else { None };
                 if let Some(r) = self.walk_of(a.i).social.as_mut() {
                     r.face_left = left.unwrap_or_else(|| r.face_left);
                 }
@@ -3137,8 +3199,8 @@ impl CharacterOverlay {
                     a.patience = tn().fish_stay_min + self.walk.rand() * tn().fish_stay_rand;
                 }
                 a.patience -= dt;
-                // lost interest or hungry: only between catches, never mid-reel
-                if (a.patience <= 0.0 || self.hungry(a.i)) && matches!(a.phase, 1 | 2) {
+                // lost interest: only between catches, never mid-reel
+                if a.patience <= 0.0 && matches!(a.phase, 1 | 2) {
                     bored_off.push(a.i);
                     f.anglers[k] = a;
                     continue;
@@ -3185,7 +3247,7 @@ impl CharacterOverlay {
                     if self.walk.rand() < quick {
                         // the better at it, the better the catch
                         let luck = self.skill(a.i, "fishing");
-                        let good = self.walk.rand() < 0.35 + 0.55 * luck;
+                        let good = self.walk.rand() < 0.50 + 0.42 * luck;
                         let pool: Vec<&(i32, f32, bool)> = CATCHES.iter().filter(|x| x.2 == good).collect();
                         let pick = pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()];
                         a.item = pick.0;
@@ -3197,15 +3259,8 @@ impl CharacterOverlay {
                                 a.item = base + (self.walk.rand() * count as f32) as i32 % count as i32;
                             }
                         }
-                        // now and then something for the park chest instead
-                        // (only in place of junk: a real fish is kept)
-                        let fish = (FISH..CREATURE).contains(&a.item);
-                        if !fish && self.walk.rand() < tn().fish_material {
-                            let n = super::park::MATERIALS.len();
-                            a.item = MATERIAL + (self.walk.rand() * n as f32) as i32 % n as i32;
-                        }
-                        // now and then something to wear it hasn't got yet
-                        if !fish && self.walk.rand() < tn().fish_find {
+                        // good catches (other than rare creatures) can turn up something to wear
+                        if good && a.item < CREATURE && self.walk.rand() < tn().fish_find {
                             let name = self.character_name(a.i);
                             let roll = self.walk.rand();
                             if let Some(k) = super::wear::unfound(&name, roll) {
@@ -3227,21 +3282,7 @@ impl CharacterOverlay {
                 4 if a.t > tn().fish_reel => {
                     a.phase = 5;
                     a.t = 0.0;
-                    let (_, points, good) = if a.item >= MATERIAL { (a.item, 2.0, true) } else if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
-                    // fishing (off the pier or by a window) is a fisher's work
-                    self.work(a.i, "fisher", if good { 1.5 } else { 1.0 });
-                    // a fish or a carrot: into the kitchen's pantry too
-                    if (FISH..CREATURE).contains(&a.item) {
-                        self.bring_food(a.i, "fish", 1);
-                    } else if a.item == 0 {
-                        self.bring_food(a.i, "carrot", 1);
-                    }
-                    // something for the park: into the chest
-                    if let Some(&(id, label)) = (a.item >= MATERIAL).then(|| super::park::MATERIALS.get((a.item - MATERIAL) as usize)).flatten() {
-                        let name = self.character_name(a.i);
-                        super::park::add(&name, id);
-                        log::debug!("chat {}: {} found {label} for the chest", c.id, a.i);
-                    }
+                    let (_, points, good) = if a.item >= CREATURE { (a.item, 8.0, true) } else if a.item >= FISH { (a.item, 4.0, true) } else if a.item >= FOUND { (a.item, 6.0, true) } else { *CATCHES.iter().find(|x| x.0 == a.item).unwrap_or(&CATCHES[0]) };
                     // found something to wear: it's in its things now
                     if let Some((id, label, _, _)) = (FOUND..FISH).contains(&a.item).then(|| super::wear::catalog_entry((a.item - FOUND) as usize)).flatten() {
                         let name = self.character_name(a.i);
@@ -3381,12 +3422,15 @@ impl CharacterOverlay {
         let size = self.row_size(c);
         if c.step == 9 {
             if self.all_arrived(c) {
+                self.clear_happy(&c.members);
                 log::debug!("chat {}: everyone's hidden, off it goes", c.id);
                 c.step = 0;
                 c.timer = tn().blind_time;
             } else if c.timer <= 0.0 {
                 self.end_game(c);
                 return;
+            } else {
+                self.chatter(c, dt);
             }
             c.blind = Some(b);
             return;
@@ -3492,6 +3536,7 @@ impl CharacterOverlay {
                     if self.run_bribe(c, dt) {
                         return;
                     }
+                    self.clear_happy(&c.members);
                     for (i, left) in c.teams.0.iter().map(|&i| (i, false)).chain(c.teams.1.iter().map(|&i| (i, true))).collect::<Vec<_>>() {
                         if let Some(r) = self.walk_of(i).social.as_mut() {
                             r.face_left = left;
@@ -3501,6 +3546,8 @@ impl CharacterOverlay {
                     }
                     c.timer = tn().tug_time;
                     c.step = 1;
+                } else {
+                    self.chatter(c, dt);
                 }
             }
             1 => {
@@ -3633,6 +3680,333 @@ impl CharacterOverlay {
         }
     }
 
+    /// Two teams line up on either side and send one fighter each to clash
+    /// head-to-head in the middle until one is pushed out and tumbled away.
+    fn start_wrestle(&mut self, c: &mut Chat) {
+        log::debug!("chat {}: wrestling", c.id);
+        let mut all = c.members.clone();
+        for k in (1..all.len()).rev() {
+            let j = (self.walk.rand() * (k + 1) as f32) as usize % (k + 1);
+            all.swap(k, j);
+        }
+        let half = all.len() / 2;
+        let teams = [all[..half].to_vec(), all[half..].to_vec()];
+        let unit = self.width_of(c.members[0]);
+        let (raw_lo, raw_hi) = self.big_window();
+        let lo = (raw_lo + unit * 0.5).min(raw_hi);
+        let hi = (raw_hi - unit * 0.5).max(lo);
+        let mid = (lo + hi) * 0.5;
+        let win = tn().wrestle_win.min(((hi - lo) * 0.25).max(unit * 0.75));
+        let ring = (win + unit * 0.95).min(((hi - lo) * 0.42).max(unit * 0.9));
+        let gap = unit * 0.42;
+
+        let arena_y = self
+            .park_row_y(&c.members)
+            .map_or(0.32, |y| y.clamp(0.14, super::park::MEADOW * 0.55));
+        for &i in &c.members.clone() {
+            let wk = self.walk_of(i);
+            wk.notify_jump = None;
+            if let Some(r) = wk.social.as_mut() {
+                r.no_touch = true;
+                r.lean = 0.0;
+                r.face_lock = false;
+            }
+        }
+        let w = Wrestle {
+            mid,
+            lo,
+            hi,
+            gap,
+            ring,
+            unit,
+            teams,
+            out: [Vec::new(), Vec::new()],
+            pair: None,
+            phase: 0,
+            t: 0.0,
+            push: 0.0,
+            push_target: 0.0,
+            offset: 0.0,
+            cheer_t: 0.3,
+            arena_y,
+        };
+        self.wrestle_benches(&w, None);
+        c.step = 9;
+        c.wait = 5.0;
+        c.timer = tn().wrestle_round;
+        c.scores.clear();
+        c.regroup = true;
+        c.stage = Stage::Wrestle;
+        c.wrestle = Some(w);
+    }
+
+    fn wrestle_benches(&mut self, w: &Wrestle, active: Option<(usize, usize)>) {
+        const LANES: [f32; 4] = [-0.16, -0.06, 0.08, 0.18];
+        let span = ((w.hi - w.lo) * 0.5 - w.ring).max(0.0);
+        for side in 0..=1 {
+            let dir = if side == 0 { -1.0 } else { 1.0 };
+            let bench: Vec<usize> = w.teams[side]
+                .iter()
+                .chain(w.out[side].iter())
+                .copied()
+                .filter(|&i| active.is_none_or(|(a, b)| i != a && i != b))
+                .collect();
+            let step = (span / bench.len().saturating_sub(1).max(1) as f32).min(w.unit * 0.9).max(w.unit * 0.5);
+            for (slot, i) in bench.into_iter().enumerate() {
+                if self.walk_ref(i).social.is_some_and(|r| r.grabbed || r.flying || r.stuck) {
+                    continue;
+                }
+                let x = (w.mid + dir * (w.ring + slot as f32 * step)).clamp(w.lo, w.hi);
+                if (self.strip_px(i) - x).abs() > w.unit * 0.12 {
+                    self.steer(i, x, 0.20);
+                }
+                if self.place_here(i).is_some() {
+                    self.walk_of(i).park_target_y = (w.arena_y + LANES[slot % LANES.len()]).clamp(0.06, super::park::MEADOW * 0.85);
+                }
+                if let Some(r) = self.walk_of(i).social.as_mut() {
+                    r.face_left = side == 1;
+                    r.face_lock = false;
+                    r.lean = 0.0;
+                }
+            }
+        }
+    }
+
+    fn finish_wrestle(&mut self, c: &mut Chat, w: Wrestle) {
+        let win_side = match (!w.teams[0].is_empty(), !w.teams[1].is_empty()) {
+            (true, false) => Some(0),
+            (false, true) => Some(1),
+            _ => None,
+        };
+        c.scores.clear();
+        if let Some(side) = win_side {
+            c.scores = w.teams[side]
+                .iter()
+                .chain(w.out[side].iter())
+                .copied()
+                .filter(|i| c.members.contains(i))
+                .map(|i| (i, 1.0))
+                .collect();
+        }
+        c.wrestle = Some(w);
+        self.end_game(c);
+    }
+
+    fn run_wrestle(&mut self, c: &mut Chat, dt: f32) {
+        let Some(mut w) = c.wrestle.take() else { return };
+        for side in 0..=1 {
+            w.teams[side].retain(|i| c.members.contains(i));
+            w.out[side].retain(|i| c.members.contains(i));
+        }
+        if let Some((a, b)) = w.pair {
+            if !c.members.contains(&a) || !c.members.contains(&b) {
+                w.pair = None;
+                w.phase = 0;
+                w.offset = 0.0;
+                w.push = 0.0;
+            }
+        }
+        if w.teams[0].is_empty() || w.teams[1].is_empty() {
+            self.finish_wrestle(c, w);
+            return;
+        }
+        if c.step == 9 {
+            c.wait -= dt;
+            if self.all_arrived(c) || c.wait <= 0.0 {
+                for side in 0..=1 {
+                    for &i in w.teams[side].iter().chain(w.out[side].iter()) {
+                        if let Some(r) = self.walk_of(i).social.as_mut() {
+                            r.happy = false;
+                            if !r.moving {
+                                r.face_left = side == 1;
+                            }
+                        }
+                    }
+                }
+                c.step = 0;
+                w.phase = 0;
+            } else {
+                self.chatter(c, dt);
+            }
+            c.wrestle = Some(w);
+            return;
+        }
+
+        // spectators on either side hop & cheer while watching the duel
+        w.cheer_t -= dt;
+        if w.cheer_t <= 0.0 {
+            w.cheer_t = 0.45 + self.walk.rand() * 0.35;
+            let side = usize::from(self.walk.rand() < 0.5);
+            let fans: Vec<usize> = w.teams[side]
+                .iter()
+                .chain(w.out[side].iter())
+                .copied()
+                .filter(|&i| {
+                    w.pair.is_none_or(|(a, b)| i != a && i != b)
+                        && self.walk_ref(i).social.is_some_and(|r| !r.moving && !r.flying && !r.stuck)
+                })
+                .collect();
+            if !fans.is_empty() {
+                let fan = fans[(self.walk.rand() * fans.len() as f32) as usize % fans.len()];
+                let wk = self.walk_of(fan);
+                if let Some(r) = wk.social.as_mut() {
+                    r.happy = true;
+                    r.face_left = side == 1;
+                }
+                if grounded(wk) {
+                    let hop = tn().jump_height * (0.12 + wk.rand() * 0.1);
+                    wk.start_bob(hop);
+                }
+            }
+        }
+
+        let win_dist = tn().wrestle_win.min(((w.hi - w.lo) * 0.25).max(w.unit * 0.75));
+        match w.phase {
+            0 => {
+                let (a, b) = (w.teams[0][0], w.teams[1][0]);
+                self.wrestle_benches(&w, Some((a, b)));
+                for (i, goal, left) in [(a, w.mid - w.gap, false), (b, w.mid + w.gap, true)] {
+                    self.go(i, goal, 0.24);
+                    if self.place_here(i).is_some() {
+                        self.walk_of(i).park_target_y = w.arena_y;
+                    }
+                    if let Some(r) = self.walk_of(i).social.as_mut() {
+                        r.face_left = left;
+                        r.face_lock = false;
+                        r.lean = 0.0;
+                    }
+                }
+                w.pair = Some((a, b));
+                w.offset = 0.0;
+                w.push = 0.0;
+                w.push_target = 0.0;
+                w.t = 0.0;
+                w.phase = 1;
+            }
+            1 => {
+                let Some((a, b)) = w.pair else { w.phase = 0; c.wrestle = Some(w); return };
+                w.t += dt;
+                if (self.arrived(a) && self.arrived(b)) || w.t > 6.0 {
+                    for (i, left) in [(a, false), (b, true)] {
+                        let wk = self.walk_of(i);
+                        if let Some(r) = wk.social.as_mut() {
+                            r.face_left = left;
+                            r.face_lock = true;
+                            r.moving = false;
+                        }
+                        if grounded(wk) {
+                            wk.start_bob(tn().jump_height * 0.14);
+                        }
+                    }
+                    w.phase = 2;
+                    w.t = 0.0;
+                    c.timer = tn().wrestle_round;
+                }
+            }
+            2 => {
+                let Some((a, b)) = w.pair else { w.phase = 0; c.wrestle = Some(w); return };
+                w.t -= dt;
+                if w.t <= 0.0 {
+                    w.t = 0.55 + self.walk.rand() * 0.45;
+                    let sa = self.skilled(a, "wrestling", 0.55, 1.35) * (self.walk_ref(a).energy / 100.0).clamp(0.6, 1.15);
+                    let sb = self.skilled(b, "wrestling", 0.55, 1.35) * (self.walk_ref(b).energy / 100.0).clamp(0.6, 1.15);
+                    let force = (self.walk.rand() * sa - self.walk.rand() * sb) * tn().wrestle_push;
+                    w.push_target = force.clamp(-tn().wrestle_push, tn().wrestle_push);
+                }
+                w.push += (w.push_target - w.push) * (dt * 3.5).min(1.0);
+                w.offset = (w.offset + w.push * dt).clamp(-win_dist * 1.15, win_dist * 1.15);
+
+                let heave = (c.timer * 7.0).sin().abs() * 0.04;
+                let bias = (w.push / tn().wrestle_push.max(1.0)).clamp(-1.0, 1.0) * 0.07;
+                for (i, goal, left, lean) in [
+                    (a, (w.mid + w.offset - w.gap).clamp(w.lo, w.hi), false, -(tn().wrestle_lean + heave + bias.max(0.0) - (-bias).max(0.0) * 0.4)),
+                    (b, (w.mid + w.offset + w.gap).clamp(w.lo, w.hi), true, tn().wrestle_lean + heave + (-bias).max(0.0) - bias.max(0.0) * 0.4),
+                ] {
+                    if !self.walk_ref(i).social.is_some_and(|r| r.grabbed) {
+                        self.steer(i, goal, 0.45);
+                    }
+                    if self.place_here(i).is_some() {
+                        self.walk_of(i).park_target_y = w.arena_y;
+                    }
+                    let wk = self.walk_of(i);
+                    if let Some(r) = wk.social.as_mut() {
+                        r.face_left = left;
+                        r.face_lock = true;
+                        r.lean = lean;
+                    }
+                    if grounded(wk) && wk.rand() < dt * 1.1 {
+                        wk.start_bob(tn().jump_height * 0.13);
+                    }
+                }
+
+                if w.offset.abs() >= win_dist || c.timer <= 0.0 {
+                    let win_side = if w.offset.abs() >= 2.0 {
+                        usize::from(w.offset < 0.0)
+                    } else {
+                        usize::from(self.walk.rand() < 0.5)
+                    };
+                    let loser_side = 1 - win_side;
+                    let (winner_f, loser, dir) = if win_side == 0 { (a, b, 1.0) } else { (b, a, -1.0) };
+                    for i in [a, b] {
+                        if let Some(r) = self.walk_of(i).social.as_mut() {
+                            r.lean = 0.0;
+                            r.face_lock = false;
+                            r.moving = false;
+                        }
+                    }
+                    let dist = (tn().wrestle_fling_min + self.walk.rand() * tn().wrestle_fling_rand).min((w.hi - w.lo) * 0.45);
+                    let time = 0.55 + self.walk.rand() * 0.25;
+                    self.fling(loser, dir, dist, time);
+                    let wwk = self.walk_of(winner_f);
+                    if let Some(r) = wwk.social.as_mut() {
+                        r.happy = true;
+                    }
+                    if grounded(wwk) {
+                        wwk.start_bob(tn().jump_height * 0.45);
+                    }
+                    w.teams[loser_side].retain(|&m| m != loser);
+                    if !w.out[loser_side].contains(&loser) {
+                        w.out[loser_side].push(loser);
+                    }
+                    w.phase = 3;
+                    w.t = 1.0;
+                }
+            }
+            _ => {
+                let airborne = c.members.iter().any(|&i| self.walk_ref(i).social.is_some_and(|s| s.flying));
+                if !airborne {
+                    w.t -= dt;
+                }
+                if !airborne && w.t <= 0.0 {
+                    for &i in w.out[0].iter().chain(w.out[1].iter()) {
+                        let wk = self.walk_of(i);
+                        if wk.act == Act::Planted {
+                            wk.act = Act::Idle;
+                        }
+                        if wk.social.is_some_and(|r| r.stuck) {
+                            wk.laugh(0.9);
+                        }
+                        if let Some(r) = wk.social.as_mut() {
+                            r.flying = false;
+                            r.stuck = false;
+                            r.rot_target = 0.0;
+                            r.sink_target = 0.0;
+                            r.lean = 0.0;
+                            r.happy = false;
+                        }
+                    }
+                    if w.teams[0].is_empty() || w.teams[1].is_empty() {
+                        self.finish_wrestle(c, w);
+                        return;
+                    }
+                    w.pair = None;
+                    w.phase = 0;
+                }
+            }
+        }
+        c.wrestle = Some(w);
+    }
+
     /// Tag: one is "it" and runs after the nearest; a touch passes it on.
     /// Whoever spent the least time being "it" wins.
     /// Volleyball in the widest window, an even number of characters: three
@@ -3645,10 +4019,11 @@ impl CharacterOverlay {
             let j = (self.walk.rand() * (k + 1) as f32) as usize % (k + 1);
             all.swap(k, j);
         }
+        let (x, cw) = self.big_window();
         // a crowd gets a taller net; the teams must still come out equal
-        // (a shorter one for a few, so each side still has someone on it)
-        let tall = all.len() >= tn().volley_big as usize;
-        let mut high = if tall { 4 } else { 3 };
+        // (a shorter one in narrower windows or for fewer players, so it stays below the ceiling)
+        let tall = all.len() >= tn().volley_big as usize && cw >= 550.0;
+        let mut high = if tall { 4 } else if cw >= 380.0 { 3 } else { 2 };
         while high > 1 && all.len() < high + 3 {
             high -= 1;
         }
@@ -3663,8 +4038,8 @@ impl CharacterOverlay {
             }
         }
         c.members = all.clone();
-        let (x, cw) = self.big_window();
-        let (lo, hi, mid) = (x + 40.0, x + cw - 40.0, x + cw * 0.5);
+        let pad = (cw * 0.08).clamp(16.0, 40.0);
+        let (lo, hi, mid) = (x + pad, (x + cw - pad).max(x + pad + 40.0), x + cw * 0.5);
         let net: Vec<usize> = all[..high].to_vec();
         let ball = all[high];
         let mut teams = [Vec::new(), Vec::new()];
@@ -3727,8 +4102,11 @@ impl CharacterOverlay {
             if wk.air < air - 1.9 && wk.vy > 0.0 {
                 return;
             }
-            let (a, b) = if v.teams[0].contains(&p) { (v.mid + 100.0, v.hi - 60.0) } else { (v.lo + 60.0, v.mid - 100.0) };
-            let to = a + self.walk.rand() * (b - a).max(0.0);
+            let half = ((v.hi - v.lo) * 0.5).max(20.0);
+            let near = (half * 0.22).min(90.0);
+            let far = (half * 0.85).max(near);
+            let (a, b) = if v.teams[0].contains(&p) { (v.mid + near, v.mid + far) } else { (v.mid - far, v.mid - near) };
+            let to = (a + self.walk.rand() * (b - a).max(0.0)).clamp(v.lo + 8.0, v.hi - 8.0);
             let time = v.clear_time(x, to, air).max(0.9);
             log::debug!("{p} knocks the ball out of the hand");
             self.ball_to(v.ball, to, time);
@@ -3999,9 +4377,12 @@ impl CharacterOverlay {
             // any power and pace: a hard one flies long and comes off the side,
             // a high one comes off the top
             let dir = if side == 0 { 1.0 } else { -1.0 };
-            let (a, b) = if side == 0 { (v.mid + 100.0, v.hi - 60.0) } else { (v.lo + 60.0, v.mid - 100.0) };
-            let power = if self.walk.rand() < 0.3 { self.walk.rand() * 500.0 } else { 0.0 };
-            let to = a + self.walk.rand() * (b - a).max(0.0) + dir * power;
+            let half = ((v.hi - v.lo) * 0.5).max(20.0);
+            let near = (half * 0.22).min(90.0);
+            let far = (half * 0.85).max(near);
+            let (a, b) = if side == 0 { (v.mid + near, v.mid + far) } else { (v.mid - far, v.mid - near) };
+            let power = if self.walk.rand() < 0.3 { self.walk.rand() * (half * 0.35).min(240.0) } else { 0.0 };
+            let to = (a + self.walk.rand() * (b - a).max(0.0) + dir * power).clamp(v.lo + 8.0, v.hi - 8.0);
             v.rally += 1;
             let mut time = ((tn().volley_time_min + self.walk.rand() * tn().volley_time_rand) * 0.97f32.powi(v.rally)).max(0.5);
             // most are hit high enough; the rest go wherever, the net included
@@ -4030,6 +4411,34 @@ impl CharacterOverlay {
     /// Things drawn beside the characters: (kind, surface box, mirrored).
     pub(super) fn props(&self) -> Vec<(i32, [f32; 4], bool, usize)> {
         let mut v: Vec<(i32, [f32; 4], bool, usize)> = self.chats.iter().filter(|c| c.stage == Stage::Carrot && c.step != 9).filter_map(|c| Some((0, self.carrot_rect(c)?, false, *c.members.first()?))).collect();
+        // gentle floating hearts while reacting to a hug
+        for i in 0..=self.extras.len() {
+            let h_left = self.walk_ref(i).hug;
+            if h_left <= 0.0 {
+                continue;
+            }
+            let r = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
+            let w = (r[2] - r[0]).max(1.0);
+            let h = (r[3] - r[1]).max(1.0);
+            let age = (1.65 - h_left).max(0.0);
+            let cx = (r[0] + r[2]) * 0.5;
+            let cy = r[1] + h * 0.45;
+            for (k, side, delay) in [(0, -1.0f32, 0.0f32), (1, 1.0f32, 0.18f32)] {
+                if age < delay {
+                    continue;
+                }
+                let t = ((age - delay) / 1.35).clamp(0.0, 1.0);
+                if t >= 1.0 {
+                    continue;
+                }
+                let rise = t * h * 0.52;
+                let drift = side * w * (0.14 + 0.08 * t) + (t * 6.0 + k as f32).sin() * w * 0.04;
+                let size = h * 0.19 * (1.0 - 0.25 * t);
+                let x = cx + drift;
+                let y = cy - rise;
+                v.push((100, [x - size * 0.5, y - size * 0.5, x + size * 0.5, y + size * 0.5], false, i));
+            }
+        }
         // training: what it's about to practise, over its head
         for c in self.chats.iter().filter(|c| c.stage == Stage::Practice && c.step != 9) {
             let Some(p) = c.practice else { continue };
@@ -4249,7 +4658,6 @@ impl CharacterOverlay {
             v.push((0, [x - size * 0.5, top, x + size * 0.5, top + size], false, b.giver));
         }
         self.mood_props(&mut v);
-        self.serve_props(&mut v);
         // a picture in place of a drawn thing fills the box's width at its own shape
         for p in &mut v {
             if (21000..FOUND).contains(&p.0) || p.0 >= FISH {
@@ -4327,6 +4735,7 @@ impl CharacterOverlay {
                 }
             }
             if self.all_arrived(c) {
+                self.clear_happy(&c.members);
                 v.x = v.lo + 110.0 + self.walk.rand() * (v.hi - v.lo - 220.0).max(0.0);
                 log::debug!("chat {}: a carrot at {:.0}", c.id, v.x);
                 c.step = 0;
@@ -4334,6 +4743,8 @@ impl CharacterOverlay {
             } else if c.timer <= 0.0 {
                 self.end_game(c);
                 return;
+            } else {
+                self.chatter(c, dt);
             }
             c.carrot = Some(v);
             return;
@@ -4374,10 +4785,18 @@ impl CharacterOverlay {
             }
             // nobody has it: a mad dash
             let mut closest: Option<(usize, f32)> = None;
+            let carrot_y = self.place_here(c.members[0]).map(|_| self.walk_ref(c.members[0]).park_y.clamp(0.06, super::park::MEADOW * 0.85));
             for k in 0..c.members.len() {
                 let i = c.members[k];
                 let pace = self.tag_pace(i, dt);
                 self.run_to(i, v.x, tn().carrot_rush * pace);
+                if k > 0 {
+                    if let Some(cy) = carrot_y {
+                        if self.place_here(i).is_some() {
+                            self.walk_of(i).park_target_y = cy;
+                        }
+                    }
+                }
                 let d = (self.strip_px(i) - v.x).abs();
                 if grounded(self.walk_ref(i)) && closest.is_none_or(|n| d < n.1) {
                     closest = Some((i, d));
@@ -4482,10 +4901,12 @@ impl CharacterOverlay {
         if at_wall {
             v.dir = -v.dir;
             v.decide = 0.8;
+            self.pick_park_y(h, None);
         } else if v.decide <= 0.0 {
             let score = |d: f32| room(d).min(clear(d));
             v.dir = if score(1.0) >= score(-1.0) { 1.0 } else { -1.0 };
             v.decide = 0.6 + self.walk.rand() * 0.6;
+            self.pick_park_y(h, None);
         }
         // sprinting too long wears it out for a good while
         if v.sprint <= 0.0 && v.tired <= 0.0 && v.sprint_cool <= 0.0 && near_d < 320.0 {
@@ -4543,11 +4964,15 @@ impl CharacterOverlay {
         }
         // the others only notice where it went a moment later, and run on
         // past that spot instead of stopping and bunching up on it
+        let hy = self.walk_ref(h).park_y.clamp(0.06, super::park::MEADOW * 0.85);
         for &i in &others {
             let pace = self.tag_pace(i, dt);
             if v.smart == Some(i) {
                 let ahead = (hx + v.dir * 80.0).clamp(v.lo, v.hi);
                 self.run_to(i, ahead, tn().carrot_chase * tn().carrot_smart_speed);
+                if self.place_here(i).is_some() {
+                    self.walk_of(i).park_target_y = hy;
+                }
                 continue;
             }
             let x = self.strip_px(i);
@@ -4563,6 +4988,7 @@ impl CharacterOverlay {
             r.hop_cool = wait;
             let goal = hx + (hx - x).signum() * 90.0 + spread;
             self.run_to(i, goal.clamp(v.lo, v.hi), tn().carrot_chase * pace);
+            self.pick_park_y(i, Some((hy, 0.24)));
         }
         c.carrot = Some(v);
     }
@@ -4820,6 +5246,7 @@ impl CharacterOverlay {
             r.no_pat = true;
         }
         wk.start_bob(tn().jump_height * 0.2);
+        self.match_park_y(i, &c.members);
         c.members.push(i);
         c.base.push((i, slot));
         c.samba_new.push(i);
@@ -4833,8 +5260,18 @@ impl CharacterOverlay {
                 c.pull = 0.0;
                 c.step = 0;
                 c.timer = tn().samba_time;
+                let left = c.turn < 0.0;
+                for k in 0..c.members.len() {
+                    if let Some(r) = self.walk_of(c.members[k]).social.as_mut() {
+                        r.happy = true;
+                        r.face_lock = true;
+                        r.face_left = left;
+                    }
+                }
             } else if c.timer <= 0.0 {
                 self.end_game(c);
+            } else {
+                self.chatter(c, dt);
             }
             return;
         }
@@ -4894,10 +5331,13 @@ impl CharacterOverlay {
             let goal = slot(x, c.pull);
             let left = c.turn < 0.0;
             let wk = self.walk_of(i);
-            if !grounded(wk) {
+            if matches!(wk.act, Act::Held | Act::Fall) {
                 continue;
             }
-            wk.start_bob(tn().jump_height * 0.12);
+            if grounded(wk) || (wk.act == Act::Jump && wk.jump <= 0.12) {
+                wk.start_bob(tn().jump_height * 0.12);
+            }
+            wk.left = left;
             if let Some(r) = wk.social.as_mut() {
                 r.goal_px = goal;
                 r.speed = tn().samba_step * 2.0 / w / 0.32;
@@ -5018,9 +5458,11 @@ impl CharacterOverlay {
                 if r.hop_cool <= 0.0 {
                     r.hop_cool = wait;
                     self.run_to(i, lo + spot * (hi - lo).max(0.0), tn().tag_run);
+                    self.pick_park_y(i, None);
                 }
             }
             if !waiting {
+                self.clear_happy(&c.members);
                 c.step = 0;
                 c.wait = tn().tag_wait;
                 c.offset = 0.0;
@@ -5028,6 +5470,8 @@ impl CharacterOverlay {
                 log::debug!("chat {}: everyone's in the window, {} is it", c.id, c.it);
             } else if c.timer <= 0.0 {
                 self.end_game(c);
+            } else {
+                self.chatter(c, dt);
             }
             return;
         }
@@ -5093,6 +5537,7 @@ impl CharacterOverlay {
             let goal = if (away > 0.0 && hi - x < 90.0) || (away < 0.0 && x - lo < 90.0) { it_x - away * 500.0 } else { x + away * 500.0 };
             let knack = self.skilled(i, "tag", 0.85, 1.15);
             self.run_to(i, goal.clamp(lo, hi), tn().tag_run * pace * knack);
+            self.pick_park_y(i, None);
             // backed into the end with "it" right there: over its head
             let cornered = (away > 0.0 && hi - x < 90.0) || (away < 0.0 && x - lo < 90.0);
             if cornered && on_ground && d.abs() < tn().tag_leap_range && pace >= tn().tag_leap_pace {
@@ -5159,6 +5604,10 @@ impl CharacterOverlay {
         let ahead = it_x + c.offset * 600.0;
         let knack = self.skilled(c.it, "tag", 0.85, 1.15);
         self.run_to(c.it, if held { ahead.clamp(lo, hi) } else { ahead }, tn().tag_it * pace * knack);
+        if self.place_here(c.it).is_some() {
+            let cy = self.walk_ref(c.chase).park_y.clamp(0.06, super::park::MEADOW * 0.85);
+            self.walk_of(c.it).park_target_y = cy;
+        }
     }
 
 
@@ -5376,6 +5825,11 @@ impl CharacterOverlay {
         }
         if !l.ready {
             l.ready = self.all_arrived(c);
+            if l.ready {
+                self.clear_happy(&c.members);
+            } else {
+                self.chatter(c, dt);
+            }
             c.long = Some(l);
             return;
         }
@@ -5505,6 +5959,7 @@ impl CharacterOverlay {
             Stage::Long => "long jump",
             Stage::Domino => "domino",
             Stage::Tug => "tug of war",
+            Stage::Wrestle => "wrestling",
             Stage::Tag => "tag",
             Stage::Carrot => "carrot grab",
             Stage::Gift => "gift",
@@ -5514,6 +5969,79 @@ impl CharacterOverlay {
             Stage::Fishing => "fishing",
             Stage::Concert => "concert",
             _ => "",
+        }
+    }
+
+    fn game_has_reward(stage: Stage, step: u8) -> bool {
+        step != 9 && !Self::game_name(stage).is_empty() && !matches!(stage, Stage::Gift | Stage::Concert)
+    }
+
+    fn pick_random_from(pool: &[usize], roll: f32, has_unfound: impl Fn(usize) -> bool) -> Option<usize> {
+        if pool.is_empty() {
+            return None;
+        }
+        let unfound: Vec<usize> = pool.iter().copied().filter(|&i| has_unfound(i)).collect();
+        let choices = if unfound.is_empty() { pool } else { unfound.as_slice() };
+        Some(choices[(roll.clamp(0.0, 0.999999) * choices.len() as f32) as usize % choices.len()])
+    }
+
+    fn pick_top_winner(members: &[usize], scores: &[(usize, f32)], roll: f32, has_unfound: impl Fn(usize) -> bool) -> Option<usize> {
+        let best = scores.iter().filter(|s| s.1 > 0.0 && members.contains(&s.0)).map(|s| s.1).reduce(f32::max)?;
+        let tied: Vec<usize> = scores
+            .iter()
+            .filter(|s| s.1 >= best - 1e-4 && members.contains(&s.0))
+            .map(|s| s.0)
+            .collect();
+        Self::pick_random_from(&tied, roll, has_unfound)
+    }
+
+    fn has_unfound(&self, i: usize) -> bool {
+        let name = self.character_name(i);
+        super::wear::unfound(&name, 0.0).is_some()
+    }
+
+    /// Gives `who` an unlocked accessory, celebrates with confetti and a jump,
+    /// and shows the found item bobbing over its head.
+    pub(super) fn award_accessory(&mut self, who: usize) -> Option<usize> {
+        let name = self.character_name(who);
+        let roll = self.walk.rand();
+        let k = super::wear::unfound(&name, roll)?;
+        let (id, label, _, _) = super::wear::catalog_entry(k)?;
+        super::wear::give(&name, &id);
+        log::info!("accessory reward: {name} won {label} ({id})");
+        let r = if who == 0 { self.hit_rect } else if let Some(e) = self.extras.get(who - 1) { e.hit_rect } else { [0.0; 4] };
+        let x = self.strip_px(who);
+        self.moods.effects.push((FOUND + k as i32, who, x, r[1], 0.0, 4.5));
+        self.confetti(who);
+        let wk = self.walk_of(who);
+        if grounded(wk) {
+            wk.start_jump(tn().jump_height * 1.4);
+        }
+        let secs = tn().laugh_time * 1.5;
+        wk.laugh(secs);
+        if let Some(s) = wk.social.as_mut() {
+            s.happy = true;
+        }
+        Some(k)
+    }
+
+    fn maybe_reward_game(&mut self, c: &mut Chat, fixed: Option<usize>) {
+        if c.rewarded || !Self::game_has_reward(c.stage, c.step) {
+            return;
+        }
+        if self.walk.rand() >= tn().game_reward {
+            return;
+        }
+        let who = match fixed {
+            Some(w) => Some(w),
+            None => {
+                let roll = self.walk.rand();
+                Self::pick_random_from(&c.members, roll, |i| self.has_unfound(i))
+            }
+        };
+        if let Some(w) = who {
+            c.rewarded = true;
+            self.award_accessory(w);
         }
     }
 
@@ -5536,11 +6064,6 @@ impl CharacterOverlay {
                 c.stage = Stage::Part;
                 return;
             }
-        }
-        // a game works up an appetite
-        for &i in &c.members.clone() {
-            let wk = self.walk_of(i);
-            wk.hunger = (wk.hunger + 0.06).min(1.0);
         }
         let game = Self::game_name(c.stage);
         if !game.is_empty() && c.stage != Stage::Gift && c.stage != Stage::Concert {
@@ -5581,15 +6104,14 @@ impl CharacterOverlay {
                 }
             }
             c.winner = None;
-            self.game_loot(c);
             c.all_cheer = true;
             c.timer = tn().cheer_time;
             c.stage = Stage::Cheer;
+            self.maybe_reward_game(c, None);
             return;
         }
-        let best = c.scores.iter().filter(|s| s.1 > 0.0 && c.members.contains(&s.0)).max_by(|a, b| a.1.total_cmp(&b.1));
-        c.winner = best.map(|s| s.0);
-        self.game_loot(c);
+        let roll = self.walk.rand();
+        c.winner = Self::pick_top_winner(&c.members, &c.scores, roll, |i| self.has_unfound(i));
         log::debug!("chat {}: game over, {:?} won of {:?}", c.id, c.winner, c.scores);
         if let Some(w) = c.winner {
             c.talker = w;
@@ -5600,27 +6122,10 @@ impl CharacterOverlay {
             c.timer = tn().cheer_time;
             c.bob = 0.0;
             c.stage = Stage::Cheer;
+            self.maybe_reward_game(c, Some(w));
         } else {
+            self.maybe_reward_game(c, None);
             self.talk_it_over(c);
-        }
-    }
-
-    /// Something for the park's chest out of a game: the winner likely, the
-    /// others now and then (fishing has its own catches).
-    fn game_loot(&mut self, c: &Chat) {
-        if c.stage == Stage::Fishing || c.stage == Stage::Practice {
-            return;
-        }
-        for &i in &c.members.clone() {
-            let chance = if Some(i) == c.winner { tn().game_material } else { tn().game_material_all };
-            if self.walk.rand() >= chance {
-                continue;
-            }
-            let k = (self.walk.rand() * super::park::MATERIALS.len() as f32) as usize % super::park::MATERIALS.len();
-            let name = self.character_name(i);
-            super::park::add(&name, super::park::MATERIALS[k].0);
-            log::debug!("chat {}: {name} gets {} from the game", c.id, super::park::MATERIALS[k].1);
-            self.walk_of(i).start_bob(tn().jump_height * 0.2);
         }
     }
 
@@ -5754,7 +6259,7 @@ impl CharacterOverlay {
             Game::Tag => 7,
             Game::Blind => 10,
             Game::Fishing => 13,
-            Game::Tug => 3,
+            Game::Tug | Game::Wrestle => 3,
             _ => 15,
         }
     }
@@ -5766,9 +6271,6 @@ impl CharacterOverlay {
         log::debug!("chat {}: part", c.id);
         let width = self.strip_width_of(c.members[0]);
         let (lo, hi) = (tn().edge_px.min(width * 0.5), (width - tn().edge_px).max(width * 0.5));
-        // at the farm: on dry land, not off into the pond
-        let land = self.dry_land(c.members[0]);
-        let (lo, hi) = if land.0.max(lo) < land.1.min(hi) { (land.0.max(lo), land.1.min(hi)) } else { (lo, hi) };
         let mean = c.members.iter().map(|&i| self.strip_px(i)).sum::<f32>() / c.members.len() as f32;
         let ws = self.walk_ref(c.members[0]).ws;
         // where other groups on this workspace are standing
@@ -5883,6 +6385,8 @@ impl CharacterOverlay {
                         self.talk_length()
                     };
                     self.start_talk(c, length);
+                } else {
+                    self.chatter(c, dt);
                 }
             }
             Stage::Talk => {
@@ -5909,8 +6413,6 @@ impl CharacterOverlay {
                     let keen = self.fewness(c.members[0]).min(1.6);
                     if self.walk.rand() >= tn().game_chance * keen * if pair_only { tn().tug_pair_chance } else { 1.0 } {
                         c.quiet = -2.0 * tn().game_after;
-                    } else if self.to_park(c) {
-                        return true;
                     } else if self.next_game(c) {
                         c.games += 1;
                         c.quiet = 0.0;
@@ -5951,12 +6453,15 @@ impl CharacterOverlay {
                 };
                 match c.step {
                     // its turn, right where it stands: everyone looks
+                    0 if !self.all_arrived(c) => self.chatter(c, dt),
                     0 if c.wait <= 0.0 => {
+                        for &m in &c.members {
+                            if let Some(r) = self.walk_of(m).social.as_mut() {
+                                r.happy = m == i;
+                            }
+                        }
                         c.talker = i;
                         self.look_at_talker(c);
-                        if let Some(r) = self.walk_of(i).social.as_mut() {
-                            r.happy = true;
-                        }
                         c.wait = 0.35;
                         c.step = 1;
                     }
@@ -5995,7 +6500,26 @@ impl CharacterOverlay {
                 for k in 0..c.members.len() {
                     let i = c.members[k];
                     let x = self.strip_px(i);
+                    let cursor_y = if let Some(p) = self.place_here(i) {
+                        let rect = if i == 0 { self.hit_rect } else { self.extras[i - 1].hit_rect };
+                        if rect[3] > rect[1] {
+                            let opaque = if i == 0 { self.opaque } else { self.extras[i - 1].opaque };
+                            let ch = rect[3] - rect[1];
+                            let air_px = self.walk_ref(i).air * ch * 0.5;
+                            let up_px = self.walk_ref(i).park_y * p.h;
+                            let ground_y = rect[1] + ch * opaque[2] + air_px + up_px;
+                            let lane = (k as f32 - (count - 1.0) * 0.5) * 0.05;
+                            Some(((ground_y - mouse[1]) / p.h.max(1.0) + lane).clamp(0.06, super::park::MEADOW * 0.85))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let wk = self.walk_of(i);
+                    if let Some(y) = cursor_y {
+                        wk.park_target_y = y;
+                    }
                     // seconds hanging off the cursor are the score
                     if wk.act == Act::Held && wk.hang > 0.0 {
                         if let Some(s) = c.scores.iter_mut().find(|s| s.0 == i) {
@@ -6028,6 +6552,7 @@ impl CharacterOverlay {
                 self.run_concert(c, dt);
             }
             Stage::Tug => self.run_tug(c, dt, mouse),
+            Stage::Wrestle => self.run_wrestle(c, dt),
             Stage::Tag => self.run_tag(c, dt),
             Stage::Carrot => self.run_carrot(c, dt),
             Stage::Gift => self.run_gift(c, dt),
@@ -6103,5 +6628,55 @@ impl CharacterOverlay {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod game_pick_tests {
+    use super::*;
+
+    #[test]
+    fn volley_waits_for_large_groups_while_tag_and_carrot_stay_small() {
+        let small = CharacterOverlay::game_pool(&[], 3, 0.0);
+        assert!(small.iter().any(|(g, _)| *g == Game::Tag));
+        assert!(small.iter().any(|(g, _)| *g == Game::Carrot));
+        assert!(!small.iter().any(|(g, _)| *g == Game::Volley));
+
+        let six = CharacterOverlay::game_pool(&[], 6, 0.0);
+        assert!(!six.iter().any(|(g, _)| *g == Game::Volley));
+
+        let seven = CharacterOverlay::game_pool(&[], 7, 0.0);
+        let total: f32 = seven.iter().map(|(_, w)| w).sum();
+        let volley = seven.iter().find(|(g, _)| *g == Game::Volley).map(|(_, w)| *w).unwrap_or(0.0);
+        assert!(volley > 0.0 && volley / total < 0.25);
+        assert!(seven.iter().any(|(g, _)| *g == Game::Wrestle));
+        assert!(!small.iter().any(|(g, _)| *g == Game::Wrestle));
+    }
+
+    #[test]
+    fn reward_picks_random_winning_teammate_or_participant_and_skips_unplayed() {
+        assert!(CharacterOverlay::game_has_reward(Stage::Contest, 0));
+        assert!(CharacterOverlay::game_has_reward(Stage::Wrestle, 0));
+        assert!(CharacterOverlay::game_has_reward(Stage::Tag, 0));
+        assert!(CharacterOverlay::game_has_reward(Stage::Samba, 0));
+        assert!(!CharacterOverlay::game_has_reward(Stage::Volley, 9));
+        assert!(!CharacterOverlay::game_has_reward(Stage::Wrestle, 9));
+        assert!(!CharacterOverlay::game_has_reward(Stage::Gift, 0));
+        assert!(!CharacterOverlay::game_has_reward(Stage::Concert, 0));
+        assert!(!CharacterOverlay::game_has_reward(Stage::Practice, 0));
+
+        // Single top scorer always wins even when already owning everything.
+        let members = [0, 1, 2];
+        let single = [(0, 1.0), (1, 2.5), (2, 1.5)];
+        assert_eq!(CharacterOverlay::pick_top_winner(&members, &single, 0.1, |_| false), Some(1));
+
+        // Team tie (e.g. Tug / Volley) picks randomly among winning teammates with unfound items.
+        let team = [(0, 1.0), (1, 0.0), (2, 1.0), (3, 0.0), (4, 1.0)];
+        assert_eq!(CharacterOverlay::pick_top_winner(&[0, 1, 2, 3, 4], &team, 0.0, |i| i != 0), Some(2));
+        assert_eq!(CharacterOverlay::pick_top_winner(&[0, 1, 2, 3, 4], &team, 0.9, |i| i != 0), Some(4));
+
+        // Winnerless group game picks one random participant, preferring unfound items.
+        assert_eq!(CharacterOverlay::pick_random_from(&[10, 20, 30], 0.1, |i| i == 20 || i == 30), Some(20));
+        assert_eq!(CharacterOverlay::pick_random_from(&[10, 20, 30], 0.9, |i| i == 20 || i == 30), Some(30));
     }
 }

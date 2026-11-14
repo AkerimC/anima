@@ -60,7 +60,20 @@ impl CharacterOverlay {
             let down = crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed);
             let now = self.start.elapsed().as_secs_f32();
             if !down {
-                self.press = None;
+                if let Some((_, _, Some((i, _)))) = self.press.take() {
+                    let a = if i == 0 { &mut *self } else { &mut self.extras[i - 1] };
+                    if a.walk.sign.is_some_and(super::sign::is_hug)
+                        && a.walk.act == Act::Idle
+                        && a.walk.race.is_none()
+                        && !a.walk.social.is_some_and(|s| s.no_touch || s.no_pat)
+                        && a.touching()
+                    {
+                        let mx = a.scene_mouse()[0];
+                        let cx = (a.hit_rect[0] + a.hit_rect[2]) * 0.5;
+                        a.walk.left = mx < cx;
+                        a.walk.start_hug();
+                    }
+                }
             } else if self.press.is_none() {
                 let [mx, my] = info.mouse;
                 let hit = |a: &CharacterOverlay| a.touching() && !a.walk.social.is_some_and(|s| s.no_touch);
@@ -96,6 +109,8 @@ impl CharacterOverlay {
                             a.walk.jump = 0.0;
                         }
                         a.walk.act = Act::Held;
+                        a.walk.petted = 0.0;
+                        a.walk.hug = 0.0;
                         a.walk.grab = Some(grab);
                         // carries on from the angle and spin it had
                         let pi = std::f32::consts::PI;
@@ -111,6 +126,10 @@ impl CharacterOverlay {
                         a.walk.held_prev = None;
                         a.walk.vx = 0.0;
                         a.walk.vy = 0.0;
+                        a.walk.shake = 0.0;
+                        a.walk.shaken = false;
+                        a.walk.jolted = false;
+                        a.walk.impact_dir = None;
                     }
                     self.press = Some((t0, at, None));
                 }
@@ -137,7 +156,7 @@ impl CharacterOverlay {
                     if a.walk.petted > 0.0 && a.touching() {
                         a.walk.petted = tn().pat_distract;
                     }
-                    if a.walk.act == Act::Pat && a.touching() {
+                    if a.walk.act == Act::Pat && a.walk.hug <= 0.0 && a.touching() {
                         a.walk.timer = a.walk.timer.max(tn().pat_keep);
                         a.patted_again = true;
                     }
@@ -162,8 +181,12 @@ impl CharacterOverlay {
             let hit = self.topmost(|a| a.touching());
             if let Some(i) = hit.filter(|&i| !self.dancing(i)) {
                 if grounded(self.walk_ref(i)) && self.walk_ref(i).race.is_none() {
-                    self.walk_of(i).start_pat();
-                    self.gather_for_pat(i);
+                    if self.walk_ref(i).sign.is_some_and(super::sign::is_hug) {
+                        self.walk_of(i).start_hug();
+                    } else {
+                        self.walk_of(i).start_pat();
+                        self.gather_for_pat(i);
+                    }
                 } else if !matches!(self.walk_ref(i).act, Act::Held) {
                     // busy in a game or a race: a happy moment, and it carries on
                     self.walk_of(i).petted = tn().pat_distract;
@@ -246,7 +269,14 @@ impl CharacterOverlay {
     }
 
     /// Held: follow the cursor; let go: fall back down (thrown).
-    pub(super) fn carry(&mut self, info: &FrameInfo, dt: f32, center_clip: [f32; 2], half_clip: [f32; 2]) {
+    pub(super) fn carry(
+        &mut self,
+        info: &FrameInfo,
+        dt: f32,
+        center_clip: [f32; 2],
+        half_clip: [f32; 2],
+        park_h: f32,
+    ) {
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         let [view, extra] = self.own_view;
         let mx = (info.mouse[0] / w) * 2.0 - 1.0;
@@ -265,12 +295,27 @@ impl CharacterOverlay {
                 let right_room = 1.0 - (center_clip[0] + half_clip[0]) + view;
                 self.walk.x = (mx - grab[0] - center_clip[0] + view).clamp(left_room, right_room);
                 self.walk.target = self.walk.x;
-                self.walk.air = ((my - grab[1] - center_clip[1]) / half_clip[1]).max(0.0);
+                let raw_air = (my - grab[1] - center_clip[1]) / half_clip[1];
+                let (air, ground_slide) = apply_vertical_drag(
+                    &mut self.walk.park_y,
+                    &mut self.walk.park_target_y,
+                    raw_air,
+                    half_clip[1],
+                    h,
+                    park_h,
+                );
+                self.walk.air = air;
                 // throw speed: smoothed motion while held
                 if let Some((px, pa)) = self.walk.held_prev {
                     let k = (dt * 12.0).min(1.0);
                     self.walk.vx += ((self.walk.x - px) / dt - self.walk.vx) * k;
-                    self.walk.vy += ((self.walk.air - pa) / dt - self.walk.vy) * k;
+                    if ground_slide {
+                        self.walk.vy = 0.0;
+                    } else {
+                        self.walk.vy += ((self.walk.air - pa) / dt - self.walk.vy) * k;
+                    }
+                } else if ground_slide {
+                    self.walk.vy = 0.0;
                 }
                 self.walk.held_prev = Some((self.walk.x, self.walk.air));
                 // held up, by hand or hanging on: a pendulum on the grip, swung
@@ -352,7 +397,18 @@ impl CharacterOverlay {
                     }
                 }
                 if self.walk.air <= 0.0 {
-                    let hard = self.walk.vy <= -(2.0 * tn().gravity * tn().fall_high).sqrt();
+                    let hard_vy = -(2.0 * tn().gravity * tn().fall_high).sqrt();
+                    let hard = self.walk.vy <= hard_vy;
+                    let thrown = !self.walk.social.is_some_and(|s| s.flying || s.no_pat);
+                    let impact = if thrown {
+                        landing_impact(self.walk.vx, self.walk.vy, self.walk.tumble, std::mem::take(&mut self.walk.shaken), hard_vy)
+                    } else {
+                        self.walk.shaken = false;
+                        None
+                    };
+                    if let Some(dir) = impact {
+                        self.walk.impact_dir = Some(dir);
+                    }
                     self.walk.air = 0.0;
                     self.walk.vx = 0.0;
                     self.walk.vy = 0.0;
@@ -416,6 +472,10 @@ impl CharacterOverlay {
                 wk.held_prev = None;
                 wk.vx = 0.0;
                 wk.vy = 0.0;
+                wk.shake = 0.0;
+                wk.shaken = false;
+                wk.jolted = false;
+                wk.impact_dir = None;
             }
         }
     }
@@ -426,9 +486,116 @@ impl CharacterOverlay {
         let r = self.hit_rect;
         const M: f32 = 12.0;
         if self.walk.act == Act::Pat
+            && self.walk.hug <= 0.0
             && !(mx >= r[0] - M && mx <= r[2] + M && my >= r[1] - M && my <= r[3] + M)
         {
             self.walk.start_jump(tn().jump_height * 0.5);
         }
+    }
+}
+
+/// Maps a vertical drag delta (`raw_air`) to `(air, ground_slide)`:
+/// - `raw_air >= 0.0`: lifts into the air (`air = raw_air`), leaving `park_y` intact.
+/// - `raw_air < 0.0` inside Anima Park (`park_h > 0.0`): slides `park_y` (and `park_target_y`)
+///   down toward `0.0` with `air = 0.0` and `ground_slide = true`.
+/// - `raw_air < 0.0` outside the park: clamps `air` to `0.0`.
+fn apply_vertical_drag(
+    park_y: &mut f32,
+    park_target_y: &mut f32,
+    raw_air: f32,
+    half_clip_y: f32,
+    surface_h: f32,
+    park_h: f32,
+) -> (f32, bool) {
+    if raw_air >= 0.0 {
+        return (raw_air, false);
+    }
+    if park_h > 0.0 {
+        let delta_park_y = raw_air * half_clip_y * surface_h / (2.0 * park_h.max(1.0));
+        *park_y = (*park_y + delta_park_y).clamp(0.0, super::park::MEADOW);
+        *park_target_y = *park_y;
+        return (0.0, true);
+    }
+    (0.0, false)
+}
+
+/// Returns an item-scatter direction when a throw/fall ends on ground impact
+/// (hard drop, fast sideways slam, heavy spin, or shaken hard while held).
+fn landing_impact(vx: f32, vy: f32, tumble: f32, shaken: bool, hard_vy: f32) -> Option<f32> {
+    if !shaken && vy > hard_vy && vx.abs() <= 1.35 && tumble.abs() <= 8.5 {
+        return None;
+    }
+    Some(if vx.abs() > 0.1 {
+        vx.signum()
+    } else if tumble.abs() > 0.5 {
+        -tumble.signum()
+    } else {
+        0.0
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn park_vertical_drag_lowers_depth_and_preserves_lift() {
+        let mut park_y = 0.45;
+        let mut park_target_y = 0.60;
+
+        // Dragging down in Anima Park lowers park_y and syncs park_target_y
+        let (air, ground_slide) = apply_vertical_drag(
+            &mut park_y,
+            &mut park_target_y,
+            -0.5,
+            0.12,
+            1000.0,
+            600.0,
+        );
+        assert_eq!(air, 0.0);
+        assert!(ground_slide);
+        assert!((park_y - 0.40).abs() < 1e-6, "got park_y={park_y}");
+        assert_eq!(park_target_y, park_y);
+
+        // Dragging further down clamps cleanly at 0.0
+        let (air, ground_slide) = apply_vertical_drag(
+            &mut park_y,
+            &mut park_target_y,
+            -10.0,
+            0.12,
+            1000.0,
+            600.0,
+        );
+        assert_eq!(air, 0.0);
+        assert!(ground_slide);
+        assert_eq!(park_y, 0.0);
+        assert_eq!(park_target_y, 0.0);
+
+        // Dragging up lifts into the air and leaves park_y / park_target_y unchanged
+        park_y = 0.25;
+        park_target_y = 0.25;
+        let (air, ground_slide) = apply_vertical_drag(
+            &mut park_y,
+            &mut park_target_y,
+            0.8,
+            0.12,
+            1000.0,
+            600.0,
+        );
+        assert!((air - 0.8).abs() < 1e-6);
+        assert!(!ground_slide);
+        assert_eq!(park_y, 0.25);
+        assert_eq!(park_target_y, 0.25);
+    }
+
+    #[test]
+    fn landing_impact_fires_on_slam_or_shake_not_gentle_putdown() {
+        let hard_vy = -12.0;
+        assert_eq!(landing_impact(0.0, -2.0, 0.0, false, hard_vy), None);
+        assert_eq!(landing_impact(0.5, -5.0, 3.0, false, hard_vy), None);
+        assert_eq!(landing_impact(2.4, -3.0, 0.0, false, hard_vy), Some(1.0));
+        assert_eq!(landing_impact(-2.0, -3.0, 0.0, false, hard_vy), Some(-1.0));
+        assert_eq!(landing_impact(0.0, -14.0, 6.0, false, hard_vy), Some(-1.0));
+        assert_eq!(landing_impact(0.0, -1.0, 0.0, true, hard_vy), Some(0.0));
     }
 }

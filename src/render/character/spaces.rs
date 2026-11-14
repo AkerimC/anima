@@ -621,14 +621,14 @@ impl CharacterOverlay {
         let surface = self.actor_ref(i).surface[0].max(1.0);
         let wk = self.walk_of(i);
         wk.target = wk.x + (px - here) * 2.0 / surface;
+        wk.park_target_y = wk.rand() * super::park::MEADOW;
         wk.act = Act::Walk;
         wk.timer = 3.0;
     }
 
-    /// The park, cafe and farm are open and home: everyone lives there,
-    /// walking from one to another now and then (or travelling, if one is on
-    /// another workspace); in mode 2 a few go out to the other workspaces and
-    /// come back after a while.
+    /// Anima Park is open and home: everyone lives there (or travelling, if one
+    /// is on another workspace); in mode 2 a few go out to the other workspaces
+    /// and come back after a while.
     fn park_roam(&mut self, n: usize, homes: &[u64]) {
         let places = governor::places();
         if places.is_empty() {
@@ -640,83 +640,21 @@ impl CharacterOverlay {
             wk.at_leisure() && wk.trip.is_none() && !wk.visiting && !wk.backstage
         };
         let in_place = |this: &Self, i: usize| governor::place_at(this.walk_ref(i).ws, this.strip_px(i)).map(|p| p.place);
-        let count = |this: &Self, p: &governor::Place| (0..n).filter(|&i| in_place(this, i).as_deref() == Some(p.place.as_str()) || this.heading_to(i) == Some(p.ws) && places.iter().filter(|q| q.ws == p.ws).count() == 1).count();
-        let emptiest = |this: &Self| places.iter().min_by_key(|p| count(this, p)).cloned().unwrap_or_else(|| places[0].clone());
         let only = tn().park_mode < 1.5;
-        // out long enough (or not allowed out at all): back to the least crowded place
+        // out long enough (or not allowed out at all): back to the park
         let back = (0..n).find(|&i| free(self, i) && !homes.contains(&self.walk_ref(i).ws) && (only || self.walk_ref(i).here_t >= tn().park_out_stay));
         if let Some(i) = back {
             if moving < tn().ws_max as usize {
-                let to = emptiest(self);
+                let to = &places[0];
                 log::debug!("park: {i} goes back to the {}", to.place);
                 self.send_to(i, to.ws);
             }
             return;
         }
-        // on the right workspace but not in any of them (beside another window): in it goes
+        // on the right workspace but not in the park (beside another window): in it goes
         if let Some(i) = (0..n).find(|&i| free(self, i) && homes.contains(&self.walk_ref(i).ws) && in_place(self, i).is_none() && self.walk_ref(i).act == Act::Idle) {
-            if let Some(p) = places.iter().filter(|p| p.ws == self.walk_ref(i).ws).min_by(|a, b| (a.x + a.w * 0.5 - self.strip_px(i)).abs().total_cmp(&(b.x + b.w * 0.5 - self.strip_px(i)).abs())).cloned() {
+            if let Some(p) = places.iter().find(|p| p.ws == self.walk_ref(i).ws).cloned() {
                 self.walk_into(i, &p);
-            }
-        }
-        // someone with a job heads to where it's done, now and then
-        if places.len() >= 2 && self.walk.rand() < 1.0 / 40.0 {
-            let worker = (0..n).filter(|&i| free(self, i) && self.walk_ref(i).here_t >= 20.0).find_map(|i| {
-                let job = super::park::job_of(&self.character_name(i))?;
-                let at = super::park::JOBS.iter().find(|j| j.0 == job)?.2;
-                let to = places.iter().find(|p| p.place == at)?.clone();
-                (in_place(self, i).as_deref() != Some(at)).then_some((i, to))
-            });
-            if let Some((i, to)) = worker {
-                if self.walk_ref(i).ws == to.ws {
-                    log::debug!("park: {i} walks to work at the {}", to.place);
-                    self.walk_into(i, &to);
-                } else if moving < tn().ws_max as usize {
-                    self.send_to(i, to.ws);
-                }
-                return;
-            }
-        }
-        // the park is where they meet: someone idle in the cafe or on the
-        // farm (and not at work there) wanders over now and then
-        if let Some(park) = places.iter().find(|p| p.place == "park").cloned() {
-            if self.walk.rand() < 1.0 / tn().park_meet_every.max(1.0) {
-                let pick = (0..n).find(|&i| {
-                    let job_here = super::park::job_of(&self.character_name(i)).and_then(|j| super::park::JOBS.iter().find(|x| x.0 == j).map(|x| x.2)) == in_place(self, i).as_deref();
-                    free(self, i) && self.walk_ref(i).here_t >= 30.0 && in_place(self, i).is_some_and(|p| p != "park") && !job_here
-                });
-                if let Some(i) = pick {
-                    if self.walk_ref(i).ws == park.ws {
-                        log::debug!("park: {i} wanders over to the park");
-                        self.walk_into(i, &park);
-                    } else if moving < tn().ws_max as usize {
-                        self.send_to(i, park.ws);
-                    }
-                    return;
-                }
-            }
-        }
-        // from one to another: an empty one gets someone soon
-        if places.len() >= 2 {
-            let lonely = places.iter().any(|p| count(self, p) == 0);
-            let every = if lonely { 15.0 } else { tn().park_move_every.max(1.0) };
-            if self.walk.rand() < 1.0 / every {
-                let to = if lonely { emptiest(self) } else { places[(self.walk.rand() * places.len() as f32) as usize % places.len()].clone() };
-                let pool: Vec<usize> = (0..n)
-                    .filter(|&i| free(self, i) && self.walk_ref(i).here_t >= 30.0)
-                    .filter(|&i| in_place(self, i).is_some_and(|p| p != to.place && places.iter().find(|q| q.place == p).is_some_and(|q| count(self, q) >= 2)))
-                    .collect();
-                if !pool.is_empty() {
-                    let i = pool[(self.walk.rand() * pool.len() as f32) as usize % pool.len()];
-                    if self.walk_ref(i).ws == to.ws {
-                        log::debug!("park: {i} walks over to the {}", to.place);
-                        self.walk_into(i, &to);
-                    } else if moving < tn().ws_max as usize {
-                        log::debug!("park: {i} goes over to the {}", to.place);
-                        self.send_to(i, to.ws);
-                    }
-                    return;
-                }
             }
         }
         if only || moving >= tn().ws_max as usize {

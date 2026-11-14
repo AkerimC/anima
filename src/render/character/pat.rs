@@ -15,12 +15,18 @@ pub(super) struct PatCrowd {
     // walking back to `home`
     back: bool,
     face_left: bool,
+    // true for friends gathered for petting, false for window curiosity
+    patting: bool,
 }
 
 impl PatCrowd {
     /// Going to have a look at something, not waiting for petting.
     pub(super) fn curious(goal: f32, home: f32, linger: f32, face_left: bool) -> Self {
-        Self { goal, home, linger, back: false, face_left }
+        Self { goal, home, linger, back: false, face_left, patting: false }
+    }
+
+    pub(super) fn is_pat(&self) -> bool {
+        !self.back && self.patting
     }
 }
 
@@ -137,6 +143,7 @@ impl CharacterOverlay {
             (0..n).filter(|&i| this.walk_ref(i).crowd.is_some_and(|c| !c.back && c.face_left == on_right)).count()
         };
         let (mut left, mut right) = (waiting(self, false), waiting(self, true));
+        let anchor_y = self.place_here(p).map(|_| self.walk_ref(p).park_y);
         for (_, i) in joiners {
             let from = middle(self.box_of(i));
             let Some((on_right, place)) = slot(from, anchor, left, right, tn().pat_side_max as usize) else { continue };
@@ -151,9 +158,15 @@ impl CharacterOverlay {
             } else {
                 left = place;
             }
+            let in_park = self.place_here(i).is_some();
             let wk = self.walk_of(i);
             let goal = wk.x + walk;
-            wk.crowd = Some(PatCrowd { goal, home: wk.x, linger: tn().pat_linger, back: false, face_left: on_right });
+            if in_park {
+                if let Some(y) = anchor_y {
+                    wk.park_target_y = y;
+                }
+            }
+            wk.crowd = Some(PatCrowd { goal, home: wk.x, linger: tn().pat_linger, back: false, face_left: on_right, patting: true });
         }
     }
 
@@ -173,7 +186,7 @@ mod tests {
 
     fn waiter(x: f32, goal: f32) -> WalkState {
         let mut wk = WalkState { act: Act::Idle, timer: 100.0, seed: 5, x, target: x, ..Default::default() };
-        wk.crowd = Some(PatCrowd { goal, home: x, linger: 1.0, back: false, face_left: true });
+        wk.crowd = Some(PatCrowd { goal, home: x, linger: 1.0, back: false, face_left: true, patting: true });
         wk
     }
 

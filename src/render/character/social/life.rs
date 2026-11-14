@@ -15,6 +15,7 @@ pub(super) fn stage_limit(stage: Stage) -> f32 {
         Stage::Part | Stage::Cheer => 60.0,
         Stage::RaceWait | Stage::Concert => 600.0,
         Stage::Fishing => t.fish_time + 120.0,
+        Stage::Wrestle => 180.0,
         Stage::Play => 900.0,
         _ => t.chat_max,
     }
@@ -34,9 +35,6 @@ impl CharacterOverlay {
     /// The chat is over: everyone in it and watching it goes.
     pub(super) fn finish(&mut self, c: &Chat, n: usize) {
         let big = c.members.len() >= tn().big_group as usize;
-        if let Some(h) = c.host.filter(|&h| h < n) {
-            self.leave(h, c.id);
-        }
         for &i in c.watchers.iter().filter(|&&i| i < n) {
             self.leave(i, c.id);
         }
@@ -105,7 +103,7 @@ pub(super) struct Allows {
 pub(super) fn allows(stage: Stage) -> Allows {
     let talk = matches!(stage, Stage::Notice | Stage::Approach | Stage::Talk | Stage::Stroll | Stage::Part | Stage::Cheer);
     Allows {
-        lean: stage == Stage::Tug,
+        lean: matches!(stage, Stage::Tug | Stage::Wrestle | Stage::Play),
         // up on a net, a box, a seat or a jetty
         perched: matches!(stage, Stage::Volley | Stage::Gift | Stage::Play | Stage::Fishing),
         game_flags: !talk,

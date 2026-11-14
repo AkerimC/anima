@@ -797,17 +797,6 @@ pub(super) fn prop_image(kind: i32) -> Option<std::path::PathBuf> {
     use std::time::{Duration, Instant};
     // something to wear, found on a fishing line: its own picture, or the
     // props folder's for its drawn kind
-    if kind >= super::social::COIN {
-        return Some(super::park::food_picture("coin")).filter(|p| p.exists());
-    }
-    if kind >= super::social::FOOD {
-        let (id, _, _) = super::park::DISHES.get((kind - super::social::FOOD) as usize)?;
-        return Some(super::park::food_picture(id)).filter(|p| p.exists());
-    }
-    if kind >= super::social::MATERIAL {
-        let (id, _) = super::park::MATERIALS.get((kind - super::social::MATERIAL) as usize)?;
-        return Some(super::park::picture(id)).filter(|p| p.exists());
-    }
     if kind >= super::social::FISH {
         return sea_picture(kind);
     }
@@ -941,7 +930,11 @@ impl CharacterOverlay {
     pub(super) fn draw_carrot(&mut self, gl: &glow::Context, info: &FrameInfo, target: &mut dyn ActorTarget) {
         let (w, h) = (info.width.max(1) as f32, info.height.max(1) as f32);
         // (kind, surface box, mirrored, turned by, where)
-        let mut props: Vec<_> = self.props().into_iter().filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, 0.0f32, z, None::<std::path::PathBuf>))).collect();
+        let mut props: Vec<_> = self
+            .props()
+            .into_iter()
+            .filter_map(|p| self.placed(p.3).map(|z| (p.0, p.1, p.2, 0.0f32, z, (p.0 == 100).then(super::sign::hug_heart).flatten())))
+            .collect();
         // dropped things, turning as they fall
         for l in &self.moods.loose {
             let Some(a) = (if l.owner == 0 { Some(&*self) } else { self.extras.get(l.owner - 1) }) else { continue };

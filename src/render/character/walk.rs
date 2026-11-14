@@ -68,20 +68,17 @@ pub(super) struct WalkState {
     pub(super) gesture: bool,
     // social energy, see social.rs
     pub(super) energy: f32,
-    // how hungry, 0 (full) to 1 (starving): work and time make it, food mends it
-    pub(super) hunger: f32,
-    // just eaten: seconds before it wants food again (work and games make it pass quicker)
-    pub(super) full: f32,
-    // chef or waiter off duty for a meal
-    pub(super) on_break: bool,
-    // over in the park, cafe or farm for a reason (play.rs, visit), for how
-    // long, where from; the mealtime it last went to eat at
+    // over in the park for a reason (visit.rs), for how long, where from
     pub(super) visit_for: u8,
     pub(super) visit_t: f32,
     pub(super) visit_from: u64,
-    pub(super) fed_meal: u32,
-    // standing about doing nothing in the park, cafe or farm (s)
+    // standing about doing nothing in the park (s)
     pub(super) idle_t: f32,
+    // depth into the park meadow (0 at the bottom .. park::MEADOW at the back)
+    pub(super) park_y: f32,
+    pub(super) park_target_y: f32,
+    // crowd scale inside the park (1.0 when few, smaller for 20-30 characters)
+    pub(super) park_crowd: f32,
     // turned (radians) and sunk into the ground (half-heights)
     pub(super) rot: f32,
     // characters on the team
@@ -145,6 +142,10 @@ pub(super) struct WalkState {
     // shook its umbrella out of its hand, and how hard it's been swung (s)
     pub(super) lost: Vec<String>,
     pub(super) shake: f32,
+    // swung violently while held; triggers item drop when the throw finishes
+    pub(super) shaken: bool,
+    // non-zero impact direction from landing hard / fast throw, triggers drop once
+    pub(super) impact_dir: Option<f32>,
     // what it does with its umbrella now (social.rs, umbrella_mode), and
     // whether one is open over it (it then floats down slowly)
     pub(super) brolly: u8,
@@ -181,10 +182,10 @@ pub(super) struct WalkState {
     pub(super) fish_cool: f32,
     // visiting a fullscreen app: gets a rod out once it's up
     pub(super) fish_on_arrival: bool,
-    // went to eat and found nothing: a nap once it's back home
-    pub(super) nap_on_arrival: bool,
     // petted while busy: a happy moment that doesn't stop what it's doing
     pub(super) petted: f32,
+    // reacting to accepting a "Hug?" sign: torso hug squeeze, then a joyful hop
+    pub(super) hug: f32,
     // waiting for its turn to be petted
     pub(super) crowd: Option<super::pat::PatCrowd>,
     // animation time not yet given to the 3D model (skipped frames)
@@ -231,7 +232,7 @@ impl WalkState {
         (self.seed >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    pub(super) fn pick(&mut self, min: f32, max: f32, can_chase: bool) {
+    pub(super) fn pick_in(&mut self, min: f32, max: f32, can_chase: bool, max_y: f32) {
         let t = tn();
         // in a panic: off to somewhere else at once, no standing about
         if self.fret {
@@ -240,6 +241,9 @@ impl WalkState {
                 to = if self.x < (min + max) * 0.5 { self.x + 0.5 } else { self.x - 0.5 };
             }
             self.target = to.clamp(min, max);
+            if max_y > 0.0 {
+                self.park_target_y = self.rand() * max_y;
+            }
             self.act = Act::Walk;
             return;
         }
@@ -260,6 +264,14 @@ impl WalkState {
             };
             let dir = if self.rand() < 0.5 { -1.0 } else { 1.0 };
             self.target = self.stroll_target(dir * dist, min, max);
+            if max_y > 0.0 {
+                let y = if self.rand() < 0.5 {
+                    self.park_y + (self.rand() - 0.5) * max_y * 0.8
+                } else {
+                    self.rand() * max_y
+                };
+                self.park_target_y = y.clamp(0.0, max_y);
+            }
             self.act = Act::Walk;
         } else if r < t.walk_chance + t.idle_chance {
             self.act = Act::Idle;
@@ -299,6 +311,15 @@ impl WalkState {
         self.jump = 0.0;
     }
 
+    pub(super) fn start_hug(&mut self) {
+        self.sign = None;
+        self.hug = 1.65;
+        self.act = Act::Pat;
+        self.timer = 0.72;
+        self.jump = 0.0;
+        self.energy = (self.energy + 0.12).min(1.0);
+    }
+
     /// Height of a jump `t` of the way through it (0..1, peak 1). Under an
     /// open umbrella it goes up quickly and drifts down slowly.
     pub(super) fn arc(&self, t: f32) -> f32 {
@@ -326,7 +347,39 @@ impl WalkState {
 
     /// Advance one frame. `mouse` is the cursor x relative to the anchor.
     /// Returns (offset, moving, jump height 0..1).
+    #[cfg(test)]
     pub(super) fn step(&mut self, dt: f32, min: f32, max: f32, mouse: Option<f32>, reach: f32) -> (f32, bool, f32) {
+        self.step_in(dt, min, max, mouse, reach, 0.0, 0.0)
+    }
+
+    /// Moves `park_y` smoothly toward `park_target_y` while grounded in the park.
+    fn step_park_y(&mut self, dt: f32, max_y: f32, y_per_clip: f32, speed: f32) -> bool {
+        if max_y <= 0.0 || y_per_clip <= 0.0 || self.social.is_some_and(|s| s.perched) {
+            return false;
+        }
+        self.park_target_y = self.park_target_y.clamp(0.0, max_y);
+        let dy = self.park_target_y - self.park_y;
+        if dy.abs() <= 0.0005 {
+            return false;
+        }
+        let step_y = speed * self.drag() * y_per_clip * dt;
+        if dy.abs() <= step_y {
+            self.park_y = self.park_target_y;
+            false
+        } else {
+            self.park_y += dy.signum() * step_y;
+            true
+        }
+    }
+
+    /// Advance one frame, including 2.5D depth when inside Anima Park
+    /// (`max_y > 0.0`, `y_per_clip` converting clip-width units to height share).
+    pub(super) fn step_in(&mut self, dt: f32, min: f32, max: f32, mouse: Option<f32>, reach: f32, max_y: f32, y_per_clip: f32) -> (f32, bool, f32) {
+        self.hug = (self.hug - dt).max(0.0);
+        if max_y <= 0.0 {
+            self.park_y = 0.0;
+            self.park_target_y = 0.0;
+        }
         if matches!(self.act, Act::Held | Act::Fall | Act::Planted | Act::Rest | Act::Travel) {
             return (self.x, false, 0.0);
         }
@@ -345,14 +398,24 @@ impl WalkState {
         if self.giggle > 0.0 && self.social.is_none() && self.race.is_none() && matches!(self.act, Act::Idle | Act::Walk) {
             return self.giggle_step(dt);
         }
-        if let Some(r) = self.crowd_step(dt, min, max) {
+        let speed = if self.crowd.is_some() {
+            tn().pat_crowd_speed.max(tn().walk_speed)
+        } else {
+            self.social.as_ref().map_or(tn().walk_speed, |r| if r.moving { r.speed.max(tn().walk_speed) } else { tn().walk_speed })
+        };
+        if let Some(mut r) = self.crowd_step(dt, min, max) {
+            r.1 |= self.step_park_y(dt, max_y, y_per_clip, speed);
             return r;
         }
         if let Some(r) = self.race_step(dt) {
             return r;
         }
-        if let Some(r) = self.social_step(dt) {
-            return r;
+        if self.social.is_some() {
+            let y_moving = self.step_park_y(dt, max_y, y_per_clip, speed);
+            if let Some(mut r) = self.social_step(dt) {
+                r.1 |= y_moving;
+                return r;
+            }
         }
         let mut moving = false;
         // circle drawn with the pointer: drop everything and chase it
@@ -374,7 +437,7 @@ impl WalkState {
                     self.timer = 0.0;
                 }
                 if self.timer <= 0.0 {
-                    self.pick(min, max, mouse.is_some());
+                    self.pick_in(min, max, mouse.is_some(), max_y);
                 }
             }
             Act::Walk | Act::Chase => {
@@ -394,28 +457,41 @@ impl WalkState {
                     tn().walk_speed
                 };
                 let d = self.target - self.x;
+                let dy = if !chase && max_y > 0.0 && y_per_clip > 0.0 {
+                    self.park_target_y = self.park_target_y.clamp(0.0, max_y);
+                    self.park_target_y - self.park_y
+                } else {
+                    0.0
+                };
+                let dy_eq = if y_per_clip > 0.0 { dy / y_per_clip } else { 0.0 };
+                let dist = d.hypot(dy_eq);
                 // close enough counts as caught, or a cursor circling fast
                 // keeps flipping the target left and right
                 let catch = if chase { tn().catch_radius } else { 0.0 };
-                if d.abs() <= speed * dt + catch {
+                if dist <= speed * dt + catch {
                     if !chase {
                         self.x = self.target;
+                        if max_y > 0.0 {
+                            self.park_y = self.park_target_y;
+                        }
                     }
                     if chase {
                         // caught it: jump up to the cursor, chase is over
                         self.start_jump(reach.max(tn().jump_height));
                         self.catch_jump = true;
                     } else {
-                        self.pick(min, max, mouse.is_some());
+                        self.pick_in(min, max, mouse.is_some(), max_y);
                     }
                 } else if chase && self.timer <= 0.0 {
-                    self.pick(min, max, false);
+                    self.pick_in(min, max, false, max_y);
                 } else {
                     // only turn around when the target is clearly on the other side
-                    if !chase || d.abs() > 0.1 {
+                    if (!chase || d.abs() > 0.1) && d.abs() > 0.005 {
                         self.left = d < 0.0;
                     }
-                    self.x += d.signum() * speed * dt;
+                    let inv = if dist > 1e-5 { speed * dt / dist } else { 0.0 };
+                    self.x += d * inv;
+                    self.park_y = (self.park_y + dy * inv).clamp(0.0, max_y.max(0.0));
                     self.energy = (self.energy + speed * dt / tn().energy_walk.max(0.01)).min(1.0);
                     moving = true;
                 }
@@ -424,8 +500,14 @@ impl WalkState {
             Act::Pat => {
                 self.timer -= dt;
                 if self.timer <= 0.0 {
-                    // happy little hop afterwards
-                    self.start_jump(tn().jump_height * 0.5);
+                    if self.hug > 0.0 {
+                        // joyful finish after a hug: hop and a quick giggle
+                        self.start_jump(tn().jump_height * 0.8);
+                        self.laugh(1.2);
+                    } else {
+                        // happy little hop afterwards
+                        self.start_jump(tn().jump_height * 0.5);
+                    }
                 }
             }
         }
@@ -442,5 +524,44 @@ impl WalkState {
             }
         }
         (self.x, moving, height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hug_sign_squeezes_then_hops_joyfully() {
+        assert!(super::super::sign::is_hug(super::super::sign::HUG));
+        assert!(!super::super::sign::is_hug(0));
+        let mut wk = WalkState::default();
+        wk.sign = Some(super::super::sign::HUG);
+        wk.energy = 0.5;
+        wk.start_hug();
+        assert!(wk.sign.is_none());
+        assert_eq!(wk.act, Act::Pat);
+        assert!(wk.hug > 1.0);
+        assert!(wk.energy > 0.5);
+        wk.step(0.8, -1.0, 1.0, None, 0.0);
+        assert_eq!(wk.act, Act::Jump);
+        assert!(wk.giggle > 0.0);
+    }
+
+    #[test]
+    fn crowd_aligns_park_y() {
+        let mut wk = WalkState {
+            act: Act::Idle,
+            x: 0.2,
+            target: 0.2,
+            park_y: 0.02,
+            park_target_y: 0.28,
+            crowd: Some(super::super::pat::PatCrowd::curious(0.2, 0.2, 2.0, false)),
+            ..Default::default()
+        };
+        for _ in 0..240 {
+            wk.step_in(1.0 / 60.0, -1.0, 1.0, None, 0.0, 0.35, 1.0);
+        }
+        assert!((wk.park_y - 0.28).abs() < 1e-3, "stuck at {}", wk.park_y);
     }
 }

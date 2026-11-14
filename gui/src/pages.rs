@@ -180,12 +180,13 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         .column_spacing(10)
         .homogeneous(true)
         .build();
-    let games: [(&str, &str, &'static str, &'static str); 12] = [
+    let games: [(&str, &str, &'static str, &'static str); 13] = [
         ("Jumping contest", "go-up-symbolic", "contest", "game_min"),
         ("Cursor game", "input-mouse-symbolic", "cursor", "game_min"),
         ("Long jump", "go-next-symbolic", "long", "long_min"),
         ("Domino", "view-dual-symbolic", "domino", "party_min"),
         ("Tug of war", "object-flip-horizontal-symbolic", "tug", "tug_min"),
+        ("Wrestling", "applications-games-symbolic", "wrestle", "wrestle_min"),
         ("Tag", "find-location-symbolic", "tag", "party_min"),
         ("Samba", "audio-x-generic-symbolic", "samba", "samba_min"),
         ("Volleyball", "weather-clear-symbolic", "volley", "volley_min"),
@@ -232,15 +233,14 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         .column_spacing(10)
         .homogeneous(true)
         .build();
-    let actions: [(&str, &str, &'static str, &'static str); 9] = [
+    let actions: [(&str, &str, &'static str, &'static str); 8] = [
         ("Train", "applications-science-symbolic", "game", "train"),
+        ("Sign", "starred-symbolic", "game", "sign"),
         ("Rain", "weather-showers-symbolic", "weather", "rain"),
         ("Snow", "weather-snow-symbolic", "weather", "snow"),
         ("Night", "weather-clear-night-symbolic", "weather", "night"),
         ("Bedtime now", "night-light-symbolic", "weather", "bedtime"),
         ("Clear sky", "weather-clear-symbolic", "weather", "clear"),
-        ("Santa hats", "starred-symbolic", "weather", "xmas"),
-        ("No hats", "non-starred-symbolic", "weather", "noxmas"),
         ("Real weather", "find-location-symbolic", "weather", "auto"),
     ];
     for (label, icon, cmd, arg) in actions {
@@ -277,31 +277,28 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         u.reload_soon();
         u.say("Weather place set");
     });
-    let try_group = adw::PreferencesGroup::builder().title("Try it out").description("Weather and hats stay as set until you pick Real weather (Santa hats come on by themselves 10 Dec - 6 Jan). Bedtime sends everyone to bed at once.").build();
+    let try_group = adw::PreferencesGroup::builder().title("Try it out").description("Weather stays as set until you pick Real weather. Bedtime sends everyone to bed at once.").build();
     try_group.add(&place);
     try_group.add(&tries);
     page.add(&try_group);
     // the park: a window of its own they can live in
-    let park_group = adw::PreferencesGroup::builder().title("Park, cafe and farm").description("Windows of their own, each on an empty workspace. The characters live in them while they're open (you pick how in their top bar), going from one to another. What they find while fishing goes into the chest; the farm's pond is where they fish, its beds, hens and cows fill the pantry, and the cafe cooks it.").build();
-    for (arg, title, sub) in [
-        ("--world", "All three", "Park, cafe and farm at once"),
-        ("--park", "Anima Park", "Slide, swings, seesaw, sandbox"),
-        ("--cafe", "Anima Cafe", "Stove and tables: cooking, finding recipes, eating together"),
-        ("--farm", "Anima Farm", "A pond with a pier for fishing, beds, hens and cows"),
-    ] {
-        let open = gtk::Button::builder().label("Open").valign(gtk::Align::Center).build();
-        if arg == "--world" {
-            open.add_css_class("suggested-action");
+    let park_group = adw::PreferencesGroup::builder()
+        .title("Anima Park")
+        .description("A park window of their own on an empty workspace, with a slide, swings, seesaw and sandbox. Everything can be placed freely anywhere on the lawn.")
+        .build();
+    let open = gtk::Button::builder().label("Open").valign(gtk::Align::Center).build();
+    open.add_css_class("suggested-action");
+    open.connect_clicked(move |_| {
+        if let Ok(me) = std::env::current_exe() {
+            let _ = std::process::Command::new(me).arg("--park").spawn();
         }
-        open.connect_clicked(move |_| {
-            if let Ok(me) = std::env::current_exe() {
-                let _ = std::process::Command::new(me).arg(arg).spawn();
-            }
-        });
-        let row = adw::ActionRow::builder().title(title).subtitle(sub).build();
-        row.add_suffix(&open);
-        park_group.add(&row);
-    }
+    });
+    let row = adw::ActionRow::builder()
+        .title("Anima Park")
+        .subtitle("Slide, swings, seesaw, sandbox")
+        .build();
+    row.add_suffix(&open);
+    park_group.add(&row);
     page.add(&park_group);
     page.upcast()
 }
@@ -550,10 +547,17 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             daemon::stop();
         }
     });
-    // keep the switch honest if the daemon dies or is started elsewhere
+    // keep the switch honest if the daemon dies or is started elsewhere,
+    // without scanning /proc on the GTK main thread
+    let latest_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(ui.power.is_active()));
+    let latest_w = latest_running.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        latest_w.store(daemon::running(), std::sync::atomic::Ordering::Relaxed);
+    });
     let u = ui.clone();
-    glib::timeout_add_seconds_local(2, move || {
-        let running = daemon::running();
+    glib::timeout_add_seconds_local(3, move || {
+        let running = latest_running.load(std::sync::atomic::Ordering::Relaxed);
         if running != u.power.is_active() {
             u.syncing.set(true);
             u.power.set_active(running);

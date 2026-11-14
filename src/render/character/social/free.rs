@@ -23,10 +23,9 @@ pub(in crate::render::character) enum Want {
     Fish,
     /// going off to find company
     Seek,
-    /// a go on something in the park, cafe or farm
+    /// calling over from another workspace, etc. (desktop fishing stays on desktop windows)
+    /// a go on something in the park
     Play,
-    /// sent to work (or to fish off the pier)
-    Work,
 }
 
 impl CharacterOverlay {
@@ -52,12 +51,11 @@ impl CharacterOverlay {
         match want {
             Want::Pair | Want::Overlap => standing && self.on_screen(i),
             Want::Join => wk.energy >= t.energy_join_need && cool <= 0.0 && self.on_screen(i),
-            Want::Called => cool <= 0.0 && !self.on_shift(i),
+            Want::Called => cool <= 0.0,
             Want::Watch => wk.energy >= t.energy_watch_need && cool <= t.overlap_cool && self.on_screen(i),
             Want::Fish => wk.fish_cool <= 0.0 && cool <= 0.0 && self.on_screen(i),
-            Want::Seek => standing && cool <= 0.0 && !wk.climb_like() && !self.on_shift(i),
+            Want::Seek => standing && cool <= 0.0 && !wk.climb_like(),
             Want::Play => standing && wk.trip.is_none() && wk.rest.is_none() && cool <= t.overlap_cool && wk.energy >= t.energy_watch_need,
-            Want::Work => standing && wk.trip.is_none() && wk.rest.is_none() && wk.air <= 0.0,
         }
     }
 }

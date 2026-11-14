@@ -20,6 +20,12 @@ pub(super) fn happy_pose(path: &Path) -> Option<PathBuf> {
         .then(|| path.with_file_name(n.replace("[A]", "[B]").replace("_0010.", "_0011.")))
 }
 
+/// True when the sibling happy pose is drawn facing the opposite way from the calm sprite
+/// (all Uma Musume `[A]` -> `[B]` sprites face left in `[B]` and right in `[A]`).
+pub(super) fn happy_opposite(path: &Path) -> bool {
+    happy_pose(path).is_some()
+}
+
 /// Where the eyes are, for the sleep mask: the left and right eye as
 /// (x0, y0, x1, y1) in texture units. The head is found from the outline
 /// first (a chibi's head is wide, its neck narrow, ears too thin to count),

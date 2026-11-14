@@ -581,6 +581,9 @@ impl CharacterOverlay {
                     wk.start_jump(tn().jump_height * 0.4);
                 }
             }
+            if let Some(w) = race.winner {
+                self.award_accessory(w);
+            }
             self.start_concert(&race.order, &ran, race.finish_px, n);
             return;
         }

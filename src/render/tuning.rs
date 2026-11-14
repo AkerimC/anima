@@ -46,7 +46,6 @@ tuning! {
         fish_most: "Most fishing together" = 5.0, 1.0, 12.0, 1.0, 0;
         fish_real: "A good catch is a real fish (share)" = 0.75, 0.0, 1.0, 0.05, 2;
         fish_creature: "Of those, a rare sea creature (share)" = 0.15, 0.0, 1.0, 0.05, 2;
-        fish_material: "Something for the park chest (share of catches)" = 0.4, 0.0, 1.0, 0.05, 2;
         fish_find: "Something to wear on the line (share of catches)" = 0.12, 0.0, 1.0, 0.01, 2;
         fish_boom: "Confetti goes off with a bang" = 0.25, 0.0, 1.0, 0.05, 2;
         fish_boom_reach: "Explosion reach (widths)" = 3.0, 0.5, 15.0, 0.5, 1;
@@ -137,48 +136,10 @@ tuning! {
         ws_speed: "Travel speed" = 2.5, 0.2, 20.0, 0.1, 1;
     }
     "Roaming", "Park" {
-        activity: "In the park, cafe and farm: 0 both, 1 only play (no hunger; they tire and nap), 2 work first (fewer games)" = 0.0, 0.0, 2.0, 1.0, 0;
-        park_mode: "With the park, cafe or farm open: 0 desktop, 1 only them, 2 them and out now and then, 3 the desktop, visiting them" = 3.0, 0.0, 3.0, 1.0, 0;
-        visit_fish_every: "Mode 3: the fisher (and the park attendant) goes over about every (s)" = 600.0, 30.0, 7200.0, 30.0, 0;
+        park_mode: "With Anima Park open: 0 desktop, 1 only park, 2 park and out now and then, 3 the desktop, visiting park" = 3.0, 0.0, 3.0, 1.0, 0;
         park_play: "Someone free in the park goes to play (chance each look)" = 0.25, 0.0, 1.0, 0.05, 2;
-        park_move_every: "Someone goes over to the park, cafe or farm about every (s)" = 90.0, 10.0, 3600.0, 10.0, 0;
-        cook_known: "A cook makes a recipe it knows instead of trying something new (share)" = 0.6, 0.0, 1.0, 0.05, 2;
-        meadow_stroll: "Someone free on the farm strolls up the meadow (chance each look)" = 0.06, 0.0, 1.0, 0.01, 2;
-        chase_chicken: "Someone free on the farm chases a hen (chance each look)" = 0.04, 0.0, 1.0, 0.01, 2;
         park_game_every: "Game time in the park about every (s)" = 150.0, 20.0, 3600.0, 10.0, 0;
         park_busy_most: "At most this share of them off on their own things at once" = 0.5, 0.1, 1.0, 0.05, 2;
-        park_meet_every: "Someone wanders from the cafe or farm to the park about every (s)" = 40.0, 5.0, 3600.0, 5.0, 0;
-        hunger_time: "From full to starving, doing nothing (s)" = 4200.0, 60.0, 36000.0, 60.0, 0;
-        hunger_eat: "Hungry enough to go and eat (0..1)" = 0.55, 0.05, 1.0, 0.05, 2;
-        hunger_stage0: "Hunger pace with nothing to cook on yet" = 0.5, 0.0, 2.0, 0.05, 2;
-        hunger_stage1: "Hunger pace with a stove but no chef" = 0.8, 0.0, 2.0, 0.05, 2;
-        hunger_meal: "At mealtimes, this share of that is enough" = 0.75, 0.1, 1.0, 0.05, 2;
-        full_time: "Full after a meal for (s)" = 900.0, 0.0, 7200.0, 60.0, 0;
-        full_busy: "Working or playing, full passes this much quicker" = 0.5, 0.0, 3.0, 0.1, 1;
-        staff_keep: "Kept in the pantry for those at work" = 2.0, 0.0, 10.0, 1.0, 0;
-        beg_hunger: "No coins: eats anyway only this hungry (0..1)" = 0.9, 0.5, 1.0, 0.05, 2;
-        play_tire: "Only playing: a go on the slide or swing tires them by" = 0.12, 0.0, 1.0, 0.01, 2;
-        idle_nudge: "Standing about in the park, cafe or farm for (s), then off to do something" = 20.0, 3.0, 600.0, 1.0, 0;
-        hungry_nap: "Nothing to eat: a nap of (s)" = 240.0, 10.0, 3600.0, 10.0, 0;
-        picnic_chance: "A meal cooked for oneself is eaten as a picnic in the park (share)" = 0.25, 0.0, 1.0, 0.05, 2;
-        wage: "Coins each job pays every 20 minutes" = 5.0, 0.0, 100.0, 1.0, 0;
-        shift_len: "Jobs change hands every (s)" = 1800.0, 300.0, 14400.0, 300.0, 0;
-        shop_rich: "Goes shopping with at least (coins)" = 30.0, 0.0, 1000.0, 5.0, 0;
-        shop_chance: "Chance to go shopping, every 8 s" = 0.08, 0.0, 1.0, 0.01, 2;
-        shop_wear: "Something to wear costs" = 15.0, 0.0, 500.0, 1.0, 0;
-        shop_gift: "A present for a friend costs" = 8.0, 0.0, 500.0, 1.0, 0;
-        shop_recipe: "A recipe costs" = 12.0, 0.0, 500.0, 1.0, 0;
-        shop_material: "Materials for the chest cost" = 6.0, 0.0, 500.0, 1.0, 0;
-        bank_full: "The park's piggy bank buys something at (coins, 0 never)" = 600.0, 0.0, 5000.0, 10.0, 0;
-        game_material: "A game's winner finds something for the chest (share)" = 0.6, 0.0, 1.0, 0.05, 2;
-        game_material_all: "The other players do (share each)" = 0.15, 0.0, 1.0, 0.05, 2;
-        park_grant: "Wages the park gets each pay day, to buy food" = 6.0, 0.0, 20.0, 0.5, 1;
-        tax_low_at: "Tax: coins above this pay the low rate" = 50.0, 0.0, 1000.0, 10.0, 0;
-        tax_low: "Tax: low rate each pay day" = 0.05, 0.0, 0.5, 0.01, 2;
-        tax_high_at: "Tax: coins above this pay the high rate" = 150.0, 0.0, 5000.0, 10.0, 0;
-        tax_high: "Tax: high rate each pay day" = 0.15, 0.0, 0.8, 0.01, 2;
-        host_fee: "The attendant's pay for each game it calls (coins)" = 2.0, 0.0, 50.0, 1.0, 0;
-        host_prize: "The attendant's prize for a game's winner (coins)" = 3.0, 0.0, 50.0, 1.0, 0;
         park_out: "Out on the desktop at once, at most (mode 2)" = 2.0, 0.0, 12.0, 1.0, 0;
         park_out_every: "Someone goes out about every (s)" = 300.0, 10.0, 7200.0, 10.0, 0;
         park_out_stay: "Stays out (s)" = 180.0, 10.0, 7200.0, 10.0, 0;
@@ -192,7 +153,7 @@ tuning! {
         parasol_peak: "Under an umbrella, the top of a jump comes at (share of it)" = 0.3, 0.1, 0.5, 0.05, 2;
         parasol_fall: "Gravity under an open umbrella (share)" = 0.22, 0.05, 1.0, 0.05, 2;
         parasol_speed: "Fastest fall under an open umbrella" = 2.0, 0.2, 20.0, 0.1, 1;
-        drop_speed: "Shaken this fast (px/s), the umbrella flies off" = 2200.0, 200.0, 10000.0, 100.0, 0;
+        drop_speed: "Shaken or carried this fast (px/s), items fly off" = 1500.0, 200.0, 10000.0, 100.0, 0;
         drop_swing: "Spun this fast (turns), the umbrella flies off" = 10.0, 0.5, 30.0, 0.5, 1;
         snow_settle: "Snow piles up on heads over (s)" = 45.0, 1.0, 600.0, 5.0, 0;
         snow_hop: "Hop after snowflakes (per s)" = 0.06, 0.0, 2.0, 0.01, 2;
@@ -423,7 +384,8 @@ tuning! {
         mood_min: "Group that splits into chat and game" = 6.0, 4.0, 30.0, 1.0, 0;
         mood_after: "Chat before splitting (s)" = 8.0, 0.0, 120.0, 1.0, 0;
         mood_game: "Someone wants a game" = 0.3, 0.0, 1.0, 0.05, 2;
-        game_fit: "Pick games that fit the group" = 2.0, 0.0, 6.0, 0.5, 1;
+        game_fit: "Pick games that fit the group" = 0.85, 0.0, 6.0, 0.05, 2;
+        game_reward: "Win an accessory in games (chance)" = 0.78, 0.0, 1.0, 0.05, 2;
         split_chance: "Split in two after a game" = 0.5, 0.0, 1.0, 0.05, 2;
     }
     "Games", "Jumping contest" {
@@ -431,7 +393,7 @@ tuning! {
         contest_rand: "Random extra height" = 1.6, 0.0, 5.0, 0.1, 1;
     }
     "Games", "Cursor game" {
-        cursor_game: "Chance" = 0.07, 0.0, 1.0, 0.01, 2;
+        cursor_game: "Chance" = 0.04, 0.0, 1.0, 0.01, 2;
         cursor_time_min: "Longest time (s)" = 12.0, 3.0, 180.0, 1.0, 0;
         cursor_time_rand: "Random extra (s)" = 6.0, 0.0, 180.0, 1.0, 0;
         cursor_win: "Win by hanging on for (s)" = 3.0, 0.5, 60.0, 0.5, 1;
@@ -456,14 +418,15 @@ tuning! {
         domino_rest: "Lying down for (s)" = 1.8, 0.0, 15.0, 0.5, 1;
     }
     "Games", "Volleyball" {
-        volley_min: "Fewest characters (even)" = 6.0, 6.0, 12.0, 2.0, 0;
+        volley_min: "Fewest players" = 7.0, 6.0, 12.0, 1.0, 0;
+        volley_weight: "Pick weight" = 0.65, 0.0, 3.0, 0.05, 2;
         volley_hold: "Ball held this long, someone knocks it out (s)" = 1.5, 0.5, 30.0, 0.5, 1;
         volley_reach: "Hit reach (px)" = 55.0, 10.0, 300.0, 5.0, 0;
         volley_big: "Fewest for a net of 4" = 11.0, 7.0, 30.0, 1.0, 0;
         volley_fumble: "Miss the ball (more in a crowd)" = 0.04, 0.0, 1.0, 0.01, 2;
         volley_time_min: "Shortest hit flight (s)" = 0.7, 0.3, 3.0, 0.05, 2;
         volley_time_rand: "Random extra (s)" = 1.0, 0.0, 3.0, 0.05, 2;
-        volley_win: "Points to win" = 5.0, 1.0, 21.0, 1.0, 0;
+        volley_win: "Points to win" = 3.0, 1.0, 21.0, 1.0, 0;
         volley_speed: "Top player speed" = 0.7, 0.1, 2.0, 0.05, 2;
         volley_net: "Hits that can catch the net" = 0.25, 0.0, 1.0, 0.01, 2;
         volley_gather: "Walking to positions" = 0.18, 0.05, 1.0, 0.01, 2;
@@ -472,8 +435,8 @@ tuning! {
     "Games", "Samba" {
         samba_min: "Fewest characters" = 3.0, 2.0, 12.0, 1.0, 0;
         samba_big: "Characters for full chance" = 7.0, 3.0, 30.0, 1.0, 0;
-        samba_weight_small: "Pick weight with few" = 0.12, 0.0, 3.0, 0.01, 2;
-        samba_weight_big: "Pick weight with many" = 0.3, 0.0, 3.0, 0.01, 2;
+        samba_weight_small: "Pick weight with few" = 0.3, 0.0, 3.0, 0.01, 2;
+        samba_weight_big: "Pick weight with many" = 0.75, 0.0, 3.0, 0.01, 2;
         samba_join: "Onlooker joins" = 0.5, 0.0, 1.0, 0.05, 2;
         samba_join_gap: "Between joins (s)" = 4.0, 0.5, 60.0, 0.5, 1;
         samba_time: "Length (s)" = 45.0, 2.0, 120.0, 1.0, 0;
@@ -497,7 +460,17 @@ tuning! {
         tug_fling_min: "Losers fly (px)" = 400.0, 0.0, 3000.0, 50.0, 0;
         tug_fling_rand: "Random extra (px)" = 350.0, 0.0, 3000.0, 50.0, 0;
     }
+    "Games", "Wrestling" {
+        wrestle_min: "Fewest for wrestling" = 4.0, 2.0, 12.0, 1.0, 0;
+        wrestle_win: "Ring out distance (px)" = 110.0, 20.0, 600.0, 10.0, 0;
+        wrestle_round: "Longest bout (s)" = 8.0, 2.0, 30.0, 0.5, 1;
+        wrestle_push: "Push strength" = 52.0, 10.0, 400.0, 5.0, 0;
+        wrestle_lean: "Leaning in" = 0.24, 0.0, 0.7, 0.02, 2;
+        wrestle_fling_min: "Losers fly (px)" = 220.0, 50.0, 1500.0, 25.0, 0;
+        wrestle_fling_rand: "Random extra (px)" = 160.0, 0.0, 1500.0, 25.0, 0;
+    }
     "Games", "Tag" {
+        tag_min: "Fewest players" = 3.0, 2.0, 12.0, 1.0, 0;
         tag_time_min: "Length (s)" = 18.0, 3.0, 180.0, 1.0, 0;
         tag_time_rand: "Random extra (s)" = 7.0, 0.0, 180.0, 1.0, 0;
         tag_pace: "Speeding up and slowing down" = 0.45, 0.0, 0.9, 0.05, 2;
