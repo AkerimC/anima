@@ -119,8 +119,12 @@ pub(super) struct Moods {
 }
 
 impl WalkState {
-    pub(super) fn at_leisure(&self) -> bool {
+    pub(super) fn can_hold_sign(&self) -> bool {
         !self.fret && matches!(self.act, Act::Idle | Act::Walk) && self.social.is_none() && self.race.is_none() && self.crowd.is_none() && !self.circle
+    }
+
+    pub(super) fn at_leisure(&self) -> bool {
+        self.can_hold_sign() && self.sign.is_none()
     }
 
     /// `until`: a nap of that many seconds; 0 sleeps until someone's back.
@@ -548,7 +552,7 @@ impl CharacterOverlay {
             wk.sign_t -= dt;
             if wk.sign.is_some() {
                 wk.sign_left -= dt;
-                if wk.sign_left <= 0.0 || !wk.at_leisure() {
+                if wk.sign_left <= 0.0 || !wk.can_hold_sign() {
                     wk.sign = None;
                 } else {
                     wk.act = Act::Idle;
@@ -1303,5 +1307,22 @@ mod tests {
         assert!(dropped);
         assert!(!shaken);
         assert_eq!(shake, 0.0);
+    }
+
+    #[test]
+    fn sign_holder_ignores_notify_jump_and_leisure_interrupts() {
+        let mut wk = idler();
+        assert!(wk.at_leisure());
+
+        wk.sign = Some(super::super::sign::HUG);
+        assert!(wk.can_hold_sign());
+        assert!(!wk.at_leisure(), "sign holders must not be picked as idle for notifications/curiosity");
+
+        // Even if a notify_jump was pending, stepping while holding a sign clears it without jumping
+        wk.notify_jump = Some(0.0);
+        wk.step(DT, -1.0, 1.0, None, 0.0);
+        assert_eq!(wk.act, Act::Idle);
+        assert!(wk.notify_jump.is_none());
+        assert!(wk.sign.is_some());
     }
 }

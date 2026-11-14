@@ -383,7 +383,7 @@ impl WalkState {
         if matches!(self.act, Act::Held | Act::Fall | Act::Planted | Act::Rest | Act::Travel) {
             return (self.x, false, 0.0);
         }
-        if self.fret {
+        if self.fret || self.sign.is_some() {
             self.notify_jump = None;
         }
         if let Some(t) = self.notify_jump.as_mut() {

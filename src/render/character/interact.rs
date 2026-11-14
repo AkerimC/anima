@@ -18,7 +18,7 @@ impl CharacterOverlay {
             let n = crate::backend::notify::NOTIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
             if n != self.notified {
                 self.notified = n;
-                let free = |w: &WalkState| w.race.is_none() && !w.social.is_some_and(|s| s.no_touch || s.no_pat);
+                let free = |w: &WalkState| w.race.is_none() && w.sign.is_none() && !w.social.is_some_and(|s| s.no_touch || s.no_pat);
                 if free(&self.walk) {
                     self.walk.notify_jump = Some(0.0);
                 }
