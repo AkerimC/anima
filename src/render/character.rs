@@ -338,6 +338,7 @@ const CHAR_VS: &str = r#"#version 300 es
 precision highp float;
 layout(location = 0) in vec2 a_pos; // -1..1
 out vec2 v_uv;
+out vec2 v_sclip;
 
 uniform vec2 u_center;    // clip space center
 uniform vec2 u_half_size; // clip space half size
@@ -377,6 +378,7 @@ void main() {
     d.x /= u_aspect;
     vec2 clip = u_center + d;
     clip.y += u_bounce - u_sink;
+    v_sclip = clip;
     gl_Position = vec4(clip * u_clip.xy + u_clip.zw, 0.0, 1.0);
 }
 "#;
@@ -384,6 +386,7 @@ void main() {
 const CHAR_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_uv;
+in vec2 v_sclip;
 
 uniform sampler2D u_tex;
 uniform float u_sleep;   // asleep: the mask on (0..1)
@@ -964,6 +967,8 @@ vec4 render_neko(vec2 uv, int style) {
     return col;
 }
 
+//SLIDE_TUBE
+
 void main() {
     vec4 c;
     if (u_mode == 0) {
@@ -1025,6 +1030,7 @@ void main() {
     } else {
         c = render_neko(v_uv, u_mode);
     }
+    c = apply_slide_tube(c, v_sclip);
     // Premultiplied alpha output so transparent Wayland overlay surfaces composite cleanly
     fragColor = vec4(c.rgb * c.a, c.a);
 }
@@ -1073,6 +1079,8 @@ pub struct CharacterOverlay {
     extras: Vec<CharacterOverlay>,
     // drawn sprite box from the last frame, surface pixels (x0, y0, x1, y1)
     hit_rect: [f32; 4],
+    // ground plane y in top-down surface pixels
+    pub(super) ground_px: f32,
     // surface size that box was measured on
     surface: [f32; 2],
     // drawn part of the sprite, image fractions: half width, top, bottom
@@ -1122,6 +1130,7 @@ pub struct CharacterOverlay {
     smooth_look: [f32; 2],
     smooth_bounce: f32,
     smooth_pos: Option<[f32; 2]>,
+    smooth_tuck: f32,
     start: Instant,
     walk: WalkState,
     // re-pose at most every this many frames (crowd budget, set by actor 0)
@@ -1253,6 +1262,42 @@ const MIN_POSE_HZ: f32 = 12.0;
 /// character say ouch when it lands.
 const HARD_THROW: (f32, f32) = (2.0, 6.0);
 
+const SLIDE_SEG_NAMES: [&str; park::SLIDE_CHORDS_MAX] = [
+    "u_slide_segs[0]", "u_slide_segs[1]", "u_slide_segs[2]", "u_slide_segs[3]", "u_slide_segs[4]",
+    "u_slide_segs[5]", "u_slide_segs[6]", "u_slide_segs[7]", "u_slide_segs[8]", "u_slide_segs[9]",
+    "u_slide_segs[10]", "u_slide_segs[11]", "u_slide_segs[12]", "u_slide_segs[13]", "u_slide_segs[14]",
+    "u_slide_segs[15]", "u_slide_segs[16]", "u_slide_segs[17]", "u_slide_segs[18]", "u_slide_segs[19]",
+];
+
+const SLIDE_META_NAMES: [&str; park::SLIDE_CHORDS_MAX] = [
+    "u_slide_meta[0]", "u_slide_meta[1]", "u_slide_meta[2]", "u_slide_meta[3]", "u_slide_meta[4]",
+    "u_slide_meta[5]", "u_slide_meta[6]", "u_slide_meta[7]", "u_slide_meta[8]", "u_slide_meta[9]",
+    "u_slide_meta[10]", "u_slide_meta[11]", "u_slide_meta[12]", "u_slide_meta[13]", "u_slide_meta[14]",
+    "u_slide_meta[15]", "u_slide_meta[16]", "u_slide_meta[17]", "u_slide_meta[18]", "u_slide_meta[19]",
+];
+
+/// Binds per-pixel slide tube occlusion/overdraw uniforms on `prog` (`u_slide_n = 0` when inactive).
+pub(super) fn bind_slide_uniforms(
+    gl: &glow::Context,
+    prog: &mut Program,
+    surface: [f32; 2],
+    slide: Option<&park::SlideRenderData>,
+) {
+    let Some(s) = slide.filter(|s| s.count > 0) else {
+        prog.set_i32(gl, "u_slide_n", 0);
+        return;
+    };
+    let n = s.count.min(park::SLIDE_CHORDS_MAX);
+    prog.set_vec2(gl, "u_surface", surface[0], surface[1]);
+    prog.set_i32(gl, "u_slide_n", n as i32);
+    prog.set_f32(gl, "u_slide_u", s.unit);
+    prog.set_f32(gl, "u_slide_seg", s.active_seg);
+    for k in 0..n {
+        prog.set_vec4(gl, SLIDE_SEG_NAMES[k], s.segs[k]);
+        prog.set_vec4(gl, SLIDE_META_NAMES[k], s.meta[k]);
+    }
+}
+
 impl CharacterOverlay {
     pub fn new(gl: &glow::Context, config: CharacterConfig, width: i32, height: i32) -> Result<Self> {
         super::tuning::set(config.tuning);
@@ -1260,7 +1305,8 @@ impl CharacterOverlay {
     }
 
     fn new_actor(gl: &glow::Context, config: CharacterConfig, width: i32, height: i32, actor: usize) -> Result<Self> {
-        let program = Program::new(gl, CHAR_VS, CHAR_FS)?;
+        let fs = CHAR_FS.replace("//SLIDE_TUBE", park::SLIDE_TUBE_GLSL);
+        let program = Program::new(gl, CHAR_VS, &fs)?;
         let (vao, vbo) = create_quad(gl)?;
         let dummy_tex = create_texture(gl, 1, 1, &[0, 0, 0, 0], Filter::Nearest, false)?;
 
@@ -1279,6 +1325,7 @@ impl CharacterOverlay {
             actor,
             extras: Vec::new(),
             hit_rect: [0.0; 4],
+            ground_px: 0.0,
             surface: [1.0; 2],
             opaque: [0.5, 0.0, 1.0],
             press: None,
@@ -1308,6 +1355,7 @@ impl CharacterOverlay {
             smooth_look: [0.0, 0.0],
             smooth_bounce: 0.0,
             smooth_pos: None,
+            smooth_tuck: 1.0,
             start: Instant::now(),
             pose_every: 1,
             voice: None,
@@ -1633,7 +1681,7 @@ impl CharacterOverlay {
             .max_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal))
     }
 
-    fn draw_pending(&mut self, gl: &glow::Context, target: &mut dyn ActorTarget) {
+    fn draw_pending(&mut self, gl: &glow::Context, target: &mut dyn ActorTarget, slide: Option<&park::SlideRenderData>) {
         let Some(tex) = self.pending.take() else { return };
         unsafe {
             gl.enable(glow::BLEND);
@@ -1646,15 +1694,16 @@ impl CharacterOverlay {
                 let clip = self.zoom.map_or_else(|| target.clip_xform(), |z| z.clip_xform());
                 // worn and held things: those behind it first, then it, then the rest
                 let worn = self.worn();
-                self.draw_worn(gl, &worn, clip, true);
+                self.draw_worn(gl, &worn, clip, true, slide);
                 self.program.bind(gl);
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 self.program.set_vec4(gl, "u_clip", clip);
+                bind_slide_uniforms(gl, &mut self.program, self.surface, slide);
                 gl.bind_vertex_array(Some(self.vao));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_vertex_array(None);
-                self.draw_worn(gl, &worn, clip, false);
+                self.draw_worn(gl, &worn, clip, false, slide);
                 target.end(gl, self.actor);
             }
             gl.bind_texture(glow::TEXTURE_2D, None);
@@ -1677,6 +1726,7 @@ impl CharacterOverlay {
         std::mem::swap(&mut self.happy_peek, &mut o.happy_peek);
         std::mem::swap(&mut self.model, &mut o.model);
         std::mem::swap(&mut self.hit_rect, &mut o.hit_rect);
+        std::mem::swap(&mut self.ground_px, &mut o.ground_px);
         std::mem::swap(&mut self.opaque, &mut o.opaque);
         std::mem::swap(&mut self.zoom, &mut o.zoom);
         std::mem::swap(&mut self.visible, &mut o.visible);
@@ -1684,6 +1734,7 @@ impl CharacterOverlay {
         std::mem::swap(&mut self.smooth_look, &mut o.smooth_look);
         std::mem::swap(&mut self.smooth_bounce, &mut o.smooth_bounce);
         std::mem::swap(&mut self.smooth_pos, &mut o.smooth_pos);
+        std::mem::swap(&mut self.smooth_tuck, &mut o.smooth_tuck);
         std::mem::swap(&mut self.walk, &mut o.walk);
         std::mem::swap(&mut self.voice, &mut o.voice);
         std::mem::swap(&mut self.greeted, &mut o.greeted);
@@ -1979,12 +2030,15 @@ impl CharacterOverlay {
         let in_park = park_win.filter(|p| {
             p.ws == self.walk.ws && (!self.walk.placed || (strip_px >= p.x - 16.0 && strip_px <= p.x + p.w + 16.0))
         });
+        let target_tuck = self.walk.social.and_then(|s| s.tuck).unwrap_or(1.0).clamp(0.3, 1.0);
+        self.smooth_tuck += (target_tuck - self.smooth_tuck) * (dt * 14.0).clamp(0.05, 1.0);
         let (park_max_y, y_per_clip, park_h) = if let Some(ref p) = in_park {
             (center_clip, half_clip) = project_park_clip(
                 base_center,
                 base_half,
                 self.walk.park_y,
                 self.walk.park_crowd,
+                self.smooth_tuck,
                 p.h,
                 h,
             );
@@ -2207,6 +2261,7 @@ impl CharacterOverlay {
                         base_half,
                         self.walk.park_y,
                         self.walk.park_crowd,
+                        self.smooth_tuck,
                         p.h,
                         h,
                     );
@@ -2231,6 +2286,8 @@ impl CharacterOverlay {
                     (center_clip[0] + walk_x + half_clip[0] + 1.0) * 0.5 * w,
                     (1.0 - (center_clip[1] - half_clip[1] + lift_now)) * 0.5 * h,
                 ];
+                let quad_h = (self.hit_rect[3] - self.hit_rect[1]).max(1.0);
+                self.ground_px = self.hit_rect[1] + quad_h * self.opaque[2] + lift_now * 0.5 * h;
                 self.pat_leaves(info);
             }
             // sprites have no rig: idle sway + hop, quicker hops while walking
@@ -2269,8 +2326,6 @@ impl CharacterOverlay {
             self.program.set_f32(gl, "u_bounce", self.smooth_bounce + hop);
             self.program.set_f32(gl, "u_rot", self.walk.rot);
             self.program.set_f32(gl, "u_sink", self.walk.sink * half_clip[1]);
-            let slide_alpha = self.walk.social.and_then(|s| s.alpha).unwrap_or(1.0).clamp(0.0, 1.0);
-            let eff_opacity = self.config.opacity * slide_alpha;
             // how the sprite is bent and lifted this frame, so things worn or held
             // can follow any point of it exactly (see `shift_at`)
             self.pose = SpritePose {
@@ -2286,7 +2341,7 @@ impl CharacterOverlay {
                 bounce: self.smooth_bounce + hop,
                 xscale: 1.0,
                 flip: false,
-                opacity: eff_opacity,
+                opacity: self.config.opacity,
             };
             self.program.set_f32(gl, "u_aspect", w / h);
             let pivot = match (self.walk.grip, self.walk.feet, self.walk.grab) {
@@ -2320,7 +2375,7 @@ impl CharacterOverlay {
             self.program.set_i32(gl, "u_mode", mode);
             self.program.set_i32(gl, "u_premul", i32::from(self.model.is_some()));
             self.program.set_f32(gl, "u_time", time);
-            self.program.set_f32(gl, "u_opacity", eff_opacity);
+            self.program.set_f32(gl, "u_opacity", self.config.opacity);
             self.program
                 .set_vec2(gl, "u_look", self.smooth_look[0], self.smooth_look[1]);
             self.program.set_vec4(gl, "u_audio", audio);
@@ -2392,7 +2447,7 @@ impl CharacterOverlay {
             self.program.set_i32(gl, "u_tex", 0);
 
             // drawn after everyone has moved, so the order can be by depth
-            self.pending = (self.visible && slide_alpha > 0.005).then_some(tex);
+            self.pending = self.visible.then_some(tex);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.disable(glow::BLEND);
         }
@@ -2415,10 +2470,11 @@ impl CharacterOverlay {
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by(|&a, &b| self.actor_at(a).draw_key().partial_cmp(&self.actor_at(b).draw_key()).unwrap_or(std::cmp::Ordering::Equal));
             for i in order {
+                let slide = self.actor_slide_render(i);
                 if i == 0 {
-                    self.draw_pending(gl, target);
+                    self.draw_pending(gl, target, slide.as_ref());
                 } else {
-                    self.extras[i - 1].draw_pending(gl, target);
+                    self.extras[i - 1].draw_pending(gl, target, slide.as_ref());
                 }
             }
             self.draw_ropes(gl, info, target, false);
@@ -2433,11 +2489,12 @@ fn project_park_clip(
     base_half: [f32; 2],
     park_y: f32,
     park_crowd: f32,
+    tuck: f32,
     park_h: f32,
     surface_h: f32,
 ) -> ([f32; 2], [f32; 2]) {
     let crowd = if park_crowd > 0.0 { park_crowd } else { 1.0 };
-    let scale = crowd * park::depth_scale(park_y);
+    let scale = crowd * park::depth_scale(park_y) * tuck;
     let feet_base = base_center[1] - base_half[1];
     let half = [base_half[0] * scale, base_half[1] * scale];
     let center_y = feet_base + (park_y * park_h) * 2.0 / surface_h + half[1];

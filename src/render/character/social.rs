@@ -77,6 +77,8 @@ pub(super) struct Social {
     pub(super) crowd: bool,
     // slide tube visibility override (None = 1.0)
     pub(super) alpha: Option<f32>,
+    // crouch scale from the feet up inside slide tubes (None = 1.0)
+    pub(super) tuck: Option<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1011,6 +1013,10 @@ impl CharacterOverlay {
                     r.alpha = None;
                     fixed.push("alpha");
                 }
+                if r.tuck.is_some() && st != Stage::Play {
+                    r.tuck = None;
+                    fixed.push("tuck");
+                }
                 if talk && (r.no_touch || r.no_pat || r.face_lock || r.chasing) {
                     r.no_touch = false;
                     r.no_pat = false;
@@ -1447,7 +1453,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0, in_talk: false, crowd: false, alpha: None });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0, in_talk: false, crowd: false, alpha: None, tuck: None });
     }
 
 

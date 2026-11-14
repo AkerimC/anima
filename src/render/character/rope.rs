@@ -140,6 +140,7 @@ const CARROT_VS: &str = r#"#version 300 es
 precision highp float;
 layout(location = 0) in vec2 a_pos;
 out vec2 v_pos;
+out vec2 v_sclip;
 uniform vec4 u_rect; // x0, y0, x1, y1 in clip space
 uniform vec4 u_clip;
 // worn on a character: a box in its sprite space, moved exactly as CHAR_VS
@@ -185,6 +186,7 @@ void main() {
         d.x /= c_aspect;
         vec2 clip = c_center + d;
         clip.y += c_bounce - c_sink;
+        v_sclip = clip;
         gl_Position = vec4(clip * u_clip.xy + u_clip.zw, 0.0, 1.0);
         return;
     }
@@ -199,6 +201,7 @@ void main() {
         d.x /= c_aspect;
         p = mid + d;
     }
+    v_sclip = p;
     gl_Position = vec4(p * u_clip.xy + u_clip.zw, 0.0, 1.0);
 }
 "#;
@@ -214,6 +217,7 @@ void main() {
 const CARROT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_pos;
+in vec2 v_sclip;
 out vec4 fragColor;
 uniform int u_kind;
 uniform int u_flip;
@@ -700,11 +704,15 @@ vec4 confetti(vec2 p) {
     vec3 col = h > 0.85 ? vec3(1.0, 0.4, 0.6) : h > 0.75 ? vec3(0.4, 0.8, 1.0) : h > 0.65 ? vec3(1.0, 0.85, 0.3) : vec3(0.5, 0.95, 0.5);
     return vec4(col, on);
 }
+//SLIDE_TUBE
+
 void main() {
     vec2 p = v_pos;
     if (u_flip == 1) p.x = -p.x;
     vec4 c = u_kind == 1 ? box(p) : u_kind == 2 ? balloon(p) : u_kind == 3 ? glove(p) : u_kind == 4 ? zee(p) : u_kind == 5 ? sweat(p) : u_kind == 6 ? crumb(p) : u_kind == 7 ? marker(p) : u_kind == 8 ? blindfold(p) : u_kind == 9 ? bush(p) : u_kind == 10 ? barrel(p) : u_kind == 11 ? crate_box(p) : u_kind == 12 ? note(p) : u_kind == 13 ? rod(p) : u_kind == 14 ? line_float(p) : u_kind == 15 ? star(p) : u_kind == 16 ? duck(p) : u_kind == 17 ? boot(p) : u_kind == 18 ? can(p) : u_kind == 20 ? confetti(p) : u_kind == 21 ? beast(p) : u_kind == 22 ? umbrella(p) : u_kind == 23 ? snowflake(p) : u_kind == 24 ? snowpile(p) : u_kind == 25 ? santa(p) : u_kind == 26 ? sleepmask(p) : u_kind == 27 ? partyhat(p) : u_kind == 28 ? tophat(p) : u_kind == 29 ? bigbow(p) : u_kind == 30 ? glasses(p, false) : u_kind == 31 ? glasses(p, true) : u_kind == 32 ? flower(p) : u_kind == 33 ? scarf(p) : u_kind == 34 ? backpack(p) : u_kind == 35 ? wings(p) : u_kind == 36 ? headphones(p) : u_kind == 37 ? crown(p) : u_kind == 38 ? canopy(p) : u_kind == 39 ? shaft(p) : u_kind == 40 ? rainfall(p) : u_kind == 41 ? snowfall(p) : u_kind == 42 ? furled(p) : u_kind == 100 ? picture(p) : carrot(p);
-    fragColor = vec4(c.rgb * c.a, c.a) * u_opacity;
+    c.a *= u_opacity;
+    c = apply_slide_tube(c, v_sclip);
+    fragColor = vec4(c.rgb * c.a, c.a);
 }
 "#;
 
@@ -719,7 +727,8 @@ pub(super) struct CarrotGl {
 
 impl CarrotGl {
     fn new(gl: &glow::Context) -> Result<Self> {
-        let program = Program::new(gl, CARROT_VS, CARROT_FS)?;
+        let fs = CARROT_FS.replace("//SLIDE_TUBE", super::park::SLIDE_TUBE_GLSL);
+        let program = Program::new(gl, CARROT_VS, &fs)?;
         let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
         unsafe {
             let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
@@ -878,7 +887,14 @@ impl CharacterOverlay {
     /// Worn and held things, drawn with the sprite's own transform: `behind`
     /// picks the ones that go behind it. Called between the sprite's
     /// target begin and end.
-    pub(super) fn draw_worn(&mut self, gl: &glow::Context, worn: &[super::wear::Worn], clip: [f32; 4], behind: bool) {
+    pub(super) fn draw_worn(
+        &mut self,
+        gl: &glow::Context,
+        worn: &[super::wear::Worn],
+        clip: [f32; 4],
+        behind: bool,
+        slide: Option<&super::park::SlideRenderData>,
+    ) {
         if !worn.iter().any(|w| w.behind == behind) {
             return;
         }
@@ -894,6 +910,7 @@ impl CharacterOverlay {
         let pose = self.pose;
         let Some(c) = self.carrot_gl.as_mut() else { return };
         c.program.bind(gl);
+        super::bind_slide_uniforms(gl, &mut c.program, pose.size, slide);
         c.program.set_vec4(gl, "u_clip", clip);
         c.program.set_i32(gl, "u_attach", 1);
         c.program.set_vec2(gl, "c_center", pose.center[0], pose.center[1]);
@@ -984,6 +1001,7 @@ impl CharacterOverlay {
         let time = self.start.elapsed().as_secs_f32();
         let Some(c) = self.carrot_gl.as_mut() else { return };
         c.program.bind(gl);
+        c.program.set_i32(gl, "u_slide_n", 0);
         c.program.set_i32(gl, "u_attach", 0);
         c.program.set_f32(gl, "u_time", time);
         c.program.set_f32(gl, "u_saspect", w / h);

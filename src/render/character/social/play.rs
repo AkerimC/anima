@@ -108,7 +108,8 @@ impl CharacterOverlay {
         for i in 0..n {
             if self.place_here(i).is_some() {
                 let d = park::depth_scale(self.walk_ref(i).park_y).max(0.5);
-                sum += self.height_of(i) / d;
+                let tuck = self.walk_ref(i).social.and_then(|s| s.tuck).unwrap_or(1.0).max(0.4);
+                sum += self.height_of(i) / (d * tuck);
                 cnt += 1;
             }
         }
@@ -531,6 +532,9 @@ impl CharacterOverlay {
                 2 => {
                     let u = (r.t / 0.5).min(1.0);
                     self.hold_at(r.i, ladder + (lip - ladder) * u, t.y, top);
+                    if let Some(sr) = self.walk_of(r.i).social.as_mut() {
+                        sr.tuck = Some(1.0 - 0.28 * u);
+                    }
                     if r.t > 0.7 {
                         self.set_happy(r.i, true);
                         r.phase = 3;
@@ -538,9 +542,7 @@ impl CharacterOverlay {
                     }
                 }
                 3 => {
-                    let dur = 0.35 + 0.48 * layout.total_len;
-                    let u = (r.t / dur).min(1.0);
-                    let s = u * (0.35 + 0.65 * u);
+                    let (u, s) = slide_frac(&layout, r.t);
                     let (sx, sh, tx, _th) = layout.at(s);
                     let x = mid + sx * unit;
                     let y = sh * unit;
@@ -948,6 +950,35 @@ impl CharacterOverlay {
         out
     }
 
+    /// Slide tube occlusion/overdraw chord data for `actor` while on or exiting a slide.
+    pub(in crate::render::character) fn actor_slide_render(&self, actor: usize) -> Option<park::SlideRenderData> {
+        let (thing, rider) = self.chats.iter().find_map(|c| {
+            if c.stage != Stage::Play {
+                return None;
+            }
+            let p = c.play.as_ref().filter(|p| p.kind == "slide")?;
+            let r = p.riders.iter().find(|r| {
+                r.i == actor && (r.phase == 2 || r.phase == 3 || (r.phase == 4 && !r.fell && r.t < 0.45))
+            })?;
+            Some((p.thing, *r))
+        })?;
+        let park = park_now();
+        let t = park.things.get(thing)?;
+        let layout = park::slide_layout(t);
+        let n = self.extras.len() + 1;
+        let unit = self.park_unit_at(t, n);
+        let a = self.actor_ref(actor);
+        let off = a.own_view[0] * self.view_w * 0.5;
+        let mid_px = self.thing_px(t) - off;
+        let gy_px = a.ground_px;
+        let frac = match rider.phase {
+            2 => 0.0,
+            3 => slide_frac(&layout, rider.t).1,
+            _ => 1.0,
+        };
+        Some(layout.chords(mid_px, gy_px, unit, layout.seg_at(frac)))
+    }
+
     /// Tells the park window which swings/seesaws are currently busy.
     pub(super) fn park_tell_world(&self) {
         let busy: Vec<usize> = self
@@ -1010,7 +1041,15 @@ fn clear_ride_state(wk: &mut WalkState) {
         r.happy = false;
         r.lean = 0.0;
         r.alpha = None;
+        r.tuck = None;
     }
+}
+
+/// Returns `(u, s)` progress along a slide for elapsed phase-3 time `t`.
+fn slide_frac(layout: &park::SlideLayout, t: f32) -> (f32, f32) {
+    let dur = 0.35 + 0.48 * layout.total_len;
+    let u = (t / dur).min(1.0);
+    (u, u * (0.35 + 0.65 * u))
 }
 
 /// Per-second probability of losing balance on a slide segment at `s`.
@@ -1052,7 +1091,7 @@ fn launch_slide_exit(wk: &mut WalkState, layout: &park::SlideLayout, unit: f32, 
     wk.laugh(secs);
 }
 
-/// Updates slide lean, tube visibility (`Social::alpha`), mid-slide fall checks, and exit launch.
+/// Updates slide lean, tuck (`Social::tuck`), mid-slide fall checks, and exit launch.
 #[allow(clippy::too_many_arguments)]
 fn slide_phase3_step(
     wk: &mut WalkState,
@@ -1069,7 +1108,8 @@ fn slide_phase3_step(
 ) {
     if let Some(sr) = wk.social.as_mut() {
         sr.lean = (tx * 0.26).clamp(-0.26, 0.26);
-        sr.alpha = Some(layout.opacity_at(s));
+        sr.alpha = None;
+        sr.tuck = Some(0.72);
     }
     let fall_rate = if !r.fell && (0.20..=0.88).contains(&s) {
         slide_fall_rate(layout.cover_at(s), layout.seg_kind_at(s))
@@ -1112,7 +1152,7 @@ mod tests {
         let mut wk = WalkState {
             seed: 4242,
             park_y: 0.25,
-            social: Some(Social { chat: 1, perched: true, happy: true, alpha: Some(0.36), ..Default::default() }),
+            social: Some(Social { chat: 1, perched: true, happy: true, alpha: Some(0.36), tuck: Some(0.72), ..Default::default() }),
             ..Default::default()
         };
         launch_slide_fall(&mut wk, 180.0, 1920.0, 1.2, 0.8, 1.0, 120.0);
@@ -1125,6 +1165,7 @@ mod tests {
         assert!(!wk.feet && !wk.grip);
         let sr = wk.social.unwrap();
         assert!(sr.alpha.is_none());
+        assert!(sr.tuck.is_none());
         assert!(!sr.perched);
         assert!(!sr.happy);
     }
@@ -1140,12 +1181,12 @@ mod tests {
     }
 
     #[test]
-    fn slide_phase3_updates_social_alpha_and_exit_glide() {
+    fn slide_phase3_keeps_full_alpha_tucks_and_launches_exit_glide() {
         let thing: Thing = serde_json::from_str(r#"{"kind":"slide","x":0.5,"pieces":3}"#).unwrap();
         let layout = park::slide_layout(&thing);
         let mut wk = WalkState {
             seed: 7,
-            social: Some(Social { chat: 1, perched: true, ..Default::default() }),
+            social: Some(Social { chat: 1, perched: true, alpha: Some(0.36), ..Default::default() }),
             ..Default::default()
         };
         let mut r = Rider { i: 0, phase: 3, t: 0.0, n: 0, want: 2, fell: false };
@@ -1153,16 +1194,12 @@ mod tests {
         for s in [0.1, 0.3, 0.5, 0.7, 0.9] {
             let (_, sh, tx, _) = layout.at(s);
             slide_phase3_step(&mut wk, &mut r, &layout, s, s, sh, tx, 120.0, 180.0, 1920.0, 0.0);
-            let expected = layout.opacity_at(s);
-            assert_eq!(wk.social.unwrap().alpha, Some(expected));
-            match layout.cover_at(s) {
-                park::TubeCover::Open => assert!(expected > 0.5, "Open cover opacity {expected}"),
-                park::TubeCover::Translucent => assert!(expected > 0.0 && expected < 0.5, "Translucent cover opacity {expected}"),
-                park::TubeCover::Opaque => assert!(expected < 0.05, "Opaque cover opacity {expected}"),
-            }
+            let sr = wk.social.unwrap();
+            assert!(sr.alpha.is_none());
+            assert_eq!(sr.tuck, Some(0.72));
         }
 
-        // Reaching exit sets Jump + glide_vx + clears alpha
+        // Reaching exit sets Jump + glide_vx + clears alpha and tuck
         let (_, sh, tx, _) = layout.at(1.0);
         slide_phase3_step(&mut wk, &mut r, &layout, 1.0, 1.0, sh, tx, 120.0, 180.0, 1920.0, 1.0 / 60.0);
         assert_eq!(r.phase, 4);
@@ -1170,6 +1207,8 @@ mod tests {
         assert_eq!(wk.act, Act::Jump);
         assert!(wk.glide_vx * layout.exit_dir > 0.0);
         assert!(wk.giggle > 0.0);
-        assert!(wk.social.unwrap().alpha.is_none());
+        let sr = wk.social.unwrap();
+        assert!(sr.alpha.is_none());
+        assert!(sr.tuck.is_none());
     }
 }
