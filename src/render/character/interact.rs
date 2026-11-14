@@ -109,6 +109,7 @@ impl CharacterOverlay {
                             a.walk.jump = 0.0;
                         }
                         a.walk.act = Act::Held;
+                        a.walk.glide_vx = 0.0;
                         a.walk.petted = 0.0;
                         a.walk.hug = 0.0;
                         a.walk.grab = Some(grab);
@@ -340,6 +341,7 @@ impl CharacterOverlay {
             }
             Act::Held => {
                 self.walk.act = Act::Fall;
+                self.walk.glide_vx = 0.0;
                 self.walk.held_prev = None;
                 self.walk.dropped_at = Some(self.screen_mouse);
                 // let go mid-swing: keeps spinning the same way until it lands,
@@ -462,6 +464,7 @@ impl CharacterOverlay {
                 wk.jump = 0.0;
                 wk.catch_jump = false;
                 wk.act = Act::Held;
+                wk.glide_vx = 0.0;
                 wk.hang = tn().cling_min + wk.rand() * tn().cling_rand;
                 wk.swing = 0.0;
                 wk.swing_v = 0.0;

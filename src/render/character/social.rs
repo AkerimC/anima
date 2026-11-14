@@ -75,6 +75,10 @@ pub(super) struct Social {
     // display-only: currently in pure chat (`Stage::Talk`) or a crowded group (3+)
     pub(super) in_talk: bool,
     pub(super) crowd: bool,
+    // slide tube visibility override (None = 1.0)
+    pub(super) alpha: Option<f32>,
+    // crouch scale from the feet up inside slide tubes (None = 1.0)
+    pub(super) tuck: Option<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -603,6 +607,7 @@ impl WalkState {
         let r = self.social.as_mut()?;
         r.leaping = false;
         if r.moving {
+            self.glide_vx = 0.0;
             let d = r.goal - self.x;
             let s = r.speed * dt * drag;
             if d.abs() > s {
@@ -753,6 +758,7 @@ impl WalkState {
     pub(super) fn social_hop(&mut self, dt: f32) {
         let drag = self.drag();
         let Some(r) = self.social.as_mut().filter(|r| r.leaping && r.moving) else { return };
+        self.glide_vx = 0.0;
         let d = r.goal - self.x;
         let s = r.speed * dt * drag;
         if r.face_lock {
@@ -1002,6 +1008,14 @@ impl CharacterOverlay {
                 if r.perched && !may.perched {
                     r.perched = false;
                     fixed.push("perched");
+                }
+                if r.alpha.is_some() && st != Stage::Play {
+                    r.alpha = None;
+                    fixed.push("alpha");
+                }
+                if r.tuck.is_some() && st != Stage::Play {
+                    r.tuck = None;
+                    fixed.push("tuck");
                 }
                 if talk && (r.no_touch || r.no_pat || r.face_lock || r.chasing) {
                     r.no_touch = false;
@@ -1279,7 +1293,8 @@ impl CharacterOverlay {
                 // (not when someone's picked it up: that's the button held down)
                 let playing = (game && (wk.act == Act::Fall || (wk.act == Act::Held && (wk.hang > 0.0 || !carried))))
                     || (wk.social.is_some_and(|s| s.grabbed) && matches!(wk.act, Act::Held | Act::Fall))
-                    || (tag && matches!(wk.act, Act::Held | Act::Fall));
+                    || (tag && matches!(wk.act, Act::Held | Act::Fall))
+                    || (c.stage == Stage::Play && wk.act == Act::Fall);
                 wk.social.is_some_and(|s| s.chat == id) && !wk.circle && (playing || !matches!(wk.act, Act::Held | Act::Fall | Act::Chase))
             };
             if !stays {
@@ -1438,7 +1453,7 @@ impl CharacterOverlay {
     fn enlist(&mut self, i: usize, id: u32) {
         let wk = self.walk_of(i);
         let face_left = wk.left;
-        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0, in_talk: false, crowd: false });
+        wk.social = Some(Social { chat: id, goal_px: 0.0, goal: 0.0, speed: 0.0, moving: false, face_left, happy: false, chasing: false, hop_cool: 0.0, flying: false, spin: 0.0, stuck: false, rot_target: 0.0, sink_target: 0.0, bump_cool: 0.0, queued: false, launch_px: 0.0, lean: 0.0, feet: false, pace: 1.0, pace_goal: 1.0, pace_wait: 0.0, leaping: false, inside: false, no_touch: false, no_pat: false, jumped: false, face_lock: false, perched: false, grabbed: false, grab_px: 0.0, bounces: 0, in_talk: false, crowd: false, alpha: None, tuck: None });
     }
 
 

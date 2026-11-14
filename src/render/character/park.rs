@@ -22,6 +22,45 @@ pub enum TubeSeg {
     Turn,
 }
 
+/// How enclosed one slide segment is: open trough, frosted translucent tube, or solid opaque tube.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TubeCover {
+    Open,
+    #[default]
+    Translucent,
+    Opaque,
+}
+
+impl TubeCover {
+    /// Cycles `Open -> Translucent -> Opaque -> Open`.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Open => Self::Translucent,
+            Self::Translucent => Self::Opaque,
+            Self::Opaque => Self::Open,
+        }
+    }
+
+    /// Short UI label for this cover style.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Translucent => "Glass",
+            Self::Opaque => "Closed",
+        }
+    }
+
+    /// Base rider opacity (`1.0` visible, `0.36` frosted, `0.0` hidden).
+    pub fn base_opacity(self) -> f32 {
+        match self {
+            Self::Open => 1.0,
+            Self::Translucent => 0.36,
+            Self::Opaque => 0.0,
+        }
+    }
+}
+
 /// Something built in the park: what, where (x share of width, y share of
 /// height from bottom edge), turned round, piece count, and tube slide segments.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -40,6 +79,8 @@ pub struct Thing {
     pub pieces: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tubes: Vec<TubeSeg>,
+    #[serde(default)]
+    pub covers: Vec<TubeCover>,
 }
 
 fn one() -> u32 {
@@ -110,10 +151,116 @@ pub const MAX_TUBE_PIECES: usize = 10;
 pub const TUBE_RADIUS: f32 = 0.28;
 pub const TUBE_EXIT_H: f32 = 0.06;
 
+/// Tube segment RGB palette matching `gui/src/park.rs`.
+pub const TUBE_RGB: [[f32; 3]; 6] = [
+    [0.94, 0.36, 0.33],
+    [0.98, 0.68, 0.22],
+    [0.28, 0.72, 0.56],
+    [0.30, 0.58, 0.92],
+    [0.68, 0.42, 0.86],
+    [0.94, 0.46, 0.68],
+];
+
+pub const SLIDE_CHORDS_MAX: usize = 20;
+
+/// Screen-space polyline chords for per-pixel slide occlusion & front-shell overdraw in GLSL.
+#[derive(Clone, Debug)]
+pub struct SlideRenderData {
+    pub count: usize,
+    pub unit: f32,
+    pub active_seg: f32,
+    /// `(x0, y0, x1, y1)` in top-down surface pixels.
+    pub segs: [[f32; 4]; SLIDE_CHORDS_MAX],
+    /// `(cover + seg_idx * 4.0, r, g, b)` where cover `0 = Open`, `1 = Translucent`, `2 = Opaque`.
+    pub meta: [[f32; 4]; SLIDE_CHORDS_MAX],
+}
+
+/// Shared GLSL uniforms and `apply_slide_tube(c, sclip)` helper for per-pixel slide masking/overdraw.
+pub const SLIDE_TUBE_GLSL: &str = r#"
+uniform vec2 u_surface;
+uniform int u_slide_n;
+uniform float u_slide_u;
+uniform float u_slide_seg;
+uniform vec4 u_slide_segs[20];
+uniform vec4 u_slide_meta[20];
+
+vec4 apply_slide_tube(vec4 c, vec2 sclip) {
+    if (u_slide_n <= 0 || c.a <= 0.001) return c;
+    vec2 px = vec2((sclip.x * 0.5 + 0.5) * u_surface.x, (0.5 - sclip.y * 0.5) * u_surface.y);
+
+    int best_k = -1;
+    float best_dist = 1e9;
+    float best_raw_t = 0.0;
+    vec2 best_q = vec2(0.0);
+    for (int k = 0; k < 20; k++) {
+        if (k >= u_slide_n) break;
+        float seg_k = floor(u_slide_meta[k].x * 0.25 + 0.01);
+        if (abs(seg_k - u_slide_seg) > 1.1) continue;
+        vec2 a = u_slide_segs[k].xy;
+        vec2 b = u_slide_segs[k].zw;
+        vec2 ab = b - a;
+        float raw_t = dot(px - a, ab) / max(dot(ab, ab), 1e-4);
+        float t = clamp(raw_t, 0.0, 1.0);
+        vec2 q = a + ab * t;
+        float dist = length(px - q);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_k = k;
+            best_raw_t = raw_t;
+            best_q = q;
+        }
+    }
+
+    if (best_k < 0 || best_dist > 0.46 * u_slide_u) return c;
+    if (best_k == 0 && best_raw_t < 0.0) return c;
+    if (best_k == u_slide_n - 1 && best_raw_t > 1.0) return c;
+
+    int cover = int(mod(u_slide_meta[best_k].x + 0.01, 4.0));
+    vec3 col = u_slide_meta[best_k].yzw;
+    float r_u = best_dist / max(u_slide_u, 1.0);
+    float dy = (px.y - best_q.y) / max(u_slide_u, 1.0);
+
+    if (cover == 0) {
+        if (dy >= 0.038 && dy <= 0.305 && r_u <= 0.31) {
+            float d_hi = (dy - 0.07) / 0.025;
+            float rim_hi = exp(-(d_hi * d_hi)) * 0.55;
+            float rim_lo = smoothstep(0.21, 0.28, dy) * 0.35;
+            vec3 wall = mix(col, vec3(1.0), rim_hi);
+            wall = mix(wall, col * 0.52, rim_lo);
+            float lip_mask = smoothstep(0.038, 0.056, dy) * (1.0 - smoothstep(0.28, 0.305, r_u));
+            c.rgb = mix(c.rgb, wall, lip_mask);
+        }
+    } else if (cover == 1) {
+        if (r_u > 0.295) {
+            c.a = 0.0;
+            return c;
+        }
+        float rim = smoothstep(0.235, 0.275, r_u);
+        vec3 body = col * 0.72 + vec3(0.28);
+        float d_sh = (dy - 0.10) / 0.055;
+        float shade = exp(-(d_sh * d_sh)) * 0.18;
+        float d_sp = (dy + 0.12) / 0.042;
+        float spec = exp(-(d_sp * d_sp)) * 0.58;
+        vec3 glass = mix(body, col * 0.52, rim);
+        glass = mix(glass, vec3(0.0), shade);
+        glass = mix(glass, vec3(1.0), spec);
+        float glass_a = mix(0.56, 0.68, rim);
+        c.rgb = mix(c.rgb * 0.80, glass, glass_a);
+    } else if (cover == 2) {
+        if (r_u <= 0.44) {
+            c.a = 0.0;
+        }
+    }
+
+    return c;
+}
+"#;
+
 /// One tube segment along a slide's centerline, in centered `unit` coords.
 #[derive(Clone, Debug)]
 pub struct SlideCurve {
     pub kind: TubeSeg,
+    pub cover: TubeCover,
     pub pts: [(f32, f32); 4],
     pub dir_in: f32,
     pub dir_out: f32,
@@ -127,6 +274,8 @@ pub struct SlideSample {
     pub tx: f32,
     pub th: f32,
     pub dist: f32,
+    pub seg: usize,
+    pub cover: TubeCover,
 }
 
 /// Full layout of a modular tube slide in centered `unit` coordinates (`h >= 0` up).
@@ -143,6 +292,15 @@ pub struct SlideLayout {
     pub curves: Vec<SlideCurve>,
     pub joints: Vec<(f32, f32, f32, f32)>,
     pub samples: Vec<SlideSample>,
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
 }
 
 impl SlideLayout {
@@ -169,6 +327,131 @@ impl SlideLayout {
         let n = (tx * tx + th * th).sqrt().max(1e-5);
         (x, h, tx / n, th / n)
     }
+
+    /// Segment index at arc-length fraction `frac` (`0.0` .. `1.0`).
+    pub fn seg_at(&self, frac: f32) -> usize {
+        if self.samples.is_empty() {
+            return 0;
+        }
+        let target = frac.clamp(0.0, 1.0) * self.total_len;
+        let idx = self.samples.partition_point(|s| s.dist < target);
+        self.samples[idx.min(self.samples.len() - 1)].seg
+    }
+
+    /// Cover style at arc-length fraction `frac`.
+    pub fn cover_at(&self, frac: f32) -> TubeCover {
+        self.curves.get(self.seg_at(frac)).map_or(TubeCover::Open, |c| c.cover)
+    }
+
+    /// Segment kind at arc-length fraction `frac`.
+    pub fn seg_kind_at(&self, frac: f32) -> TubeSeg {
+        self.curves.get(self.seg_at(frac)).map_or(TubeSeg::Straight, |c| c.kind)
+    }
+
+    fn seg_bounds(&self, si: usize) -> (f32, f32) {
+        if self.total_len <= 1e-6 || self.samples.is_empty() || self.curves.is_empty() {
+            return (0.0, 1.0);
+        }
+        let start = if si == 0 {
+            0.0
+        } else {
+            let p = self.samples.partition_point(|s| s.seg < si);
+            if p == 0 { 0.0 } else { self.samples[p - 1].dist / self.total_len }
+        };
+        let end = if si + 1 >= self.curves.len() {
+            1.0
+        } else {
+            let q = self.samples.partition_point(|s| s.seg <= si);
+            if q == 0 { 1.0 } else { self.samples[q - 1].dist / self.total_len }
+        };
+        (start, end)
+    }
+
+    /// Smooth rider alpha in `[0.0, 1.0]` along the slide at arc-length fraction `frac`.
+    pub fn opacity_at(&self, frac: f32) -> f32 {
+        if self.curves.is_empty() {
+            return 1.0;
+        }
+        let f = frac.clamp(0.0, 1.0);
+        let si = self.seg_at(f).min(self.curves.len() - 1);
+        let (start, end) = self.seg_bounds(si);
+        let cur = self.curves[si].cover.base_opacity();
+        let mut alpha = cur;
+
+        if si > 0 {
+            let (prev_start, _) = self.seg_bounds(si - 1);
+            let half = 0.025_f32.min((start - prev_start) * 0.45).min((end - start) * 0.45);
+            if half > 1e-5 && f < start + half {
+                let prev = self.curves[si - 1].cover.base_opacity();
+                alpha = lerp(prev, cur, smoothstep((f - (start - half)) / (2.0 * half)));
+            }
+        }
+        if si + 1 < self.curves.len() {
+            let (_, next_end) = self.seg_bounds(si + 1);
+            let half = 0.025_f32.min((end - start) * 0.45).min((next_end - end) * 0.45);
+            if half > 1e-5 && f > end - half {
+                let next = self.curves[si + 1].cover.base_opacity();
+                alpha = lerp(cur, next, smoothstep((f - (end - half)) / (2.0 * half)));
+            }
+        }
+
+        if f < 0.04 && self.curves[0].cover != TubeCover::Open {
+            alpha = lerp(1.0, alpha, smoothstep(f / 0.04));
+        }
+        if f > 0.92 && self.curves.last().is_some_and(|c| c.cover != TubeCover::Open) {
+            alpha = lerp(alpha, 1.0, smoothstep((f - 0.92) / 0.08));
+        }
+        alpha.clamp(0.0, 1.0)
+    }
+
+    /// Samples up to 5 slide segments into screen-space polyline chords for GLSL masking.
+    pub fn chords(&self, mid_px: f32, gy_px: f32, unit: f32, active_seg: usize) -> SlideRenderData {
+        let mut segs = [[0.0; 4]; SLIDE_CHORDS_MAX];
+        let mut meta = [[0.0; 4]; SLIDE_CHORDS_MAX];
+        let mut count = 0;
+        let to_px = |(px, ph): (f32, f32)| -> (f32, f32) {
+            (mid_px + px * unit, gy_px - (ph + TUBE_RADIUS) * unit)
+        };
+        for (si, curve) in self.curves.iter().take(5).enumerate() {
+            let cover_f = match curve.cover {
+                TubeCover::Open => 0.0,
+                TubeCover::Translucent => 1.0,
+                TubeCover::Opaque => 2.0,
+            };
+            let rgb = TUBE_RGB[si % TUBE_RGB.len()];
+            let seg_meta = [cover_f + (si as f32) * 4.0, rgb[0], rgb[1], rgb[2]];
+            for k in 0..4 {
+                if count >= SLIDE_CHORDS_MAX {
+                    break;
+                }
+                let t0 = k as f32 / 4.0;
+                let t1 = (k + 1) as f32 / 4.0;
+                let (p0, _) = eval_cubic(curve.pts, t0);
+                let (p1, _) = eval_cubic(curve.pts, t1);
+                let (x0, y0) = to_px(p0);
+                let (x1, y1) = to_px(p1);
+                segs[count] = [x0, y0, x1, y1];
+                meta[count] = seg_meta;
+                count += 1;
+            }
+        }
+        SlideRenderData {
+            count,
+            unit,
+            active_seg: active_seg as f32,
+            segs,
+            meta,
+        }
+    }
+}
+
+/// Default cover style for segment `idx` so multi-segment slides naturally mix styles.
+pub fn default_tube_cover(idx: usize, _kind: TubeSeg) -> TubeCover {
+    match idx % 3 {
+        0 => TubeCover::Open,
+        1 => TubeCover::Translucent,
+        _ => TubeCover::Opaque,
+    }
 }
 
 /// Segments forming a slide, falling back to `pieces` straight segments for older saves.
@@ -178,6 +461,15 @@ pub fn slide_segments(t: &Thing) -> Vec<TubeSeg> {
     } else {
         vec![TubeSeg::Straight; (t.pieces.clamp(1, 5) as usize).min(MAX_TUBE_PIECES)]
     }
+}
+
+/// Cover style per slide segment, falling back to [`default_tube_cover`] for missing entries.
+pub fn slide_covers(t: &Thing) -> Vec<TubeCover> {
+    slide_segments(t)
+        .into_iter()
+        .enumerate()
+        .map(|(i, seg)| t.covers.get(i).copied().unwrap_or_else(|| default_tube_cover(i, seg)))
+        .collect()
 }
 
 /// Cubic Bézier points and outgoing horizontal direction (`+1.0` or `-1.0`) for one tube segment.
@@ -208,15 +500,16 @@ pub fn eval_cubic(p: [(f32, f32); 4], t: f32) -> ((f32, f32), (f32, f32)) {
 /// Computes the full centered geometry of a modular tube slide `t`.
 pub fn slide_layout(t: &Thing) -> SlideLayout {
     let segs = slide_segments(t);
+    let covers = slide_covers(t);
     let ladder_raw = 0.0_f32;
     let lip_raw = 0.30_f32;
     let (mut cur_x, mut cur_h, mut dir) = (lip_raw, 0.0_f32, 1.0_f32);
     let mut raw_curves = Vec::with_capacity(segs.len());
-    for kind in segs {
+    for (kind, cover) in segs.into_iter().zip(covers) {
         let (pts, next_dir) = next_tube_curve(cur_x, cur_h, dir, kind);
         cur_x = pts[3].0;
         cur_h = pts[3].1;
-        raw_curves.push(SlideCurve { kind, pts, dir_in: dir, dir_out: next_dir });
+        raw_curves.push(SlideCurve { kind, cover, pts, dir_in: dir, dir_out: next_dir });
         dir = next_dir;
     }
     let shift_h = TUBE_EXIT_H - cur_h;
@@ -251,18 +544,18 @@ pub fn slide_layout(t: &Thing) -> SlideLayout {
         if si == 0 {
             let ((x0, h0), (tx0, th0)) = eval_cubic(pts, 0.0);
             joints.push((x0, h0, tx0, th0));
-            samples.push(SlideSample { x: x0, h: h0, tx: tx0, th: th0, dist: 0.0 });
+            samples.push(SlideSample { x: x0, h: h0, tx: tx0, th: th0, dist: 0.0, seg: si, cover: c.cover });
         }
         const STEPS: usize = 20;
         for k in 1..=STEPS {
             let ((sx, sh), (tx, th)) = eval_cubic(pts, k as f32 / STEPS as f32);
             let prev = *samples.last().unwrap();
             total_len += ((sx - prev.x).powi(2) + (sh - prev.h).powi(2)).sqrt();
-            samples.push(SlideSample { x: sx, h: sh, tx, th, dist: total_len });
+            samples.push(SlideSample { x: sx, h: sh, tx, th, dist: total_len, seg: si, cover: c.cover });
         }
         let ((jx, jh), (jtx, jth)) = eval_cubic(pts, 1.0);
         joints.push((jx, jh, jtx, jth));
-        curves.push(SlideCurve { kind: c.kind, pts, dir_in: c.dir_in * flip, dir_out: c.dir_out * flip });
+        curves.push(SlideCurve { kind: c.kind, cover: c.cover, pts, dir_in: c.dir_in * flip, dir_out: c.dir_out * flip });
     }
     let last_pt = samples.last().copied().unwrap();
     SlideLayout {
@@ -377,6 +670,7 @@ mod tests {
             flip,
             pieces,
             tubes,
+            covers: Vec::new(),
         }
     }
 
@@ -385,6 +679,35 @@ mod tests {
         let raw = r#"{"kind":"slide","x":0.4,"y":0.1,"flip":false,"pieces":3}"#;
         let t: Thing = serde_json::from_str(raw).unwrap();
         assert_eq!(slide_segments(&t), vec![TubeSeg::Straight; 3]);
+        assert!(t.covers.is_empty());
+        assert_eq!(
+            slide_covers(&t),
+            vec![TubeCover::Open, TubeCover::Translucent, TubeCover::Opaque]
+        );
+    }
+
+    #[test]
+    fn explicit_covers_preserved_by_layout_and_cover_at() {
+        let mut t = sample_slide(vec![TubeSeg::Straight, TubeSeg::Turn, TubeSeg::Straight], 1, false);
+        t.covers = vec![TubeCover::Opaque, TubeCover::Open, TubeCover::Translucent];
+        let layout = slide_layout(&t);
+        assert_eq!(layout.curves.iter().map(|c| c.cover).collect::<Vec<_>>(), t.covers);
+        assert_eq!(layout.cover_at(0.10), TubeCover::Opaque);
+        assert_eq!(layout.cover_at(0.50), TubeCover::Open);
+        assert_eq!(layout.cover_at(0.88), TubeCover::Translucent);
+        assert_eq!(layout.seg_kind_at(0.50), TubeSeg::Turn);
+    }
+
+    #[test]
+    fn opacity_at_matches_segment_covers_and_blends_smoothly() {
+        let mut t = sample_slide(vec![TubeSeg::Straight; 3], 1, false);
+        t.covers = vec![TubeCover::Open, TubeCover::Translucent, TubeCover::Opaque];
+        let layout = slide_layout(&t);
+        assert!((layout.opacity_at(0.15) - 1.0).abs() < 1e-4);
+        assert!((layout.opacity_at(0.50) - 0.36).abs() < 1e-4);
+        assert!(layout.opacity_at(0.82).abs() < 1e-4);
+        assert!(layout.opacity_at(0.96) > 0.1 && layout.opacity_at(0.96) < 0.9);
+        assert!((layout.opacity_at(1.0) - 1.0).abs() < 1e-4);
     }
 
     #[test]
@@ -414,5 +737,52 @@ mod tests {
         assert!((a.ladder_x + b.ladder_x).abs() < 1e-4);
         assert!((a.exit_x + b.exit_x).abs() < 1e-4);
         assert!((a.exit_dir + b.exit_dir).abs() < 1e-4);
+    }
+
+    #[test]
+    fn chords_samples_segments_coordinates_metadata_and_colors() {
+        let mut t = sample_slide(
+            vec![TubeSeg::Straight, TubeSeg::Turn, TubeSeg::Straight],
+            1,
+            false,
+        );
+        t.covers = vec![TubeCover::Open, TubeCover::Translucent, TubeCover::Opaque];
+        let layout = slide_layout(&t);
+        let (mid_px, gy_px, unit) = (400.0, 500.0, 80.0);
+        let data = layout.chords(mid_px, gy_px, unit, 2);
+
+        assert_eq!(data.count, t.tubes.len() * 4);
+        assert!((data.unit - unit).abs() < 1e-5);
+        assert!((data.active_seg - 2.0).abs() < 1e-5);
+
+        let expected_covers = [0.0_f32, 1.0, 2.0];
+        for (si, curve) in layout.curves.iter().enumerate() {
+            let rgb = TUBE_RGB[si % TUBE_RGB.len()];
+            let expected_tag = expected_covers[si] + (si as f32) * 4.0;
+            for k in 0..4 {
+                let idx = si * 4 + k;
+                let (p0, _) = eval_cubic(curve.pts, k as f32 / 4.0);
+                let (p1, _) = eval_cubic(curve.pts, (k + 1) as f32 / 4.0);
+                let ex0 = mid_px + p0.0 * unit;
+                let ey0 = gy_px - (p0.1 + TUBE_RADIUS) * unit;
+                let ex1 = mid_px + p1.0 * unit;
+                let ey1 = gy_px - (p1.1 + TUBE_RADIUS) * unit;
+
+                assert!((data.segs[idx][0] - ex0).abs() < 1e-4);
+                assert!((data.segs[idx][1] - ey0).abs() < 1e-4);
+                assert!((data.segs[idx][2] - ex1).abs() < 1e-4);
+                assert!((data.segs[idx][3] - ey1).abs() < 1e-4);
+                assert!((data.meta[idx][0] - expected_tag).abs() < 1e-5);
+                assert_eq!(&data.meta[idx][1..4], &rgb);
+            }
+        }
+
+        // Caps at 5 segments (SLIDE_CHORDS_MAX = 20) while matching color cycling.
+        let long = sample_slide(vec![TubeSeg::Straight; 7], 1, false);
+        let long_data = slide_layout(&long).chords(mid_px, gy_px, unit, 0);
+        assert_eq!(long_data.count, SLIDE_CHORDS_MAX);
+        for si in 0..5 {
+            assert_eq!(&long_data.meta[si * 4][1..4], &TUBE_RGB[si % TUBE_RGB.len()]);
+        }
     }
 }
