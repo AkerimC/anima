@@ -36,6 +36,8 @@ pub enum Anchor {
     Hand,
     // the middle of the chest, where it holds things close
     Chest,
+    // upper/front arm between shoulder and hand
+    Arm,
     // the other hand, the one at the back
     OffHand,
     // the feet (shoes come in pairs)
@@ -43,14 +45,41 @@ pub enum Anchor {
 }
 
 impl Anchor {
-    fn parse(s: &str) -> Option<Self> {
+    pub const ALL: [Anchor; 9] = [
+        Anchor::Crown,
+        Anchor::Eyes,
+        Anchor::Neck,
+        Anchor::Chest,
+        Anchor::Arm,
+        Anchor::Back,
+        Anchor::Hand,
+        Anchor::OffHand,
+        Anchor::Feet,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Crown => "Head",
+            Self::Eyes => "Face",
+            Self::Neck => "Neck",
+            Self::Chest => "Body",
+            Self::Arm => "Arm",
+            Self::Back => "Back",
+            Self::Hand => "Hand",
+            Self::OffHand => "Off-hand",
+            Self::Feet => "Feet",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "crown" | "head" => Self::Crown,
             "eyes" | "face" => Self::Eyes,
             "neck" => Self::Neck,
             "back" => Self::Back,
             "hand" => Self::Hand,
-            "chest" => Self::Chest,
+            "chest" | "body" => Self::Chest,
+            "arm" => Self::Arm,
             "offhand" | "other_hand" => Self::OffHand,
             "feet" | "foot" => Self::Feet,
             _ => return None,
@@ -66,11 +95,11 @@ pub struct Item {
     /// prop shader kind, or 100 for a picture
     kind: i32,
     image: Option<PathBuf>,
-    anchor: Anchor,
+    pub anchor: Anchor,
     size: [f32; 2],
     pivot: [f32; 2],
     offset: [f32; 2],
-    behind: bool,
+    pub behind: bool,
     /// worn twice, mirrored, this far either side (head widths): shoes, wings
     pair: f32,
 }
@@ -146,10 +175,105 @@ pub fn turn_key(id: &str, happy: bool) -> String {
     format!("{}~turn", fit_key(id, happy))
 }
 
+/// Raw per-character turn/mirror/layer record: `[turn, mirror, behind_override, 0.0]`.
+pub fn turn_raw(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, happy: bool) -> [f32; 4] {
+    fits.and_then(|f| f.get(&turn_key(id, happy)).or_else(|| f.get(&turn_key(id, false))))
+        .copied()
+        .unwrap_or([0.0; 4])
+}
+
 /// (angle, mirrored) set by hand for `id`, the happy pose's own if it has one.
 pub fn turn_of(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, happy: bool) -> (f32, bool) {
-    let f = fits.and_then(|f| f.get(&turn_key(id, happy)).or_else(|| f.get(&turn_key(id, false))));
-    f.map_or((0.0, false), |t| (t[0], t[1] > 0.5))
+    let t = turn_raw(fits, id, happy);
+    (t[0], t[1] > 0.5)
+}
+
+/// Whether `id` is drawn behind the character (`t[2] > 0.5` forces behind,
+/// `t[2] < -0.5` forces in front, `0.0` keeps `default`).
+pub fn behind_of(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, happy: bool, default: bool) -> bool {
+    let v = turn_raw(fits, id, happy)[2];
+    if v > 0.5 {
+        true
+    } else if v < -0.5 {
+        false
+    } else {
+        default
+    }
+}
+
+/// Key suffix for an independent side of a pair (`-1.0` = Left, `+1.0` = Right).
+pub fn side_id(id: &str, side: f32) -> String {
+    if side < 0.0 { format!("{id}~L") } else { format!("{id}~R") }
+}
+
+/// Fit for one side of a pair, preferring `id~L` / `id~R` and falling back to
+/// the legacy shared key (`(fit, is_independent)`).
+pub fn fit_of_side(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, side: f32, happy: bool) -> (Option<[f32; 4]>, bool) {
+    let sid = side_id(id, side);
+    if let Some(f) = fits.and_then(|m| m.get(&fit_key(&sid, happy)).or_else(|| m.get(&sid))) {
+        return (Some(*f), true);
+    }
+    let shared = fits.and_then(|m| m.get(&fit_key(id, happy)).or_else(|| m.get(id))).copied();
+    (shared, false)
+}
+
+/// Turn & mirror for one side of a pair, preferring `id~L` / `id~R` and
+/// falling back to the legacy shared turn.
+pub fn turn_of_side(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, side: f32, happy: bool) -> (f32, bool) {
+    let sid = side_id(id, side);
+    if let Some(t) = fits.and_then(|f| f.get(&turn_key(&sid, happy)).or_else(|| f.get(&turn_key(&sid, false)))) {
+        return (t[0], t[1] > 0.5);
+    }
+    let (t, m) = turn_of(fits, id, happy);
+    (if pair_mirrored(side) { -t } else { t }, m)
+}
+
+/// Behind override for one side of a pair, falling back to shared override then `default`.
+pub fn behind_of_side(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, side: f32, happy: bool, default: bool) -> bool {
+    let sid = side_id(id, side);
+    if let Some(t) = fits.and_then(|f| f.get(&turn_key(&sid, happy)).or_else(|| f.get(&turn_key(&sid, false)))) {
+        if t[2] > 0.5 {
+            return true;
+        }
+        if t[2] < -0.5 {
+            return false;
+        }
+    }
+    behind_of(fits, id, happy, default)
+}
+
+/// Key for per-character part/anchor & draw order overrides: `[anchor_idx_1based, z_order, 0.0, 0.0]`.
+pub fn meta_key(id: &str, happy: bool) -> String {
+    format!("{}~meta", fit_key(id, happy))
+}
+
+pub fn meta_raw(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, happy: bool) -> [f32; 4] {
+    fits.and_then(|f| f.get(&meta_key(id, happy)).or_else(|| f.get(&meta_key(id, false))))
+        .copied()
+        .unwrap_or([0.0; 4])
+}
+
+pub fn anchor_of(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, happy: bool, default: Anchor) -> Anchor {
+    let idx = meta_raw(fits, id, happy)[0].round() as usize;
+    idx.checked_sub(1).and_then(|k| Anchor::ALL.get(k).copied()).unwrap_or(default)
+}
+
+pub fn anchor_of_side(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, side: f32, happy: bool, default: Anchor) -> Anchor {
+    let sid = side_id(id, side);
+    let idx = meta_raw(fits, &sid, happy)[0].round() as usize;
+    idx.checked_sub(1).and_then(|k| Anchor::ALL.get(k).copied()).unwrap_or_else(|| anchor_of(fits, id, happy, default))
+}
+
+pub fn order_of(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, happy: bool) -> f32 {
+    meta_raw(fits, id, happy)[1]
+}
+
+pub fn order_of_side(fits: Option<&HashMap<String, [f32; 4]>>, id: &str, side: f32, happy: bool) -> f32 {
+    let sid = side_id(id, side);
+    if fits.is_some_and(|f| f.contains_key(&meta_key(&sid, happy)) || f.contains_key(&meta_key(&sid, false))) {
+        return order_of(fits, &sid, happy);
+    }
+    order_of(fits, id, happy)
 }
 
 /// Where `item` goes on a sprite with these anchors: left, top, width,
@@ -175,6 +299,10 @@ pub fn anchor_point(a: &crate::render::anchors::Anchors, anchor: Anchor, faces_r
         Anchor::Back => a.back,
         Anchor::Hand => if faces_right { a.hands[1] } else { a.hands[0] },
         Anchor::Chest => [(a.hands[0][0] + a.hands[1][0]) * 0.5, a.neck[1] + (a.feet[1] - a.neck[1]) * 0.2],
+        Anchor::Arm => {
+            let hand = if faces_right { a.hands[1] } else { a.hands[0] };
+            [a.neck[0] * 0.45 + hand[0] * 0.55, a.neck[1] * 0.55 + hand[1] * 0.45]
+        }
         Anchor::OffHand => if faces_right { a.hands[0] } else { a.hands[1] },
         Anchor::Feet => a.feet,
     }
@@ -229,22 +357,22 @@ pub fn pair_of(item: &Item) -> f32 {
 /// rather than shifting both. Pictures of pairs face left, as emoji do:
 /// the right one is drawn mirrored (`pair_mirrored`).
 pub fn pair_copy(item: &Item, side: f32, fit: Option<[f32; 4]>) -> (Item, Option<[f32; 4]>) {
+    pair_copy_side(item, side, fit, false)
+}
+
+pub fn pair_copy_side(item: &Item, side: f32, fit: Option<[f32; 4]>, independent: bool) -> (Item, Option<[f32; 4]>) {
     let mut one = item.clone();
     one.offset[0] += side * item.pair;
     if side < 0.0 {
         one.pivot[0] = 1.0 - one.pivot[0];
     }
-    (one, fit.map(|f| [f[0] * side, f[1], f[2], f[3]]))
+    let fit = if independent { fit } else { fit.map(|f| [f[0] * side, f[1], f[2], f[3]]) };
+    (one, fit)
 }
 
 /// Whether this side of a pair is drawn mirrored.
 pub fn pair_mirrored(side: f32) -> bool {
     side > 0.0
-}
-
-/// Santa hat as an item, so it can be fitted like the rest.
-pub fn santa_item() -> Item {
-    Item { id: "santa".into(), label: "Santa hat (Christmas)".into(), kind: 25, image: None, anchor: Anchor::Crown, size: [0.95, 0.72], pivot: [0.5, 1.0], offset: [0.0, 0.2], behind: false, pair: 0.0 }
 }
 
 /// What each character has found (character name -> item ids), beyond what
@@ -253,8 +381,7 @@ pub fn inventory_path() -> PathBuf {
     crate::util::data_dir().join("inventory.json")
 }
 
-/// Everyone has these from the start (the umbrella and the Santa hat come
-/// with the weather and the season anyway).
+/// Everyone has these from the start (the umbrella comes with the weather).
 pub const STARTERS: [&str; 1] = ["scarf"];
 
 pub type Inventory = HashMap<String, Vec<String>>;
@@ -281,44 +408,11 @@ pub(super) fn give(name: &str, id: &str) {
     }
 }
 
-/// What each job comes with (accessories folder pictures), given and put on
-/// when the job is earned; changed in the wardrobe like anything else.
-pub const JOB_GEAR: [(&str, [&str; 2]); 5] = [
-    ("chef", ["custom:chef_hat", "custom:mustache"]),
-    ("waiter", ["custom:bow_tie", "custom:tray"]),
-    ("fisher", ["custom:fishing_hat", "custom:rubber_boot"]),
-    ("farmer", ["custom:straw_hat", "custom:pitchfork"]),
-    ("attendant", ["custom:staff_cap", "custom:megaphone"]),
-];
-
-/// `name` got `job`: its gear is theirs, and on.
-pub(super) fn kit_out(name: &str, job: &str) {
-    let Some((_, gear)) = JOB_GEAR.iter().find(|g| g.0 == job) else { return };
-    let mut worn: HashMap<String, Vec<String>> = std::fs::read_to_string(wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let mine = worn.entry(name.to_string()).or_default();
-    for id in gear {
-        give(name, id);
-        if !mine.iter().any(|x| x == id) {
-            mine.push(id.to_string());
-        }
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&worn) {
-        let _ = crate::util::atomic_write(&wardrobe_path(), text.as_bytes());
-    }
-}
-
-/// Wears `id` right now (from the wardrobe).
-pub(super) fn wears(name: &str, id: &str) -> bool {
-    wardrobe().0.get(name).is_some_and(|v| v.iter().any(|x| x == id))
-}
-
 /// Something `name` hasn't found yet, at random (`roll` 0..1), as its place
 /// in the catalog; None once it has everything.
 pub(super) fn unfound(name: &str, roll: f32) -> Option<usize> {
     let shared = wardrobe();
-    // (a job's gear comes with the job, not off the line)
-    let gear = |id: &str| JOB_GEAR.iter().any(|g| g.1.contains(&id));
-    let left: Vec<usize> = (0..shared.1.len()).filter(|&k| !owns(&shared.3, name, &shared.1[k].id) && shared.1[k].id != "sleep_mask" && !gear(&shared.1[k].id)).collect();
+    let left: Vec<usize> = (0..shared.1.len()).filter(|&k| !owns(&shared.3, name, &shared.1[k].id) && shared.1[k].id != "sleep_mask").collect();
     (!left.is_empty()).then(|| left[(roll * left.len() as f32) as usize % left.len()])
 }
 
@@ -441,8 +535,8 @@ fn wardrobe() -> Wardrobe {
 /// and the picture for kind 100.
 #[derive(Clone, Debug)]
 pub(super) struct Worn {
-    // what it is, for things that can be lost: "umbrella", "santa", a wardrobe id
-    pub(super) id: &'static str,
+    // what it is, for things that can be lost: "umbrella", "weapon", an accessory id, or empty
+    pub(super) id: String,
     pub(super) kind: i32,
     pub(super) rect: [f32; 4],
     // turned about its middle (radians), by hand in the fitting
@@ -452,18 +546,17 @@ pub(super) struct Worn {
     pub(super) image: Option<PathBuf>,
 }
 
-/// Things that can be knocked off or out of the hand (hats, the umbrella).
-fn droppable(id: &str) -> &'static str {
-    const LOOSE: [&str; 24] = [
-        "party_hat", "top_hat", "crown", "headphones", "helmet", "cap", "grad_cap", "chick", "sword", "shield", "wand", "bow_arrow", "axe", "hammer", "broom",
-        "mic", "lollipop", "ice_cream", "bubble_tea", "trophy", "handbag", "flashlight", "crystal_ball", "gem",
-    ];
+/// Things worn on the head, face, or in the hand that can be knocked off on hard impact.
+fn droppable(id: &str, anchor: Anchor) -> String {
+    if id == "sleep_mask" || !matches!(anchor, Anchor::Crown | Anchor::Eyes | Anchor::Hand | Anchor::OffHand) {
+        return String::new();
+    }
     if id.starts_with("weapon:") {
         // weapons fly out of the hand too; one id for all of them is enough to
         // know it's lost and to have it back
-        return "weapon";
+        return "weapon".to_string();
     }
-    LOOSE.iter().copied().find(|&x| x == id).unwrap_or("")
+    id.to_string()
 }
 
 impl CharacterOverlay {
@@ -505,7 +598,7 @@ impl CharacterOverlay {
             let (a, b) = (sx(left), sx(left + w));
             [a.min(b), sy(top + h), a.max(b), sy(top)]
         };
-        let mut out = Vec::new();
+        let mut out: Vec<(f32, Worn)> = Vec::new();
         let wk = &self.walk;
         let asleep = wk.act == Act::Rest && wk.rest.is_some_and(|r| r.kind == super::moods::RestKind::Sleep);
         let shared = wardrobe();
@@ -532,19 +625,28 @@ impl CharacterOverlay {
                 if (it.id == "sleep_mask" && !asleep) || wk.lost.iter().any(|l| l == &it.id || (l == "weapon" && it.id.starts_with("weapon:"))) || !owns(&shared.3, &name, &it.id) {
                     continue;
                 }
-                // turned and mirrored by hand; on a mirrored sprite the turn goes the other way
-                let (turn, mirror) = turn_of(fits, &it.id, happy);
-                let turn = if flip { -turn } else { turn };
                 if it.pair > 0.0 {
-                    // a pair: one each side, the second mirrored
+                    // a pair: one each side, each side configurable on its own
                     for side in [-1.0f32, 1.0] {
-                        let (one, fit) = pair_copy(it, side, fit_for(&it.id));
-                        let t = if pair_mirrored(side) { -turn } else { turn };
-                        out.push(Worn { turn: t, id: "", kind: it.kind, rect: place_with(&one, fit), flip: flip ^ pair_mirrored(side) ^ mirror, behind: it.behind, image: it.image.clone() });
+                        let (fit, independent) = fit_of_side(fits, &it.id, side, happy);
+                        let (mut one, fit) = pair_copy_side(it, side, fit, independent);
+                        one.anchor = anchor_of_side(fits, &it.id, side, happy, it.anchor);
+                        let (t, m) = turn_of_side(fits, &it.id, side, happy);
+                        let t = if flip { -t } else { t };
+                        let behind = behind_of_side(fits, &it.id, side, happy, it.behind);
+                        let z = order_of_side(fits, &it.id, side, happy);
+                        out.push((z, Worn { turn: t, id: String::new(), kind: it.kind, rect: place_with(&one, fit), flip: flip ^ pair_mirrored(side) ^ m, behind, image: it.image.clone() }));
                     }
                 } else {
+                    // turned and mirrored by hand; on a mirrored sprite the turn goes the other way
+                    let mut one = it.clone();
+                    one.anchor = anchor_of(fits, &it.id, happy, it.anchor);
+                    let (turn, mirror) = turn_of(fits, &it.id, happy);
+                    let turn = if flip { -turn } else { turn };
+                    let behind = behind_of(fits, &it.id, happy, it.behind);
+                    let z = order_of(fits, &it.id, happy);
                     let image = if it.kind == 100 { picture_for(it, &name) } else { None };
-                    out.push(Worn { turn, id: droppable(&it.id), kind: it.kind, rect: fitted(it), flip: flip ^ mirror, behind: it.behind, image });
+                    out.push((z, Worn { turn, id: droppable(&it.id, one.anchor), kind: it.kind, rect: fitted(&one), flip: flip ^ mirror, behind, image }));
                 }
             }
         }
@@ -552,24 +654,19 @@ impl CharacterOverlay {
         // then carried on its back
         if let Some(kind) = wk.keepsake {
             if asleep {
-                out.push(Worn { turn: 0.0, id: "", kind, rect: place(Anchor::Chest, [0.46, 0.4], [0.5, 0.5], [0.0, 0.0]), flip, behind: false, image: None });
+                out.push((0.0, Worn { turn: 0.0, id: String::new(), kind, rect: place(Anchor::Chest, [0.46, 0.4], [0.5, 0.5], [0.0, 0.0]), flip, behind: false, image: None }));
             } else if wk.carry && wk.act != Act::Rest {
-                out.push(Worn { turn: 0.0, id: "", kind, rect: place(Anchor::Back, [0.5, 0.44], [0.5, 0.5], [0.0, -0.05]), flip, behind: true, image: None });
+                out.push((0.0, Worn { turn: 0.0, id: String::new(), kind, rect: place(Anchor::Back, [0.5, 0.44], [0.5, 0.5], [0.0, -0.05]), flip, behind: true, image: None }));
             }
         }
         // a sign held up in both hands, in front of its chest
         if let Some(k) = wk.sign.filter(|_| wk.act == Act::Idle) {
             if let Some(image) = super::sign::picture(k) {
-                out.push(Worn { turn: 0.0, id: "", kind: 100, rect: place(Anchor::Chest, [1.15, 0.75], [0.5, 0.1], [0.0, 0.0]), flip: false, behind: false, image: Some(image) });
+                out.push((0.0, Worn { turn: 0.0, id: String::new(), kind: 100, rect: place(Anchor::Chest, [1.15, 0.75], [0.5, 0.1], [0.0, 0.0]), flip: false, behind: false, image: Some(image) }));
             }
         }
         let weather = super::weather::now();
-        // Christmas: a Santa hat, the tip falling away from where it looks
-        let xmas = super::weather::christmas();
-        let hatted = xmas || out.iter().any(|w| matches!(w.kind, 27 | 28 | 37 | 36) || (w.kind == 100));
-        if xmas && !wk.lost.iter().any(|l| l == "santa") {
-            out.push(Worn { turn: 0.0, id: "santa", kind: 25, rect: fitted(&santa_item()), flip: !flip, behind: false, image: None });
-        }
+        let hatted = out.iter().any(|(_, w)| matches!(w.kind, 27 | 28 | 37 | 36) || (w.kind == 100));
         // snow that has settled on its head (or hat)
         let pile = wk.snow_pile;
         if pile >= 0.05 && tn().weather_show >= 0.5 {
@@ -578,7 +675,7 @@ impl CharacterOverlay {
             } else {
                 ([0.6 + 0.3 * pile, 0.12 + 0.42 * pile], [0.5, 0.8], [0.0, 0.1])
             };
-            out.push(Worn { turn: 0.0, id: "", kind: 24, rect: place(Anchor::Crown, size, pivot, offset), flip: false, behind: false, image: None });
+            out.push((0.0, Worn { turn: 0.0, id: String::new(), kind: 24, rect: place(Anchor::Crown, size, pivot, offset), flip: false, behind: false, image: None }));
         }
         // rain: what it does with the umbrella depends on what it's up to
         let has = weather.rain && tn().weather_show >= 0.5 && !wk.lost.iter().any(|l| l == "umbrella");
@@ -597,25 +694,25 @@ impl CharacterOverlay {
             let tall = wide * 0.5 * tex_aspect;
             let rim = crown[1] - 0.015;
             let (x0, x1) = (sx(hold[0] - wide * 0.5), sx(hold[0] + wide * 0.5));
-            out.push(Worn { turn: 0.0, id: "umbrella", kind: 38, rect: [x0.min(x1), sy(rim), x0.max(x1), sy(rim - tall)], flip: false, behind, image: None });
+            out.push((0.0, Worn { turn: 0.0, id: "umbrella".to_string(), kind: 38, rect: [x0.min(x1), sy(rim), x0.max(x1), sy(rim - tall)], flip: false, behind, image: None }));
             let thin = wide * 0.04;
             let (a0, a1) = (sx(hold[0] - thin * 0.5), sx(hold[0] + thin * 0.5));
             let stick = [a0.min(a1) - (a1 - a0).abs() * 2.5, sy(hold[1] + hh * 0.04), a0.max(a1) + (a1 - a0).abs() * 2.5, sy(rim - tall * 0.9)];
             // the hook turns towards the character
-            out.push(Worn { turn: 0.0, id: "umbrella", kind: 39, rect: stick, flip: self.faces_right == flip, behind: true, image: None });
+            out.push((0.0, Worn { turn: 0.0, id: "umbrella".to_string(), kind: 39, rect: stick, flip: self.faces_right == flip, behind: true, image: None }));
         };
         match mode {
             1 => open(hand, false),
             // strapped upright to its back, open over its head
             2 => open([a.back[0], a.back[1]], true),
             // rolled up and slung across its back, sticking out past the shoulder
-            3 => out.push(Worn { turn: 0.0, id: "", kind: 42, rect: place(Anchor::Back, [0.85, 1.3], [0.5, 0.5], [0.2, -0.22]), flip, behind: true, image: None }),
+            3 => out.push((0.0, Worn { turn: 0.0, id: String::new(), kind: 42, rect: place(Anchor::Back, [0.85, 1.3], [0.5, 0.5], [0.2, -0.22]), flip, behind: true, image: None })),
             _ => {}
         }
         // a picture fills its box's width at its own shape, about the box's middle
         let (bw, bh) = (self.pose.half[0] * self.pose.size[0], self.pose.half[1] * self.pose.size[1]);
         if bw > 0.0 && bh > 0.0 {
-            for w in out.iter_mut().filter(|w| w.kind != 38) {
+            for (_, w) in out.iter_mut().filter(|(_, w)| w.kind != 38) {
                 let picture = w.image.clone().or_else(|| super::rope::prop_image(w.kind));
                 let Some(aspect) = picture.and_then(|p| super::rope::picture_aspect(&p)) else { continue };
                 let [x0, y0, x1, y1] = w.rect;
@@ -624,6 +721,28 @@ impl CharacterOverlay {
                 w.rect = [x0, mid - want * 0.5, x1, mid + want * 0.5];
             }
         }
-        out
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out.into_iter().map(|(_, w)| w).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_anchor_and_order_per_side() {
+        let mut map = HashMap::new();
+        // arm = 1-based index of Anchor::Arm, z = 3.0
+        let arm_idx = Anchor::ALL.iter().position(|&a| a == Anchor::Arm).unwrap() as f32 + 1.0;
+        map.insert(meta_key("boots~L", false), [arm_idx, 3.0, 0.0, 0.0]);
+        map.insert(meta_key("hat", true), [Anchor::ALL.iter().position(|&a| a == Anchor::Eyes).unwrap() as f32 + 1.0, -2.0, 0.0, 0.0]);
+
+        assert_eq!(anchor_of_side(Some(&map), "boots", -1.0, false, Anchor::Feet), Anchor::Arm);
+        assert_eq!(anchor_of_side(Some(&map), "boots", 1.0, false, Anchor::Feet), Anchor::Feet);
+        assert_eq!(order_of_side(Some(&map), "boots", -1.0, false), 3.0);
+        assert_eq!(order_of_side(Some(&map), "boots", 1.0, false), 0.0);
+        assert_eq!(anchor_of(Some(&map), "hat", true, Anchor::Crown), Anchor::Eyes);
+        assert_eq!(order_of(Some(&map), "hat", true), -2.0);
     }
 }

@@ -562,29 +562,35 @@ impl CharacterOverlay {
                     wk.sign_left = 20.0 + wk.rand() * 10.0;
                 }
             }
-            // swung about hard in the rain: the umbrella flies out of its hand
+            // carried fast or shaken hard while held: items fly off mid-hold once
+            // momentum builds, and a brief whip still triggers on landing impact
             let wk = self.walk_ref(i);
             if wk.act == Act::Held {
-                // only real shaking: the cursor whipped about fast, or the character
-                // spun round hard, for a moment; just lifting it up isn't that
                 let speed = (wk.swing_vel[0] * wk.swing_vel[0] + wk.swing_vel[1] * wk.swing_vel[1]).sqrt();
                 let whipped = speed > tn().drop_speed || wk.swing_v.abs() > tn().drop_swing;
+                let dir = if wk.swing_v.abs() > 1.0 {
+                    Some(-wk.swing_v.signum())
+                } else if wk.swing_vel[0].abs() > 100.0 {
+                    Some(-wk.swing_vel[0].signum())
+                } else {
+                    None
+                };
                 let wk = self.walk_of(i);
-                wk.shake = if whipped { wk.shake + dt } else { (wk.shake - dt * 2.0).max(0.0) };
-                if wk.shake > 0.35 {
-                    wk.shake = 0.0;
-                    self.knock_off(i, 1.0, 0.3);
+                if step_hold_shake(&mut wk.shake, &mut wk.shaken, whipped, dt) {
+                    self.knock_off(i, 1.0, tn().jolt_drop, dir);
                 }
             }
-            // a jolt, a tumble, a crash: what's in its hand and on its head may go flying
+            // interaction finished on impact (or race knockdown): headgear, eyewear, and held items fly off
+            let impact_dir = self.walk_of(i).impact_dir.take();
             let wk = self.walk_ref(i);
-            // let go spinning fast, crashed into the ground, knocked over in a race
-            let tumbling = (wk.act == Act::Fall && wk.tumble.abs() > 9.0) || wk.act == Act::Planted || wk.race_down;
+            let tumbling = impact_dir.is_some() || wk.act == Act::Planted || wk.race_down;
             if tumbling && !wk.jolted {
                 self.walk_of(i).jolted = true;
-                self.knock_off(i, tn().jolt_drop, tn().jolt_drop * 0.7);
+                self.knock_off(i, tn().jolt_drop, tn().jolt_drop * 0.85, impact_dir);
             } else if !tumbling && matches!(wk.act, Act::Idle | Act::Walk) {
-                self.walk_of(i).jolted = false;
+                let wk = self.walk_of(i);
+                wk.jolted = false;
+                wk.shaken = false;
             }
             let wk = self.walk_of(i);
             // snow settles on its head while it stands about, and comes off when it jumps or runs
@@ -604,9 +610,9 @@ impl CharacterOverlay {
         }
     }
 
-    /// Things go flying: the umbrella out of the hand (with `hand` chance),
-    /// hats off the head (`head` chance), from where they're drawn now.
-    fn knock_off(&mut self, i: usize, hand: f32, head: f32) {
+    /// Things go flying: the umbrella/handheld items (with `hand` chance),
+    /// hats & eyewear (`head` chance), from where they're drawn on impact.
+    fn knock_off(&mut self, i: usize, hand: f32, head: f32, impact_dir: Option<f32>) {
         let a = self.actor_ref(i);
         let (r, pose) = (a.hit_rect, a.pose);
         let (w, h) = (r[2] - r[0], r[3] - r[1]);
@@ -632,23 +638,35 @@ impl CharacterOverlay {
             } else {
                 (t.kind, px)
             };
-            gone.push((t.id.to_string(), kind, px, t.image.clone()));
+            gone.push((t.id.clone(), kind, px, t.image.clone()));
         }
         let wk = self.walk_of(i);
-        let dir = if wk.swing_v.abs() > 0.5 { -wk.swing_v.signum() } else if wk.vx.abs() > 0.01 { wk.vx.signum() } else if wk.rand() < 0.5 { -1.0 } else { 1.0 };
+        let dir = if let Some(d) = impact_dir.filter(|d| d.abs() > 0.05) {
+            d.signum()
+        } else if wk.swing_v.abs() > 0.5 {
+            -wk.swing_v.signum()
+        } else if wk.vx.abs() > 0.01 {
+            wk.vx.signum()
+        } else if wk.rand() < 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
         let mut flying = Vec::new();
-        for (id, kind, px, image) in gone {
-            let chance = if id == "umbrella" { hand } else { head };
+        for (idx, (id, kind, px, image)) in gone.into_iter().enumerate() {
+            let chance = if id == "umbrella" || kind == 100 { hand.max(head) } else { head };
             if wk.rand() >= chance {
                 continue;
             }
-            let (vx, spin) = (dir * (200.0 + wk.rand() * 300.0), -dir * (5.0 + wk.rand() * 7.0));
+            // fan multiple dropped items apart so they don't stack in one spot
+            let spread = if idx % 2 == 0 { dir } else { -dir * (0.4 + wk.rand() * 0.6) };
+            let (vx, spin) = (spread * (180.0 + wk.rand() * 280.0), -spread * (5.0 + wk.rand() * 7.0));
             let size = [px[2] - px[0], px[3] - px[1]];
             let (x, y) = ((px[0] + px[2]) * 0.5 + view, (px[1] + px[3]) * 0.5);
             let lie = size[0].min(size[1]) * 0.5;
             log::debug!("{i} loses its {id}");
             wk.lost.push(id.clone());
-            flying.push(Loose { id, image, owner_name: owner_name.clone(), helper_name: None, kind, owner: i, x, y, vx, vy: -300.0 - wk.rand() * 200.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
+            flying.push(Loose { id, image, owner_name: owner_name.clone(), helper_name: None, kind, owner: i, x, y, vx, vy: -290.0 - wk.rand() * 220.0, rot: 0.0, spin, floor: floor - lie, size, still: 0.0, helper: None, carried: false });
         }
         self.moods.loose.extend(flying);
     }
@@ -798,10 +816,10 @@ impl CharacterOverlay {
     }
 
     pub(super) fn mood_props(&self, v: &mut Vec<(i32, [f32; 4], bool, usize)>) {
+        let time = self.start.elapsed().as_secs_f32();
         // rain: an umbrella over everyone not busy in a game; snow: flakes about them
         let w = self.moods.weather;
         if (w.rain || w.snow) && (0.5..1.5).contains(&tn().weather_show) {
-            let time = self.start.elapsed().as_secs_f32();
             let actors = std::iter::once((&self.walk, self.hit_rect, self.visible, self.opaque)).chain(self.extras.iter().map(|e| (&e.walk, e.hit_rect, e.visible, e.opaque)));
             for (k, (wk, r, seen, _)) in actors.enumerate() {
                 let h = r[3] - r[1];
@@ -825,9 +843,19 @@ impl CharacterOverlay {
             let a = if owner == 0 { self } else if let Some(e) = self.extras.get(owner - 1) { e } else { continue };
             // grows quickly, then fades by shrinking
             let k = if left > 0.3 { 1.0 } else { left / 0.3 };
-            let s = size * (0.6 + 0.4 * k);
-            let sx = x - a.own_view[0] * self.view_w * 0.5;
-            v.push((kind, [sx - s * 0.5, y - s * 0.5, sx + s * 0.5, y + s * 0.5], false, owner));
+            let (cx, cy, s) = if kind >= super::social::FOUND {
+                let r = a.hit_rect;
+                let h = r[3] - r[1];
+                if h <= 0.0 {
+                    continue;
+                }
+                let s = h * 0.46 * (0.6 + 0.4 * k);
+                let bob = (time * 6.0).sin() * h * 0.04;
+                ((r[0] + r[2]) * 0.5, r[1] + h * a.opaque[1] - s * 0.58 + bob, s)
+            } else {
+                (x - a.own_view[0] * self.view_w * 0.5, y, size * (0.6 + 0.4 * k))
+            };
+            v.push((kind, [cx - s * 0.5, cy - s * 0.5, cx + s * 0.5, cy + s * 0.5], false, owner));
         }
         for c in &self.moods.crumbs {
             let a = if c.owner == 0 { self } else { &self.extras[c.owner - 1] };
@@ -1108,6 +1136,21 @@ impl Bonds {
     }
 }
 
+/// Tracks fast carrying or shaking while held. Returns `true` when items should
+/// scatter immediately mid-hold, and marks `shaken` for brief whips released into a throw.
+fn step_hold_shake(shake: &mut f32, shaken: &mut bool, whipped: bool, dt: f32) -> bool {
+    *shake = if whipped { *shake + dt } else { (*shake - dt * 1.2).max(0.0) };
+    if *shake > 0.18 {
+        *shake = 0.0;
+        *shaken = false;
+        return true;
+    }
+    if *shake > 0.08 {
+        *shaken = true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,5 +1273,35 @@ mod tests {
         assert_eq!(b.get("Suzuka", "Rice"), (0.5, 0.25));
         b.add("Suzuka", "Rice", 10.0, 0.0);
         assert_eq!(b.get("Rice", "Suzuka").0, 3.0);
+    }
+
+    #[test]
+    fn hold_shake_drops_mid_hold_and_remembers_brief_whip() {
+        let mut shake = 0.0;
+        let mut shaken = false;
+
+        // Gentle carry never triggers either mid-hold drop or landing shaken flag
+        for _ in 0..20 {
+            assert!(!step_hold_shake(&mut shake, &mut shaken, false, DT));
+        }
+        assert!(!shaken);
+
+        // Brief whip sets shaken (for landing impact) before hitting mid-hold drop
+        for _ in 0..6 {
+            assert!(!step_hold_shake(&mut shake, &mut shaken, true, DT));
+        }
+        assert!(shaken);
+
+        // Sustained fast carry or shake triggers immediate mid-hold drop and clears shaken
+        let mut dropped = false;
+        for _ in 0..10 {
+            if step_hold_shake(&mut shake, &mut shaken, true, DT) {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped);
+        assert!(!shaken);
+        assert_eq!(shake, 0.0);
     }
 }
