@@ -36,6 +36,14 @@ impl Compositor for Niri {
         *governor::STRIP.lock().unwrap()
     }
 
+    fn columns(&self) -> Vec<(f32, f32)> {
+        governor::niri_columns()
+    }
+
+    fn window_x(&self, id: u64) -> Option<(f32, f32)> {
+        governor::niri_window_x(id)
+    }
+
     fn cursor(&self) -> Option<Option<(f32, f32)>> {
         governor::niri_cursor()
     }

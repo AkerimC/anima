@@ -1,7 +1,7 @@
 //! The window: a tab for the characters, one per group of behaviour
 //! settings (built from anima's tuning table) and one for general options.
 
-use crate::{config, daemon, roster, team};
+use crate::{config, daemon, library, roster, team};
 use adw::prelude::*;
 use anima::render::tuning::{FIELDS, Field};
 use gtk::{gdk, glib};
@@ -32,6 +32,8 @@ pub(crate) struct Ui {
     pub(crate) data: RefCell<team::Team>,
     // pictures are rebuilt on every change: don't decode them again
     pub(crate) team_thumbs: RefCell<HashMap<String, gdk::Texture>>,
+    /// The wallpaper card currently marked as applied (library page).
+    current_card: RefCell<Option<gtk::Button>>,
     toast: adw::ToastOverlay,
     power: gtk::Switch,
     syncing: Cell<bool>,
@@ -41,7 +43,17 @@ pub(crate) struct Ui {
 
 impl Ui {
     pub(crate) fn say(&self, text: &str) {
-        self.toast.add_toast(adw::Toast::builder().title(text).timeout(2).build());
+        self.toast
+            .add_toast(adw::Toast::builder().title(text).timeout(2).build());
+    }
+
+    /// Mark one wallpaper card as the applied one, clearing the previous.
+    pub(crate) fn set_current_card(&self, button: &gtk::Button) {
+        if let Some(old) = self.current_card.borrow_mut().take() {
+            old.remove_css_class("current");
+        }
+        button.add_css_class("current");
+        *self.current_card.borrow_mut() = Some(button.clone());
     }
 
     pub(crate) fn is_on(&self) -> bool {
@@ -110,7 +122,10 @@ pub(crate) fn thumb_pixels(path: &Path, size: i32) -> Option<(u32, u32, Vec<u8>)
     let crop = image::imageops::crop_imm(&img, x0, y0, cw, ch).to_image();
     let target = (size.max(8) * 2) as f32;
     let k = (target / cw.max(ch) as f32).min(1.0);
-    let (nw, nh) = (((cw as f32 * k).round() as u32).max(1), ((ch as f32 * k).round() as u32).max(1));
+    let (nw, nh) = (
+        ((cw as f32 * k).round() as u32).max(1),
+        ((ch as f32 * k).round() as u32).max(1),
+    );
     let small = image::imageops::resize(&crop, nw, nh, image::imageops::FilterType::Lanczos3);
     if let (Some(c), Some(f)) = (cache, file) {
         let _ = std::fs::create_dir_all(c);
@@ -129,20 +144,48 @@ pub(crate) fn picture(tex: Option<&gdk::Texture>, size: i32) -> gtk::Widget {
             pic.set_content_fit(gtk::ContentFit::Contain);
             pic.upcast()
         }
-        None => gtk::Image::builder().icon_name("applications-graphics-symbolic").pixel_size(size / 2).build().upcast(),
+        None => gtk::Image::builder()
+            .icon_name("applications-graphics-symbolic")
+            .pixel_size(size / 2)
+            .build()
+            .upcast(),
     }
 }
 
 /// One setting: a slider and a number box sharing one value, and a button
 /// back to the default once it's been changed.
 fn tuning_row(ui: &Rc<Ui>, f: &'static Field) -> (adw::ActionRow, gtk::Adjustment) {
-    let adj = gtk::Adjustment::new(f.default as f64, f.min as f64, f.max as f64, f.step as f64, f.step as f64 * 10.0, 0.0);
+    let adj = gtk::Adjustment::new(
+        f.default as f64,
+        f.min as f64,
+        f.max as f64,
+        f.step as f64,
+        f.step as f64 * 10.0,
+        0.0,
+    );
     adj.set_value(config::tuning_value(f.key).unwrap_or(f.default as f64));
     let shown = |v: f32| format!("{v:.*}", f.digits as usize);
-    let row = adw::ActionRow::builder().title(f.label).subtitle(format!("Default {}", shown(f.default))).build();
-    let scale = gtk::Scale::builder().adjustment(&adj).width_request(200).valign(gtk::Align::Center).draw_value(false).build();
-    let spin = gtk::SpinButton::builder().adjustment(&adj).digits(f.digits).width_chars(6).valign(gtk::Align::Center).build();
-    let reset = gtk::Button::builder().icon_name("edit-undo-symbolic").tooltip_text("Back to default").valign(gtk::Align::Center).build();
+    let row = adw::ActionRow::builder()
+        .title(f.label)
+        .subtitle(format!("Default {}", shown(f.default)))
+        .build();
+    let scale = gtk::Scale::builder()
+        .adjustment(&adj)
+        .width_request(200)
+        .valign(gtk::Align::Center)
+        .draw_value(false)
+        .build();
+    let spin = gtk::SpinButton::builder()
+        .adjustment(&adj)
+        .digits(f.digits)
+        .width_chars(6)
+        .valign(gtk::Align::Center)
+        .build();
+    let reset = gtk::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Back to default")
+        .valign(gtk::Align::Center)
+        .build();
     reset.add_css_class("flat");
     reset.add_css_class("circular");
     let is_default = move |v: f64| (v - f.default as f64).abs() < 1e-4;
@@ -166,7 +209,10 @@ fn tuning_row(ui: &Rc<Ui>, f: &'static Field) -> (adw::ActionRow, gtk::Adjustmen
 
 /// The current value of a tuning number.
 fn tuning_now(key: &str) -> f64 {
-    let default = FIELDS.iter().find(|f| f.key == key).map_or(0.0, |f| f.default as f64);
+    let default = FIELDS
+        .iter()
+        .find(|f| f.key == key)
+        .map_or(0.0, |f| f.default as f64);
     config::tuning_value(key).unwrap_or(default)
 }
 
@@ -189,14 +235,29 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         ("Wrestling", "applications-games-symbolic", "wrestle", "wrestle_min"),
         ("Tag", "find-location-symbolic", "tag", "party_min"),
         ("Samba", "audio-x-generic-symbolic", "samba", "samba_min"),
-        ("Volleyball", "weather-clear-symbolic", "volley", "volley_min"),
+        (
+            "Volleyball",
+            "weather-clear-symbolic",
+            "volley",
+            "volley_min",
+        ),
         ("Carrot grab", "emoji-food-symbolic", "carrot", "carrot_min"),
         ("Gift", "emblem-favorite-symbolic", "gift", "gift_min"),
-        ("Blind man's buff", "view-conceal-symbolic", "blind", "blind_min"),
+        (
+            "Blind man's buff",
+            "view-conceal-symbolic",
+            "blind",
+            "blind_min",
+        ),
         ("Fishing", "weather-showers-symbolic", "fishing", "fish_min"),
     ];
     for (label, icon, name, min_key) in games {
-        let inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).margin_top(10).margin_bottom(10).build();
+        let inner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(10)
+            .margin_bottom(10)
+            .build();
         inner.append(&gtk::Image::builder().icon_name(icon).pixel_size(28).build());
         inner.append(&gtk::Label::new(Some(label)));
         let b = gtk::Button::builder().child(&inner).build();
@@ -208,7 +269,9 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
             if !daemon::running() {
                 u.say("Anima is off");
             } else if have < need {
-                u.say(&format!("This game needs at least {need} characters, {have} are on"));
+                u.say(&format!(
+                    "This game needs at least {need} characters, {have} are on"
+                ));
             } else {
                 daemon::game(name);
                 u.say(&format!("{label}!"));
@@ -216,8 +279,18 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         });
         flow.insert(&b, -1);
     }
-    let inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).margin_top(10).margin_bottom(10).build();
-    inner.append(&gtk::Image::builder().icon_name("media-seek-forward-symbolic").pixel_size(28).build());
+    let inner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(10)
+        .margin_bottom(10)
+        .build();
+    inner.append(
+        &gtk::Image::builder()
+            .icon_name("media-seek-forward-symbolic")
+            .pixel_size(28)
+            .build(),
+    );
     inner.append(&gtk::Label::new(Some("Race")));
     let race = gtk::Button::builder().child(&inner).build();
     race.add_css_class("tile");
@@ -265,7 +338,12 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
         tries.insert(&b, -1);
     }
     let page = adw::PreferencesPage::new();
-    let group = adw::PreferencesGroup::builder().title("Play now").description("Starts straight away with the characters nearest the screen, whatever their energy").build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Play now")
+        .description(
+            "Starts straight away with the characters nearest the screen, whatever their energy",
+        )
+        .build();
     group.add(&flow);
     page.add(&group);
     // whose weather: a town, or empty for wherever the connection is
@@ -306,16 +384,44 @@ fn play_now(ui: &Rc<Ui>) -> gtk::Widget {
 /// A tab of behaviour settings, like a settings app: sections on the left
 /// (with a search over everything), the chosen section's settings on the right.
 fn tuning_page(ui: &Rc<Ui>, tab: &str) -> gtk::Widget {
-    let search = gtk::SearchEntry::builder().placeholder_text("Search").margin_start(10).margin_end(10).margin_top(10).margin_bottom(6).build();
-    let nav = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search")
+        .margin_start(10)
+        .margin_end(10)
+        .margin_top(10)
+        .margin_bottom(6)
+        .build();
+    let nav = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
     nav.add_css_class("navigation-sidebar");
-    let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).hexpand(true).build();
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .hexpand(true)
+        .build();
     // per section: name, the count label in the list, its settings
-    type Section = (String, gtk::Label, Vec<(adw::ActionRow, gtk::Adjustment, &'static Field)>);
+    type Section = (
+        String,
+        gtk::Label,
+        Vec<(adw::ActionRow, gtk::Adjustment, &'static Field)>,
+    );
     let sections: Rc<RefCell<Vec<Section>>> = Rc::default();
     let nav_row = |title: &str, count: &gtk::Label| {
-        let b = gtk::Box::builder().spacing(8).margin_top(8).margin_bottom(8).margin_start(6).margin_end(6).build();
-        b.append(&gtk::Label::builder().label(title).xalign(0.0).hexpand(true).wrap(true).build());
+        let b = gtk::Box::builder()
+            .spacing(8)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        b.append(
+            &gtk::Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .hexpand(true)
+                .wrap(true)
+                .build(),
+        );
         b.append(count);
         gtk::ListBoxRow::builder().child(&b).build()
     };
@@ -323,7 +429,9 @@ fn tuning_page(ui: &Rc<Ui>, tab: &str) -> gtk::Widget {
         let count = gtk::Label::new(None);
         nav.append(&nav_row("Play now", &count));
         stack.add_named(&play_now(ui), Some("0"));
-        sections.borrow_mut().push(("Play now".into(), count, Vec::new()));
+        sections
+            .borrow_mut()
+            .push(("Play now".into(), count, Vec::new()));
     }
     let mut groups: Vec<&str> = Vec::new();
     for f in FIELDS.iter().filter(|f| f.tab == tab) {
@@ -334,7 +442,10 @@ fn tuning_page(ui: &Rc<Ui>, tab: &str) -> gtk::Widget {
     for g in groups {
         let k = sections.borrow().len();
         let page = adw::PreferencesPage::new();
-        let group = adw::PreferencesGroup::builder().title(g).description("Changes apply straight away").build();
+        let group = adw::PreferencesGroup::builder()
+            .title(g)
+            .description("Changes apply straight away")
+            .build();
         page.add(&group);
         let mut rows = Vec::new();
         for f in FIELDS.iter().filter(|f| f.tab == tab && f.group == g) {
@@ -342,9 +453,16 @@ fn tuning_page(ui: &Rc<Ui>, tab: &str) -> gtk::Widget {
             group.add(&row);
             rows.push((row, adj, f));
         }
-        let reset = gtk::Button::builder().label("Reset this section").halign(gtk::Align::Center).margin_top(12).build();
+        let reset = gtk::Button::builder()
+            .label("Reset this section")
+            .halign(gtk::Align::Center)
+            .margin_top(12)
+            .build();
         reset.add_css_class("pill");
-        let adjs: Vec<(gtk::Adjustment, f64)> = rows.iter().map(|(_, a, f)| (a.clone(), f.default as f64)).collect();
+        let adjs: Vec<(gtk::Adjustment, f64)> = rows
+            .iter()
+            .map(|(_, a, f)| (a.clone(), f.default as f64))
+            .collect();
         reset.connect_clicked(move |_| adjs.iter().for_each(|(a, d)| a.set_value(*d)));
         let foot = adw::PreferencesGroup::new();
         foot.add(&reset);
@@ -355,9 +473,17 @@ fn tuning_page(ui: &Rc<Ui>, tab: &str) -> gtk::Widget {
         nav.append(&nav_row(g, &count));
         // the badge says how many in it are changed
         let update = {
-            let (count, adjs) = (count.clone(), rows.iter().map(|(_, a, f)| (a.clone(), f.default as f64)).collect::<Vec<_>>());
+            let (count, adjs) = (
+                count.clone(),
+                rows.iter()
+                    .map(|(_, a, f)| (a.clone(), f.default as f64))
+                    .collect::<Vec<_>>(),
+            );
             move || {
-                let n = adjs.iter().filter(|(a, d)| (a.value() - d).abs() > 1e-4).count();
+                let n = adjs
+                    .iter()
+                    .filter(|(a, d)| (a.value() - d).abs() > 1e-4)
+                    .count();
                 count.set_label(&n.to_string());
                 count.set_visible(n > 0);
             }
@@ -403,10 +529,19 @@ fn tuning_page(ui: &Rc<Ui>, tab: &str) -> gtk::Widget {
             nv.select_row(Some(&r));
         }
     });
-    let side = gtk::Box::builder().orientation(gtk::Orientation::Vertical).width_request(250).build();
+    let side = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(250)
+        .build();
     side.add_css_class("sidebar-pane");
     side.append(&search);
-    side.append(&gtk::ScrolledWindow::builder().child(&nav).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
+    side.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&nav)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     body.append(&side);
     body.append(&stack);
@@ -416,9 +551,28 @@ fn tuning_page(ui: &Rc<Ui>, tab: &str) -> gtk::Widget {
 fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
     let page = adw::PreferencesPage::new();
     let doc = config::read();
-    let spin = |group: &adw::PreferencesGroup, section: &'static str, key: &'static str, title: &str, def: f64, min: f64, max: f64, step: f64, digits: u32| {
-        let adj = gtk::Adjustment::new(config::number(&doc, section, key, def), min, max, step, step * 10.0, 0.0);
-        let row = adw::SpinRow::builder().title(title).adjustment(&adj).digits(digits).build();
+    let spin = |group: &adw::PreferencesGroup,
+                section: &'static str,
+                key: &'static str,
+                title: &str,
+                def: f64,
+                min: f64,
+                max: f64,
+                step: f64,
+                digits: u32| {
+        let adj = gtk::Adjustment::new(
+            config::number(&doc, section, key, def),
+            min,
+            max,
+            step,
+            step * 10.0,
+            0.0,
+        );
+        let row = adw::SpinRow::builder()
+            .title(title)
+            .adjustment(&adj)
+            .digits(digits)
+            .build();
         let u = ui.clone();
         row.connect_value_notify(move |r| {
             if digits == 0 {
@@ -430,8 +584,15 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
         });
         group.add(&row);
     };
-    let switch = |group: &adw::PreferencesGroup, section: &'static str, key: &'static str, title: &str, def: bool| {
-        let row = adw::SwitchRow::builder().title(title).active(config::boolean(&doc, section, key, def)).build();
+    let switch = |group: &adw::PreferencesGroup,
+                  section: &'static str,
+                  key: &'static str,
+                  title: &str,
+                  def: bool| {
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .active(config::boolean(&doc, section, key, def))
+            .build();
         let u = ui.clone();
         row.connect_active_notify(move |r| {
             config::set(section, key, r.is_active());
@@ -439,15 +600,23 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
         });
         group.add(&row);
     };
-    let choice = |group: &adw::PreferencesGroup, key: &'static str, title: &str, def: &str, values: &'static [(&'static str, &'static str)]| {
+    let choice = |group: &adw::PreferencesGroup,
+                  section: &'static str,
+                  key: &'static str,
+                  title: &str,
+                  def: &str,
+                  values: &'static [(&'static str, &'static str)]| {
         let labels: Vec<&str> = values.iter().map(|v| v.1).collect();
-        let current = config::text(&doc, "character", key, def);
-        let row = adw::ComboRow::builder().title(title).model(&gtk::StringList::new(&labels)).build();
+        let current = config::text(&doc, section, key, def);
+        let row = adw::ComboRow::builder()
+            .title(title)
+            .model(&gtk::StringList::new(&labels))
+            .build();
         row.set_selected(values.iter().position(|v| v.0 == current).unwrap_or(0) as u32);
         let u = ui.clone();
         row.connect_selected_notify(move |r| {
             if let Some(v) = values.get(r.selected() as usize) {
-                config::set("character", key, v.0);
+                config::set(section, key, v.0);
                 u.restart_soon();
             }
         });
@@ -455,24 +624,55 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
     };
 
     let look = adw::PreferencesGroup::builder().title("Look").build();
-    spin(&look, "character", "opacity", "Opacity", 1.0, 0.05, 1.0, 0.05, 2);
+    spin(
+        &look,
+        "character",
+        "opacity",
+        "Opacity",
+        1.0,
+        0.05,
+        1.0,
+        0.05,
+        2,
+    );
     switch(&look, "character", "flip_x", "Mirror", false);
-    choice(&look, "placement", "Placement", "screen-front", &[
-        ("screen-front", "In front of windows"),
-        ("wallpaper", "On the wallpaper"),
-        ("window-inside", "Inside the window"),
-        ("window-outside", "Outside the window"),
-    ]);
-    choice(&look, "corner", "Corner", "bottom-right", &[
-        ("bottom-right", "Bottom right"),
-        ("bottom-left", "Bottom left"),
-        ("top-right", "Top right"),
-        ("top-left", "Top left"),
-    ]);
+    choice(
+        &look,
+        "character",
+        "placement",
+        "Placement",
+        "screen-front",
+        &[
+            ("screen-front", "In front of windows"),
+            ("wallpaper", "On the wallpaper"),
+            ("window-inside", "Inside the window"),
+            ("window-outside", "Outside the window"),
+        ],
+    );
+    choice(
+        &look,
+        "character",
+        "corner",
+        "Corner",
+        "bottom-right",
+        &[
+            ("bottom-right", "Bottom right"),
+            ("bottom-left", "Bottom left"),
+            ("top-right", "Top right"),
+            ("top-left", "Top left"),
+        ],
+    );
     let offset = config::read_offset();
-    for (index, title) in [(0usize, "Horizontal offset (px)"), (1, "Vertical offset (px)")] {
+    for (index, title) in [
+        (0usize, "Horizontal offset (px)"),
+        (1, "Vertical offset (px)"),
+    ] {
         let adj = gtk::Adjustment::new(offset[index], -2000.0, 2000.0, 1.0, 10.0, 0.0);
-        let row = adw::SpinRow::builder().title(title).adjustment(&adj).digits(0).build();
+        let row = adw::SpinRow::builder()
+            .title(title)
+            .adjustment(&adj)
+            .digits(0)
+            .build();
         let u = ui.clone();
         row.connect_value_notify(move |r| {
             config::set_offset(index, r.value());
@@ -482,27 +682,148 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
     }
     page.add(&look);
 
-    let sound = adw::PreferencesGroup::builder().title("Sound and music").build();
-    switch(&sound, "character", "audio_reactive", "React to music", true);
+    let sound = adw::PreferencesGroup::builder()
+        .title("Sound and music")
+        .build();
+    switch(
+        &sound,
+        "character",
+        "audio_reactive",
+        "React to music",
+        true,
+    );
     switch(&sound, "character", "voice", "Character voices", true);
-    spin(&sound, "character", "voice_volume", "Volume", 0.6, 0.0, 1.0, 0.05, 2);
-    switch(&sound, "general", "audio_capture", "Listen to desktop audio", true);
+    spin(
+        &sound,
+        "character",
+        "voice_volume",
+        "Volume",
+        0.6,
+        0.0,
+        1.0,
+        0.05,
+        2,
+    );
+    switch(
+        &sound,
+        "general",
+        "audio_capture",
+        "Listen to desktop audio",
+        true,
+    );
     page.add(&sound);
 
-    let models = adw::PreferencesGroup::builder().title("3D characters").build();
-    switch(&models, "character", "screen_light", "Light from screen colours", true);
+    let comp = adw::PreferencesGroup::builder().title("Compositor").build();
+    choice(
+        &comp,
+        "general",
+        "compositor",
+        "Backend",
+        "auto",
+        &[
+            ("auto", "Auto-detect"),
+            ("hyprland", "Hyprland"),
+            ("niri", "niri"),
+            ("generic", "Generic (no IPC)"),
+        ],
+    );
+    let comp_note = gtk::Label::builder()
+        .label("Takes effect when animad restarts.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    comp_note.add_css_class("dim-label");
+    comp.add(&comp_note);
+    page.add(&comp);
+
+    let models = adw::PreferencesGroup::builder()
+        .title("3D characters")
+        .build();
+    switch(
+        &models,
+        "character",
+        "screen_light",
+        "Light from screen colours",
+        true,
+    );
     switch(&models, "character", "weapons", "Show weapons", false);
-    switch(&models, "character", "windows", "One window per workspace (Hyprland)", true);
+    switch(
+        &models,
+        "character",
+        "windows",
+        "One window per workspace (Hyprland plugin)",
+        true,
+    );
     page.add(&models);
 
-    let perf = adw::PreferencesGroup::builder().title("Performance").build();
-    spin(&perf, "character", "fps", "Character frame rate", 144.0, 10.0, 360.0, 1.0, 0);
-    spin(&perf, "general", "fps", "Wallpaper frame rate", 60.0, 10.0, 360.0, 1.0, 0);
-    spin(&perf, "general", "battery_fps", "Frame rate on battery", 30.0, 5.0, 360.0, 1.0, 0);
-    switch(&perf, "general", "pause_on_fullscreen", "Pause on fullscreen", true);
-    switch(&perf, "general", "pause_on_maximized", "Pause on maximized windows", false);
-    switch(&perf, "general", "pause_on_battery", "Pause on battery", false);
-    spin(&perf, "general", "low_battery_pause", "Pause on low battery (%)", 15.0, 0.0, 100.0, 1.0, 0);
+    let perf = adw::PreferencesGroup::builder()
+        .title("Performance")
+        .build();
+    spin(
+        &perf,
+        "character",
+        "fps",
+        "Character frame rate",
+        144.0,
+        10.0,
+        360.0,
+        1.0,
+        0,
+    );
+    spin(
+        &perf,
+        "general",
+        "fps",
+        "Wallpaper frame rate",
+        60.0,
+        10.0,
+        360.0,
+        1.0,
+        0,
+    );
+    spin(
+        &perf,
+        "general",
+        "battery_fps",
+        "Frame rate on battery",
+        30.0,
+        5.0,
+        360.0,
+        1.0,
+        0,
+    );
+    switch(
+        &perf,
+        "general",
+        "pause_on_fullscreen",
+        "Pause on fullscreen",
+        true,
+    );
+    switch(
+        &perf,
+        "general",
+        "pause_on_maximized",
+        "Pause on maximized windows",
+        false,
+    );
+    switch(
+        &perf,
+        "general",
+        "pause_on_battery",
+        "Pause on battery",
+        false,
+    );
+    spin(
+        &perf,
+        "general",
+        "low_battery_pause",
+        "Pause on low battery (%)",
+        15.0,
+        0.0,
+        100.0,
+        1.0,
+        0,
+    );
     page.add(&perf);
     page.upcast()
 }
@@ -517,18 +838,32 @@ const STYLE: &str = "
 .main-badge { background-color: @accent_bg_color; color: @accent_fg_color; border-radius: 99px; padding: 1px 9px; font-size: 0.8em; font-weight: bold; }
 .bottom-bar { padding: 10px 14px; border-radius: 14px; background-color: alpha(currentColor, 0.045); }
 .picker { background-color: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.12); }
+.wp-card { padding: 8px; border-radius: 12px; background-color: alpha(currentColor, 0.04); }
+.wp-card:hover { background-color: alpha(currentColor, 0.10); }
+.wp-card.current { outline: 2px solid @accent_bg_color; outline-offset: -2px; }
+.wp-title { font-weight: bold; }
+.wp-badge { border-radius: 99px; padding: 1px 8px; font-size: 0.75em; font-weight: bold; background-color: alpha(currentColor, 0.12); }
 ";
 
 pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let css = gtk::CssProvider::new();
     css.load_from_string(STYLE);
     if let Some(display) = gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
-    let power = gtk::Switch::builder().valign(gtk::Align::Center).tooltip_text("Turn Anima on or off").active(daemon::running()).build();
+    let power = gtk::Switch::builder()
+        .valign(gtk::Align::Center)
+        .tooltip_text("Turn Anima on or off")
+        .active(daemon::running())
+        .build();
     let ui = Rc::new(Ui {
         data: RefCell::new(team::Team::load()),
         team_thumbs: RefCell::default(),
+        current_card: RefCell::default(),
         toast: adw::ToastOverlay::new(),
         power: power.clone(),
         syncing: Cell::new(false),
@@ -568,7 +903,18 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     let stack = adw::ViewStack::new();
     let open_tab = std::env::var("ANIMA_GUI_TAB").ok();
-    stack.add_titled_with_icon(&roster::page(&ui), Some("characters"), "Team", "avatar-default-symbolic");
+    stack.add_titled_with_icon(
+        &roster::page(&ui),
+        Some("characters"),
+        "Team",
+        "avatar-default-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &library::page(&ui),
+        Some("wallpapers"),
+        "Library",
+        "preferences-desktop-wallpaper-symbolic",
+    );
     for (tab, icon) in [
         ("Roaming", "find-location-symbolic"),
         ("Touch", "input-mouse-symbolic"),
@@ -578,13 +924,23 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     ] {
         stack.add_titled_with_icon(&tuning_page(&ui, tab), Some(tab), tab, icon);
     }
-    stack.add_titled_with_icon(&general_page(&ui), Some("general"), "General", "emblem-system-symbolic");
+    stack.add_titled_with_icon(
+        &general_page(&ui),
+        Some("general"),
+        "General",
+        "emblem-system-symbolic",
+    );
 
     if let Some(t) = open_tab {
         stack.set_visible_child_name(&t);
     }
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::ViewSwitcher::builder().stack(&stack).policy(adw::ViewSwitcherPolicy::Wide).build()));
+    header.set_title_widget(Some(
+        &adw::ViewSwitcher::builder()
+            .stack(&stack)
+            .policy(adw::ViewSwitcherPolicy::Wide)
+            .build(),
+    ));
     let power_box = gtk::Box::builder().spacing(8).build();
     power_box.append(&power);
     header.pack_end(&power_box);

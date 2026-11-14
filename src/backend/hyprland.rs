@@ -40,6 +40,14 @@ impl Compositor for Hyprland {
         hypr_view()
     }
 
+    fn columns(&self) -> Vec<(f32, f32)> {
+        hypr_columns()
+    }
+
+    fn window_x(&self, id: u64) -> Option<(f32, f32)> {
+        hypr_window_x(id)
+    }
+
     fn swipe(&self, active: bool) {
         *SWIPE.lock().unwrap() = active.then(Swipe::default);
     }
@@ -141,6 +149,7 @@ fn run(tx: Sender<GovernorEvent>) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { break };
+        super::desktop::window_event(&line);
 
         if ["workspace>>", "focusedmon>>", "createworkspace>>", "destroyworkspace>>", "moveworkspace>>",
             "openwindow>>", "closewindow>>", "movewindow>>"]
@@ -684,4 +693,64 @@ fn query_hypr_active_window() -> Option<(bool, bool, Option<WindowRect>)> {
     };
 
     Some((fs_mode >= 2, fs_mode == 1, rect))
+}
+
+/// Tiled windows on the focused monitor's active workspace, as `(left edge,
+/// width)` in logical pixels from that monitor's left edge. Floating and
+/// fullscreen windows are left out: games and races want real columns, like
+/// niri's strip. Empty when Hyprland can't be asked.
+fn hypr_columns() -> Vec<(f32, f32)> {
+    let Some(sock1) = hypr_socket1() else { return Vec::new() };
+    let json = |cmd: &[u8]| {
+        let text = hypr_request(&sock1, cmd)?;
+        serde_json::from_str::<serde_json::Value>(&text).ok()
+    };
+    let Some(mons) = json(b"j/monitors") else { return Vec::new() };
+    let Some(mons) = mons.as_array() else { return Vec::new() };
+    let Some(mon) = mons.iter().find(|m| m["focused"].as_bool() == Some(true)) else { return Vec::new() };
+    let (Some(index), Some(mon_x)) = (mon["id"].as_i64(), mon["x"].as_f64()) else { return Vec::new() };
+    let Some(ws) = mon["activeWorkspace"]["id"].as_i64() else { return Vec::new() };
+    let Some(clients) = json(b"j/clients") else { return Vec::new() };
+    let Some(clients) = clients.as_array() else { return Vec::new() };
+    let mut cols: Vec<(f32, f32)> = clients
+        .iter()
+        .filter(|c| {
+            c["mapped"].as_bool() == Some(true)
+                && c["hidden"].as_bool() != Some(true)
+                && c["floating"].as_bool() != Some(true)
+                && c["monitor"].as_i64() == Some(index)
+                && c["workspace"]["id"].as_i64() == Some(ws)
+                && c["fullscreen"].as_i64().unwrap_or(0) == 0
+        })
+        .filter_map(|c| {
+            let x = c["at"][0].as_f64()? as f32 - mon_x as f32;
+            let w = c["size"][0].as_f64()? as f32;
+            (w > 0.0).then_some((x, w))
+        })
+        .collect();
+    cols.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cols
+}
+
+/// Where window `id` (a Hyprland address) sits on the focused monitor's
+/// active workspace, or on whichever monitor it is on.
+fn hypr_window_x(id: u64) -> Option<(f32, f32)> {
+    let sock1 = hypr_socket1()?;
+    let clients: serde_json::Value = serde_json::from_str(&hypr_request(&sock1, b"j/clients")?).ok()?;
+    let client = clients.as_array()?.iter().find(|c| {
+        c["address"]
+            .as_str()
+            .and_then(|a| u64::from_str_radix(a.strip_prefix("0x").unwrap_or(a), 16).ok())
+            == Some(id)
+    })?;
+    let mon_x = hypr_monitor_x(&sock1, client["monitor"].as_i64()?)?;
+    let x = client["at"][0].as_f64()? as f32 - mon_x;
+    let w = client["size"][0].as_f64()? as f32;
+    (w > 0.0).then_some((x, w))
+}
+
+fn hypr_monitor_x(sock1: &Path, index: i64) -> Option<f32> {
+    let mons: serde_json::Value = serde_json::from_str(&hypr_request(sock1, b"j/monitors")?).ok()?;
+    let mon = mons.as_array()?.iter().find(|m| m["id"].as_i64() == Some(index))?;
+    Some(mon["x"].as_f64().unwrap_or(0.0) as f32)
 }

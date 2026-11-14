@@ -422,6 +422,9 @@ fn run() -> Result<()> {
         println!("{}", response.message);
         if is_status {
             if let Some(data) = &response.data {
+                if let Some(compositor) = data.get("compositor").and_then(|v| v.as_str()) {
+                    println!("  compositor: {compositor}");
+                }
                 if let Some(monitors) = data.get("monitors").and_then(|m| m.as_array()) {
                     for monitor in monitors {
                         let name = monitor.get("name").and_then(|v| v.as_str()).unwrap_or("?");

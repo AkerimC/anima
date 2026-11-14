@@ -45,6 +45,11 @@ pub struct BonePose {
 #[derive(Debug, Clone)]
 pub struct MdlsBone {
     pub parent: i32,
+    /// Bone name, as used by scene objects' `attachment` field.
+    pub name: String,
+    /// Offset from the bone to the attachment point, as stored in the
+    /// `MDAT` block.  Identity when the scene does not attach anything.
+    pub attachment: [f32; 6],
     pub rest_local: BonePose,
     pub inv_rest_world: [f32; 6],
 }
@@ -91,10 +96,62 @@ impl ParsedMdl {
         !self.bones.is_empty() && !self.anims.is_empty()
     }
 
-    pub fn evaluate_vertices(&self, time: f32, layers: &[PuppetAnimLayer]) -> Vec<MeshVertex> {
-        if self.bones.is_empty() || self.anims.is_empty() {
-            return self.vertices.clone();
+    /// Index of a bone by name (scene objects reference these with
+    /// `attachment`).
+    pub fn bone_index(&self, name: &str) -> Option<usize> {
+        self.bones.iter().position(|b| b.name == name)
+    }
+
+    /// World matrix of an attachment point in the rest pose (model space,
+    /// y-up).  `None` when the model has no bone with that name.
+    pub fn attachment_world(&self, name: &str) -> Option<[f32; 6]> {
+        let idx = self.bone_index(name)?;
+        let world = self.rest_world();
+        Some(mat2d_mul(world[idx], self.bones[idx].attachment))
+    }
+
+    /// World matrix of every bone in the rest pose (model space, y-up), so
+    /// attached layers can be placed where their bone is.
+    pub fn rest_world(&self) -> Vec<[f32; 6]> {
+        let mut world: Vec<[f32; 6]> = Vec::with_capacity(self.bones.len());
+        for (i, bone) in self.bones.iter().enumerate() {
+            let pose = self.base_pose.get(i).copied().unwrap_or(bone.rest_local);
+            let local = mat2d_from_pose(pose);
+            let w = if bone.parent >= 0 && (bone.parent as usize) < world.len() {
+                mat2d_mul(world[bone.parent as usize], local)
+            } else {
+                local
+            };
+            world.push(w);
         }
+        world
+    }
+
+    /// World matrix of an attachment point at `time`, following the animated
+    /// skeleton.  Same space and layout as [`Self::attachment_world`].
+    pub fn animated_attachment_world(
+        &self,
+        time: f32,
+        layers: &[PuppetAnimLayer],
+        name: &str,
+    ) -> Option<[f32; 6]> {
+        let idx = self.bone_index(name)?;
+        let pose = self.evaluate_pose(time, layers);
+        let mut world: Vec<[f32; 6]> = Vec::with_capacity(self.bones.len());
+        for (i, bone) in self.bones.iter().enumerate() {
+            let local = mat2d_from_pose(pose.get(i).copied().unwrap_or(bone.rest_local));
+            let w = if bone.parent >= 0 && (bone.parent as usize) < world.len() {
+                mat2d_mul(world[bone.parent as usize], local)
+            } else {
+                local
+            };
+            world.push(w);
+        }
+        Some(mat2d_mul(world[idx], self.bones[idx].attachment))
+    }
+
+    /// Bone poses at `time`, starting from the assembled rest pose.
+    pub fn evaluate_pose(&self, time: f32, layers: &[PuppetAnimLayer]) -> Vec<BonePose> {
         // The assembled rest pose: the MDLS reference array when present, otherwise
         // the first keyframe of the first clip (see `compute_base_pose`).
         let mut pose = self.base_pose.clone();
@@ -121,6 +178,14 @@ impl ParsedMdl {
             }
         }
 
+        pose
+    }
+
+    pub fn evaluate_vertices(&self, time: f32, layers: &[PuppetAnimLayer]) -> Vec<MeshVertex> {
+        if self.bones.is_empty() || self.anims.is_empty() {
+            return self.vertices.clone();
+        }
+        let pose = self.evaluate_pose(time, layers);
         skin_vertices(&self.raw_vertices, &self.bones, &pose)
     }
 }
@@ -408,6 +473,7 @@ fn parse_mdls(bytes: &[u8], from: usize) -> Option<(Vec<MdlsBone>, Option<Vec<Bo
     let mut world = Vec::with_capacity(nbones);
     for _ in 0..nbones {
         let z = bytes.get(pos..)?.iter().position(|&b| b == 0)?;
+        let name = String::from_utf8_lossy(&bytes[pos..pos + z]).into_owned();
         pos += z + 1;
         let _unk = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?);
         let parent = i32::from_le_bytes(bytes.get(pos + 4..pos + 8)?.try_into().ok()?);
@@ -434,6 +500,8 @@ fn parse_mdls(bytes: &[u8], from: usize) -> Option<(Vec<MdlsBone>, Option<Vec<Bo
         world.push(w_m);
         bones.push(MdlsBone {
             parent,
+            name,
+            attachment: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             rest_local,
             inv_rest_world: mat2d_inv(w_m),
         });
@@ -443,8 +511,54 @@ fn parse_mdls(bytes: &[u8], from: usize) -> Option<(Vec<MdlsBone>, Option<Vec<Bo
     // assembled reference pose.  It is the pose the artist intended the mesh to
     // be seen in (the per-bone bind matrices are often an exploded texture-sheet
     // layout).  Animation tracks are expressed relative to it.
+    parse_mdat(bytes, section_end, &mut bones);
     let reference = parse_reference_pose(bytes, pos, section_end, mdls_off, nbones);
     Some((bones, reference))
+}
+
+/// Read the attachment table that follows the bone records.
+///
+/// `MDAT0001\0`, a `u32` end offset, a `u16` entry count, then per entry a
+/// `u16` bone index, a NUL-terminated name and a 4x4 matrix whose translation
+/// is the attachment point relative to the bone.
+fn parse_mdat(bytes: &[u8], from: usize, bones: &mut [MdlsBone]) {
+    let Some(off) = bytes
+        .get(from..)
+        .and_then(|s| s.windows(8).position(|w| w == b"MDAT0001"))
+        .map(|p| p + from)
+    else {
+        return;
+    };
+    let mut pos = off + 9;
+    let Some(header) = bytes.get(pos..pos + 6) else {
+        return;
+    };
+    let end = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes([header[4], header[5]]) as usize;
+    let limit = end.min(bytes.len());
+    pos += 6;
+    for _ in 0..count {
+        let Some(idx_bytes) = bytes.get(pos..pos + 2) else { break };
+        let idx = u16::from_le_bytes([idx_bytes[0], idx_bytes[1]]) as usize;
+        pos += 2;
+        let Some(z) = bytes.get(pos..limit).and_then(|s| s.iter().position(|&b| b == 0)) else {
+            break;
+        };
+        let name = String::from_utf8_lossy(&bytes[pos..pos + z]).into_owned();
+        pos += z + 1;
+        let Some(m) = bytes.get(pos..pos + 64) else { break };
+        let mut mat = [0.0f32; 16];
+        for k in 0..16 {
+            mat[k] = f32::from_le_bytes(m[k * 4..k * 4 + 4].try_into().unwrap());
+        }
+        pos += 64;
+        if let Some(bone) = bones.get_mut(idx) {
+            if !name.is_empty() {
+                bone.name = name;
+            }
+            bone.attachment = [mat[0], mat[1], mat[4], mat[5], mat[12], mat[13]];
+        }
+    }
 }
 
 fn pose_from_matrix(m: &[f32; 16]) -> BonePose {

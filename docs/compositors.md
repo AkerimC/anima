@@ -12,6 +12,35 @@ implementation at startup and the rest of animad only talks to that.
 | Hyprland | `backend/hyprland.rs` (+ `contrib/hyprland-plugin`) | `$HYPRLAND_INSTANCE_SIGNATURE` socket |
 | generic | `Fallback` in `compositor.rs`: window state every 2 s, fullscreen on sway | anything else |
 
+## Choosing one
+
+By default animad detects the compositor (`auto`: niri, then Hyprland, then
+generic). Either backend can be forced, which is useful if both sockets are
+in the environment, or to keep the Hyprland path on a nested/niri session:
+
+```toml
+[general]
+compositor = "niri"      # auto | hyprland | niri | generic
+```
+
+`ANIMA_COMPOSITOR` overrides the config file, so a systemd unit can pin it
+with `Environment=ANIMA_COMPOSITOR=hyprland`. A forced backend that isn't
+running logs a warning and falls back to detection; the daemon still starts.
+The value is read once at startup, so restart animad after changing it
+(`systemctl --user restart animad`).
+
+Both backends use the same character, game and race code. The differences
+are what the compositor can tell us and how windows can be placed:
+
+| | Hyprland | niri |
+|---|---|---|
+| fullscreen/maximized/active window | IPC events | IPC events |
+| strip (`strip()`) | row of workspaces (`hypr_view`) | scrolling columns, exact with the optional patch |
+| cursor | `cursorpos` over IPC | estimated from evdev (exact with the optional patch) |
+| window mode (`can_place_windows`) | with `contrib/hyprland-plugin` | not implemented; overlay is used |
+| game/race window (`columns()`) | tiled windows on the active workspace | tiled columns on the active workspace |
+| position of a window that just opened (`window_x()`) | from `j/clients` | from niri's layout |
+
 ## The trait
 
 Every method except these three has a default that means "not supported":
@@ -31,6 +60,11 @@ The rest:
 - `strip()`: what the characters walk along and where it's drawn right now
   (logical px). niri: the scrolling strip of columns. Hyprland: the row of
   workspaces. None: just the screen.
+- `columns()`: tiled windows on the active workspace, `(x, width)` on the
+  strip, for games and races that want a wide window. Both backends report
+  them; on a compositor without per-window layout the whole screen is used.
+- `window_x(id)`: where a window that just opened sits, so a character can
+  glance at it. niri answers from its layout, Hyprland from `j/clients`.
 - `cursor()`: for compositors that can be asked where the pointer is
   (patched niri). `pointer.rs` then polls it instead of estimating.
 - `swipe(active)`, `swipe_scroll(dx)`: three/four-finger touchpad swipes,
@@ -44,6 +78,7 @@ The rest:
 
 1. Write `backend/<name>.rs` with a struct, a `detect()` that returns
    `Some` when animad runs on it, and `impl Compositor`.
-2. Add it to the detection order in `compositor::current()`.
+2. Add it to the detection order in `compositor::current()` (and to the
+   `compositor` values in `src/config.rs` if users should be able to force it).
 3. Implement `run` and `window_state` first; everything else is optional
    and can come later.

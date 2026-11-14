@@ -3,6 +3,7 @@
 
 mod config;
 mod daemon;
+mod library;
 mod pages;
 mod park;
 mod roster;

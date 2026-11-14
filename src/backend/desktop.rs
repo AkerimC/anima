@@ -31,6 +31,9 @@ pub static LAST_OPENED: Mutex<Option<u64>> = Mutex::new(None);
 
 static KNOWN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
 
+/// Hyprland doesn't list its windows up front, so this one starts empty.
+static HYPR_KNOWN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
 pub fn spawn() {
     let _ = std::thread::Builder::new().name("anima-idle".into()).spawn(|| {
         if watch_idle().is_none() {
@@ -98,12 +101,31 @@ fn watch_cpu() {
     }
 }
 
-/// One line of niri's event stream.
+/// One line of the compositor's event stream: niri's JSON, or Hyprland's
+/// `.socket2.sock` text (`openwindow>>0x55d0…,1,class,title`).
 pub fn window_event(line: &str) {
-    let opened = line.starts_with("{\"WindowOpenedOrChanged\"");
-    let closed = line.starts_with("{\"WindowClosed\"");
+    if let Some(rest) = line.strip_prefix("openwindow>>") {
+        if let Some(id) = hypr_address(rest) {
+            if HYPR_KNOWN.lock().unwrap().get_or_insert_with(HashSet::new).insert(id) {
+                opened(Some(id));
+            }
+        }
+        return;
+    }
+    if let Some(rest) = line.strip_prefix("closewindow>>") {
+        if let Some(id) = hypr_address(rest) {
+            if let Some(set) = HYPR_KNOWN.lock().unwrap().as_mut() {
+                set.remove(&id);
+            }
+            closed();
+        }
+        return;
+    }
+
+    let opened_ev = line.starts_with("{\"WindowOpenedOrChanged\"");
+    let closed_ev = line.starts_with("{\"WindowClosed\"");
     let listed = line.starts_with("{\"WindowsChanged\"");
-    if !(opened || closed || listed) {
+    if !(opened_ev || closed_ev || listed) {
         return;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
@@ -114,18 +136,34 @@ pub fn window_event(line: &str) {
         return;
     }
     let Some(set) = known.as_mut() else { return };
-    if opened {
+    if opened_ev {
         if let Some(id) = v["WindowOpenedOrChanged"]["window"]["id"].as_u64() {
             if set.insert(id) {
-                *LAST_OPENED.lock().unwrap() = Some(id);
-                OPENED.fetch_add(1, Relaxed);
+                opened(Some(id));
             }
         }
     } else if let Some(id) = v["WindowClosed"]["id"].as_u64() {
         if set.remove(&id) {
-            CLOSED.fetch_add(1, Relaxed);
+            closed();
         }
     }
+}
+
+/// A window showed up or went away. `id` is the compositor's own handle,
+/// which only some compositors can resolve back to a position.
+fn opened(id: Option<u64>) {
+    *LAST_OPENED.lock().unwrap() = id;
+    OPENED.fetch_add(1, Relaxed);
+}
+
+fn closed() {
+    CLOSED.fetch_add(1, Relaxed);
+}
+
+/// `0x55d0c3…` (Hyprland's window address) as a number.
+fn hypr_address(rest: &str) -> Option<u64> {
+    let addr = rest.split(',').next()?.trim();
+    u64::from_str_radix(addr.strip_prefix("0x").unwrap_or(addr), 16).ok()
 }
 
 #[cfg(test)]
@@ -148,5 +186,18 @@ mod tests {
         assert_eq!(OPENED.load(Relaxed), o + 1);
         window_event(r#"{"WindowClosed":{"id":2}}"#);
         assert_eq!(CLOSED.load(Relaxed), c + 1);
+
+        // Hyprland's text events
+        window_event("openwindow>>0x55d0c3,1,firefox,Mozilla Firefox");
+        assert_eq!(OPENED.load(Relaxed), o + 2);
+        assert_eq!(*LAST_OPENED.lock().unwrap(), Some(0x55d0c3));
+        window_event("openwindow>>0x55d0c3,1,firefox,Mozilla Firefox");
+        assert_eq!(OPENED.load(Relaxed), o + 2, "not a new window");
+        window_event("closewindow>>0x55d0c3");
+        assert_eq!(CLOSED.load(Relaxed), c + 2);
+        // the same address after a close is a new window again
+        window_event("openwindow>>0x55d0c3,1,firefox,Mozilla Firefox");
+        assert_eq!(OPENED.load(Relaxed), o + 3);
+        window_event("closewindow>>0x55d0c3");
     }
 }

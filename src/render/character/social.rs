@@ -2721,7 +2721,11 @@ impl CharacterOverlay {
     fn fishing_window(&self, i: usize, at: f32) -> (f32, f32) {
         let active = self.spaces.active;
         let here = active == 0 || self.walk_ref(i).ws == active;
-        let cols = if here { crate::backend::governor::niri_columns() } else { Vec::new() };
+        let cols = if here && !super::locked() {
+            crate::backend::compositor::current().columns()
+        } else {
+            Vec::new()
+        };
         match cols.into_iter().find(|c| at >= c.0 && at <= c.0 + c.1) {
             Some(c) => (c.0, c.0 + c.1),
             None => (at - self.view_w * 0.5, at + self.view_w * 0.5),
@@ -5396,7 +5400,11 @@ impl CharacterOverlay {
         let w = self.view_w;
         let view_px = self.view[0] * w * 0.5;
         let middle = view_px + w * 0.5;
-        let cols = if super::locked() { Vec::new() } else { crate::backend::governor::niri_columns() };
+        let cols = if super::locked() {
+            Vec::new()
+        } else {
+            crate::backend::compositor::current().columns()
+        };
         let widest = cols.iter().map(|c| c.1).fold(0.0, f32::max);
         cols.into_iter()
             .filter(|c| c.1 >= widest * 0.9)

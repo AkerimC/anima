@@ -223,6 +223,8 @@ struct Prim {
     node: usize,
     skin: Option<usize>,
     vao: glow::VertexArray,
+    vbo: glow::Buffer,
+    ibo: glow::Buffer,
     count: i32,
     tex: Option<usize>,
     color: [f32; 4],
@@ -520,7 +522,7 @@ impl Model3d {
                     verts.extend_from_slice(&weights[i]);
                     verts.extend_from_slice(&morph[i].to_array());
                 }
-                let vao = upload(gl, &verts, &indices)?;
+                let (vao, vbo, ibo) = upload(gl, &verts, &indices)?;
 
                 let mat = p.material();
                 let pbr = mat.pbr_metallic_roughness();
@@ -533,6 +535,8 @@ impl Model3d {
                     node: node.index(),
                     skin,
                     vao,
+                    vbo,
+                    ibo,
                     count: indices.len() as i32,
                     tex: pbr.base_color_texture().map(|t| t.texture().source().index()),
                     color: pbr.base_color_factor(),
@@ -924,6 +928,31 @@ impl Model3d {
         (self.color, self.size.0, self.size.1)
     }
 
+    /// The offscreen colour texture, so callers can tell whether a cached
+    /// sprite texture is the same object (and must not delete it twice).
+    pub fn color(&self) -> glow::Texture {
+        self.color
+    }
+
+    /// Delete every GL object owned by the model.  Requires a current context.
+    pub fn destroy(&mut self, gl: &glow::Context) {
+        unsafe {
+            for prim in &self.prims {
+                gl.delete_vertex_array(prim.vao);
+                gl.delete_buffer(prim.vbo);
+                gl.delete_buffer(prim.ibo);
+            }
+            for tex in self.textures.drain(..) {
+                gl.delete_texture(tex);
+            }
+            gl.delete_texture(self.white);
+            gl.delete_framebuffer(self.fbo);
+            gl.delete_texture(self.color);
+            gl.delete_renderbuffer(self.depth);
+        }
+        self.program.destroy(gl);
+    }
+
     /// Advance the animation and redraw the offscreen texture.
     /// Leaves the framebuffer, viewport and clear colour as it found them.
     /// `light` is the environment around the character; `mirrored` when the
@@ -1148,7 +1177,11 @@ fn to_rgba(img: &gltf::image::Data) -> Vec<u8> {
     }
 }
 
-fn upload(gl: &glow::Context, verts: &[f32], indices: &[u32]) -> Result<glow::VertexArray> {
+fn upload(
+    gl: &glow::Context,
+    verts: &[f32],
+    indices: &[u32],
+) -> Result<(glow::VertexArray, glow::Buffer, glow::Buffer)> {
     unsafe {
         let vao = gl.create_vertex_array().map_err(|e| anyhow!(e))?;
         let vbo = gl.create_buffer().map_err(|e| anyhow!(e))?;
@@ -1167,7 +1200,7 @@ fn upload(gl: &glow::Context, verts: &[f32], indices: &[u32]) -> Result<glow::Ve
             off += n * 4;
         }
         gl.bind_vertex_array(None);
-        Ok(vao)
+        Ok((vao, vbo, ibo))
     }
 }
 

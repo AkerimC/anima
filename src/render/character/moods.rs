@@ -402,7 +402,7 @@ impl CharacterOverlay {
         self.moods.idle_t = if idle { self.moods.idle_t + dt } else { 0.0 };
         let waited = self.moods.idle_t + desktop::IDLE_AFTER_MS as f32 / 1000.0;
         let drowsy = idle && waited >= tn().sleep_after;
-        let crowded = crate::backend::governor::niri_columns().len() >= tn().win_crowded as usize;
+        let crowded = crate::backend::compositor::current().columns().len() >= tn().win_crowded as usize;
         for i in 0..n {
             self.walk_of(i).rest_tick(dt, idle, drowsy, crowded);
         }
@@ -413,7 +413,7 @@ impl CharacterOverlay {
         if opened != self.moods.seen_opened {
             self.moods.seen_opened = opened;
             let id = *desktop::LAST_OPENED.lock().unwrap();
-            // niri's layout for it arrives a moment later
+            // the compositor lists its layout a moment later
             self.moods.pending = Some((id, 0.5));
         }
         if let Some((id, t)) = self.moods.pending {
@@ -422,7 +422,9 @@ impl CharacterOverlay {
             } else {
                 self.moods.pending = None;
                 let view = self.view[0] * self.view_w * 0.5;
-                let (x, w) = id.and_then(crate::backend::governor::niri_window_x).unwrap_or((view + self.view_w * 0.25, self.view_w * 0.5));
+                let (x, w) = id
+                    .and_then(|id| crate::backend::compositor::current().window_x(id))
+                    .unwrap_or((view + self.view_w * 0.25, self.view_w * 0.5));
                 self.peek_at(x + w * 0.5, w);
             }
         }

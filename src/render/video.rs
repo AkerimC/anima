@@ -458,3 +458,97 @@ unsafe fn cstr(ptr: *const c_char) -> String {
     }
     unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
 }
+
+/// Headless libmpv audio player used for Wallpaper Engine scene `sound`
+/// layers (background music bundled with a scene).  Wallpaper Engine plays
+/// these and its own audio visualiser reacts to them, so audio-reactive
+/// effects (pulses, glitch transitions) depend on the music actually playing.
+pub struct AudioPlayer {
+    handle: *mut mpv_handle,
+    volume: f32,
+    muted: bool,
+}
+
+impl AudioPlayer {
+    pub fn new(files: &[PathBuf], shuffle: bool, volume: f32, muted: bool) -> Result<Self> {
+        if files.is_empty() {
+            bail!("no audio files");
+        }
+        unsafe {
+            let handle = mpv_create();
+            if handle.is_null() {
+                bail!("mpv_create() failed");
+            }
+            let opts: &[(&str, &str)] = &[
+                ("vid", "no"),
+                ("video", "no"),
+                ("vo", "null"),
+                ("loop-playlist", "inf"),
+                ("idle", "yes"),
+                ("terminal", "no"),
+                ("msg-level", "all=warn"),
+                ("ytdl", "no"),
+                ("audio-display", "no"),
+                ("input-default-bindings", "no"),
+                ("shuffle", if shuffle { "yes" } else { "no" }),
+                ("audio-client-name", "anima"),
+            ];
+            for (name, value) in opts {
+                let cname = CString::new(*name)?;
+                let cvalue = CString::new(*value)?;
+                mpv_set_option_string(handle, cname.as_ptr(), cvalue.as_ptr());
+            }
+            let rc = mpv_initialize(handle);
+            if rc < 0 {
+                let msg = cstr(mpv_error_string(rc));
+                mpv_terminate_destroy(handle);
+                bail!("mpv_initialize failed: {msg}");
+            }
+            let this = Self { handle, volume, muted };
+            this.apply();
+            for (i, f) in files.iter().enumerate() {
+                let path = CString::new(f.to_string_lossy().as_bytes())?;
+                let cmd = c"loadfile";
+                let mode = if i == 0 { c"replace" } else { c"append" };
+                let args = [cmd.as_ptr(), path.as_ptr(), mode.as_ptr(), ptr::null()];
+                mpv_command(handle, args.as_ptr());
+            }
+            Ok(this)
+        }
+    }
+
+    fn apply(&self) {
+        let volume = (self.volume.clamp(0.0, 1.0) * 100.0).round();
+        unsafe {
+            let _ = set_prop(self.handle, "mute", if self.muted { "yes" } else { "no" });
+            let _ = set_prop(self.handle, "volume", &volume.to_string());
+        }
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        unsafe {
+            let _ = set_prop(self.handle, "pause", if paused { "yes" } else { "no" });
+        }
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.apply();
+    }
+
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        self.apply();
+    }
+}
+
+impl Drop for AudioPlayer {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.handle.is_null() {
+                mpv_terminate_destroy(self.handle);
+                self.handle = ptr::null_mut();
+            }
+        }
+    }
+}

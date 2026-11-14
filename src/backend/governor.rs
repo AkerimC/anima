@@ -221,11 +221,17 @@ pub(super) fn niri_gesture_scroll(dx: f32) {
     {
         return;
     }
-    let mut strip = STRIP.lock().unwrap();
-    let Some(st) = strip.as_mut() else { return };
-    st.view_x = (st.view_x + dx * st.screen_w / 1200.0 * GESTURE_SCALE).clamp(-st.screen_w * 0.2, st.width - st.screen_w * 0.8);
-    if let Some(v) = NIRI_VIEWS.lock().unwrap().iter_mut().find(|v| v.0 == st.ws) {
-        v.1 = st.view_x;
+    // Never take NIRI_VIEWS while holding STRIP: `update_niri_strip` takes
+    // them the other way round (NIRI_VIEWS, then STRIP), and a three-finger
+    // swipe runs this from the pointer thread while the view thread polls.
+    let (view, ws) = {
+        let mut strip = STRIP.lock().unwrap();
+        let Some(st) = strip.as_mut() else { return };
+        st.view_x = (st.view_x + dx * st.screen_w / 1200.0 * GESTURE_SCALE).clamp(-st.screen_w * 0.2, st.width - st.screen_w * 0.8);
+        (st.view_x, st.ws)
+    };
+    if let Some(v) = NIRI_VIEWS.lock().unwrap().iter_mut().find(|v| v.0 == ws) {
+        v.1 = view;
     }
 }
 
@@ -516,6 +522,8 @@ fn update_niri_strip(sock: &Path) {
         Some(v) => v.1 = view,
         None => views.push((ws.active, view)),
     }
+    // release before locking STRIP (see niri_gesture_scroll for the order)
+    drop(views);
     let new = Strip { view_x: view, width: width.max(screen_w), screen_w, ws: ws.active, exact: seen_pos.is_some() };
     let mut strip = STRIP.lock().unwrap();
     if strip.is_none_or(|o| o.view_x != new.view_x || o.width != new.width) {
