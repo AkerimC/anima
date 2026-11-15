@@ -45,10 +45,33 @@ fn rgba_to_texture(raw: Vec<u8>, w: u32, h: u32) -> gdk::Texture {
     .upcast()
 }
 
-/// A centre-cropped, downscaled first frame of `path`, sized for a card.
-fn preview_texture(path: &Path) -> Option<gdk::Texture> {
-    let (raw, tw, th) = crop_preview_rgba(path, THUMB_W as u32, THUMB_H as u32)?;
-    Some(rgba_to_texture(raw, tw, th))
+/// One preview to decode: the file, and where to send what came out.
+type PreviewJob = (std::path::PathBuf, mpsc::Sender<Option<(Vec<u8>, u32, u32)>>);
+
+/// Two worker threads decode card previews off the GTK main thread.  Two is
+/// deliberate: a 4K preview decodes to ~33 MB, so a whole library must never
+/// be in flight at once, and the grid must not wait on any of them.
+fn preview_pool() -> &'static mpsc::Sender<PreviewJob> {
+    static POOL: std::sync::OnceLock<mpsc::Sender<PreviewJob>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<PreviewJob>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for _ in 0..2 {
+            let rx = std::sync::Arc::clone(&rx);
+            let _ = std::thread::Builder::new()
+                .name("anima-preview".into())
+                .spawn(move || loop {
+                    // hold the lock only to take a job; decoding runs unlocked
+                    let job = match rx.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok((path, out)) = job else { return };
+                    let _ = out.send(crop_preview_rgba(&path, THUMB_W as u32, THUMB_H as u32));
+                });
+        }
+        tx
+    })
 }
 
 /// Local wallpapers first, then the Steam Workshop, de-duplicated by path.
@@ -1484,20 +1507,25 @@ pub fn page(ui: &Rc<Ui>) -> gtk::Widget {
                 button.connect_clicked(move |_| apply(&ui, &wp, btn.clone(), &insp));
                 flow.append(&button);
             }
-            for (i, (path, body)) in pending.into_iter().enumerate() {
-                // Decode off the frame that builds the window: one preview per
-                // idle tick keeps the grid responsive on a large library.
-                glib::timeout_add_local_once(
-                    Duration::from_millis(i as u64 * 12),
-                    move || {
-                        if let Some(tex) = preview_texture(&path) {
-                            if let Some(old) = body.first_child() {
-                                body.remove(&old);
-                            }
-                            body.prepend(&thumbnail(&tex));
+            for (path, body) in pending {
+                let (tx, rx) = mpsc::channel();
+                if preview_pool().send((path, tx)).is_err() {
+                    continue;
+                }
+                // Decoded on a worker thread; the card gets its picture when
+                // the result arrives, so a large library never stalls the UI.
+                glib::timeout_add_local(Duration::from_millis(30), move || match rx.try_recv() {
+                    Ok(Some((raw, w, h))) => {
+                        let tex = rgba_to_texture(raw, w, h);
+                        if let Some(old) = body.first_child() {
+                            body.remove(&old);
                         }
-                    },
-                );
+                        body.prepend(&thumbnail(&tex));
+                        glib::ControlFlow::Break
+                    }
+                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                });
             }
             mark_current(&ui, &cards, &inspector);
         }
