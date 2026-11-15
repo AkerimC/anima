@@ -467,16 +467,17 @@ def on_snap(view, res, _data=None):
         data = surf.get_data()
         header = struct.pack("<II", w, h)
         row_bytes = w * 4
+        # Write straight from the surface (zero-copy) instead of `bytes(...)`:
+        # a full 1920x1080 frame is 8 MB and this runs 20+ times a second.
         if stride == row_bytes:
-            payload = bytes(memoryview(data)[:h * row_bytes])
+            payload = memoryview(data)[:h * row_bytes]
         else:
             mv = memoryview(data)
-            buf = bytearray(h * row_bytes)
+            payload = bytearray(h * row_bytes)
             for y in range(h):
                 s = y * stride
                 d = y * row_bytes
-                buf[d:d + row_bytes] = mv[s:s + row_bytes]
-            payload = bytes(buf)
+                payload[d:d + row_bytes] = mv[s:s + row_bytes]
         _frame_out.write(header)
         _frame_out.write(payload)
     except BrokenPipeError:
@@ -663,6 +664,10 @@ impl WebWorker {
             .name("anima-webkit-rx".into())
             .spawn(move || {
                 let mut hdr = [0u8; 8];
+                // A spare frame buffer: the renderer normally takes each frame
+                // before the next arrives, so without this the reader would
+                // allocate (and zero) 8 MB for every 1080p frame.
+                let mut spare: Option<Vec<u8>> = None;
                 loop {
                     if stdout.read_exact(&mut hdr).is_err() {
                         break;
@@ -678,17 +683,31 @@ impl WebWorker {
                     else {
                         break;
                     };
-                    let mut bgra = vec![0u8; len];
+                    let mut bgra = match spare.take() {
+                        Some(mut buf) => {
+                            if buf.len() < len {
+                                buf.resize(len, 0);
+                            } else {
+                                buf.truncate(len);
+                            }
+                            buf
+                        }
+                        None => vec![0u8; len],
+                    };
                     if stdout.read_exact(&mut bgra).is_err() {
                         break;
                     }
                     let (lock, cvar) = &*shared_rx;
                     if let Ok(mut guard) = lock.lock() {
-                        guard.latest_frame = Some(WebFrame {
+                        let frame = WebFrame {
                             width: w,
                             height: h,
                             bgra,
-                        });
+                        };
+                        // the frame not taken last time becomes the next buffer
+                        if let Some(old) = guard.latest_frame.replace(frame) {
+                            spare = Some(old.bgra);
+                        }
                         cvar.notify_all();
                     }
                 }
