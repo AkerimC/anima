@@ -176,6 +176,7 @@ import posixpath
 import struct
 import sys
 import threading
+import time
 import urllib.parse
 
 # Preserve original stdout fd for binary frames; redirect fd 1 to stderr so no
@@ -442,12 +443,15 @@ state = {
     "loaded": False,
     "paused": False,
     "in_flight": False,
+    "snap_since": 0.0,
+    "stall_warned": False,
     "needs_snap": False,
     "closed": False,
 }
 
 def on_snap(view, res, _data=None):
     state["in_flight"] = False
+    state["stall_warned"] = False
     if state["closed"]:
         return
     try:
@@ -485,6 +489,7 @@ def trigger_snap():
     if state["closed"] or not state["loaded"] or state["in_flight"]:
         return False
     state["in_flight"] = True
+    state["snap_since"] = time.monotonic()
     state["needs_snap"] = False
     webview.get_snapshot(
         WebKit2.SnapshotRegion.VISIBLE,
@@ -498,6 +503,13 @@ def trigger_snap():
 def periodic_tick():
     if state["closed"]:
         return False
+    if state["in_flight"] and time.monotonic() - state["snap_since"] > 2.0:
+        # WebKit drops snapshot callbacks now and then; without a watchdog the
+        # pipeline would wait forever and the wallpaper would freeze silently.
+        state["in_flight"] = False
+        if not state["stall_warned"]:
+            state["stall_warned"] = True
+            print("anima: snapshot callback lost, retrying", file=sys.stderr)
     if state["loaded"] and (not state["paused"] or state["needs_snap"]):
         trigger_snap()
     return True
