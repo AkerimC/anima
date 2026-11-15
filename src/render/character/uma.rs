@@ -49,7 +49,7 @@ pub(super) fn mask_eyes(img: &image::RgbaImage) -> Option<([f32; 4], [f32; 4], [
     let htop = (top..bot).find(|&y| smooth[y] >= upper * 0.45)?;
     let (lo, hi) = (top + (hh_all * 0.38) as usize, top + (hh_all * 0.62) as usize);
     let mut neck = (lo..hi).min_by(|&a, &b| smooth[a].total_cmp(&smooth[b]))?;
-    if ((neck - htop) as f32) < hh_all * 0.32 {
+    if (neck.saturating_sub(htop) as f32) < hh_all * 0.32 {
         neck = htop + (hh_all * 0.4) as usize;
     }
     let head_rows = (neck - htop).max(1) as u32;
@@ -151,7 +151,7 @@ pub(super) fn head_box(img: &image::RgbaImage) -> Option<[f32; 4]> {
     let htop = (top..bot).find(|&y| smooth[y] >= upper * 0.45)?;
     let (lo, hi) = (top + (all * 0.38) as usize, top + (all * 0.62) as usize);
     let mut neck = (lo..hi).min_by(|&a, &b| smooth[a].total_cmp(&smooth[b]))?;
-    if ((neck - htop) as f32) < all * 0.32 {
+    if (neck.saturating_sub(htop) as f32) < all * 0.32 {
         neck = htop + (all * 0.4) as usize;
     }
     let head_rows = (neck - htop).max(1) as u32;

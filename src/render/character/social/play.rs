@@ -799,30 +799,25 @@ impl CharacterOverlay {
     }
 }
 
-/// Picked by a right double click: (who, when).
-static PICKED: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
-static ORDERS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
+/// Picked by a right double click: (who, when), per output — this used to be
+/// one global, so the first output to tick swallowed every order.
 impl CharacterOverlay {
     /// Right double click on a character picks it; then a right double click
     /// on the park grass walks it there in 2D, or on a park item sends it to play.
     pub(super) fn right_orders(&mut self, chats: &mut Vec<Chat>, n: usize) {
         use std::sync::atomic::Ordering::Relaxed;
-        let expired = {
-            let mut picked = PICKED.lock().unwrap();
-            let gone = picked.filter(|p| p.1.elapsed().as_secs_f32() > 5.0).map(|p| p.0);
-            if gone.is_some() {
-                *picked = None;
-            }
-            gone
-        };
+        let expired = self.picked.filter(|p| p.1.elapsed().as_secs_f32() > 5.0).map(|p| p.0);
+        if expired.is_some() {
+            self.picked = None;
+        }
         if let Some(i) = expired.filter(|&i| i < n) {
             tell(&format!("{} is no longer picked", self.character_name(i)));
         }
         let now = crate::backend::pointer::RIGHT_DOUBLE.load(Relaxed);
-        if ORDERS_SEEN.swap(now, Relaxed) == now || now == 0 {
+        if self.orders_seen == now || now == 0 {
             return;
         }
+        self.orders_seen = now;
         let m = self.screen_mouse;
         let hit = (0..n).find(|&i| {
             let a = self.actor_ref(i);
@@ -831,7 +826,7 @@ impl CharacterOverlay {
             a.visible && m[0] >= r[0] && m[0] <= r[2] && m[1] >= r[1] && m[1] <= r[3]
         });
         if let Some(i) = hit {
-            *PICKED.lock().unwrap() = Some((i, Instant::now()));
+            self.picked = Some((i, Instant::now()));
             let wk = self.walk_of(i);
             if matches!(wk.act, Act::Idle | Act::Walk) && wk.air <= 0.0 {
                 wk.start_jump(tn().jump_height * 0.4);
@@ -840,7 +835,7 @@ impl CharacterOverlay {
             tell(&format!("{} is picked: right double click where it should go", self.character_name(i)));
             return;
         }
-        let Some((i, at)) = PICKED.lock().unwrap().take() else { return };
+        let Some((i, at)) = self.picked.take() else { return };
         if at.elapsed().as_secs_f32() > 5.0 || i >= n {
             return;
         }

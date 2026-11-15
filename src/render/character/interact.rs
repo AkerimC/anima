@@ -61,17 +61,19 @@ impl CharacterOverlay {
             let now = self.start.elapsed().as_secs_f32();
             if !down {
                 if let Some((_, _, Some((i, _)))) = self.press.take() {
-                    let a = if i == 0 { &mut *self } else { &mut self.extras[i - 1] };
-                    if a.walk.sign.is_some_and(super::sign::is_hug)
-                        && a.walk.act == Act::Idle
-                        && a.walk.race.is_none()
-                        && !a.walk.social.is_some_and(|s| s.no_touch || s.no_pat)
-                        && a.touching()
-                    {
-                        let mx = a.scene_mouse()[0];
-                        let cx = (a.hit_rect[0] + a.hit_rect[2]) * 0.5;
-                        a.walk.left = mx < cx;
-                        a.walk.start_hug();
+                    // the team may have changed while the button was held
+                    if let Some(a) = self.actor_mut_checked(i) {
+                        if a.walk.sign.is_some_and(super::sign::is_hug)
+                            && a.walk.act == Act::Idle
+                            && a.walk.race.is_none()
+                            && !a.walk.social.is_some_and(|s| s.no_touch || s.no_pat)
+                            && a.touching()
+                        {
+                            let mx = a.scene_mouse()[0];
+                            let cx = (a.hit_rect[0] + a.hit_rect[2]) * 0.5;
+                            a.walk.left = mx < cx;
+                            a.walk.start_hug();
+                        }
                     }
                 }
             } else if self.press.is_none() {
@@ -89,48 +91,50 @@ impl CharacterOverlay {
                 let [mx, my] = info.mouse;
                 let moved = (mx - at[0]).hypot(my - at[1]) > tn().drag_px * info.scale.max(1.0);
                 if now - t0 > tn().pick_delay || moved {
-                    let a = if i == 0 { &mut *self } else { &mut self.extras[i - 1] };
-                    if a.walk.act != Act::Held {
-                        // caught in flight: it has moved and turned since the press
-                        // (or lying where it landed, or still turning: anything not upright)
-                        let flying = matches!(a.walk.act, Act::Fall | Act::Planted)
-                            || a.walk.rot.abs() > 0.05
-                            || a.walk.social.is_some_and(|s| s.flying || s.stuck);
-                        a.walk.sink = 0.0;
-                        a.walk.race_down = false;
-                        let grab = if flying { a.body_clip(a.scene_mouse()) } else { grab };
-                        // it may have moved on since the press: the hand closes on
-                        // the body all the same, never on the air beside it
-                        let grab = a.on_body_clip(grab);
-                        // caught mid-jump: keep it at the height it is drawn at
-                        if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
-                            let t = 1.0 - (a.walk.jump / a.walk.jump_dur).clamp(0.0, 1.0);
-                            a.walk.air += a.walk.arc(t) * a.walk.jump_amp;
-                            a.walk.jump = 0.0;
+                    // the team may have changed since the press
+                    if let Some(a) = self.actor_mut_checked(i) {
+                        if a.walk.act != Act::Held {
+                            // caught in flight: it has moved and turned since the press
+                            // (or lying where it landed, or still turning: anything not upright)
+                            let flying = matches!(a.walk.act, Act::Fall | Act::Planted)
+                                || a.walk.rot.abs() > 0.05
+                                || a.walk.social.is_some_and(|s| s.flying || s.stuck);
+                            a.walk.sink = 0.0;
+                            a.walk.race_down = false;
+                            let grab = if flying { a.body_clip(a.scene_mouse()) } else { grab };
+                            // it may have moved on since the press: the hand closes on
+                            // the body all the same, never on the air beside it
+                            let grab = a.on_body_clip(grab);
+                            // caught mid-jump: keep it at the height it is drawn at
+                            if a.walk.act == Act::Jump && a.walk.jump_dur > 0.0 {
+                                let t = 1.0 - (a.walk.jump / a.walk.jump_dur).clamp(0.0, 1.0);
+                                a.walk.air += a.walk.arc(t) * a.walk.jump_amp;
+                                a.walk.jump = 0.0;
+                            }
+                            a.walk.act = Act::Held;
+                            a.walk.glide_vx = 0.0;
+                            a.walk.petted = 0.0;
+                            a.walk.hug = 0.0;
+                            a.walk.grab = Some(grab);
+                            // carries on from the angle and spin it had
+                            let pi = std::f32::consts::PI;
+                            a.walk.swing = if flying { (a.walk.rot + pi).rem_euclid(2.0 * pi) - pi } else { 0.0 };
+                            a.walk.swing_v = if flying { a.walk.tumble.clamp(-30.0, 30.0) } else { 0.0 };
+                            a.walk.tumble = 0.0;
+                            a.walk.rolling = false;
+                            if flying {
+                                a.walk.grip = true;
+                            }
+                            a.walk.swing_last = None;
+                            a.walk.swing_vel = [0.0, 0.0];
+                            a.walk.held_prev = None;
+                            a.walk.vx = 0.0;
+                            a.walk.vy = 0.0;
+                            a.walk.shake = 0.0;
+                            a.walk.shaken = false;
+                            a.walk.jolted = false;
+                            a.walk.impact_dir = None;
                         }
-                        a.walk.act = Act::Held;
-                        a.walk.glide_vx = 0.0;
-                        a.walk.petted = 0.0;
-                        a.walk.hug = 0.0;
-                        a.walk.grab = Some(grab);
-                        // carries on from the angle and spin it had
-                        let pi = std::f32::consts::PI;
-                        a.walk.swing = if flying { (a.walk.rot + pi).rem_euclid(2.0 * pi) - pi } else { 0.0 };
-                        a.walk.swing_v = if flying { a.walk.tumble.clamp(-30.0, 30.0) } else { 0.0 };
-                        a.walk.tumble = 0.0;
-                        a.walk.rolling = false;
-                        if flying {
-                            a.walk.grip = true;
-                        }
-                        a.walk.swing_last = None;
-                        a.walk.swing_vel = [0.0, 0.0];
-                        a.walk.held_prev = None;
-                        a.walk.vx = 0.0;
-                        a.walk.vy = 0.0;
-                        a.walk.shake = 0.0;
-                        a.walk.shaken = false;
-                        a.walk.jolted = false;
-                        a.walk.impact_dir = None;
                     }
                     self.press = Some((t0, at, None));
                 }

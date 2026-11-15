@@ -110,7 +110,7 @@ pub fn park_path() -> PathBuf {
 }
 
 pub fn read_park() -> Park {
-    let mut p: Park = std::fs::read_to_string(park_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let mut p: Park = crate::util::read_json_or_backup(&park_path());
     p.things.retain(|t| t.place == "park" && recipe(&t.kind).is_some());
     p
 }

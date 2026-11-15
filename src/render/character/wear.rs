@@ -387,7 +387,7 @@ pub const STARTERS: [&str; 1] = ["scarf"];
 pub type Inventory = HashMap<String, Vec<String>>;
 
 fn read_inventory() -> Inventory {
-    std::fs::read_to_string(inventory_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    crate::util::read_json_or_backup(&inventory_path())
 }
 
 /// Whether `name` has `id` to wear.
@@ -522,8 +522,8 @@ fn wardrobe() -> Wardrobe {
         let both = stamp.max(dir_stamp).max(fit_stamp).max(inv_stamp);
         if both != s.1 || s.2.1.is_empty() {
             s.1 = both;
-            let saved = std::fs::read_to_string(wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-            let fits: Fits = std::fs::read_to_string(fit_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            let saved = crate::util::read_json_or_backup(&wardrobe_path());
+            let fits: Fits = crate::util::read_json_or_backup(&fit_path());
             s.2 = std::sync::Arc::new((saved, catalog(), fits, read_inventory()));
         }
     }

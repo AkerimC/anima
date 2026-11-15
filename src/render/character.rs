@@ -1089,6 +1089,10 @@ pub struct CharacterOverlay {
     // with where on it the press landed (clip offset from its centre)
     // and where the cursor was
     press: Option<(f32, [f32; 2], Option<(usize, [f32; 2])>)>,
+    // right double click orders: the character picked on this output, and
+    // the pointer counter already handled here (each output has its own)
+    picked: Option<(usize, Instant)>,
+    orders_seen: u64,
     // a race between the walking characters (main character only)
     race: Option<Race>,
     // pairs chatting, and when to look for the next (main character only)
@@ -1329,6 +1333,8 @@ impl CharacterOverlay {
             surface: [1.0; 2],
             opaque: [0.5, 0.0, 1.0],
             press: None,
+            picked: None,
+            orders_seen: 0,
             race: None,
             chats: Vec::new(),
             moods: Default::default(),
@@ -1428,6 +1434,10 @@ impl CharacterOverlay {
         self.config.extra = extra.to_vec();
         if !appended {
             self.clear_chats();
+            // a press or an order points at an actor by position: after a
+            // reorder or a shorter team it may be someone else, or gone
+            self.press = None;
+            self.picked = None;
         }
     }
 
@@ -1435,6 +1445,9 @@ impl CharacterOverlay {
     /// its overlay program and quad intact.  Called before reloading a source
     /// or destroying the overlay.
     fn release_art(&mut self, gl: &glow::Context) {
+        // actors are about to be replaced: stored indices mean nothing now
+        self.press = None;
+        self.picked = None;
         // `sprite_tex` aliases the model's offscreen colour texture when a 3D
         // model is loaded, so destroy the model first and skip that handle.
         let model_color = self.model.as_ref().map(|m| m.color());

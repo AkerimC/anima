@@ -721,8 +721,9 @@ pub(super) struct CarrotGl {
     vao: glow::VertexArray,
     #[allow(dead_code)]
     vbo: glow::Buffer,
-    // accessories' pictures, loaded once (None: couldn't be read)
-    images: std::collections::HashMap<std::path::PathBuf, Option<(glow::Texture, f32)>>,
+    // accessories' pictures, loaded once, reloaded when the file changes
+    // (None: couldn't be read), with the mtime they were loaded at
+    images: std::collections::HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, Option<(glow::Texture, f32)>)>,
 }
 
 impl CarrotGl {
@@ -745,7 +746,7 @@ impl CarrotGl {
 
     pub(super) fn destroy(&mut self, gl: &glow::Context) {
         unsafe {
-            for (_, tex) in self.images.drain() {
+            for (_, (_, tex)) in self.images.drain() {
                 if let Some((t, _)) = tex {
                     gl.delete_texture(t);
                 }
@@ -758,14 +759,27 @@ impl CarrotGl {
 }
 
 impl CarrotGl {
-    /// A picture's texture and width / height, loaded once.
+    /// A picture's texture and width / height, loaded once and reloaded when
+    /// the file is edited by hand in the fitting studio.
     fn picture(&mut self, gl: &glow::Context, path: &std::path::Path) -> Option<(glow::Texture, f32)> {
-        *self.images.entry(path.to_path_buf()).or_insert_with(|| {
+        let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some((s, tex)) = self.images.get(path) {
+            if *s == stamp {
+                return *tex;
+            }
+            // the file changed: drop the old texture before loading the new one
+            if let Some((old, _)) = self.images.remove(path).and_then(|(_, t)| t) {
+                unsafe { gl.delete_texture(old) };
+            }
+        }
+        let loaded = (|| {
             let img = image::open(path).ok()?.to_rgba8();
             let (iw, ih) = img.dimensions();
             let tex = crate::render::gl::create_texture(gl, iw, ih, img.as_raw(), crate::render::gl::Filter::Linear, true).ok()?;
             Some((tex, iw as f32 / ih.max(1) as f32))
-        })
+        })();
+        self.images.insert(path.to_path_buf(), (stamp, loaded));
+        loaded
     }
 }
 
@@ -811,8 +825,18 @@ pub(super) fn sea_name(kind: i32) -> Option<String> {
 
 /// A picture's width / height, read once.
 pub(super) fn picture_aspect(path: &std::path::Path) -> Option<f32> {
-    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<f32>>>> = std::sync::LazyLock::new(Default::default);
-    *SEEN.lock().unwrap().entry(path.to_path_buf()).or_insert_with(|| image::image_dimensions(path).ok().map(|(w, h)| w as f32 / h.max(1) as f32))
+    type Seen = std::collections::HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, Option<f32>)>;
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<Seen>> = std::sync::LazyLock::new(Default::default);
+    let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut seen = SEEN.lock().unwrap();
+    if let Some((s, aspect)) = seen.get(path) {
+        if *s == stamp {
+            return *aspect;
+        }
+    }
+    let aspect = image::image_dimensions(path).ok().map(|(w, h)| w as f32 / h.max(1) as f32);
+    seen.insert(path.to_path_buf(), (stamp, aspect));
+    aspect
 }
 
 /// A box made as tall as a picture of `aspect` needs at the box's width,

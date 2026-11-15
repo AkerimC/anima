@@ -55,6 +55,30 @@ pub fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Parse a JSON file.  A corrupt file is renamed to `<name>.corrupt-<secs>`
+/// and defaults are returned, so the next save cannot silently destroy it.
+pub fn read_json_or_backup<T>(path: &Path) -> T
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return T::default();
+    };
+    match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(err) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let bad = path.with_extension(format!("corrupt-{stamp}"));
+            log::warn!("{}: {err}; kept as {}", path.display(), bad.display());
+            let _ = std::fs::rename(path, bad);
+            T::default()
+        }
+    }
+}
+
 /// Write a file atomically (write to a sibling temp file, then rename).
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -68,4 +92,33 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     ));
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod json_tests {
+    #[test]
+    fn corrupt_json_is_kept_aside_not_lost() {
+        let dir = std::env::temp_dir().join(format!("anima-json-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("inventory.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let v: std::collections::HashMap<String, Vec<String>> = super::read_json_or_backup(&path);
+        assert!(v.is_empty());
+        assert!(!path.exists(), "the bad file is moved aside");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("inventory.corrupt-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "one backup: {kept:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_json_uses_defaults() {
+        let path = std::env::temp_dir().join(format!("anima-missing-{}.json", std::process::id()));
+        let v: std::collections::HashMap<String, Vec<String>> = super::read_json_or_backup(&path);
+        assert!(v.is_empty());
+    }
 }

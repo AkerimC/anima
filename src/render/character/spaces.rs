@@ -193,6 +193,12 @@ impl CharacterOverlay {
         if i == 0 { self } else { &mut self.extras[i - 1] }
     }
 
+    /// Like `actor_mut`, but `None` when the extras changed under a stored
+    /// index (a team edit or a reload while the cursor holds someone).
+    pub(super) fn actor_mut_checked(&mut self, i: usize) -> Option<&mut CharacterOverlay> {
+        if i == 0 { Some(self) } else { self.extras.get_mut(i - 1) }
+    }
+
     /// Where this frame's workspaces are, for every character.
     pub(super) fn sync_spaces(&mut self, info: &FrameInfo) {
         let n = self.extras.len() + 1;

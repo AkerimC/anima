@@ -415,13 +415,13 @@ fn mask_view(r: &Rc<Roster>, pop: &Panel, i: usize, name: &str, path: &str) -> g
 }
 
 fn wardrobe_all() -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read_to_string(anima::render::character::wear::wardrobe_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    anima::util::read_json_or_backup(&anima::render::character::wear::wardrobe_path())
 }
 
 /// What the character wears: a switch for each thing there is. The weather
 /// and Christmas put on their own things on top of these.
 fn fits_all() -> anima::render::character::wear::Fits {
-    std::fs::read_to_string(anima::render::character::wear::fit_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    anima::util::read_json_or_backup(&anima::render::character::wear::fit_path())
 }
 
 fn save_fits(f: &anima::render::character::wear::Fits) {
