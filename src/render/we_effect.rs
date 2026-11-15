@@ -144,6 +144,8 @@ impl TextureCache {
                 .map(|t| (t.tex, t.w, t.h, t.spritesheet, t.is_r8));
         }
 
+        let trace = std::env::var_os("ANIMA_TRACE_SCENE").is_some();
+        let started = std::time::Instant::now();
         let loaded = match pkg.load_rgba(&key) {
             Ok(decoded) => {
                 let (w, h) = (decoded.image.width(), decoded.image.height());
@@ -154,7 +156,8 @@ impl TextureCache {
                 } else {
                     Filter::Linear
                 };
-                create_texture_ex(
+                let decoded_at = started.elapsed();
+                let tex = create_texture_ex(
                     gl,
                     w,
                     h,
@@ -162,7 +165,15 @@ impl TextureCache {
                     filter,
                     true,
                     decoded.clamp_uvs,
-                )
+                );
+                if trace && started.elapsed().as_secs_f32() > 0.02 {
+                    log::info!(
+                        "texture {key} {w}x{h}: decode {:.0} ms, upload+mips {:.0} ms",
+                        decoded_at.as_secs_f32() * 1000.0,
+                        (started.elapsed() - decoded_at).as_secs_f32() * 1000.0
+                    );
+                }
+                tex
                 .ok()
                 .map(|tex| CachedTexture {
                     tex,

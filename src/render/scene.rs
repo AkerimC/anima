@@ -2638,7 +2638,12 @@ impl SceneRenderer {
         height: i32,
         project: Option<&serde_json::Value>,
     ) -> Result<Self> {
+        let trace = std::env::var_os("ANIMA_TRACE_SCENE").is_some();
+        let started = std::time::Instant::now();
         let pkg = PackageFs::open(root)?;
+        if trace {
+            log::info!("scene load: package {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+        }
         let content_prog = Program::new(gl, CONTENT_VS, CONTENT_FS)?;
         let puppet_prog = Program::new(gl, PUPPET_VS, CONTENT_FS)?;
         let composite_prog = Program::new(gl, COMPOSITE_VS, COMPOSITE_FS)?;
@@ -2647,6 +2652,9 @@ impl SceneRenderer {
         let particle_prog = Program::new(gl, PARTICLE_VS, PARTICLE_FS)?;
         let (quad_vao, quad_vbo) = create_quad(gl)?;
         let (particle_vao, particle_quad_vbo, particle_inst_vbo) = create_particle_buffers(gl)?;
+        if trace {
+            log::info!("scene load: programs {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+        }
 
         let mut this = Self {
             content_prog,
@@ -2735,10 +2743,17 @@ impl SceneRenderer {
             } else {
                 anyhow::bail!("no scene.json found in {}", root.display());
             };
+            let t = std::time::Instant::now();
             this.load_we_scene(gl, &pkg, &json_text)?;
+            if trace {
+                log::info!("scene load: objects/textures {:.0} ms", t.elapsed().as_secs_f32() * 1000.0);
+            }
         }
 
         this.pkg = pkg;
+        if trace {
+            log::info!("scene load: total {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+        }
         Ok(this)
     }
 
@@ -2771,11 +2786,19 @@ impl SceneRenderer {
                 candidates.push(format!("materials/{no_ext}.tex"));
             }
         }
+        let trace = std::env::var_os("ANIMA_TRACE_SCENE").is_some();
+        let started = std::time::Instant::now();
         for candidate in candidates {
             if candidate.is_empty() {
                 continue;
             }
             if let Some((t, w, h, ss, _)) = textures.get_spritesheet(gl, pkg, &candidate) {
+                if trace {
+                    let ms = started.elapsed().as_secs_f32() * 1000.0;
+                    if ms > 20.0 {
+                        log::info!("scene load: texture {candidate} {w}x{h} {ms:.0} ms");
+                    }
+                }
                 return Some((t, w, h, ss));
             }
         }

@@ -507,7 +507,39 @@ fn parse_texs_spritesheet(data: &[u8], img_w: u32, img_h: u32) -> Option<Sprites
 /// The atlas is capped at roughly 24 Mpx (≈96 MiB RGBA) and 8192 px per side,
 /// so long or 4K clips are downscaled; short WE video textures (transition
 /// clips, glitch overlays) fit comfortably.
+///
+/// Two things keep a 4K video texture (24 s of 3840x2160 at 60 fps, 45 MB in
+/// the `.pkg`) from freezing the switch for seconds:
+/// * long clips are decoded from keyframes only (see `sparse` below), and
+/// * the finished atlas is cached under `~/.cache/anima/atlas`, so switching
+///   back to the wallpaper costs a disk read instead of an ffmpeg run.
 fn decode_mp4_atlas(
+    mp4: &[u8],
+    hint_w: u32,
+    hint_h: u32,
+) -> Result<(RgbaImage, Option<SpritesheetMeta>)> {
+    let cache = atlas_cache_path(mp4);
+    if let Some(path) = &cache {
+        if let Some(hit) = read_atlas_cache(path) {
+            log::debug!("video texture: cache hit {}", path.display());
+            return Ok(hit);
+        }
+    }
+
+    let decoded = decode_mp4_atlas_uncached(mp4, hint_w, hint_h)?;
+    if let Some(path) = &cache {
+        match write_atlas_cache(path, &decoded.0, decoded.1.as_ref()) {
+            Ok(()) => {
+                log::debug!("video texture: cached {}", path.display());
+                prune_atlas_cache(path);
+            }
+            Err(err) => log::debug!("video texture: not cached: {err:#}"),
+        }
+    }
+    Ok(decoded)
+}
+
+fn decode_mp4_atlas_uncached(
     mp4: &[u8],
     hint_w: u32,
     hint_h: u32,
@@ -592,8 +624,18 @@ fn decode_mp4_atlas(
         // Even dimensions keep ffmpeg's scaler happy.
         let fw = ((fw as u32) & !1).max(2);
         let fh = ((fh as u32) & !1).max(2);
-        let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-i"])
+        // A long clip is sampled down to `keep` frames anyway, and decoding
+        // 1440 4K frames to keep 64 of them costs seconds (5.8 s for a 24 s
+        // 60 fps clip here, against 2.1 s when only keyframes are decoded).
+        // Keyframes are evenly spaced, so the sampled result looks the same.
+        let sparse = frames > keep * 3;
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-v").arg("error");
+        if sparse {
+            cmd.arg("-skip_frame").arg("nokey");
+        }
+        let out = cmd
+            .arg("-i")
             .arg(&tmp)
             .args([
                 "-vf",
@@ -636,6 +678,157 @@ fn decode_mp4_atlas(
     })();
     let _ = fs::remove_file(&tmp);
     result
+}
+
+// ---------------------------------------------------------------------------
+// Decoded video-texture atlas cache
+// ---------------------------------------------------------------------------
+
+/// Bump when the atlas layout or sampling changes, so a file written by an
+/// older build is not mistaken for one with the new meaning.
+const ATLAS_CACHE_VERSION: u32 = 1;
+/// The cache is a pure optimisation, so it may be dropped at any time.  One
+/// 4K video texture atlas is ~100 MiB; keep a handful of them.
+const ATLAS_CACHE_BUDGET: u64 = 512 * 1024 * 1024;
+const ATLAS_CACHE_MAGIC: &[u8; 8] = b"ANIMATL1";
+/// magic + width, height, cols, rows, frames + duration.
+const ATLAS_HEADER: usize = 8 + 5 * 4 + 4;
+
+fn atlas_cache_path(mp4: &[u8]) -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("anima").join("atlas");
+    Some(dir.join(format!("{:016x}-{ATLAS_CACHE_VERSION}.rgba", atlas_hash(mp4))))
+}
+
+/// Identity of a video payload for caching: its length plus blocks spread
+/// across it.  Hashing all 45 MB on every load would cost a good part of what
+/// the cache saves, and a false hit would need identical length *and*
+/// identical bytes at every sampled offset.
+fn atlas_hash(mp4: &[u8]) -> u64 {
+    const BLOCK: usize = 4096;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    mix(&(mp4.len() as u64).to_le_bytes());
+    if mp4.len() <= 32 * BLOCK {
+        mix(mp4);
+    } else {
+        let stride = (mp4.len() / 32).max(BLOCK);
+        let mut off = 0;
+        while off + BLOCK <= mp4.len() {
+            mix(&mp4[off..off + BLOCK]);
+            off += stride;
+        }
+        mix(&mp4[mp4.len() - BLOCK..]);
+    }
+    h
+}
+
+fn read_atlas_cache(path: &Path) -> Option<(RgbaImage, Option<SpritesheetMeta>)> {
+    let data = fs::read(path).ok()?;
+    if data.len() < ATLAS_HEADER || &data[..8] != ATLAS_CACHE_MAGIC {
+        return None;
+    }
+    let word = |i: usize| -> u32 {
+        let at = 8 + i * 4;
+        u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
+    };
+    let (w, h) = (word(0), word(1));
+    let (cols, rows, frames) = (word(2), word(3), word(4));
+    let duration = f32::from_le_bytes([data[28], data[29], data[30], data[31]]);
+    if w == 0 || h == 0 || frames == 0 {
+        return None;
+    }
+    let expected = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if data.len() != ATLAS_HEADER + expected {
+        return None;
+    }
+    let image = RgbaImage::from_raw(w, h, data[ATLAS_HEADER..].to_vec())?;
+    let meta = (frames > 1).then(|| SpritesheetMeta {
+        cols,
+        rows,
+        frames,
+        duration: duration.max(0.01),
+    });
+    Some((image, meta))
+}
+
+fn write_atlas_cache(
+    path: &Path,
+    atlas: &RgbaImage,
+    meta: Option<&SpritesheetMeta>,
+) -> Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let (cols, rows, frames, duration) = match meta {
+        Some(m) => (m.cols, m.rows, m.frames, m.duration),
+        None => (1, 1, 1, 1.0),
+    };
+    let mut header = [0u8; ATLAS_HEADER];
+    header[..8].copy_from_slice(ATLAS_CACHE_MAGIC);
+    for (i, v) in [atlas.width(), atlas.height(), cols, rows, frames]
+        .into_iter()
+        .enumerate()
+    {
+        header[8 + i * 4..12 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    header[28..32].copy_from_slice(&duration.to_le_bytes());
+
+    // Stream to a sibling file first: a half-written atlas must never be read
+    // back as a valid cache entry.
+    let tmp = path.with_extension("rgba.tmp");
+    {
+        let mut f = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
+        f.write_all(&header)?;
+        f.write_all(atlas.as_raw())?;
+        f.flush()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Drop the oldest cache files until the directory fits the budget again.
+fn prune_atlas_cache(newest: &Path) {
+    let Some(dir) = newest.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        total += meta.len();
+        files.push((mtime, meta.len(), entry.path()));
+    }
+    if total <= ATLAS_CACHE_BUDGET {
+        return;
+    }
+    files.sort_by_key(|(mtime, _, _)| *mtime);
+    for (_, len, path) in files {
+        if total <= ATLAS_CACHE_BUDGET {
+            break;
+        }
+        if path == newest {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+            log::debug!("video texture: evicted {}", path.display());
+        }
+    }
 }
 
 fn crop_if_needed(img: RgbaImage, img_w: u32, img_h: u32, _flags: u32) -> RgbaImage {
@@ -1082,5 +1275,62 @@ mod tests {
         let decoded = decode_tex(&tex).unwrap();
         assert_eq!(decoded.image.dimensions(), (2, 2));
         assert_eq!(decoded.image.as_raw(), &pixels[..]);
+    }
+    fn atlas_temp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("anima-atlas-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn atlas_cache_roundtrip_restores_frames_and_meta() {
+        let path = atlas_temp("roundtrip");
+        let mut img = RgbaImage::new(4, 2);
+        for (i, px) in img.pixels_mut().enumerate() {
+            px.0 = [i as u8, 7, 9, 255];
+        }
+        let meta = SpritesheetMeta {
+            cols: 2,
+            rows: 1,
+            frames: 2,
+            duration: 3.5,
+        };
+        write_atlas_cache(&path, &img, Some(&meta)).unwrap();
+        let (back, meta_back) = read_atlas_cache(&path).unwrap();
+        assert_eq!(back.dimensions(), (4, 2));
+        assert_eq!(back.as_raw(), img.as_raw());
+        let meta_back = meta_back.unwrap();
+        assert_eq!((meta_back.cols, meta_back.rows, meta_back.frames), (2, 1, 2));
+        assert!((meta_back.duration - 3.5).abs() < 1e-6);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn atlas_cache_rejects_truncated_or_foreign_files() {
+        let path = atlas_temp("bad");
+        // not ours
+        fs::write(&path, b"definitely not an atlas").unwrap();
+        assert!(read_atlas_cache(&path).is_none());
+        // right magic, wrong payload length
+        let mut short = Vec::new();
+        short.extend_from_slice(ATLAS_CACHE_MAGIC);
+        for v in [8u32, 8, 1, 1, 1] {
+            short.extend_from_slice(&v.to_le_bytes());
+        }
+        short.extend_from_slice(&1.0f32.to_le_bytes());
+        short.extend_from_slice(&[0u8; 16]);
+        fs::write(&path, &short).unwrap();
+        assert!(read_atlas_cache(&path).is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn atlas_hash_tracks_length_and_content() {
+        let a = vec![7u8; 4096 * 40];
+        let mut b = a.clone();
+        assert_eq!(atlas_hash(&a), atlas_hash(&b));
+        b[0] ^= 0xFF;
+        assert_ne!(atlas_hash(&a), atlas_hash(&b));
+        let mut c = a.clone();
+        c.push(1);
+        assert_ne!(atlas_hash(&a), atlas_hash(&c));
     }
 }
