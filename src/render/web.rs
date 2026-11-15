@@ -820,17 +820,22 @@ impl WebRenderer {
                 || html_lower.contains("audio");
         }
 
-        let (bg_texture, tex_size, has_bg) = match find_web_background(root, &html) {
-            Some(img_path) => {
-                let img = image::ImageReader::open(&img_path)
-                    .with_context(|| format!("opening {}", img_path.display()))?
-                    .with_guessed_format()?
-                    .decode()?
-                    .to_rgba8();
-                let dims = img.dimensions();
-                let tex = create_texture(gl, dims.0, dims.1, img.as_raw(), Filter::Linear, true)?;
-                (tex, dims, true)
-            }
+        let found_bg = find_web_background(root, &html).and_then(|img_path| {
+            let decoded = image::open(&img_path);
+            let img = match decoded {
+                Ok(img) => img.to_rgba8(),
+                Err(err) => {
+                    log::warn!("web background {}: {err}", img_path.display());
+                    return None;
+                }
+            };
+            let dims = img.dimensions();
+            let tex = create_texture(gl, dims.0, dims.1, img.as_raw(), Filter::Linear, true).ok()?;
+            Some((tex, dims))
+        });
+        // a preview that will not decode must not take the web wallpaper down
+        let (bg_texture, tex_size, has_bg) = match found_bg {
+            Some((tex, dims)) => (tex, dims, true),
             None => {
                 let tex = create_texture(gl, 1, 1, &[12, 16, 28, 255], Filter::Nearest, false)?;
                 (tex, (1, 1), false)

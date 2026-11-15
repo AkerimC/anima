@@ -1670,6 +1670,7 @@ pub fn eval_property_condition(cond: &str, values: &BTreeMap<String, String>) ->
         tokens: &tokens,
         pos: 0,
         values,
+        depth: 0,
     };
     match parser.parse_or() {
         Ok(val) if parser.pos == tokens.len() => cond_truthy(&val),
@@ -1839,6 +1840,7 @@ struct CondParser<'a> {
     tokens: &'a [CondTok],
     pos: usize,
     values: &'a BTreeMap<String, String>,
+    depth: u32,
 }
 
 impl<'a> CondParser<'a> {
@@ -1847,6 +1849,18 @@ impl<'a> CondParser<'a> {
     }
 
     fn parse_or(&mut self) -> std::result::Result<CondVal, ()> {
+        // project.json comes from downloaded content: a few thousand nested
+        // tokens would overflow the stack, which is an abort and not a panic
+        if self.depth >= 64 {
+            return Err(());
+        }
+        self.depth += 1;
+        let out = self.parse_or_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_or_inner(&mut self) -> std::result::Result<CondVal, ()> {
         let mut lhs = self.parse_and()?;
         while matches!(self.peek(), Some(CondTok::Or)) {
             self.pos += 1;
@@ -2233,6 +2247,12 @@ fn find_by_id_or_name(query: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn deeply_nested_conditions_fail_open_instead_of_overflowing() {
+        let cond = format!("{}1 == 1{}", "(".repeat(5000), ")".repeat(5000));
+        assert!(eval_property_condition(&cond, &BTreeMap::new()));
+    }
 
     #[test]
     fn clean_we_label_strips_html_and_decodes_entities() {

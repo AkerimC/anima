@@ -2588,6 +2588,9 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Leave { .. } => {
                     self.pointer_down = false;
+                    // the pressed surface can go away without a Release (wallpaper
+                    // switch, overlay teardown): never leave the button stuck down
+                    crate::backend::pointer::BUTTON_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {}
             }

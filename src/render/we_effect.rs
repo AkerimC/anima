@@ -395,14 +395,19 @@ vec3 we_mix(vec3 a, float b, vec3 t) { return mix(a, vec3(b), t); }
 vec2 we_mix(vec2 a, float b, vec2 t) { return mix(a, vec2(b), t); }
 #define mix(a, b, t) we_mix(a, b, t)
 
-float we_pow(float a, float b) { return pow(max(a, 0.0), b); }
-vec2 we_pow(vec2 a, vec2 b) { return pow(max(a, vec2(0.0)), b); }
-vec3 we_pow(vec3 a, vec3 b) { return pow(max(a, vec3(0.0)), b); }
-vec4 we_pow(vec4 a, vec4 b) { return pow(max(a, vec4(0.0)), b); }
-vec2 we_pow(vec2 a, float b) { return pow(max(a, vec2(0.0)), vec2(b)); }
-vec3 we_pow(vec3 a, float b) { return pow(max(a, vec3(0.0)), vec3(b)); }
-vec4 we_pow(vec4 a, float b) { return pow(max(a, vec4(0.0)), vec4(b)); }
+float we_pow(float a, float b) { return pow(max(a, 1e-6), b); }
+vec2 we_pow(vec2 a, vec2 b) { return pow(max(a, vec2(1e-6)), b); }
+vec3 we_pow(vec3 a, vec3 b) { return pow(max(a, vec3(1e-6)), b); }
+vec4 we_pow(vec4 a, vec4 b) { return pow(max(a, vec4(1e-6)), b); }
+vec2 we_pow(vec2 a, float b) { return pow(max(a, vec2(1e-6)), vec2(b)); }
+vec3 we_pow(vec3 a, float b) { return pow(max(a, vec3(1e-6)), vec3(b)); }
+vec4 we_pow(vec4 a, float b) { return pow(max(a, vec4(1e-6)), vec4(b)); }
 #define pow(a, b) we_pow(a, b)
+float we_distance(float a, float b) { return distance(clamp(a, -1e6, 1e6), clamp(b, -1e6, 1e6)); }
+float we_distance(vec2 a, vec2 b) { return distance(clamp(a, -1e6, 1e6), clamp(b, -1e6, 1e6)); }
+float we_distance(vec3 a, vec3 b) { return distance(clamp(a, -1e6, 1e6), clamp(b, -1e6, 1e6)); }
+float we_distance(vec4 a, vec4 b) { return distance(clamp(a, -1e6, 1e6), clamp(b, -1e6, 1e6)); }
+#define distance(a, b) we_distance(a, b)
 
 float we_max(float a, float b) { return max(a, b); }
 vec2 we_max(vec2 a, vec2 b) { return max(a, b); }
@@ -428,14 +433,14 @@ vec4 we_smoothstep(vec4 a, vec4 b, vec4 x) { return mix(step(a, x), smoothstep(a
 #define smoothstep(a, b, x) we_smoothstep(a, b, x)
 
 vec4 mmul(vec4 v, mat4 m) { return m * v; }
-vec4 mmul(mat4 m, vec4 v) { return m * v; }
+vec4 mmul(mat4 m, vec4 v) { return v * m; }
 vec3 mmul(vec3 v, mat3 m) { return m * v; }
-vec3 mmul(mat3 m, vec3 v) { return m * v; }
+vec3 mmul(mat3 m, vec3 v) { return v * m; }
 vec2 mmul(vec2 v, mat2 m) { return m * v; }
-vec2 mmul(mat2 m, vec2 v) { return m * v; }
-mat4 mmul(mat4 a, mat4 b) { return a * b; }
-mat3 mmul(mat3 a, mat3 b) { return a * b; }
-mat2 mmul(mat2 a, mat2 b) { return a * b; }
+vec2 mmul(mat2 m, vec2 v) { return v * m; }
+mat4 mmul(mat4 a, mat4 b) { return b * a; }
+mat3 mmul(mat3 a, mat3 b) { return b * a; }
+mat2 mmul(mat2 a, mat2 b) { return b * a; }
 #define mul(a, b) mmul(a, b)
 
 vec2 modV2(vec2 x, vec2 y) { return mod(x, y); }
@@ -4329,24 +4334,45 @@ impl EffectInstance {
             .cloned()
             .unwrap_or_default();
 
-        let mut passes = Vec::new();
+        let mut passes: Vec<EffectPass> = Vec::new();
+        // A scene load happens on every wallpaper switch, and `CompiledProgram`
+        // has no context-aware Drop: any later `?` must release what was built.
+        macro_rules! bail {
+            () => {{
+                for pass in passes.drain(..) {
+                    if let Some(program) = pass.program.as_ref() {
+                        program.destroy(gl);
+                    }
+                }
+                return None;
+            }};
+        }
         for (i, def_pass) in def_passes.iter().enumerate() {
-            let material_path = def_pass.get("material")?.as_str()?;
-            let material = read_json(pkg, material_path)?;
-            let mat_pass = material
+            let Some(material_path) = def_pass.get("material").and_then(|v| v.as_str()) else {
+                bail!()
+            };
+            let Some(material) = read_json(pkg, material_path) else {
+                bail!()
+            };
+            let Some(mat_pass) = material
                 .get("passes")
                 .and_then(|p| p.as_array())
-                .and_then(|a| a.first())?;
-            let shader = mat_pass.get("shader")?.as_str()?;
+                .and_then(|a| a.first())
+            else {
+                bail!()
+            };
+            let Some(shader) = mat_pass.get("shader").and_then(|v| v.as_str()) else {
+                bail!()
+            };
             let vert_path = format!("shaders/{shader}.vert");
             let frag_path = format!("shaders/{shader}.frag");
             let Some(vert_src) = read_text(pkg, &vert_path) else {
                 log::debug!("effect {effect_file}: missing {vert_path}");
-                return None;
+                bail!()
             };
             let Some(frag_src) = read_text(pkg, &frag_path) else {
                 log::debug!("effect {effect_file}: missing {frag_path}");
-                return None;
+                bail!()
             };
 
             let scene_pass = scene_passes.get(i);
@@ -4425,7 +4451,7 @@ impl EffectInstance {
                 Ok(p) => Some(p),
                 Err(err) => {
                     log::warn!("effect shader {shader} failed: {err}");
-                    return None;
+                    bail!()
                 }
             };
 
@@ -5436,5 +5462,22 @@ void main() {
         let out = preprocess(frag, false, &[]);
         assert!(out.contains("a.z = frac(a.z) - 0.5;"), "lost trailing stmt: {out}");
         assert!(out.contains("x = x + 2.0;"), "lost trailing scalar stmt: {out}");
+    }
+
+    #[test]
+    fn preamble_uses_row_major_mat_vec_mul_and_nan_guards() {
+        let out = preprocess("void main() {}", false, &[]);
+        assert!(out.contains("vec4 mmul(mat4 m, vec4 v) { return v * m; }"));
+        assert!(out.contains("vec3 mmul(mat3 m, vec3 v) { return v * m; }"));
+        assert!(out.contains("vec2 mmul(mat2 m, vec2 v) { return v * m; }"));
+        // HLSL matrices are row-major: GLSL storage is the transpose, so
+        // composing A*B has to come out as b * a.
+        assert!(out.contains("mat4 mmul(mat4 a, mat4 b) { return b * a; }"));
+        assert!(out.contains("mat3 mmul(mat3 a, mat3 b) { return b * a; }"));
+        assert!(out.contains("mat2 mmul(mat2 a, mat2 b) { return b * a; }"));
+        assert!(out.contains("float we_pow(float a, float b) { return pow(max(a, 1e-6), b); }"));
+        assert!(out.contains("vec4 we_pow(vec4 a, float b) { return pow(max(a, vec4(1e-6)), vec4(b)); }"));
+        assert!(out.contains("float we_distance(vec2 a, vec2 b) { return distance(clamp(a, -1e6, 1e6), clamp(b, -1e6, 1e6)); }"));
+        assert!(out.contains("#define distance(a, b) we_distance(a, b)"));
     }
 }
