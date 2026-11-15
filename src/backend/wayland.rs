@@ -77,6 +77,13 @@ pub fn run(opts: RunOptions) -> Result<()> {
     if let Some(fps) = opts.fps {
         config.general.fps = fps.clamp(1, 360);
     }
+    // Overrides for wallpapers that were deleted or uninstalled would otherwise
+    // stay in the file forever (the key is the path or the Workshop id).
+    if config.prune_missing_wallpapers() > 0 {
+        if let Err(err) = config.save(&config_path) {
+            log::error!("saving pruned config: {err:#}");
+        }
+    }
     compositor::configure(&config.general.compositor);
 
     let conn = Connection::connect_to_env()
@@ -129,6 +136,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         display_ptr,
         config,
         config_path,
+        config_save: Default::default(),
         outputs: Vec::new(),
         audio,
         lyrics,
@@ -205,6 +213,10 @@ pub fn run(opts: RunOptions) -> Result<()> {
         app.tick();
     }
 
+    // Flush a change the coalescing timer had not written yet.
+    if app.config_save.is_pending() {
+        app.save_config();
+    }
     app.audio.stop();
     app.lyrics.stop();
     // Tear outputs down while the EGL display and Wayland connection are still
@@ -345,6 +357,8 @@ pub struct App {
 
     config: Config,
     config_path: PathBuf,
+    /// Pending coalesced config write (see `config_changed`).
+    config_save: crate::config::SaveDebounce,
     outputs: Vec<OutputCtx>,
     audio: AudioAnalyzer,
     lyrics: LyricsEngine,
@@ -771,6 +785,10 @@ impl App {
                     &wp.entry,
                     w,
                     h,
+                    crate::render::web::WebOptions {
+                        scale: config.web_scale(),
+                        fps: config.web_fps(),
+                    },
                     wp.project.as_ref(),
                 )
                 .map(|r| Box::new(r) as Box<dyn Renderer>),
@@ -1395,14 +1413,32 @@ impl App {
             self.refresh_pause();
             applied.push(name);
         }
-        let _ = self.config.save(&self.config_path);
+        self.config_changed();
         self.last_playlist_advance = Instant::now();
         Ok(format!("switched to {} on {}", wp.title, applied.join(", ")))
+    }
+
+    /// Write the config now and clear any pending coalesced write.
+    fn save_config(&mut self) {
+        self.config_save.clear();
+        match self.config.save(&self.config_path) {
+            Ok(()) => log::debug!("config saved"),
+            Err(err) => log::error!("saving config: {err:#}"),
+        }
+    }
+
+    /// Remember that the config changed without writing it yet: the write
+    /// happens in `tick` once `CONFIG_SAVE_DELAY` has passed quietly.
+    fn config_changed(&mut self) {
+        self.config_save.note(Instant::now() + CONFIG_SAVE_DELAY);
     }
 
     fn next_timeout(&self) -> Duration {
         let now = Instant::now();
         let mut timeout = Duration::from_secs(1);
+        if let Some(wait) = self.config_save.wait(now) {
+            timeout = timeout.min(wait);
+        }
         if crate::render::character::LOCK_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
             timeout = LOCK_FRAME.saturating_sub(self.lock_last.elapsed());
         }
@@ -1416,6 +1452,9 @@ impl App {
     }
 
     fn tick(&mut self) {
+        if self.config_save.due_now(Instant::now()) {
+            self.save_config();
+        }
         if crate::render::character::LOCK_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
             // the lock screen went away without saying so
             if self.lock_heard.elapsed() > Duration::from_secs(15) {
@@ -1674,9 +1713,7 @@ impl App {
                                 self.config.general.default_wallpaper = Some(save_path);
                             }
                         }
-                        if let Err(err) = self.config.save(&self.config_path) {
-                            log::error!("saving config: {err:#}");
-                        }
+                        self.save_config();
                         Response::ok(format!(
                             "set {} [{}] on {}",
                             wallpaper.title,
@@ -1747,7 +1784,7 @@ impl App {
                         }
                     }
                 }
-                let _ = self.config.save(&self.config_path);
+                self.config_changed();
                 Response::ok("audio settings updated")
             }
             Request::SetProperty {
@@ -1774,7 +1811,7 @@ impl App {
                     }
                 }
                 self.update_audio_state();
-                let _ = self.config.save(&self.config_path);
+                self.config_changed();
                 Response::ok(format!("property {key} = {value}"))
             }
             Request::ListProperties { monitor } => {
@@ -1875,7 +1912,7 @@ impl App {
                     }
                 }
                 self.update_audio_state();
-                let _ = self.config.save(&self.config_path);
+                self.config_changed();
                 let msg = match &key {
                     Some(k) => format!("reset property {k} to default"),
                     None => "reset all properties to defaults".to_string(),
@@ -1897,7 +1934,7 @@ impl App {
                     self.config.general.playlist = list;
                 }
                 self.last_playlist_advance = Instant::now();
-                let _ = self.config.save(&self.config_path);
+                self.config_changed();
                 Response::ok(format!(
                     "playlist updated (interval={}s, shuffle={})",
                     self.config.general.playlist_interval_secs,
@@ -1971,7 +2008,7 @@ impl App {
                     self.schedule_render(idx);
                 }
                 self.update_audio_state();
-                let _ = self.config.save(&self.config_path);
+                self.config_changed();
                 Response::with_data(
                     format!(
                         "character: {} ({} @ {} [{}], scale={:.2})",
@@ -2604,6 +2641,10 @@ delegate_registry!(App);
 /// Lock screen frames: this often, and this much of the screen from the bottom.
 const LOCK_FRAME: Duration = Duration::from_millis(50);
 const LOCK_BAND: f32 = 0.45;
+/// How long config changes are coalesced before being written.  A GUI slider
+/// sends a property update every 35 ms while it is dragged, and every one of
+/// them used to rewrite the whole file.
+const CONFIG_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 /// Turns a frame (premultiplied, bottom row first) into a PNG on a worker
 /// thread; a frame that arrives while the last is still being written is

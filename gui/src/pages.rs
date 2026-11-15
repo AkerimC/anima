@@ -792,6 +792,39 @@ fn general_page(ui: &Rc<Ui>) -> gtk::Widget {
         1.0,
         0,
     );
+    spin(
+        &perf,
+        "general",
+        "web_fps",
+        "Web wallpaper frame rate",
+        30.0,
+        5.0,
+        60.0,
+        1.0,
+        0,
+    );
+    spin(
+        &perf,
+        "general",
+        "web_scale",
+        "Web wallpaper resolution",
+        1.0,
+        0.25,
+        1.0,
+        0.05,
+        2,
+    );
+    let web_note = gtk::Label::builder()
+        .label(
+            "Web (HTML/WebGL) wallpapers are rasterised in software. Lower the \
+             resolution to 0.5 to roughly quarter the pixel work; both values \
+             apply when animad restarts.",
+        )
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    web_note.add_css_class("dim-label");
+    perf.add(&web_note);
     switch(
         &perf,
         "general",

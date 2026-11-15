@@ -195,10 +195,26 @@ entry_abs = os.path.abspath(sys.argv[1])
 root_dir = os.path.dirname(entry_abs)
 entry_name = os.path.basename(entry_abs)
 
+# Internal render scale and snapshot rate: WebKit rasterises these pages in
+# software, so both are the main CPU dial.  Clamped by the daemon's config.
+try:
+    render_scale = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0
+except ValueError:
+    render_scale = 1.0
+if not (render_scale > 0.0):
+    render_scale = 1.0
+render_scale = min(max(render_scale, 0.25), 1.0)
+try:
+    target_fps = int(sys.argv[6]) if len(sys.argv) > 6 else 30
+except ValueError:
+    target_fps = 30
+target_fps = min(max(target_fps, 1), 120)
+
 def _clamp_dims(w, h):
     w = max(64, int(w))
     h = max(64, int(h))
-    scale = min(1920.0 / w, 1080.0 / h, 1.0)
+    cap = min(1920.0 / w, 1080.0 / h, 1.0)
+    scale = min(cap, render_scale)
     return max(64, int(round(w * scale))), max(64, int(round(h * scale)))
 
 width, height = _clamp_dims(sys.argv[2], sys.argv[3])
@@ -529,7 +545,7 @@ def on_load_changed(_view, event):
 webview.connect("load-changed", on_load_changed)
 webview.connect("permission-request", lambda _v, req: (req.deny(), True)[1])
 webview.load_uri(url)
-GLib.timeout_add(33, periodic_tick)
+GLib.timeout_add(max(1, int(round(1000.0 / target_fps))), periodic_tick)
 
 def handle_cmd(msg):
     if state["closed"]:
@@ -607,6 +623,42 @@ struct WebFrame {
     bgra: Vec<u8>,
 }
 
+/// How the offscreen WebKit worker renders and how often it is polled.
+///
+/// WebKit rasterises web wallpapers in software (`HardwareAccelerationPolicy.NEVER`
+/// is the only mode that produces frames offscreen on EGL/llvmpipe), so the
+/// internal resolution and the snapshot rate are the two knobs that actually
+/// change CPU load.
+#[derive(Debug, Clone, Copy)]
+pub struct WebOptions {
+    /// Internal render scale as a fraction of the output size, 0.25..=1.0.
+    pub scale: f32,
+    /// Snapshots per second.
+    pub fps: u32,
+}
+
+impl Default for WebOptions {
+    fn default() -> Self {
+        Self { scale: 1.0, fps: 30 }
+    }
+}
+
+impl WebOptions {
+    /// Clamp to the range the worker accepts, so a hand-edited config cannot
+    /// ask for a 1-pixel render or a 1000 fps snapshot loop.
+    fn sane(self) -> Self {
+        let scale = if self.scale.is_finite() {
+            self.scale.clamp(0.25, 1.0)
+        } else {
+            1.0
+        };
+        Self {
+            scale,
+            fps: self.fps.clamp(1, 120),
+        }
+    }
+}
+
 struct WorkerShared {
     latest_frame: Option<WebFrame>,
     exited: bool,
@@ -624,6 +676,7 @@ impl WebWorker {
         entry: &Path,
         width: i32,
         height: i32,
+        options: WebOptions,
         initial_props: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Self> {
         let abs = entry
@@ -641,6 +694,8 @@ impl WebWorker {
                 &width.max(64).to_string(),
                 &height.max(64).to_string(),
                 &init_json,
+                &format!("{:.3}", options.scale),
+                &options.fps.clamp(1, 120).to_string(),
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -803,6 +858,7 @@ impl WebRenderer {
         entry: &Path,
         width: i32,
         height: i32,
+        options: WebOptions,
         project: Option<&serde_json::Value>,
     ) -> Result<Self> {
         let triangle = Triangle::new(gl)?;
@@ -843,7 +899,8 @@ impl WebRenderer {
             }
         }
 
-        let worker = WebWorker::spawn(entry, width, height, &we_props).ok();
+        let options = options.sane();
+        let worker = WebWorker::spawn(entry, width, height, options, &we_props).ok();
         if worker.is_none() {
             let html_lower = html.to_ascii_lowercase();
             show_clock = true;
@@ -1311,5 +1368,34 @@ fn local_hms() -> (f32, f32, f32) {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&now, &mut tm);
         (tm.tm_hour as f32, tm.tm_min as f32, tm.tm_sec as f32)
+    }
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+
+    #[test]
+    fn web_options_are_clamped() {
+        let sane = WebOptions { scale: 0.0, fps: 0 }.sane();
+        assert_eq!(sane.scale, 0.25);
+        assert_eq!(sane.fps, 1);
+        let sane = WebOptions { scale: 9.0, fps: 1000 }.sane();
+        assert_eq!(sane.scale, 1.0);
+        assert_eq!(sane.fps, 120);
+        let sane = WebOptions { scale: f32::NAN, fps: 30 }.sane();
+        assert_eq!(sane.scale, 1.0);
+    }
+
+    #[test]
+    fn worker_script_takes_scale_and_rate_from_argv() {
+        // The daemon appends `scale` and `fps` after the initial properties;
+        // the script must read them and drive the tick with the rate.
+        assert!(WEBKIT_WORKER_SCRIPT.contains("sys.argv[5]"));
+        assert!(WEBKIT_WORKER_SCRIPT.contains("sys.argv[6]"));
+        assert!(WEBKIT_WORKER_SCRIPT.contains("render_scale"));
+        assert!(WEBKIT_WORKER_SCRIPT.contains("target_fps"));
+        assert!(WEBKIT_WORKER_SCRIPT
+            .contains("GLib.timeout_add(max(1, int(round(1000.0 / target_fps))), periodic_tick)"));
     }
 }

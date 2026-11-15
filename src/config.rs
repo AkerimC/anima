@@ -57,6 +57,12 @@ pub struct General {
     pub low_battery_pause: u8,
     /// mpv hardware decoding mode: `auto-safe`, `auto`, `vaapi`, `nvdec`, `no`...
     pub hwdec: String,
+    /// Snapshot rate for web (HTML/WebGL) wallpapers, in frames per second.
+    /// WebKit renders these in software, so this is the main CPU dial.
+    pub web_fps: u32,
+    /// Internal render scale for web wallpapers, 0.25..=1.0 of the output.
+    /// Lower renders fewer pixels and upscales; 1.0 is unscaled.
+    pub web_scale: f32,
     /// Compositor backend: `auto` (detect), `hyprland`, `niri` or `generic`.
     /// `ANIMA_COMPOSITOR` overrides this. Changing it needs an animad restart.
     #[serde(default = "default_compositor")]
@@ -92,6 +98,8 @@ impl Default for General {
             battery_fps: 30,
             low_battery_pause: 15,
             hwdec: "auto-safe".into(),
+            web_fps: 30,
+            web_scale: 1.0,
             compositor: default_compositor(),
             default_wallpaper: None,
             wallpapers_dir: None,
@@ -116,6 +124,47 @@ pub struct MonitorConfig {
     /// Persisted user property overrides (`schemecolor`, `speed`, `parallax`...).
     #[serde(default)]
     pub properties: BTreeMap<String, String>,
+}
+
+/// Coalesces config writes: a burst of changes (a GUI slider drag sends a
+/// property update every 35 ms) costs one file write after the burst ends,
+/// instead of a full serialise + fsync per change.
+#[derive(Debug, Default)]
+pub struct SaveDebounce {
+    due: Option<std::time::Instant>,
+}
+
+impl SaveDebounce {
+    /// Mark a change that should be written at `at`.
+    pub fn note(&mut self, at: std::time::Instant) {
+        self.due = Some(at);
+    }
+
+    /// Whether a write is still pending.
+    pub fn is_pending(&self) -> bool {
+        self.due.is_some()
+    }
+
+    /// How long until the pending write is due, if any.
+    pub fn wait(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.due.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// True when the write is due; the pending flag is cleared then.
+    pub fn due_now(&mut self, now: std::time::Instant) -> bool {
+        match self.due {
+            Some(at) if now >= at => {
+                self.due = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Forget a pending write (it has just been written).
+    pub fn clear(&mut self) {
+        self.due = None;
+    }
 }
 
 impl Config {
@@ -191,6 +240,59 @@ impl Config {
             .unwrap_or(self.general.mute)
     }
 
+    /// Snapshot rate for web wallpapers, clamped to something usable.
+    pub fn web_fps(&self) -> u32 {
+        self.general.web_fps.clamp(1, 120)
+    }
+
+    /// Internal render scale for web wallpapers, clamped to 0.25..=1.0.
+    pub fn web_scale(&self) -> f32 {
+        let s = self.general.web_scale;
+        if s.is_finite() {
+            s.clamp(0.25, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Drop saved property overrides whose wallpaper no longer exists: a
+    /// deleted local folder, or a removed Steam Workshop item.  Keys are
+    /// `"<monitor>::<wallpaper_id>"`, where a workshop wallpaper uses its id
+    /// and a local one its absolute entry path.
+    ///
+    /// Workshop ids are only pruned when some workshop directory exists, so a
+    /// Steam library that is currently unmounted cannot wipe the overrides.
+    /// Returns the number of entries removed.
+    pub fn prune_missing_wallpapers(&mut self) -> usize {
+        let workshop_dirs: Vec<PathBuf> = crate::wallpaper::steam_workshop_dirs()
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect();
+        let mut removed = 0;
+        self.wallpaper_properties.retain(|key, props| {
+            if props.is_empty() {
+                return false;
+            }
+            let Some((_monitor, wp_id)) = key.split_once("::") else {
+                // not a key this version wrote: leave it be
+                return true;
+            };
+            let is_workshop_id =
+                !wp_id.is_empty() && wp_id.bytes().all(|b| b.is_ascii_digit());
+            let exists = if is_workshop_id {
+                workshop_dirs.is_empty() || workshop_dirs.iter().any(|d| d.join(wp_id).is_dir())
+            } else {
+                Path::new(wp_id).exists()
+            };
+            if !exists {
+                removed += 1;
+                log::info!("config: forgetting properties of missing wallpaper {wp_id}");
+            }
+            exists
+        });
+        removed
+    }
+
     pub fn wallpapers_dir(&self) -> PathBuf {
         self.general
             .wallpapers_dir
@@ -253,5 +355,101 @@ impl Config {
                 self.wallpaper_properties.remove(&outer);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "anima-config-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prune_keeps_live_wallpapers_and_drops_dead_paths() {
+        let dir = temp_dir("prune");
+        let live = dir.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let live_id = live.to_string_lossy().into_owned();
+        let dead_id = dir.join("gone").to_string_lossy().into_owned();
+
+        let mut cfg = Config::default();
+        cfg.set_property_for("DP-1", &live_id, "speed", "1.5");
+        cfg.set_property_for("DP-1", &dead_id, "speed", "2.0");
+        cfg.set_property_for("DP-1", "999999999999", "speed", "3.0");
+
+        let removed = cfg.prune_missing_wallpapers();
+        cfg.set_property_for("DP-1", &live_id, "speed", "1.5");
+
+        assert!(!cfg.wallpaper_properties.contains_key(&format!("DP-1::{dead_id}")));
+        assert!(cfg.wallpaper_properties.contains_key(&format!("DP-1::{live_id}")));
+        // a workshop id survives when no workshop directory is mounted
+        let workshop_key = format!("DP-1::999999999999");
+        if crate::wallpaper::steam_workshop_dirs().iter().all(|d| !d.is_dir()) {
+            assert!(cfg.wallpaper_properties.contains_key(&workshop_key));
+            assert_eq!(removed, 1, "only the dead local path is pruned");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_override_sets_are_dropped() {
+        let mut cfg = Config::default();
+        cfg.wallpaper_properties
+            .insert("DP-1::/nowhere".into(), BTreeMap::new());
+        cfg.prune_missing_wallpapers();
+        assert!(cfg.wallpaper_properties.is_empty());
+    }
+
+    #[test]
+    fn web_settings_are_clamped() {
+        let mut cfg = Config::default();
+        cfg.general.web_fps = 0;
+        assert_eq!(cfg.web_fps(), 1);
+        cfg.general.web_fps = 500;
+        assert_eq!(cfg.web_fps(), 120);
+        cfg.general.web_scale = 0.0;
+        assert_eq!(cfg.web_scale(), 0.25);
+        cfg.general.web_scale = 4.0;
+        assert_eq!(cfg.web_scale(), 1.0);
+        cfg.general.web_scale = f32::NAN;
+        assert_eq!(cfg.web_scale(), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod debounce_tests {
+    use super::SaveDebounce;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn writes_once_the_burst_is_over() {
+        let mut d = SaveDebounce::default();
+        let t0 = Instant::now();
+        d.note(t0 + Duration::from_millis(500));
+        assert!(d.is_pending());
+        assert!(!d.due_now(t0 + Duration::from_millis(200)));
+        // a second change pushes the deadline out
+        d.note(t0 + Duration::from_millis(700));
+        assert!(!d.due_now(t0 + Duration::from_millis(600)));
+        assert!(d.due_now(t0 + Duration::from_millis(750)));
+        assert!(!d.is_pending());
+        assert!(!d.due_now(t0 + Duration::from_millis(900)));
+    }
+
+    #[test]
+    fn clear_forgets_a_pending_write() {
+        let mut d = SaveDebounce::default();
+        d.note(Instant::now());
+        d.clear();
+        assert!(!d.is_pending());
+        assert!(d.wait(Instant::now()).is_none());
     }
 }
