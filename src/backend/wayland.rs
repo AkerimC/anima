@@ -133,7 +133,6 @@ pub fn run(opts: RunOptions) -> Result<()> {
         egl_display,
         egl_config,
         egl_alpha_config,
-        display_ptr,
         config,
         config_path,
         config_save: Default::default(),
@@ -353,7 +352,6 @@ pub struct App {
     egl_display: Display,
     egl_config: glutin::config::Config,
     egl_alpha_config: glutin::config::Config,
-    display_ptr: *mut c_void,
 
     config: Config,
     config_path: PathBuf,
@@ -727,7 +725,6 @@ impl App {
         }
 
         let config = &self.config;
-        let display_ptr = self.display_ptr;
         let oc = &mut self.outputs[idx];
         if let (Some(ctx), Some(surf)) = (&oc.gl_context, &oc.gl_surface) {
             let _ = ctx.make_current(surf);
@@ -765,7 +762,6 @@ impl App {
                     w,
                     h,
                     &config.general.hwdec,
-                    display_ptr,
                     config.volume_for(&name),
                     config.mute_for(&name),
                 )
@@ -776,6 +772,7 @@ impl App {
                     &wp.entry,
                     w,
                     h,
+                    &config.general.hwdec,
                     wp.project.as_ref(),
                 )
                 .map(|r| Box::new(r) as Box<dyn Renderer>),

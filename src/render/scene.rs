@@ -2636,6 +2636,7 @@ impl SceneRenderer {
         entry: &Path,
         width: i32,
         height: i32,
+        hwdec: &str,
         project: Option<&serde_json::Value>,
     ) -> Result<Self> {
         let trace = std::env::var_os("ANIMA_TRACE_SCENE").is_some();
@@ -2724,6 +2725,10 @@ impl SceneRenderer {
                 }
             }
         }
+
+        // Video textures are decoded by mpv into a texture the size of an
+        // output layer; configure that before any texture is loaded.
+        this.textures.set_video_hint(width, height, hwdec);
 
         let entry_name = entry
             .file_name()
@@ -5003,6 +5008,9 @@ impl Renderer for SceneRenderer {
     fn render(&mut self, gl: &glow::Context, info: &FrameInfo) -> Result<bool> {
         self.ensure_scene(gl)?;
         self.start_sounds();
+        // Video-texture layers play their own stream; hand them the frame
+        // before anything samples the texture.
+        self.textures.update_videos(gl, self.paused);
         let time = (info.time as f32) * self.speed_multiplier;
         let dt = (info.delta as f32) * self.speed_multiplier;
 

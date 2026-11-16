@@ -46,6 +46,12 @@ struct MpvOpenglFbo {
     internal_format: c_int,
 }
 
+#[link(name = "wayland-client")]
+unsafe extern "C" {
+    fn wl_display_connect(name: *const c_char) -> *mut c_void;
+    fn wl_display_disconnect(display: *mut c_void);
+}
+
 #[link(name = "mpv")]
 unsafe extern "C" {
     fn mpv_create() -> *mut mpv_handle;
@@ -120,6 +126,8 @@ pub struct VideoRenderer {
     paused: bool,
     volume: f32,
     muted: bool,
+    /// Private Wayland connection for libva (see `VideoTexture`).
+    wl_display: *mut c_void,
 }
 
 impl VideoRenderer {
@@ -128,7 +136,6 @@ impl VideoRenderer {
         width: i32,
         height: i32,
         hwdec: &str,
-        _wl_display: *mut c_void,
         volume: f32,
         muted: bool,
     ) -> Result<Self> {
@@ -140,6 +147,11 @@ impl VideoRenderer {
 
             let opts: &[(&str, &str)] = &[
                 ("vo", "libmpv"),
+                ("gpu-api", "opengl"),
+                // Bilinear scaling and no dithering: decodes 4K sources to the
+                // output texture without the default profile's 20 ms/frame of
+                // scaler work on integrated GPUs.
+                ("profile", "fast"),
                 ("hwdec", hwdec),
                 ("loop-file", "inf"),
                 ("keep-open", "yes"),
@@ -190,6 +202,7 @@ impl VideoRenderer {
                 paused: false,
                 volume,
                 muted,
+                wl_display: connect_va_display(),
             };
 
             this.apply_audio();
@@ -218,13 +231,7 @@ impl VideoRenderer {
                     type_: MPV_RENDER_PARAM_WL_DISPLAY,
                     // Unlike the int parameters, mpv stores this one by value:
                     // `data` itself is the `struct wl_display*`.
-                    //
-                    // Disabled for now: libva's vaGetDisplayWl() drives the
-                    // compositor connection from mpv's own threads, which
-                    // corrupts the connection our event loop owns (Hyprland
-                    // then rejects wl_surface.attach). Hardware decoding is
-                    // still available through EGL dmabuf import.
-                    data: ptr::null_mut(),
+                    data: this.wl_display,
                 },
                 MpvRenderParam {
                     type_: 0,
@@ -460,6 +467,7 @@ impl Drop for VideoRenderer {
                 mpv_terminate_destroy(self.handle);
                 self.handle = ptr::null_mut();
             }
+            disconnect_va_display(&mut self.wl_display);
         }
     }
 }
@@ -479,7 +487,32 @@ unsafe fn set_prop(handle: *mut mpv_handle, name: &str, value: &str) -> Result<(
     Ok(())
 }
 
-unsafe fn cstr(ptr: *const c_char) -> String {
+/// Open a Wayland connection that libva may drive from its own threads.
+///
+/// `vaGetDisplayWl()` dispatches on the display it is given, so handing it the
+/// connection our event loop owns breaks the compositor link.  A second
+/// connection keeps libva isolated and still enables the zero-copy EGL/dmabuf
+/// path (`vaapi` instead of the slow `vulkan-copy` fallback).
+fn connect_va_display() -> *mut c_void {
+    let name = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let display = match CString::new(name) {
+        Ok(cname) => unsafe { wl_display_connect(cname.as_ptr()) },
+        Err(_) => ptr::null_mut(),
+    };
+    if display.is_null() {
+        log::warn!("could not open a private wl_display for libva");
+    }
+    display
+}
+
+fn disconnect_va_display(display: &mut *mut c_void) {
+    if !display.is_null() {
+        unsafe { wl_display_disconnect(*display) };
+        *display = ptr::null_mut();
+    }
+}
+
+fn cstr(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return "<unknown>".into();
     }
@@ -577,5 +610,368 @@ impl Drop for AudioPlayer {
                 self.handle = ptr::null_mut();
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Video textures: an MP4 stream inside a `.tex`, played into a GL texture
+// ---------------------------------------------------------------------------
+
+/// A Wallpaper Engine *video texture*: the `.tex` container holds an MP4
+/// stream (a 24 s 3840x2160 60 fps clip in Workshop 3401773707) that an image
+/// layer draws like any other texture.
+///
+/// Decoding such a clip into a spritesheet atlas (`pkg::decode_mp4_atlas`)
+/// caps it at 64 frames, which makes the layer play at ~2.7 fps.  Instead mpv
+/// plays the stream and renders the current frame into a texture this struct
+/// owns, so the layer runs at the video's own frame rate.
+pub struct VideoTexture {
+    handle: *mut mpv_handle,
+    render_ctx: *mut mpv_render_context,
+    tex: glow::Texture,
+    fbo: glow::Framebuffer,
+    w: i32,
+    h: i32,
+    first_frame: bool,
+    paused: bool,
+    frames_drawn: u32,
+    decoder_logged: bool,
+    /// Dedicated Wayland connection handed to libva (`vaGetDisplayWl`), so its
+    /// own dispatch threads never touch the connection our event loop owns.
+    wl_display: *mut c_void,
+}
+
+impl VideoTexture {
+    pub fn new(gl: &glow::Context, path: &Path, w: i32, h: i32, hwdec: &str) -> Result<Self> {
+        let w = (w.max(2)) & !1;
+        let h = (h.max(2)) & !1;
+        let (tex, fbo) = unsafe {
+            let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+
+            let fbo = gl.create_framebuffer().map_err(|e| anyhow!(e))?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(tex),
+                0,
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            (tex, fbo)
+        };
+
+        let mut this = Self {
+            handle: ptr::null_mut(),
+            render_ctx: ptr::null_mut(),
+            tex,
+            fbo,
+            w,
+            h,
+            first_frame: true,
+            paused: false,
+            frames_drawn: 0,
+            decoder_logged: false,
+            wl_display: ptr::null_mut(),
+        };
+        match this.start(path, hwdec) {
+            Ok(()) => Ok(this),
+            Err(err) => {
+                this.destroy(gl);
+                Err(err)
+            }
+        }
+    }
+
+    fn start(&mut self, path: &Path, hwdec: &str) -> Result<()> {
+        unsafe {
+            let handle = mpv_create();
+            if handle.is_null() {
+                bail!("mpv_create() failed");
+            }
+            let opts: &[(&str, &str)] = &[
+                ("vo", "libmpv"),
+                ("gpu-api", "opengl"),
+                // Bilinear scaling and no dithering: decodes 4K sources to the
+                // output texture without the default profile's 20 ms/frame of
+                // scaler work on integrated GPUs.
+                ("profile", "fast"),
+                ("hwdec", hwdec),
+                ("loop-file", "inf"),
+                ("keep-open", "yes"),
+                ("idle", "yes"),
+                // The texture fills the layer quad; keep the whole frame.
+                ("keepaspect", "no"),
+                ("panscan", "0.0"),
+                ("audio", "no"),
+                ("osc", "no"),
+                ("osd-level", "0"),
+                ("input-default-bindings", "no"),
+                ("input-vo-keyboard", "no"),
+                ("terminal", "no"),
+                ("msg-level", "all=warn"),
+                ("ytdl", "no"),
+                ("audio-display", "no"),
+                ("demuxer-max-bytes", "64MiB"),
+                ("demuxer-max-back-bytes", "8MiB"),
+            ];
+            for (name, value) in opts {
+                let cname = CString::new(*name)?;
+                let cvalue = CString::new(*value)?;
+                let rc = mpv_set_option_string(handle, cname.as_ptr(), cvalue.as_ptr());
+                if rc < 0 {
+                    log::warn!(
+                        "mpv option {name}={value} rejected: {}",
+                        cstr(mpv_error_string(rc))
+                    );
+                }
+            }
+            let rc = mpv_initialize(handle);
+            if rc < 0 {
+                let msg = cstr(mpv_error_string(rc));
+                mpv_terminate_destroy(handle);
+                bail!("mpv_initialize failed: {msg}");
+            }
+            self.handle = handle;
+
+            if self.wl_display.is_null() {
+                self.wl_display = connect_va_display();
+            }
+
+            let api = c"opengl";
+            let mut init = MpvOpenglInitParams {
+                get_proc_address: Some(get_proc_address),
+                get_proc_address_ctx: ptr::null_mut(),
+            };
+            let mut advanced: c_int = 1;
+            let mut params = [
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_API_TYPE,
+                    data: api.as_ptr() as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                    data: &mut init as *mut _ as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_ADVANCED_CONTROL,
+                    data: &mut advanced as *mut _ as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_WL_DISPLAY,
+                    data: self.wl_display,
+                },
+                MpvRenderParam {
+                    type_: 0,
+                    data: ptr::null_mut(),
+                },
+            ];
+            let mut ctx: *mut mpv_render_context = ptr::null_mut();
+            let rc = mpv_render_context_create(&mut ctx, handle, params.as_mut_ptr());
+            if rc < 0 {
+                let msg = cstr(mpv_error_string(rc));
+                mpv_terminate_destroy(handle);
+                self.handle = ptr::null_mut();
+                bail!("mpv_render_context_create failed: {msg}");
+            }
+            self.render_ctx = ctx;
+            mpv_render_context_set_update_callback(ctx, Some(update_callback), ptr::null_mut());
+
+            let cmd = CString::new("loadfile")?;
+            let file = CString::new(path.to_string_lossy().as_bytes())?;
+            let args = [cmd.as_ptr(), file.as_ptr(), ptr::null()];
+            let rc = mpv_command(self.handle, args.as_ptr());
+            if rc < 0 {
+                bail!(
+                    "mpv loadfile {} failed: {}",
+                    path.display(),
+                    cstr(mpv_error_string(rc))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn texture(&self) -> glow::Texture {
+        self.tex
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.w as u32, self.h as u32)
+    }
+
+    /// Render the current frame into the texture.  Returns whether a new frame
+    /// was drawn.
+    pub fn update(&mut self, gl: &glow::Context, paused: bool) -> bool {
+        if self.render_ctx.is_null() || self.handle.is_null() {
+            return false;
+        }
+        if paused != self.paused {
+            self.paused = paused;
+            unsafe {
+                let _ = set_prop(self.handle, "pause", if paused { "yes" } else { "no" });
+            }
+        }
+        if self.paused {
+            return false;
+        }
+        unsafe {
+            for _ in 0..64 {
+                let event = mpv_wait_event(self.handle, 0.0);
+                if event.is_null() || (*event).event_id == 0 {
+                    break;
+                }
+            }
+            let flags = if self.first_frame {
+                MPV_RENDER_UPDATE_FRAME
+            } else {
+                mpv_render_context_update(self.render_ctx)
+            };
+            if flags & MPV_RENDER_UPDATE_FRAME == 0 {
+                return false;
+            }
+
+            let mut prev_viewport = [0i32; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut prev_viewport);
+            let prev_fbo = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+            let blend = gl.is_enabled(glow::BLEND);
+            let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+            gl.viewport(0, 0, self.w, self.h);
+
+            let mut fbo = MpvOpenglFbo {
+                fbo: self.fbo.0.get() as c_int,
+                w: self.w,
+                h: self.h,
+                internal_format: glow::RGBA8 as c_int,
+            };
+            // No flip: mpv already writes the frame's top row to the first
+            // texture row, which is where the scene quad samples v = 0.
+            let mut flip: c_int = 0;
+            let mut params = [
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_OPENGL_FBO,
+                    data: &mut fbo as *mut _ as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_FLIP_Y,
+                    data: &mut flip as *mut _ as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: 0,
+                    data: ptr::null_mut(),
+                },
+            ];
+            let rc = mpv_render_context_render(self.render_ctx, params.as_mut_ptr());
+            if rc < 0 {
+                log::warn!("mpv texture render failed: {}", cstr(mpv_error_string(rc)));
+            }
+            mpv_render_context_report_swap(self.render_ctx);
+
+            gl.bind_framebuffer(
+                glow::FRAMEBUFFER,
+                std::num::NonZeroU32::new(prev_fbo.max(0) as u32).map(glow::NativeFramebuffer),
+            );
+            gl.viewport(
+                prev_viewport[0],
+                prev_viewport[1],
+                prev_viewport[2],
+                prev_viewport[3],
+            );
+            if blend {
+                gl.enable(glow::BLEND);
+            }
+            if scissor {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            self.first_frame = false;
+            self.frames_drawn += 1;
+            if !self.decoder_logged && self.frames_drawn >= 15 {
+                self.log_decoder();
+                self.decoder_logged = true;
+            }
+        }
+        true
+    }
+
+    /// Report the decoder mpv actually picked, mirroring `VideoRenderer`.
+    fn log_decoder(&self) {
+        unsafe {
+            let mut parts = Vec::new();
+            for prop in ["hwdec-current", "video-codec"] {
+                let Ok(name) = CString::new(prop) else { continue };
+                let value = mpv_get_property_string(self.handle, name.as_ptr());
+                if value.is_null() {
+                    parts.push(format!("{prop}=<unavailable>"));
+                    continue;
+                }
+                parts.push(format!("{prop}={}", cstr(value)));
+                mpv_free(value as *mut c_void);
+            }
+            log::info!("video texture {}: {}", self.path_display(), parts.join(" "));
+        }
+    }
+
+    fn path_display(&self) -> String {
+        // The path is not stored; mpv's `path` property is good enough.
+        unsafe {
+            let name = c"path";
+            let value = mpv_get_property_string(self.handle, name.as_ptr());
+            if value.is_null() {
+                return "<unknown>".into();
+            }
+            let out = cstr(value).to_string();
+            mpv_free(value as *mut c_void);
+            out
+        }
+    }
+
+    /// Release mpv and the GL objects.  Must run with the GL context current.
+    pub fn destroy(&mut self, gl: &glow::Context) {
+        self.free_mpv();
+        unsafe {
+            gl.delete_framebuffer(self.fbo);
+            gl.delete_texture(self.tex);
+        }
+    }
+
+    fn free_mpv(&mut self) {
+        unsafe {
+            if !self.render_ctx.is_null() {
+                mpv_render_context_free(self.render_ctx);
+                self.render_ctx = ptr::null_mut();
+            }
+            if !self.handle.is_null() {
+                mpv_terminate_destroy(self.handle);
+                self.handle = ptr::null_mut();
+            }
+            disconnect_va_display(&mut self.wl_display);
+        }
+    }
+}
+
+impl Drop for VideoTexture {
+    fn drop(&mut self) {
+        self.free_mpv();
     }
 }

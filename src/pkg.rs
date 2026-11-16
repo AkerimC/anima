@@ -121,33 +121,36 @@ impl PackageFs {
         resolve_we_asset(&key).is_some()
     }
 
+    /// If `rel` names a video texture (an MP4 stream inside a `.tex`), return
+    /// the cached file holding that stream plus the size the container records
+    /// for it.  The stream is extracted once into the texture cache directory;
+    /// `mpv` plays it from there at full frame rate instead of the sampled
+    /// atlas that `decode_tex` would build.
+    pub fn video_file(&self, rel: &str) -> Option<(PathBuf, u32, u32)> {
+        for cand in texture_candidates(rel) {
+            if !cand.ends_with(".tex") {
+                continue;
+            }
+            let Ok(bytes) = self.read(&cand) else {
+                continue;
+            };
+            let Ok((hdr, payload)) = split_tex(&bytes) else {
+                continue;
+            };
+            if !is_mp4(&payload) {
+                continue;
+            }
+            let path = mp4_cache_file(&payload)?;
+            return Some((path, hdr.img_width, hdr.img_height));
+        }
+        None
+    }
+
     /// Load an image or `.tex` texture by relative path (or material path).
     pub fn load_rgba(&self, rel: &str) -> Result<DecodedTex> {
         let key = normalize_key(rel);
-        // Texture names may end in a space before the extension
-        // (`materials/Miles & Gwen Parts 1 .tex`).  `normalize_key` trims the
-        // whole path, so try the untrimmed stem first.
-        let raw = rel
-            .replace('\\', "/")
-            .trim_start()
-            .trim_start_matches("./")
-            .trim_start_matches('/')
-            .to_string();
-        let mut candidates = Vec::new();
-        if raw != key {
-            candidates.push(format!("{raw}.tex"));
-            candidates.push(format!("materials/{raw}.tex"));
-        }
-        candidates.extend([
-            key.clone(),
-            format!("materials/{key}"),
-            format!("materials/{key}.tex"),
-            format!("{key}.tex"),
-            format!("materials/{key}.png"),
-            format!("{key}.png"),
-        ]);
 
-        for cand in &candidates {
+        for cand in &texture_candidates(rel) {
             if let Ok(bytes) = self.read(cand) {
                 if cand.ends_with(".tex") || bytes.starts_with(b"TEXV") {
                     return decode_tex(&bytes)
@@ -211,6 +214,39 @@ fn normalize_key(path: &str) -> String {
         .trim_start_matches("./")
         .trim_start_matches('/')
         .to_string()
+}
+
+/// Relative paths a texture name can resolve to, most specific first.
+fn texture_candidates(rel: &str) -> Vec<String> {
+    let key = normalize_key(rel);
+    // Texture names may end in a space before the extension
+    // (`materials/Miles & Gwen Parts 1 .tex`).  `normalize_key` trims the
+    // whole path, so try the untrimmed stem first.
+    let raw = rel
+        .replace('\\', "/")
+        .trim_start()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+    let mut candidates = Vec::new();
+    if raw != key {
+        candidates.push(format!("{raw}.tex"));
+        candidates.push(format!("materials/{raw}.tex"));
+    }
+    candidates.extend([
+        key.clone(),
+        format!("materials/{key}"),
+        format!("materials/{key}.tex"),
+        format!("{key}.tex"),
+        format!("materials/{key}.png"),
+        format!("{key}.png"),
+    ]);
+    candidates
+}
+
+/// Whether a decompressed `.tex` payload is an MP4 stream (video texture).
+fn is_mp4(payload: &[u8]) -> bool {
+    payload.len() >= 12 && &payload[4..8] == b"ftyp"
 }
 
 pub fn resolve_we_asset(rel: &str) -> Option<PathBuf> {
@@ -338,8 +374,19 @@ pub struct DecodedTex {
     pub is_r8: bool,
 }
 
-/// Decode a Wallpaper Engine `.tex` binary buffer into an `RgbaImage`.
-pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
+/// Header fields of a `.tex` container plus the size hints WE stores in it.
+struct TexHeader {
+    format: u32,
+    flags: u32,
+    img_width: u32,
+    img_height: u32,
+    mip_width: u32,
+    mip_height: u32,
+}
+
+/// Split a `.tex` container into its header and the first mipmap payload
+/// (LZ4 blocks already decompressed).
+fn split_tex(data: &[u8]) -> Result<(TexHeader, Vec<u8>)> {
     let mut r = BinReader::new(data);
     let magic1 = r.read_c_magic(9)?;
     if !magic1.starts_with("TEXV") {
@@ -352,13 +399,11 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
 
     let format = r.read_u32()?;
     let flags = r.read_u32()?;
-    let tex_width = r.read_u32()?;
-    let tex_height = r.read_u32()?;
+    let _tex_width = r.read_u32()?;
+    let _tex_height = r.read_u32()?;
     let img_width = r.read_u32()?;
     let img_height = r.read_u32()?;
     let _unk = r.read_u32()?;
-    let no_interpolation = (flags & 1) != 0;
-    let clamp_uvs = (flags & 2) != 0;
 
     let texb = r.read_c_magic(9)?;
     if !texb.starts_with("TEXB") {
@@ -402,10 +447,37 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
         raw_slice.to_vec()
     };
 
+    Ok((
+        TexHeader {
+            format,
+            flags,
+            img_width,
+            img_height,
+            mip_width,
+            mip_height,
+        },
+        payload,
+    ))
+}
+
+/// Decode a Wallpaper Engine `.tex` binary buffer into an `RgbaImage`.
+pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
+    let (hdr, payload) = split_tex(data)?;
+    let TexHeader {
+        format,
+        flags,
+        img_width,
+        img_height,
+        mip_width,
+        mip_height,
+    } = hdr;
+    let no_interpolation = (flags & 1) != 0;
+    let clamp_uvs = (flags & 2) != 0;
+
     // Video textures (`flags & 32`) carry a raw MP4 stream.  Decode it into a
     // spritesheet atlas so image layers can play it back like an animated
     // texture.
-    if payload.len() >= 12 && &payload[4..8] == b"ftyp" {
+    if is_mp4(&payload) {
         let (image, spritesheet) = decode_mp4_atlas(&payload, img_width, img_height)
             .context("decoding embedded MP4 in .tex")?;
         return Ok(DecodedTex {
@@ -451,7 +523,6 @@ pub fn decode_tex(data: &[u8]) -> Result<DecodedTex> {
 
     let full = RgbaImage::from_raw(mip_width, mip_height, rgba)
         .context("constructing RgbaImage from decoded .tex")?;
-    let _ = (tex_width, tex_height);
     let cropped = crop_if_needed(full, img_width, img_height, flags);
     let spritesheet = parse_texs_spritesheet(data, cropped.width(), cropped.height());
 
@@ -546,12 +617,21 @@ fn decode_mp4_atlas_uncached(
 ) -> Result<(RgbaImage, Option<SpritesheetMeta>)> {
     use std::process::Command;
 
-    let tmp = std::env::temp_dir().join(format!(
-        "anima-tex-{}-{:x}.mp4",
-        std::process::id(),
-        mp4.len() ^ (mp4.as_ptr() as usize)
-    ));
-    fs::write(&tmp, mp4)?;
+    // Prefer the extracted copy the video renderer also uses; only fall back
+    // to a scratch file when the cache directory is unusable.
+    let cached = mp4_cache_file(mp4);
+    let tmp = match &cached {
+        Some(path) => path.clone(),
+        None => {
+            let path = std::env::temp_dir().join(format!(
+                "anima-tex-{}-{:x}.mp4",
+                std::process::id(),
+                mp4.len() ^ (mp4.as_ptr() as usize)
+            ));
+            fs::write(&path, mp4)?;
+            path
+        }
+    };
     let result = (|| -> Result<(RgbaImage, Option<SpritesheetMeta>)> {
         let probe = Command::new("ffprobe")
             .args([
@@ -676,7 +756,9 @@ fn decode_mp4_atlas_uncached(
         });
         Ok((atlas, meta))
     })();
-    let _ = fs::remove_file(&tmp);
+    if cached.is_none() {
+        let _ = fs::remove_file(&tmp);
+    }
     result
 }
 
@@ -694,9 +776,30 @@ const ATLAS_CACHE_MAGIC: &[u8; 8] = b"ANIMATL1";
 /// magic + width, height, cols, rows, frames + duration.
 const ATLAS_HEADER: usize = 8 + 5 * 4 + 4;
 
+fn atlas_cache_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("anima").join("atlas"))
+}
+
 fn atlas_cache_path(mp4: &[u8]) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("anima").join("atlas");
+    let dir = atlas_cache_dir()?;
     Some(dir.join(format!("{:016x}-{ATLAS_CACHE_VERSION}.rgba", atlas_hash(mp4))))
+}
+
+/// Extract a video stream next to the atlases, once.  `mpv` needs a file and
+/// re-extracting 45 MB on every load would show up in the switch time; the
+/// directory is pruned by the same budget as the atlas cache.
+fn mp4_cache_file(mp4: &[u8]) -> Option<PathBuf> {
+    let dir = atlas_cache_dir()?;
+    let path = dir.join(format!("{:016x}-{ATLAS_CACHE_VERSION}.mp4", atlas_hash(mp4)));
+    if path.is_file() {
+        return Some(path);
+    }
+    fs::create_dir_all(&dir).ok()?;
+    if let Err(err) = crate::util::atomic_write(&path, mp4) {
+        log::debug!("video texture: cannot cache {}: {err}", path.display());
+        return None;
+    }
+    Some(path)
 }
 
 /// Identity of a video payload for caching: its length plus blocks spread
@@ -1276,6 +1379,81 @@ mod tests {
         assert_eq!(decoded.image.dimensions(), (2, 2));
         assert_eq!(decoded.image.as_raw(), &pixels[..]);
     }
+    /// `TEXV0005` container holding `payload` as its only mipmap.
+    fn tex_with_payload(flags: u32, img_w: u32, img_h: u32, payload: &[u8]) -> Vec<u8> {
+        let mut tex = Vec::new();
+        tex.extend_from_slice(b"TEXV0005\0");
+        tex.extend_from_slice(b"TEXI0001\0");
+        tex.extend_from_slice(&0u32.to_le_bytes()); // format 0 = RGBA8
+        tex.extend_from_slice(&flags.to_le_bytes());
+        tex.extend_from_slice(&img_w.to_le_bytes()); // tex_w
+        tex.extend_from_slice(&img_h.to_le_bytes()); // tex_h
+        tex.extend_from_slice(&img_w.to_le_bytes()); // img_w
+        tex.extend_from_slice(&img_h.to_le_bytes()); // img_h
+        tex.extend_from_slice(&0u32.to_le_bytes()); // unk
+        tex.extend_from_slice(b"TEXB0003\0");
+        tex.extend_from_slice(&1u32.to_le_bytes()); // image_count = 1
+        tex.extend_from_slice(&(-1i32).to_le_bytes()); // free_image_format
+        tex.extend_from_slice(&1u32.to_le_bytes()); // mipmap_count = 1
+        tex.extend_from_slice(&img_w.to_le_bytes()); // mip_w
+        tex.extend_from_slice(&img_h.to_le_bytes()); // mip_h
+        tex.extend_from_slice(&0u32.to_le_bytes()); // lz4 = 0
+        tex.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // decomp_size
+        tex.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // byte_count
+        tex.extend_from_slice(payload);
+        tex
+    }
+
+    fn tex_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("anima-tex-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn texture_candidates_try_the_exact_name_before_generated_paths() {
+        let cands = texture_candidates("materials/video.tex");
+        assert_eq!(cands[0], "materials/video.tex");
+        assert!(cands.contains(&"materials/materials/video.tex".to_string()));
+
+        // A missing extension is completed under `materials/` and the root.
+        let cands = texture_candidates("grid");
+        assert_eq!(cands[0], "grid");
+        assert!(cands.contains(&"materials/grid.tex".to_string()));
+        assert!(cands.contains(&"grid.png".to_string()));
+    }
+
+    #[test]
+    fn is_mp4_recognises_streams_only() {
+        assert!(is_mp4(b"\0\0\0\x18ftypisom\0\0\0\0"));
+        assert!(!is_mp4(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR"));
+        // Too short to hold both the size and the `ftyp` box name.
+        assert!(!is_mp4(b"\0\0\0\x18fty"));
+    }
+
+    #[test]
+    fn split_tex_exposes_the_video_payload_untouched() {
+        let mp4 = b"\0\0\0\x18ftypisom\0\0\0\x08free".to_vec();
+        // flags bit 5 marks a video texture; the size hints come from the header.
+        let tex = tex_with_payload(32, 3840, 2160, &mp4);
+        let (hdr, payload) = split_tex(&tex).unwrap();
+        assert_eq!((hdr.img_width, hdr.img_height), (3840, 2160));
+        assert_eq!(hdr.flags & 32, 32, "video flag survives the split");
+        assert_eq!(payload, mp4);
+    }
+
+    #[test]
+    fn video_file_skips_regular_images() {
+        let dir = tex_temp_dir("no-video");
+        let pixels = [255u8, 0, 0, 255].repeat(4);
+        fs::write(dir.join("layer.tex"), tex_with_payload(0, 2, 2, &pixels)).unwrap();
+        let pkg = PackageFs::open(&dir).unwrap();
+        assert!(pkg.video_file("layer").is_none());
+        assert!(pkg.video_file("does-not-exist").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn atlas_temp(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("anima-atlas-{tag}-{}", std::process::id()))
     }

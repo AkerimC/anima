@@ -99,16 +99,44 @@ struct CachedTexture {
     h: u32,
     spritesheet: Option<crate::pkg::SpritesheetMeta>,
     is_r8: bool,
+    /// The texture is owned by a `VideoTexture` that redraws it every frame.
+    video: bool,
 }
 
 pub struct TextureCache {
     map: HashMap<String, Option<CachedTexture>>,
+    /// Video textures (MP4 streams inside a `.tex`), each played by its own
+    /// mpv instance into a GL texture.  Refreshed by `update_videos`.
+    videos: Vec<super::video::VideoTexture>,
+    /// Output size video textures are scaled to fit, and the decoding mode.
+    video_size: (i32, i32),
+    hwdec: String,
 }
 
 impl TextureCache {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
+            videos: Vec::new(),
+            video_size: (1920, 1080),
+            hwdec: "auto-safe".into(),
+        }
+    }
+
+    /// Tell the cache how large an output video texture may get and how to
+    /// decode it.  Scene layers are drawn at output resolution, so decoding a
+    /// 4K video stream into a 4K texture on a 1080p screen would only cost GPU
+    /// time.
+    pub fn set_video_hint(&mut self, width: i32, height: i32, hwdec: &str) {
+        self.video_size = (width.max(64), height.max(64));
+        self.hwdec = hwdec.to_string();
+    }
+
+    /// Render the current frame of every video texture.  Call once per frame
+    /// before drawing.
+    pub fn update_videos(&mut self, gl: &glow::Context, paused: bool) {
+        for video in &mut self.videos {
+            video.update(gl, paused);
         }
     }
 
@@ -116,8 +144,16 @@ impl TextureCache {
     pub fn clear(&mut self, gl: &glow::Context) {
         for (_, cached) in self.map.drain() {
             if let Some(t) = cached {
+                // Video textures belong to their `VideoTexture`; deleting them
+                // here as well would leave it with a dangling name.
+                if t.video {
+                    continue;
+                }
                 unsafe { gl.delete_texture(t.tex) };
             }
+        }
+        for mut video in self.videos.drain(..) {
+            video.destroy(gl);
         }
     }
 
@@ -142,6 +178,43 @@ impl TextureCache {
             return cached
                 .as_ref()
                 .map(|t| (t.tex, t.w, t.h, t.spritesheet, t.is_r8));
+        }
+
+        if let Some((file, vw, vh)) = pkg.video_file(&key) {
+            let (cap_w, cap_h) = self.video_size;
+            let scale = (cap_w as f32 / vw.max(1) as f32)
+                .min(cap_h as f32 / vh.max(1) as f32)
+                .min(1.0);
+            let w = (vw.max(2) as f32 * scale).round().max(2.0) as i32;
+            let h = (vh.max(2) as f32 * scale).round().max(2.0) as i32;
+            match super::video::VideoTexture::new(gl, &file, w, h, &self.hwdec) {
+                Ok(video) => {
+                    let (w, h) = video.size();
+                    let tex = video.texture();
+                    log::info!("video texture {key}: {w}x{h} ({})", file.display());
+                    self.videos.push(video);
+                    let entry = self.map.insert(
+                        key.clone(),
+                        Some(CachedTexture {
+                            tex,
+                            w,
+                            h,
+                            spritesheet: None,
+                            is_r8: false,
+                            video: true,
+                        }),
+                    );
+                    if let Some(Some(old)) = entry {
+                        // A previous atlas of the same video: the viewer now
+                        // plays it with mpv instead.
+                        unsafe { gl.delete_texture(old.tex) };
+                    }
+                    return Some((tex, w, h, None, false));
+                }
+                Err(err) => {
+                    log::debug!("video texture {key}: mpv failed ({err:#}), using an atlas");
+                }
+            }
         }
 
         let trace = std::env::var_os("ANIMA_TRACE_SCENE").is_some();
@@ -181,6 +254,7 @@ impl TextureCache {
                     h,
                     spritesheet,
                     is_r8,
+                    video: false,
                 })
             }
             Err(err) => {
@@ -197,6 +271,7 @@ impl TextureCache {
                             h,
                             spritesheet: None,
                             is_r8: false,
+                            video: false,
                         })
                 } else {
                     log::debug!("effect texture {key}: {err}");
@@ -212,6 +287,7 @@ impl TextureCache {
                                     h,
                                     spritesheet: None,
                                     is_r8: false,
+                                    video: false,
                                 })
                         })
                     } else {
