@@ -951,6 +951,7 @@ fn preprocess(src: &str, vertex: bool, combos: &[(String, i32)]) -> String {
 
     // HLSL numeric coercions: promote integer literals and wrap integer
     // variables used in float arithmetic (GLSL ES forbids both implicitly).
+    src = demote_uint_types(&src);
     let float_names = float_identifiers(&src);
     src = src
         .lines()
@@ -975,20 +976,20 @@ fn preprocess(src: &str, vertex: bool, combos: &[(String, i32)]) -> String {
     let functions = function_widths(&src);
     collect_define_widths(&src, &mut types, &functions);
     let params = function_params(&src, &types);
-    src = coerce_mixed_arithmetic(&src, &types, &functions);
-    src = coerce_assignments(&src, &types, &functions);
-    src = coerce_call_args(&src, &types, &functions, &params);
-    src = coerce_for_headers(&src, &types);
-    src = coerce_float_modulo(&src, &types, &functions);
-    src = coerce_array_indices(&src, &types);
-    src = coerce_return_values(&src, &types, &functions);
-    src = hoist_global_initializers(&src);
     let mut int_names = int_identifiers(&src);
-    for name in &combo_names {
+    for name in &int_like {
         if !int_names.iter().any(|n| n == name) {
             int_names.push(name.clone());
         }
     }
+    src = coerce_mixed_arithmetic(&src, &types, &functions);
+    src = coerce_assignments(&src, &types, &functions, &int_names);
+    src = coerce_call_args(&src, &types, &functions, &params, &int_names);
+    src = coerce_for_headers(&src, &types);
+    src = coerce_float_modulo(&src, &types, &functions);
+    src = coerce_array_indices(&src, &types);
+    src = coerce_return_values(&src, &types, &functions, &int_names);
+    src = hoist_global_initializers(&src);
     let float_scalars: Vec<String> = types
         .iter()
         .filter_map(|(k, &w)| (w == 1 && !functions.contains_key(k)).then(|| k.clone()))
@@ -1472,6 +1473,44 @@ fn wrap_int_vars(src: &str, extra_ints: &[String]) -> String {
         }
         out.push_str(&line_out);
         out.push('\n');
+    }
+    out
+}
+
+/// GLSL ES has no implicit conversion between `int` and `uint`, and Workshop
+/// shaders only use `uint` for integer bookkeeping (`uint i = ...; arr[i]`).
+/// Demote the type to `int` and drop unsigned literal suffixes.
+fn demote_uint_types(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if is_ident_start(bytes[i]) && (i == 0 || !is_ident_char(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && is_ident_char(bytes[i]) {
+                i += 1;
+            }
+            let word = &src[start..i];
+            out.push_str(if word == "uint" { "int" } else { word });
+            continue;
+        }
+        if bytes[i].is_ascii_digit() && (i == 0 || !is_ident_char(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.')
+            {
+                i += 1;
+            }
+            let token = &src[start..i];
+            match token.strip_suffix(['u', 'U']) {
+                Some(core) => out.push_str(core),
+                None => out.push_str(token),
+            }
+            continue;
+        }
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -2029,6 +2068,7 @@ fn coerce_expr(
     lhs_width: u8,
     types: &HashMap<String, u8>,
     funcs: &HashMap<String, u8>,
+    ints: &[String],
 ) -> String {
     let trimmed = expr.trim();
     if trimmed.is_empty() || lhs_width == 0 {
@@ -2036,6 +2076,15 @@ fn coerce_expr(
     }
     if lhs_width == 1 && trimmed.starts_with("int(") {
         return format!("float({trimmed})");
+    }
+    // Integer variables and integer combo macros expand to `int` literals,
+    // which GLSL ES will not convert implicitly.
+    if lhs_width > 0 && ints.iter().any(|n| n == trimmed) {
+        return if lhs_width == 1 {
+            format!("float({trimmed})")
+        } else {
+            format!("vec{lhs_width}({trimmed})")
+        };
     }
     let mut rhs_width = infer_width(trimmed, types, funcs);
     if rhs_width == 0 && is_literal_expression(trimmed) {
@@ -2061,19 +2110,45 @@ fn coerce_assignments(
     src: &str,
     types: &HashMap<String, u8>,
     funcs: &HashMap<String, u8>,
+    ints: &[String],
 ) -> String {
     let mut out = String::with_capacity(src.len() + 128);
     for raw in src.lines() {
-        out.push_str(&coerce_assignment_line(raw, types, funcs));
+        out.push_str(&coerce_assignment_line(raw, types, funcs, ints));
         out.push('\n');
     }
     out
+}
+
+/// Width of an assignment target such as `albedo`, `albedo.rgb` or `uv.x`.
+fn assign_target_width(lhs: &str, types: &HashMap<String, u8>) -> Option<u8> {
+    let base = lhs.split('.').next().unwrap_or(lhs);
+    if base.is_empty() || !base.bytes().all(is_ident_char) {
+        return None;
+    }
+    let rest = &lhs[base.len()..];
+    if rest.is_empty() {
+        return types.get(base).copied().filter(|&w| w > 0);
+    }
+    let swz = rest.strip_prefix('.')?;
+    if swz.is_empty() || !swz.bytes().all(is_swizzle_char) {
+        return None;
+    }
+    Some(swz.len() as u8)
+}
+
+fn is_swizzle_char(b: u8) -> bool {
+    matches!(
+        b,
+        b'x' | b'y' | b'z' | b'w' | b'r' | b'g' | b'b' | b'a' | b's' | b't' | b'p' | b'q'
+    )
 }
 
 fn coerce_assignment_line(
     raw: &str,
     types: &HashMap<String, u8>,
     funcs: &HashMap<String, u8>,
+    ints: &[String],
 ) -> String {
     let code = strip_line_comment(raw);
     let trimmed = code.trim_start();
@@ -2122,7 +2197,7 @@ fn coerce_assignment_line(
                 let coerced = if decl_int {
                     coerce_int_expr(rhs, first_word, types, funcs)
                 } else {
-                    coerce_expr(rhs, decl_width, types, funcs)
+                    coerce_expr(rhs, decl_width, types, funcs, ints)
                 };
                 pieces.push(format!("{lhs}= {coerced}"));
             } else {
@@ -2133,32 +2208,35 @@ fn coerce_assignment_line(
         let tail = if tail_code.trim().is_empty() {
             String::new()
         } else {
-            format!(" {}", coerce_assignment_line(tail_code, types, funcs).trim_start())
+            format!(
+                " {}",
+                coerce_assignment_line(tail_code, types, funcs, ints).trim_start()
+            )
         };
         return format!("{indent}{first_word} {};{tail}{comment}", pieces.join(", "));
     }
 
-    // Plain assignment: `<ident> = <expr>;`
+    // Plain assignment: `<ident> = <expr>;` or `<ident>.rgb = <expr>;`
     let Some(eq) = find_assignment(trimmed) else {
         return raw.to_string();
     };
     let lhs = trimmed[..eq].trim();
-    if !lhs.bytes().all(is_ident_char) {
-        return raw.to_string();
-    }
-    let Some(&lhs_width) = types.get(lhs) else {
+    let Some(lhs_width) = assign_target_width(lhs, types) else {
         return raw.to_string();
     };
     let Some(semi) = trimmed[eq + 1..].find(';') else {
         return raw.to_string();
     };
     let rhs = trimmed[eq + 1..eq + 1 + semi].trim();
-    let coerced = coerce_expr(rhs, lhs_width, types, funcs);
+    let coerced = coerce_expr(rhs, lhs_width, types, funcs, ints);
     let tail_code = &trimmed[eq + 1 + semi + 1..];
     let tail = if tail_code.trim().is_empty() {
         String::new()
     } else {
-        format!(" {}", coerce_assignment_line(tail_code, types, funcs).trim_start())
+        format!(
+            " {}",
+            coerce_assignment_line(tail_code, types, funcs, ints).trim_start()
+        )
     };
     format!("{indent}{lhs} = {coerced};{tail}{comment}")
 }
@@ -2203,6 +2281,39 @@ fn strip_whole_float_suffix(s: &str) -> Option<&str> {
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(num)
 }
 
+/// Builtins that only accept floating-point arguments in GLSL ES.
+const FLOAT_BUILTINS: &[&str] = &[
+    "step",
+    "smoothstep",
+    "mix",
+    "pow",
+    "fract",
+    "floor",
+    "ceil",
+    "round",
+    "trunc",
+    "sqrt",
+    "inversesqrt",
+    "exp",
+    "exp2",
+    "log",
+    "log2",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "mod",
+    "normalize",
+    "dot",
+    "cross",
+    "length",
+    "distance",
+    "reflect",
+    "refract",
+];
+
 /// Coerce arguments of calls to user-defined functions (HLSL lets a `vec4`
 /// argument bind to a `vec3` parameter by truncation, and integer literals
 /// promoted earlier to `.0` bind back to `int`/`uint` parameters).
@@ -2211,6 +2322,7 @@ fn coerce_call_args(
     types: &HashMap<String, u8>,
     funcs: &HashMap<String, u8>,
     params: &HashMap<(String, usize), Vec<Vec<i8>>>,
+    ints: &[String],
 ) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len() + 64);
@@ -2262,15 +2374,35 @@ fn coerce_call_args(
                                 coerced.push(arg.to_string());
                                 continue;
                             }
-                            let nested = coerce_call_args(arg, types, funcs, params);
+                            let nested = coerce_call_args(arg, types, funcs, params, ints);
                             let c = if first == -1 {
                                 coerce_int_expr(&nested, "int", types, funcs)
                             } else if first == -2 {
                                 coerce_int_expr(&nested, "uint", types, funcs)
                             } else {
-                                coerce_expr(&nested, first as u8, types, funcs)
+                                coerce_expr(&nested, first as u8, types, funcs, ints)
                             };
                             coerced.push(c);
+                        }
+                        out.push_str(word);
+                        out.push('(');
+                        out.push_str(&coerced.join(", "));
+                        out.push(')');
+                        i = end + 1;
+                        continue;
+                    }
+                    // GLSL builtins take floats, but HLSL happily passes an
+                    // integer variable (`step(0.5, nodeNum)`).
+                    if FLOAT_BUILTINS.contains(&word) && !arg_list.is_empty() {
+                        let mut coerced = Vec::new();
+                        for arg in arg_list {
+                            let nested = coerce_call_args(arg, types, funcs, params, ints);
+                            let t = nested.trim();
+                            if ints.iter().any(|n| n == t) {
+                                coerced.push(format!("float({t})"));
+                            } else {
+                                coerced.push(nested);
+                            }
                         }
                         out.push_str(word);
                         out.push('(');
@@ -2631,10 +2763,34 @@ fn hoist_global_initializers(src: &str) -> String {
 
     let mut depth = 0i32;
     let mut lines: Vec<String> = Vec::new();
-    let mut assigns: Vec<String> = Vec::new();
+    let mut assigns: Vec<(String, String)> = Vec::new();
+    // Enclosing preprocessor condition of the declaration site, so hoisted
+    // assignments stay guarded (`mat3 colorMatrix` lives inside
+    // `#if PROPERTIES == 6`, together with the uniforms it uses).
+    let mut conds: Vec<String> = Vec::new();
     for raw in src.lines() {
         let code = strip_line_comment(raw);
         let trimmed = code.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let directive = rest.trim_start();
+            if let Some(c) = directive.strip_prefix("ifdef ") {
+                conds.push(format!("defined({})", c.trim()));
+            } else if let Some(c) = directive.strip_prefix("ifndef ") {
+                conds.push(format!("!defined({})", c.trim()));
+            } else if let Some(c) = directive.strip_prefix("if ") {
+                conds.push(c.trim().to_string());
+            } else if let Some(c) = directive.strip_prefix("elif ") {
+                if let Some(prev) = conds.pop() {
+                    conds.push(format!("!({prev}) && ({})", c.trim()));
+                }
+            } else if directive.starts_with("else") {
+                if let Some(prev) = conds.pop() {
+                    conds.push(format!("!({prev})"));
+                }
+            } else if directive.starts_with("endif") {
+                conds.pop();
+            }
+        }
         let mut replaced = raw.to_string();
         if depth == 0 && !trimmed.starts_with('#') && !trimmed.starts_with("const ") {
             let first_word = trimmed
@@ -2657,7 +2813,7 @@ fn hoist_global_initializers(src: &str) -> String {
                             if non_const.iter().any(|u| contains_word(rhs, u)) {
                                 let indent = &raw[..raw.len() - raw.trim_start().len()];
                                 replaced = format!("{indent}{first_word} {name};");
-                                assigns.push(format!("{name} = {rhs};"));
+                                assigns.push((conds.join(" && "), format!("{name} = {rhs};")));
                             }
                             non_const.push(name.to_string());
                         }
@@ -2678,7 +2834,19 @@ fn hoist_global_initializers(src: &str) -> String {
         if let Some(pos) = out.find("void main") {
             if let Some(open) = out[pos..].find('{') {
                 let at = pos + open + 1;
-                let insert = format!("\n\t{}", assigns.join("\n\t"));
+                let mut insert = String::new();
+                for (guard, assign) in &assigns {
+                    insert.push('\n');
+                    if guard.is_empty() {
+                        insert.push('\t');
+                    } else {
+                        insert.push_str(&format!("#if {guard}\n\t"));
+                    }
+                    insert.push_str(assign);
+                    if !guard.is_empty() {
+                        insert.push_str("\n#endif");
+                    }
+                }
                 out.insert_str(at, &insert);
             }
         }
@@ -2749,8 +2917,9 @@ fn has_comparison(text: &str) -> bool {
     false
 }
 
-/// HLSL allows `bool * float`; GLSL ES does not.  Wrap comparison groups that
-/// are used as arithmetic operands in `float(...)`.
+/// HLSL allows `bool * float` and `float > bool`; GLSL ES does not.  Wrap
+/// comparison groups and `bool` variables that end up as arithmetic or
+/// relational operands in `float(...)`.
 fn coerce_bool_arithmetic(src: &str) -> String {
     let mut out = String::with_capacity(src.len() + 32);
     for raw in src.lines() {
@@ -2780,10 +2949,17 @@ fn coerce_bool_arithmetic(src: &str) -> String {
                 .first()
                 .copied()
                 .unwrap_or(0);
-            let arithmetic =
-                |c: u8| matches!(c, b'*' | b'+' | b'-' | b'/' | b'%' | b'=');
-            // A comparison group followed by `?` is a ternary condition.
-            if after == b'?' {
+            // Arithmetic or a relational comparison against the boolean
+            // group (`luma > (threshold != 0.0)`), but not a logical
+            // operator or `!`, where a bool operand is required.
+            let arithmetic = |c: u8| {
+                matches!(c, b'*' | b'+' | b'-' | b'/' | b'%' | b'=' | b'>' | b'<')
+            };
+            // A comparison group followed by `?` is a ternary condition,
+            // unless it is the right operand of a comparison
+            // (`luma > (threshold != 0.0) ? a : b`), which HLSL reads as
+            // `luma > (threshold != 0 ? 1 : 0)`.
+            if after == b'?' && !matches!(before, b'>' | b'<') {
                 continue;
             }
             if arithmetic(before) || arithmetic(after) {
@@ -3342,10 +3518,11 @@ fn coerce_return_expr(
     ret: u8,
     types: &HashMap<String, u8>,
     funcs: &HashMap<String, u8>,
+    ints: &[String],
     lines: &[&str],
     idx: usize,
 ) -> String {
-    let coerced = coerce_expr(expr, ret, types, funcs);
+    let coerced = coerce_expr(expr, ret, types, funcs, ints);
     if coerced != expr {
         return coerced;
     }
@@ -3367,6 +3544,7 @@ fn coerce_return_values(
     src: &str,
     types: &HashMap<String, u8>,
     funcs: &HashMap<String, u8>,
+    ints: &[String],
 ) -> String {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = String::with_capacity(src.len() + 32);
@@ -3388,7 +3566,7 @@ fn coerce_return_values(
             if ret > 0 {
                 if let Some(semi) = rest.rfind(';') {
                     let expr = rest[..semi].trim();
-                    let coerced = coerce_return_expr(expr, ret, types, funcs, &lines, idx);
+                    let coerced = coerce_return_expr(expr, ret, types, funcs, ints, &lines, idx);
                     if coerced != expr {
                         let comment = raw.find("//").map(|p| &raw[p..]).unwrap_or("");
                         let indent = &raw[..raw.len() - raw.trim_start().len()];
@@ -3486,11 +3664,31 @@ fn coerce_bool_conditions(
             if k < end {
                 let word = &line[k..end];
                 if let Some(suffix) = cond_suffix(word) {
-                    let before_ok = k == 0
-                        || matches!(
-                            line.as_bytes()[k - 1],
-                            b'(' | b'=' | b'!' | b'&' | b'|' | b',' | b' ' | b'\t' | b':'
-                        );
+                    // The identifier is the condition only when it starts a
+                    // statement/expression; `luma > threshold ? a : b` has a
+                    // comparison as its condition, and wrapping the operand
+                    // would make the comparison `float > bool`.
+                    let mut b = k;
+                    while b > 0 && line.as_bytes()[b - 1].is_ascii_whitespace() {
+                        b -= 1;
+                    }
+                    let before_ok = if b == 0 {
+                        true
+                    } else {
+                        match line.as_bytes()[b - 1] {
+                            b'>' | b'<' | b'+' | b'-' | b'*' | b'/' | b'%' | b'!' => false,
+                            b'=' => !(b >= 2
+                                && matches!(line.as_bytes()[b - 2], b'>' | b'<' | b'!' | b'=')),
+                            b'(' | b'&' | b'|' | b',' | b':' | b';' | b'{' | b'}' => true,
+                            _ => {
+                                let mut w = b;
+                                while w > 0 && is_ident_char(line.as_bytes()[w - 1]) {
+                                    w -= 1;
+                                }
+                                matches!(&line[w..b], "return" | "case")
+                            }
+                        }
+                    };
                     if before_ok {
                         line.replace_range(k..end, &format!("({word} {suffix})"));
                     }
@@ -3498,6 +3696,86 @@ fn coerce_bool_conditions(
             }
         }
         out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Drop the `in` qualifier from fragment varyings the vertex stage never
+/// outputs.
+///
+/// Desktop GLSL only links fragment inputs that are actually read, so
+/// Workshop shaders leave stale declarations behind (chromatic_aberration
+/// declares `varying vec4 rValue;` and then shadows it with a local of the
+/// same name).  GLSL ES rejects the link regardless, but a plain global
+/// variable is legal and - because the declaration is shadowed - never read.
+fn demote_unmatched_inputs(vert: &str, frag: &str) -> String {
+    let mut outputs: Vec<&str> = Vec::new();
+    for raw in vert.lines() {
+        let t = raw.trim_start();
+        let Some(rest) = t.strip_prefix("out ") else {
+            continue;
+        };
+        let ty = rest.split_whitespace().next().unwrap_or("");
+        if !matches!(ty, "float" | "vec2" | "vec3" | "vec4" | "mat2" | "mat3" | "mat4") {
+            continue;
+        }
+        let tail = rest[rest.find(ty).unwrap_or(0) + ty.len()..].trim_start();
+        for part in tail.split(',') {
+            let name = part
+                .trim()
+                .trim_end_matches(';')
+                .split('[')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty() {
+                outputs.push(name);
+            }
+        }
+    }
+    if outputs.is_empty() {
+        return frag.to_string();
+    }
+
+    let mut out = String::with_capacity(frag.len());
+    for raw in frag.lines() {
+        let t = raw.trim_start();
+        let Some(rest) = t.strip_prefix("in ") else {
+            out.push_str(raw);
+            out.push('\n');
+            continue;
+        };
+        let indent = &raw[..raw.len() - t.len()];
+        let ty = rest.split_whitespace().next().unwrap_or("");
+        if !matches!(ty, "float" | "vec2" | "vec3" | "vec4" | "mat2" | "mat3" | "mat4") {
+            out.push_str(raw);
+            out.push('\n');
+            continue;
+        }
+        let tail = rest[rest.find(ty).unwrap_or(0) + ty.len()..].trim_start();
+        let mut names = Vec::new();
+        for part in tail.split(',') {
+            let name = part
+                .trim()
+                .trim_end_matches(';')
+                .split('[')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        let keep = !names.is_empty() && names.iter().all(|n| outputs.contains(n));
+        if keep || names.is_empty() {
+            out.push_str(raw);
+        } else {
+            // `in vec4 rValue;` -> `vec4 rValue;`
+            let body = t.strip_prefix("in ").unwrap_or(t);
+            out.push_str(indent);
+            out.push_str(body);
+        }
         out.push('\n');
     }
     out
@@ -3978,6 +4256,7 @@ impl CompiledProgram {
         let vs = preprocess(vert_src, true, combos);
         let fs = preprocess(frag_src, false, combos);
         let (vs, fs) = reconcile_varyings(&vs, &fs);
+        let fs = demote_unmatched_inputs(&vs, &fs);
         let (vs, fs) = reconcile_uniforms(&vs, &fs);
         let (vs, fs) = lower_large_varying_kernels(&vs, &fs);
         let fs = make_written_inputs_mutable(&fs);
@@ -5566,5 +5845,93 @@ void main() {
         assert!(out.contains("vec4 we_pow(vec4 a, float b) { return pow(max(a, vec4(1e-6)), vec4(b)); }"));
         assert!(out.contains("float we_distance(vec2 a, vec2 b) { return distance(clamp(a, -1e6, 1e6), clamp(b, -1e6, 1e6)); }"));
         assert!(out.contains("#define distance(a, b) we_distance(a, b)"));
+    }
+
+    #[test]
+    fn comparison_group_as_ternary_operand_is_cast_not_condition() {
+        let frag = r#"
+uniform float u_threshold;
+void main() {
+    float luma = 0.5;
+    vec4 lightMap = vec4(0.0);
+    vec4 sample_ = vec4(1.0);
+    lightMap = luma > (u_threshold != 0.0) ? lightMap + sample_ : lightMap;
+}
+"#;
+        let out = preprocess(frag, false, &[]);
+        let line = out.lines().find(|l| l.contains("u_threshold !=")).unwrap_or("");
+        assert!(
+            line.contains("luma > float((u_threshold != 0.0)) ?"),
+            "boolean operand was not cast: {line}"
+        );
+    }
+
+    #[test]
+    fn ternary_condition_keeps_comparison_operand_unwrapped() {
+        let frag = r#"
+uniform float u_threshold;
+void main() {
+    float luma = 0.5;
+    float x = luma > u_threshold ? 1.0 : 0.0;
+    gl_FragColor = vec4(x);
+}
+"#;
+        let out = preprocess(frag, false, &[]);
+        let line = out.lines().find(|l| l.contains("luma > u_threshold ?")).unwrap_or("");
+        assert!(
+            line.contains("luma > u_threshold ? 1.0 : 0.0"),
+            "comparison operand was wrapped as a condition: {line}"
+        );
+    }
+
+    #[test]
+    fn swizzled_assignment_broadcasts_scalar_return() {
+        let frag = r#"
+float greyscale(vec3 color) { return color.g; }
+void main() {
+    vec4 albedo = vec4(1.0);
+    albedo.rgb = greyscale(albedo.rgb);
+    gl_FragColor = albedo;
+}
+"#;
+        let out = preprocess(frag, false, &[]);
+        assert!(
+            out.contains("albedo.rgb = vec3(greyscale(albedo.rgb));"),
+            "scalar result was not broadcast: {out}"
+        );
+    }
+
+    #[test]
+    fn uint_arithmetic_is_demoted_to_int() {
+        let frag = r#"
+#define RESOLUTION 64
+void main() {
+    uint barFreq1 = uint(3.0);
+    uint barFreq2 = (barFreq1 + 1) % RESOLUTION;
+    gl_FragColor = vec4(float(barFreq2));
+}
+"#;
+        let out = preprocess(frag, false, &[]);
+        assert!(!out.contains("uint "), "uint survived: {out}");
+        assert!(
+            out.contains("int barFreq2 = (barFreq1 + 1) % RESOLUTION;"),
+            "integer modulo was not demoted: {out}"
+        );
+    }
+
+    #[test]
+    fn integer_variable_as_float_builtin_argument_is_cast() {
+        let frag = r#"
+void main() {
+    int nodeNum = 2;
+    float w = step(0.5, nodeNum);
+    gl_FragColor = vec4(w);
+}
+"#;
+        let out = preprocess(frag, false, &[]);
+        assert!(
+            out.contains("step(0.5, float(nodeNum))"),
+            "integer argument was not cast: {out}"
+        );
     }
 }
