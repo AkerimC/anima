@@ -11,7 +11,7 @@
 //! scripts compiled once at load, and a single JSON round trip per frame for
 //! the properties that actually have scripts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rquickjs::{Context, Function, Runtime};
 use serde::Deserialize;
@@ -145,6 +145,7 @@ pub struct LayerSeed {
     pub name: String,
     pub kind: String,
     pub visible: bool,
+    pub solid: bool,
     pub alpha: f32,
     pub origin: [f32; 3],
     pub scale: [f32; 3],
@@ -182,12 +183,49 @@ pub struct LayerFrame {
     pub video_time: Option<(f32, f32)>,
 }
 
+/// Pointer interaction event types delivered to layer scripts (`cursorEnter`, `cursorClick`, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorEventKind {
+    Enter,
+    Leave,
+    Down,
+    Up,
+    Click,
+    Move,
+}
+
+impl CursorEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enter => "cursorEnter",
+            Self::Leave => "cursorLeave",
+            Self::Down => "cursorDown",
+            Self::Up => "cursorUp",
+            Self::Click => "cursorClick",
+            Self::Move => "cursorMove",
+        }
+    }
+}
+
+/// One hit-tested pointer event mapped to world, normalized screen, and layer-local space.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorEventInput {
+    pub layer_id: i64,
+    pub kind: CursorEventKind,
+    pub world_pos: [f32; 2],
+    pub screen_pos: [f32; 2],
+    pub local_pos: [f32; 2],
+}
+
 /// Destination property targeted by a [`ScriptOutput`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptTarget {
     Layer {
         id: i64,
         field: ScriptField,
+    },
+    LayerSolid {
+        id: i64,
     },
     EffectVisible {
         layer_id: i64,
@@ -250,6 +288,8 @@ pub struct SceneScripts {
     timeouts: usize,
     /// Whether any loaded script called `engine.registerAudioBuffers(...)`.
     uses_audio: bool,
+    /// Layers that declare at least one `cursor*` event callback.
+    cursor_layers: HashSet<i64>,
     /// Whether `finalize_init()` has executed `init()` + startup `applyUserProperties()`.
     initialized: bool,
 }
@@ -266,6 +306,8 @@ struct AddScriptAck {
     error: Option<String>,
     #[serde(default, rename = "usesAudio")]
     uses_audio: bool,
+    #[serde(default, rename = "hasCursor")]
+    has_cursor: bool,
 }
 
 #[derive(Deserialize)]
@@ -338,6 +380,7 @@ impl SceneScripts {
             errors: Vec::new(),
             timeouts: 0,
             uses_audio: false,
+            cursor_layers: HashSet::new(),
             initialized: false,
         })
     }
@@ -348,6 +391,7 @@ impl SceneScripts {
             "name": seed.name,
             "kind": seed.kind,
             "visible": seed.visible,
+            "solid": seed.solid,
             "alpha": seed.alpha,
             "origin": seed.origin,
             "scale": seed.scale,
@@ -582,6 +626,22 @@ impl SceneScripts {
                 Ok(ack) => {
                     self.uses_audio |= ack.uses_audio;
                     if ack.ok {
+                        if ack.has_cursor {
+                            let lid = match &target {
+                                ScriptTarget::Layer { id, .. }
+                                | ScriptTarget::LayerAnimControl { id, .. }
+                                | ScriptTarget::LayerSolid { id } => *id,
+                                ScriptTarget::EffectVisible { layer_id, .. }
+                                | ScriptTarget::EffectConstant { layer_id, .. }
+                                | ScriptTarget::EffectConstAnimControl { layer_id, .. }
+                                | ScriptTarget::TextureAnimation { layer_id }
+                                | ScriptTarget::VideoTexture { layer_id }
+                                | ScriptTarget::PuppetAnimLayerField { layer_id, .. }
+                                | ScriptTarget::PuppetAnimLayerControl { layer_id, .. }
+                                | ScriptTarget::InstanceOverride { layer_id, .. } => *layer_id,
+                            };
+                            self.cursor_layers.insert(lid);
+                        }
                         self.bindings.push(Binding {
                             target,
                             enabled: true,
@@ -676,6 +736,16 @@ impl SceneScripts {
         self.uses_audio
     }
 
+    /// Whether any loaded script registered a `cursor*` callback.
+    pub fn has_cursor_layers(&self) -> bool {
+        !self.cursor_layers.is_empty()
+    }
+
+    /// Whether layer `id` has at least one active `cursor*` callback.
+    pub fn is_cursor_layer(&self, id: i64) -> bool {
+        self.cursor_layers.contains(&id)
+    }
+
     /// Whether `(id, field)` is currently driven by an enabled layer binding.
     pub fn has_layer_binding(&self, id: i64, field: ScriptField) -> bool {
         self.bindings.iter().any(|b| {
@@ -716,6 +786,37 @@ impl SceneScripts {
         spectrum: Option<&[f32; 64]>,
         layers: &[LayerFrame],
     ) -> Vec<ScriptOutput> {
+        self.tick_with_input(
+            runtime,
+            frametime,
+            time_of_day,
+            mouse,
+            canvas,
+            screen,
+            spectrum,
+            layers,
+            [0.0, 0.0],
+            false,
+            &[],
+        )
+    }
+
+    /// Run one frame of scripts with live pointer state and hit-tested cursor events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_with_input(
+        &mut self,
+        runtime: f32,
+        frametime: f32,
+        time_of_day: f32,
+        mouse: [f32; 2],
+        canvas: [f32; 2],
+        screen: [f32; 2],
+        spectrum: Option<&[f32; 64]>,
+        layers: &[LayerFrame],
+        mouse_screen: [f32; 2],
+        mouse_down: bool,
+        cursor_events: &[CursorEventInput],
+    ) -> Vec<ScriptOutput> {
         if self.bindings.is_empty() {
             return Vec::new();
         }
@@ -749,10 +850,29 @@ impl SceneScripts {
             "frametime": frametime,
             "timeOfDay": time_of_day,
             "mouse": mouse,
+            "mouseScreen": mouse_screen,
+            "mouseDown": mouse_down,
             "canvas": canvas,
             "screen": screen,
             "layers": layer_json,
         });
+        if !cursor_events.is_empty() {
+            let ev_json: Vec<Value> = cursor_events
+                .iter()
+                .map(|ev| {
+                    json!({
+                        "layerId": ev.layer_id,
+                        "kind": ev.kind.as_str(),
+                        "worldPos": ev.world_pos,
+                        "screenPos": ev.screen_pos,
+                        "localPos": ev.local_pos,
+                    })
+                })
+                .collect();
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("cursorEvents".to_string(), Value::Array(ev_json));
+            }
+        }
         if self.uses_audio {
             if let Some(spec) = spectrum {
                 if let Some(obj) = payload.as_object_mut() {
@@ -808,6 +928,7 @@ impl SceneScripts {
                         field,
                     }
                 }
+                "layer_solid" => ScriptTarget::LayerSolid { id: entry.id },
                 "effect_visible" => ScriptTarget::EffectVisible {
                     layer_id: entry.layer_id,
                     effect_idx: entry.effect_idx,
@@ -884,6 +1005,9 @@ impl SceneScripts {
                 ScriptTarget::Layer { id, field }
                 | ScriptTarget::LayerAnimControl { id, field } => {
                     log::warn!("scenescript: {} on object {id}: {err}", field.as_str());
+                }
+                ScriptTarget::LayerSolid { id } => {
+                    log::warn!("scenescript: solid on object {id}: {err}");
                 }
                 ScriptTarget::EffectVisible {
                     layer_id,
@@ -2031,6 +2155,7 @@ const PRELUDE: &str = r#"
       var l = layers[id];
       snap[id] = {
         visible: !!l.visible,
+        solid: !!l.solid,
         alpha: num(l.alpha, 1),
         origin: toArr3(l.origin),
         scale: toArr3(l.scale),
@@ -2090,6 +2215,10 @@ const PRELUDE: &str = r#"
       var curText = l.text === undefined || l.text === null ? '' : String(l.text);
       if (curText !== prev.text || forcedLayers[idStr + ':text']) {
         outputs.push({ kind: 'layer', id: numId, field: 'text', value: curText });
+      }
+      var curSolid = !!l.solid;
+      if (curSolid !== prev.solid) {
+        outputs.push({ kind: 'layer_solid', id: numId, value: curSolid });
       }
     }
 
@@ -2282,6 +2411,7 @@ const PRELUDE: &str = r#"
       var l = makeLayer(d.id, d.name);
       l.kind = d.kind || '';
       l.visible = d.visible !== false;
+      l.solid = d.solid !== false;
       l.alpha = num(d.alpha, 1);
       l.origin = parseVec(d.origin);
       l.scale = parseVec(d.scale);
@@ -2458,6 +2588,15 @@ const PRELUDE: &str = r#"
       entry.scriptPropTypes = spMeta.types;
       entry.dead = !!compileErr;
       entry.error = compileErr;
+      var hasCursor = !!(mod && (
+        typeof mod.cursorEnter === 'function' ||
+        typeof mod.cursorLeave === 'function' ||
+        typeof mod.cursorDown === 'function' ||
+        typeof mod.cursorUp === 'function' ||
+        typeof mod.cursorClick === 'function' ||
+        typeof mod.cursorMove === 'function'
+      ));
+      entry.hasCursor = hasCursor;
 
       if (kind === 'layer') {
         entry.initial = normalizeField(d.field, d.initial);
@@ -2475,7 +2614,8 @@ const PRELUDE: &str = r#"
       return JSON.stringify({
         ok: !compileErr,
         error: compileErr,
-        usesAudio: audioRegistered
+        usesAudio: audioRegistered,
+        hasCursor: hasCursor
       });
     },
     finalizeInit: function () {
@@ -2618,7 +2758,10 @@ const PRELUDE: &str = r#"
       e.canvasSize = new Vec2(s.canvas && s.canvas[0], s.canvas && s.canvas[1]);
       e.screenResolution = new Vec2(s.screen && s.screen[0], s.screen && s.screen[1]);
       globalThis.input.cursorWorldPosition = new Vec3(e.mousePosition.x, e.mousePosition.y, 0);
-      globalThis.input.cursorScreenPosition = new Vec2(e.mousePosition.x, e.mousePosition.y);
+      globalThis.input.cursorScreenPosition = s.mouseScreen
+        ? new Vec2(s.mouseScreen[0], s.mouseScreen[1])
+        : new Vec2(e.mousePosition.x, e.mousePosition.y);
+      globalThis.input.cursorLeftDown = !!s.mouseDown;
 
       if (s.spectrum) {
         updateAudioBuffers(s.spectrum);
@@ -2654,6 +2797,41 @@ const PRELUDE: &str = r#"
       for (var ta = 0; ta < allTexAnims.length; ta++) advanceTexAnim(allTexAnims[ta], dt, e.runtime);
 
       runTimers();
+
+      if (Array.isArray(s.cursorEvents) && s.cursorEvents.length) {
+        for (var ci = 0; ci < s.cursorEvents.length; ci++) {
+          var ev = s.cursorEvents[ci];
+          var targetLayer = layers[String(ev.layerId)];
+          if (!targetLayer) continue;
+          var eventObj = {
+            worldPosition: new Vec3(ev.worldPos[0], ev.worldPos[1], 0),
+            screenPosition: new Vec2(ev.screenPos[0], ev.screenPos[1]),
+            rawPosition: new Vec2(ev.screenPos[0], ev.screenPos[1]),
+            localPosition: new Vec3(ev.localPos[0], ev.localPos[1], 0),
+            layer: targetLayer
+          };
+          for (var k = 0; k < scripts.length; k++) {
+            var b = scripts[k];
+            if (b.dead || !b.hasCursor || b.layer !== targetLayer || !b.mod) continue;
+            var fn = b.mod[ev.kind];
+            if (typeof fn !== 'function') continue;
+            try {
+              globalThis.thisScene = scene;
+              globalThis.thisLayer = b.layer;
+              globalThis.thisObject = b.animLayer || b.effect || b.layer;
+              currentBinding = b;
+              var ret = fn(eventObj);
+              applyBindingValue(b, ret, forcedLayers, forcedEffects, forcedAnimLayers);
+            } catch (err) {
+              b.dead = true;
+              b.error = errText(err);
+              errors.push({ idx: k, kind: ev.kind, message: b.error });
+            } finally {
+              currentBinding = null;
+            }
+          }
+        }
+      }
 
       for (var k = 0; k < scripts.length; k++) {
         var b = scripts[k];
@@ -2796,6 +2974,7 @@ mod tests {
             name: name.to_string(),
             kind: "image".into(),
             visible: true,
+            solid: true,
             alpha: 1.0,
             origin: [0.0, 0.0, 0.0],
             scale: [1.0, 1.0, 1.0],
@@ -3773,6 +3952,156 @@ mod tests {
         assert_eq!(v2.value.get("seek"), Some(&Value::Null));
     }
 
+    #[test]
+    fn cursor_events_hover_click_drag_and_solid_sync() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(101, "btn"));
+        let mut drag_seed = seed(102, "drag");
+        drag_seed.origin = [500.0, 400.0, 0.0];
+        host.add_layer(&drag_seed);
+        host.add_layer(&seed(103, "plain"));
+
+        host.add_property_script(
+            101,
+            ScriptField::Alpha,
+            "export function cursorEnter(event) { thisLayer.visible = true; }\nexport function cursorLeave(event) { thisLayer.visible = false; }\nexport function cursorClick(event) { thisLayer.solid = false; }\nexport function update(v) { shared.down = input.cursorLeftDown; return v; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+        host.add_property_script(
+            102,
+            ScriptField::Origin,
+            "let dragging = false, offset;\nexport function cursorDown(event) { dragging = true; offset = thisLayer.origin.subtract(event.worldPosition); }\nexport function cursorMove(event) { if (dragging) thisLayer.origin = event.worldPosition.add(offset); }\nexport function cursorUp(event) { dragging = false; }",
+            json!("500 400 0"),
+            &serde_json::Map::new(),
+            None,
+        );
+        host.add_property_script(
+            103,
+            ScriptField::Alpha,
+            "export function update(v) { return v; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+        let _ = host.finalize_init();
+
+        assert!(host.has_cursor_layers());
+        assert!(host.is_cursor_layer(101));
+        assert!(host.is_cursor_layer(102));
+        assert!(!host.is_cursor_layer(103));
+
+        // Frame 1: enter btn, down on drag at (510, 410) with mouse_down=true.
+        let mut f_btn = frame(101);
+        f_btn.visible = false;
+        let mut f_drag = frame(102);
+        f_drag.origin = [500.0, 400.0, 0.0];
+        let f_plain = frame(103);
+        let ev1 = [
+            CursorEventInput {
+                layer_id: 101,
+                kind: CursorEventKind::Enter,
+                world_pos: [100.0, 100.0],
+                screen_pos: [0.1, 0.1],
+                local_pos: [0.0, 0.0],
+            },
+            CursorEventInput {
+                layer_id: 102,
+                kind: CursorEventKind::Down,
+                world_pos: [510.0, 410.0],
+                screen_pos: [0.5, 0.5],
+                local_pos: [10.0, 10.0],
+            },
+        ];
+        let out1 = host.tick_with_input(
+            0.1,
+            0.016,
+            0.5,
+            [510.0, 410.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[f_btn.clone(), f_drag.clone(), f_plain.clone()],
+            [0.5, 0.5],
+            true,
+            &ev1,
+        );
+        assert!(out1.iter().any(|o| {
+            o.target == ScriptTarget::Layer { id: 101, field: ScriptField::Visible }
+                && o.value == json!(true)
+        }));
+        f_btn.visible = true;
+
+        // Frame 2: drag move to (545, 430) -> origin becomes (535, 420).
+        let ev2 = [CursorEventInput {
+            layer_id: 102,
+            kind: CursorEventKind::Move,
+            world_pos: [545.0, 430.0],
+            screen_pos: [0.52, 0.52],
+            local_pos: [45.0, 30.0],
+        }];
+        let out2 = host.tick_with_input(
+            0.12,
+            0.016,
+            0.5,
+            [545.0, 430.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[f_btn.clone(), f_drag.clone(), f_plain.clone()],
+            [0.52, 0.52],
+            true,
+            &ev2,
+        );
+        let moved = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 102, field: ScriptField::Origin })
+            .expect("dragged origin output");
+        let arr = moved.value.as_array().unwrap();
+        assert!((arr[0].as_f64().unwrap() - 535.0).abs() < 1e-4);
+        assert!((arr[1].as_f64().unwrap() - 420.0).abs() < 1e-4);
+        f_drag.origin = [535.0, 420.0, 0.0];
+
+        // Frame 3: leave btn + click btn -> visible=false and solid=false emitted.
+        let ev3 = [
+            CursorEventInput {
+                layer_id: 101,
+                kind: CursorEventKind::Leave,
+                world_pos: [0.0, 0.0],
+                screen_pos: [0.0, 0.0],
+                local_pos: [-100.0, -100.0],
+            },
+            CursorEventInput {
+                layer_id: 101,
+                kind: CursorEventKind::Click,
+                world_pos: [100.0, 100.0],
+                screen_pos: [0.1, 0.1],
+                local_pos: [0.0, 0.0],
+            },
+        ];
+        let out3 = host.tick_with_input(
+            0.14,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[f_btn, f_drag, f_plain],
+            [0.0, 0.0],
+            false,
+            &ev3,
+        );
+        assert!(out3.iter().any(|o| {
+            o.target == ScriptTarget::Layer { id: 101, field: ScriptField::Visible }
+                && o.value == json!(false)
+        }));
+        assert!(out3.iter().any(|o| {
+            o.target == ScriptTarget::LayerSolid { id: 101 } && o.value == json!(false)
+        }));
+    }
+
     /// Compile and tick every SceneScript (layer properties, effect visibility,
     /// effect constant shaders, puppet animation layers, and particle instance
     /// overrides) in the local Wallpaper Engine Workshop library.
@@ -3872,6 +4201,7 @@ mod tests {
                         .to_string(),
                     kind: "image".into(),
                     visible: true,
+                    solid: true,
                     alpha: 1.0,
                     origin: vec("origin", [0.0; 3]),
                     scale: vec("scale", [1.0; 3]),

@@ -27,24 +27,29 @@ pub struct Canvas {
     pub fbo: glow::Framebuffer,
     pub w: i32,
     pub h: i32,
+    pub hdr: bool,
 }
 
 impl Canvas {
-    pub fn new(gl: &glow::Context, w: i32, h: i32) -> Result<Self> {
-        let w = w.max(1);
-        let h = h.max(1);
+    fn alloc_gl(
+        gl: &glow::Context,
+        w: i32,
+        h: i32,
+        internal_format: i32,
+        pixel_type: u32,
+    ) -> Result<(glow::Texture, glow::Framebuffer, u32)> {
         unsafe {
             let tex = gl.create_texture().map_err(|e| anyhow!(e))?;
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::RGBA8 as i32,
+                internal_format,
                 w,
                 h,
                 0,
                 glow::RGBA,
-                glow::UNSIGNED_BYTE,
+                pixel_type,
                 glow::PixelUnpackData::Slice(None),
             );
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
@@ -64,11 +69,55 @@ impl Canvas {
             );
             let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            if status != glow::FRAMEBUFFER_COMPLETE {
-                bail!("framebuffer incomplete: {status:#x}");
-            }
-            Ok(Self { tex, fbo, w, h })
+            Ok((tex, fbo, status))
         }
+    }
+
+    pub fn new(gl: &glow::Context, w: i32, h: i32) -> Result<Self> {
+        let w = w.max(1);
+        let h = h.max(1);
+        let (tex, fbo, status) =
+            Self::alloc_gl(gl, w, h, glow::RGBA8 as i32, glow::UNSIGNED_BYTE)?;
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            unsafe {
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(tex);
+            }
+            bail!("framebuffer incomplete: {status:#x}");
+        }
+        Ok(Self {
+            tex,
+            fbo,
+            w,
+            h,
+            hdr: false,
+        })
+    }
+
+    /// Allocate a 16-bit half-float render target for HDR bloom scenes,
+    /// falling back transparently to `RGBA8` when unsupported by the driver.
+    pub fn new_hdr(gl: &glow::Context, w: i32, h: i32) -> Result<Self> {
+        let w = w.max(1);
+        let h = h.max(1);
+        let (tex, fbo, status) =
+            Self::alloc_gl(gl, w, h, glow::RGBA16F as i32, glow::HALF_FLOAT)?;
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            unsafe {
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(tex);
+            }
+            log::debug!(
+                "scene: RGBA16F framebuffer unsupported ({status:#x}), falling back to RGBA8"
+            );
+            return Self::new(gl, w, h);
+        }
+        Ok(Self {
+            tex,
+            fbo,
+            w,
+            h,
+            hdr: true,
+        })
     }
 
     pub fn bind(&self, gl: &glow::Context) {

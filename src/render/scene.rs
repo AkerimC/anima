@@ -32,8 +32,9 @@ use crate::pkg::PackageFs;
 use super::gl::{bytemuck_cast, create_texture, Filter, Program};
 use super::keytrack::KeyTrack;
 use super::scenescript::{
-    AnimLayerField, AnimLayerSeed, EffectSeed, LayerFrame, LayerSeed, PropAnimSeed, SceneScripts,
-    ScriptField, ScriptOutput, ScriptTarget, TexAnimSeed, VideoTexSeed,
+    AnimLayerField, AnimLayerSeed, CursorEventInput, CursorEventKind, EffectSeed, LayerFrame,
+    LayerSeed, PropAnimSeed, SceneScripts, ScriptField, ScriptOutput, ScriptTarget, TexAnimSeed,
+    VideoTexSeed,
 };
 use super::text;
 use super::we_effect::{Canvas, EffectContext, EffectInstance, TextureCache};
@@ -323,10 +324,15 @@ const COPY_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_tex;
+uniform sampler2D u_bloom;
+uniform int u_has_bloom;
 uniform vec4 u_bcs_hue; // x=brightness(-1..1), y=contrast(1), z=saturation(1), w=hue(rad)
 out vec4 fragColor;
 void main() {
     vec4 c = texture(u_tex, v_uv);
+    if (u_has_bloom != 0) {
+        c.rgb += texture(u_bloom, v_uv).rgb;
+    }
     c.rgb += u_bcs_hue.x;
     c.rgb = (c.rgb - 0.5) * u_bcs_hue.y + 0.5;
     float luma = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
@@ -339,6 +345,70 @@ void main() {
     }
     c.rgb = clamp(c.rgb, 0.0, 1.0);
     fragColor = c;
+}
+"#;
+
+const BLOOM_VS: &str = r#"#version 300 es
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec2 a_uv;
+out vec2 v_uv;
+void main() {
+    v_uv = a_uv;
+    gl_Position = vec4(a_pos.x, -a_pos.y, 0.0, 1.0);
+}
+"#;
+
+const BLOOM_FS: &str = r#"#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform int u_mode; // 0=sdr_prefilter, 1=sdr_blur13, 2=hdr_prefilter, 3=box4
+uniform vec2 u_texel_step;
+uniform float u_threshold;
+uniform float u_strength;
+uniform vec3 u_tint;
+uniform vec4 u_blend_params;
+out vec4 fragColor;
+
+void main() {
+    if (u_mode == 1) {
+        const float w[13] = float[13](
+            0.006299, 0.017298, 0.039533, 0.075189,
+            0.119007, 0.156756, 0.171834, 0.156756,
+            0.119007, 0.075189, 0.039533, 0.017298, 0.006299
+        );
+        vec3 acc = vec3(0.0);
+        for (int i = 0; i < 13; i++) {
+            acc += texture(u_tex, v_uv + u_texel_step * float(i - 6)).rgb * w[i];
+        }
+        fragColor = vec4(acc, 1.0);
+        return;
+    }
+
+    vec3 albedo = texture(u_tex, v_uv + vec2(-u_texel_step.x, -u_texel_step.y)).rgb
+                + texture(u_tex, v_uv + vec2( u_texel_step.x, -u_texel_step.y)).rgb
+                + texture(u_tex, v_uv + vec2(-u_texel_step.x,  u_texel_step.y)).rgb
+                + texture(u_tex, v_uv + vec2( u_texel_step.x,  u_texel_step.y)).rgb;
+    albedo *= 0.25;
+
+    if (u_mode == 0) {
+        float scale = max(albedo.r, max(albedo.g, albedo.b));
+        albedo *= clamp(scale - u_threshold, 0.0, 1.0);
+        float grayscale = dot(vec3(0.2989, 0.5870, 0.1140), albedo);
+        albedo = -grayscale + albedo * 2.0;
+        albedo = max(vec3(0.0), albedo * u_strength * u_tint);
+    } else if (u_mode == 2) {
+        albedo = max(vec3(0.0), albedo);
+        float brightness = max(albedo.r, max(albedo.g, albedo.b));
+        float soft = brightness - u_blend_params.y;
+        soft = clamp(soft, 0.0, u_blend_params.z);
+        soft = soft * soft * u_blend_params.w;
+        float contribution = max(soft, brightness - u_blend_params.x);
+        contribution /= max(brightness, 0.00001);
+        albedo *= contribution * u_strength * u_tint;
+    }
+
+    fragColor = vec4(albedo, 1.0);
 }
 "#;
 
@@ -488,6 +558,18 @@ impl Affine {
     fn apply_vec(self, v: [f32; 2]) -> [f32; 2] {
         [self.a * v[0] + self.c * v[1], self.b * v[0] + self.d * v[1]]
     }
+    fn invert_point(self, p: [f32; 2]) -> Option<[f32; 2]> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-6 {
+            return None;
+        }
+        let dx = p[0] - self.tx;
+        let dy = p[1] - self.ty;
+        Some([
+            (self.d * dx - self.c * dy) / det,
+            (-self.b * dx + self.a * dy) / det,
+        ])
+    }
 }
 
 /// Build the local (parent-relative) transform from Wallpaper Engine's
@@ -496,6 +578,83 @@ fn compose_local(origin: [f32; 3], scale: [f32; 3], angles: [f32; 3]) -> Affine 
     Affine::translate(origin[0], origin[1])
         .mul(Affine::rotate(angles[2]))
         .mul(Affine::scale(scale[0], scale[1]))
+}
+
+#[derive(Debug, Clone)]
+struct BloomConfig {
+    enabled: bool,
+    hdr: bool,
+    strength: f32,
+    threshold: f32,
+    tint: [f32; 3],
+    hdr_strength: f32,
+    hdr_threshold: f32,
+    hdr_feather: f32,
+    hdr_scatter: f32,
+    hdr_iterations: usize,
+}
+
+impl Default for BloomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hdr: false,
+            strength: 2.0,
+            threshold: 0.65,
+            tint: [1.0, 1.0, 1.0],
+            hdr_strength: 2.0,
+            hdr_threshold: 1.0,
+            hdr_feather: 0.1,
+            hdr_scatter: 1.619,
+            hdr_iterations: 8,
+        }
+    }
+}
+
+fn parse_bloom_config(
+    general: &serde_json::Value,
+    props: &HashMap<String, serde_json::Value>,
+) -> BloomConfig {
+    let def = BloomConfig::default();
+    let resolve_bool = |key: &str, d: bool| {
+        general
+            .get(key)
+            .map(|v| resolve_prop(v, props))
+            .and_then(|v| value_bool(&v))
+            .unwrap_or(d)
+    };
+    let resolve_f32 = |key: &str, d: f32| {
+        general
+            .get(key)
+            .map(|v| resolve_prop(v, props))
+            .and_then(|v| value_f32(&v))
+            .unwrap_or(d)
+    };
+    let tint = general
+        .get("bloomtint")
+        .map(|v| parse_color(&resolve_prop(v, props), def.tint))
+        .unwrap_or(def.tint);
+    let hdr_iterations = general
+        .get("bloomhdriterations")
+        .map(|v| resolve_prop(v, props))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| value_f32(&v).map(|f| f.round() as i64))
+        })
+        .unwrap_or(def.hdr_iterations as i64)
+        .clamp(1, 8) as usize;
+    BloomConfig {
+        enabled: resolve_bool("bloom", def.enabled),
+        hdr: resolve_bool("hdr", def.hdr),
+        strength: resolve_f32("bloomstrength", def.strength).max(0.0),
+        threshold: resolve_f32("bloomthreshold", def.threshold).clamp(0.0, 0.999),
+        tint,
+        hdr_strength: resolve_f32("bloomhdrstrength", def.hdr_strength).max(0.0),
+        hdr_threshold: resolve_f32("bloomhdrthreshold", def.hdr_threshold).max(0.0),
+        hdr_feather: resolve_f32("bloomhdrfeather", def.hdr_feather).max(0.0),
+        hdr_scatter: resolve_f32("bloomhdrscatter", def.hdr_scatter).max(0.0),
+        hdr_iterations,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2153,6 +2312,7 @@ struct SceneObject {
     color_blend: i32,
     parallax: [f32; 2],
     visible: VisibleRule,
+    solid: bool,
     dependencies: Vec<i64>,
     capture_composite: bool,
     effects: Vec<EffectInstance>,
@@ -2518,6 +2678,56 @@ impl SceneObject {
         world_t
     }
 
+    fn hit_base_transform(&self, parallax_offset: [f32; 2]) -> Affine {
+        let mut t = self.transform;
+        t.tx += parallax_offset[0];
+        t.ty += parallax_offset[1];
+        if matches!(self.kind, ObjectKind::Puppet { .. }) {
+            t
+        } else {
+            self.quad_transform(t)
+        }
+    }
+
+    /// Map a scene world coordinate into the layer's local space.
+    fn world_to_local(&self, world_pos: [f32; 2], parallax_offset: [f32; 2]) -> [f32; 2] {
+        self.hit_base_transform(parallax_offset)
+            .invert_point(world_pos)
+            .unwrap_or([0.0, 0.0])
+    }
+
+    /// Hit-test a scene world coordinate against the layer's oriented bounds.
+    fn hit_test(&self, world_pos: [f32; 2], parallax_offset: [f32; 2]) -> Option<[f32; 2]> {
+        if !self.solid || matches!(self.kind, ObjectKind::Post | ObjectKind::Particle(_)) {
+            return None;
+        }
+        let local = self
+            .hit_base_transform(parallax_offset)
+            .invert_point(world_pos)?;
+        match &self.kind {
+            ObjectKind::Puppet { bounds, .. } => {
+                if local[0] >= bounds.0[0]
+                    && local[0] <= bounds.1[0]
+                    && local[1] >= bounds.0[1]
+                    && local[1] <= bounds.1[1]
+                {
+                    Some(local)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let hw = self.size[0].abs() * 0.5;
+                let hh = self.size[1].abs() * 0.5;
+                if hw > 0.0 && hh > 0.0 && local[0].abs() <= hw && local[1].abs() <= hh {
+                    Some(local)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     fn aabb(&self, offset: [f32; 2]) -> ([f32; 2], [f32; 2]) {
         let transform = self.quad_transform(Affine {
             tx: self.transform.tx + offset[0],
@@ -2693,6 +2903,7 @@ pub struct SceneRenderer {
     composite_prog: Program,
     blend_prog: Program,
     copy_prog: Program,
+    bloom_prog: Program,
     particle_prog: Program,
 
     quad_vao: glow::VertexArray,
@@ -2711,6 +2922,11 @@ pub struct SceneRenderer {
     composites: HashMap<i64, Canvas>,
     pool: CanvasPool,
     textures: TextureCache,
+    bloom: BloomConfig,
+    hdr_supported: bool,
+    bloom_a: Option<Canvas>,
+    bloom_b: Option<Canvas>,
+    bloom_mips: Vec<Canvas>,
 
     ortho_size: [f32; 2],
     clear_color: [f32; 3],
@@ -2758,6 +2974,13 @@ pub struct SceneRenderer {
     script_frames: Vec<LayerFrame>,
     /// Set when scripts need a full rebuild (only used before scripts exist).
     scripts_dirty: bool,
+    /// Layers currently hovered by the pointer for `cursorEnter`/`cursorLeave`.
+    cursor_hovered: std::collections::HashSet<i64>,
+    /// Layers currently holding a pointer down press for `cursorMove`/`Up`/`Click`.
+    cursor_pressed: std::collections::HashSet<i64>,
+    prev_mouse_down: bool,
+    prev_cursor_world: Option<[f32; 2]>,
+    cursor_events: Vec<CursorEventInput>,
     pkg: PackageFs,
 
     width: i32,
@@ -2787,6 +3010,7 @@ impl SceneRenderer {
         let composite_prog = Program::new(gl, COMPOSITE_VS, COMPOSITE_FS)?;
         let blend_prog = Program::new(gl, BLEND_VS, BLEND_FS)?;
         let copy_prog = Program::new(gl, COPY_VS, COPY_FS)?;
+        let bloom_prog = Program::new(gl, BLOOM_VS, BLOOM_FS)?;
         let particle_prog = Program::new(gl, PARTICLE_VS, PARTICLE_FS)?;
         let (quad_vao, quad_vbo) = create_quad(gl)?;
         let (particle_vao, particle_quad_vbo, particle_inst_vbo) = create_particle_buffers(gl)?;
@@ -2800,6 +3024,7 @@ impl SceneRenderer {
             composite_prog,
             blend_prog,
             copy_prog,
+            bloom_prog,
             particle_prog,
             quad_vao,
             quad_vbo,
@@ -2813,6 +3038,11 @@ impl SceneRenderer {
             composites: HashMap::new(),
             pool: CanvasPool::new(),
             textures: TextureCache::new(),
+            bloom: BloomConfig::default(),
+            hdr_supported: true,
+            bloom_a: None,
+            bloom_b: None,
+            bloom_mips: Vec::new(),
             ortho_size: [1920.0, 1080.0],
             clear_color: [0.04, 0.05, 0.08],
             parallax_enabled: false,
@@ -2845,6 +3075,11 @@ impl SceneRenderer {
             pending_user_props: serde_json::Map::new(),
             script_frames: Vec::new(),
             scripts_dirty: false,
+            cursor_hovered: std::collections::HashSet::new(),
+            cursor_pressed: std::collections::HashSet::new(),
+            prev_mouse_down: false,
+            prev_cursor_world: None,
+            cursor_events: Vec::new(),
             pkg: PackageFs::default(),
             width,
             height,
@@ -2966,8 +3201,10 @@ impl SceneRenderer {
         self.sounds_started = false;
         self.scene_general = root.get("general").cloned();
         self.raw_nodes.clear();
+        self.bloom = BloomConfig::default();
 
         if let Some(general) = root.get("general") {
+            self.bloom = parse_bloom_config(general, &self.properties);
             if let Some(ortho) = general.get("orthogonalprojection") {
                 let w = ortho.get("width").and_then(value_f32).unwrap_or(1920.0);
                 let h = ortho.get("height").and_then(value_f32).unwrap_or(1080.0);
@@ -3193,6 +3430,7 @@ impl SceneRenderer {
                 .to_string();
 
             let visible = own_visible[i].clone();
+            let solid = obj.get("solid").and_then(value_bool).unwrap_or(true);
             let align = parse_alignment(obj);
 
             if let Some(particle_path) = obj
@@ -3245,6 +3483,7 @@ impl SceneRenderer {
                     blend: LayerBlend::Normal,
                     parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
+                    solid,
                     dependencies,
                     capture_composite: false,
                     effects: Vec::new(),
@@ -3289,6 +3528,7 @@ impl SceneRenderer {
                         color_blend: object_color_blend(obj),
                         parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                         visible,
+                        solid,
                         dependencies,
                         capture_composite,
                         effects: load_effects(gl, pkg, obj, &self.properties, now),
@@ -3331,6 +3571,7 @@ impl SceneRenderer {
                     blend: LayerBlend::Normal,
                     parallax: [0.0, 0.0],
                     visible,
+                    solid,
                     dependencies,
                     capture_composite,
                     effects,
@@ -3381,6 +3622,7 @@ impl SceneRenderer {
                     color_blend: object_color_blend(obj),
                     parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
+                    solid,
                     dependencies,
                     capture_composite,
                     effects,
@@ -3421,6 +3663,7 @@ impl SceneRenderer {
                     color_blend: object_color_blend(obj),
                     parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
+                    solid,
                     dependencies,
                     capture_composite,
                     effects: load_effects(gl, pkg, obj, &self.properties, now),
@@ -3552,6 +3795,7 @@ impl SceneRenderer {
                     color_blend: object_color_blend(obj),
                     parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                     visible,
+                    solid,
                     dependencies,
                     capture_composite,
                     effects,
@@ -3739,6 +3983,7 @@ impl SceneRenderer {
                 color_blend: object_color_blend(obj),
                 parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                 visible,
+                solid,
                 dependencies,
                 capture_composite,
                 effects: load_effects(gl, pkg, obj, &self.properties, now),
@@ -3794,6 +4039,7 @@ impl SceneRenderer {
                 color_blend: 0,
                 parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
                 visible: own_visible[i].clone(),
+                solid: obj.get("solid").and_then(value_bool).unwrap_or(true),
                 dependencies: Vec::new(),
                 capture_composite: false,
                 effects: Vec::new(),
@@ -4032,6 +4278,11 @@ impl SceneRenderer {
         self.script_binding_props.clear();
         self.pending_user_props.clear();
         self.script_frames.clear();
+        self.cursor_hovered.clear();
+        self.cursor_pressed.clear();
+        self.prev_mouse_down = false;
+        self.prev_cursor_world = None;
+        self.cursor_events.clear();
         for obj in self.objects.iter_mut() {
             obj.script_visible = None;
             obj.script_text_override = None;
@@ -4157,6 +4408,7 @@ impl SceneRenderer {
                 name: obj.name.clone(),
                 kind: kind.to_string(),
                 visible: obj.is_own_visible(&self.properties),
+                solid: obj.solid,
                 alpha: obj.color[3],
                 origin,
                 scale,
@@ -4750,11 +5002,118 @@ impl SceneRenderer {
                         }
                     }
                 }
+                ScriptTarget::LayerSolid { id } => {
+                    let Some(&idx) = self.script_ids.get(&id) else {
+                        continue;
+                    };
+                    self.objects[idx].solid = out.value.as_bool().unwrap_or(true);
+                }
             }
         }
         if transforms_dirty {
             self.propagate_transforms();
         }
+    }
+
+    fn collect_cursor_events(
+        &mut self,
+        cursor_world: [f32; 2],
+        cursor_screen: [f32; 2],
+        mouse_down: bool,
+        time: f32,
+    ) {
+        self.cursor_events.clear();
+        if self.scripts.as_ref().is_none_or(|h| !h.has_cursor_layers()) {
+            self.prev_mouse_down = mouse_down;
+            self.prev_cursor_world = Some(cursor_world);
+            return;
+        }
+        let just_pressed = mouse_down && !self.prev_mouse_down;
+        let just_released = !mouse_down && self.prev_mouse_down;
+        let moved = self.prev_cursor_world.is_some_and(|p| {
+            (cursor_world[0] - p[0]).abs() > 1e-3 || (cursor_world[1] - p[1]).abs() > 1e-3
+        });
+
+        for i in 0..self.objects.len() {
+            let Some(id) = self.objects[i].id else {
+                continue;
+            };
+            if !self
+                .scripts
+                .as_ref()
+                .is_some_and(|h| h.is_cursor_layer(id))
+            {
+                continue;
+            }
+            let depth = self.effective_parallax(i);
+            let offset = self.parallax_offset(depth, time);
+            let obj = &self.objects[i];
+            let hit = obj.hit_test(cursor_world, offset);
+            let is_hit = hit.is_some();
+            let was_hovered = self.cursor_hovered.contains(&id);
+            let was_pressed = self.cursor_pressed.contains(&id);
+            let local_pos = hit.unwrap_or_else(|| obj.world_to_local(cursor_world, offset));
+
+            if is_hit && !was_hovered {
+                self.cursor_hovered.insert(id);
+                self.cursor_events.push(CursorEventInput {
+                    layer_id: id,
+                    kind: CursorEventKind::Enter,
+                    world_pos: cursor_world,
+                    screen_pos: cursor_screen,
+                    local_pos,
+                });
+            } else if !is_hit && was_hovered {
+                self.cursor_hovered.remove(&id);
+                self.cursor_events.push(CursorEventInput {
+                    layer_id: id,
+                    kind: CursorEventKind::Leave,
+                    world_pos: cursor_world,
+                    screen_pos: cursor_screen,
+                    local_pos,
+                });
+            }
+            if just_pressed && is_hit {
+                self.cursor_pressed.insert(id);
+                self.cursor_events.push(CursorEventInput {
+                    layer_id: id,
+                    kind: CursorEventKind::Down,
+                    world_pos: cursor_world,
+                    screen_pos: cursor_screen,
+                    local_pos,
+                });
+            }
+            if moved && (is_hit || was_pressed) {
+                self.cursor_events.push(CursorEventInput {
+                    layer_id: id,
+                    kind: CursorEventKind::Move,
+                    world_pos: cursor_world,
+                    screen_pos: cursor_screen,
+                    local_pos,
+                });
+            }
+            if just_released && was_pressed {
+                self.cursor_pressed.remove(&id);
+                self.cursor_events.push(CursorEventInput {
+                    layer_id: id,
+                    kind: CursorEventKind::Up,
+                    world_pos: cursor_world,
+                    screen_pos: cursor_screen,
+                    local_pos,
+                });
+                if is_hit {
+                    self.cursor_events.push(CursorEventInput {
+                        layer_id: id,
+                        kind: CursorEventKind::Click,
+                        world_pos: cursor_world,
+                        screen_pos: cursor_screen,
+                        local_pos,
+                    });
+                }
+            }
+        }
+        self.prev_mouse_down = mouse_down;
+        self.prev_cursor_world = Some(cursor_world);
     }
 
     /// Run one frame of SceneScripts and apply the produced property values.
@@ -4765,7 +5124,9 @@ impl SceneRenderer {
         dt: f32,
         daytime: f32,
         now: text::LocalTime,
-        pointer_world: [f32; 2],
+        cursor_world: [f32; 2],
+        cursor_screen: [f32; 2],
+        mouse_down: bool,
         ortho: [f32; 2],
         spectrum: &[f32; 64],
     ) {
@@ -4817,15 +5178,18 @@ impl SceneRenderer {
             let Some(host) = self.scripts.as_mut() else {
                 return;
             };
-            host.tick(
+            host.tick_with_input(
                 time,
                 dt,
                 daytime,
-                pointer_world,
+                cursor_world,
                 ortho,
                 screen,
                 Some(spectrum),
                 &self.script_frames,
+                cursor_screen,
+                mouse_down,
+                &self.cursor_events,
             )
         };
         self.apply_script_outputs(outputs);
@@ -5119,6 +5483,7 @@ impl SceneRenderer {
                 color_blend: 0,
                 parallax: l.parallax_depth.unwrap_or([0.0, 0.0]),
                 visible: VisibleRule::Script(parse_visible_script(&serde_json::Value::Null, now)),
+                solid: true,
                 dependencies: Vec::new(),
                 capture_composite: false,
                 effects: Vec::new(),
@@ -5162,6 +5527,7 @@ impl SceneRenderer {
                 blend: LayerBlend::Normal,
                 parallax: p.parallax_depth.unwrap_or([0.0, 0.0]),
                 visible: VisibleRule::Always,
+                solid: true,
                 dependencies: Vec::new(),
                 capture_composite: false,
                 effects: Vec::new(),
@@ -5350,6 +5716,7 @@ impl SceneRenderer {
     fn reapply_scene_properties(&mut self) {
         let now = text::local_time();
         if let Some(general) = &self.scene_general {
+            self.bloom = parse_bloom_config(general, &self.properties);
             if let Some(cc) = general.get("clearcolor").filter(|v| v.get("user").is_some()) {
                 self.clear_color = eval_color_field(Some(cc), &self.properties, self.clear_color);
             }
@@ -5605,8 +5972,9 @@ impl SceneRenderer {
         let (uv_scale, _) = self.cover_uv_transform();
         let w = ((self.width.max(1) as f32 / uv_scale[0]).round() as i32).clamp(1, 4096);
         let h = ((self.height.max(1) as f32 / uv_scale[1]).round() as i32).clamp(1, 4096);
+        let want_hdr = self.bloom.hdr && self.hdr_supported;
         let recreate = match &self.scene {
-            Some(c) => c.w != w || c.h != h,
+            Some(c) => c.w != w || c.h != h || c.hdr != want_hdr,
             None => true,
         };
         if recreate {
@@ -5619,11 +5987,33 @@ impl SceneRenderer {
             if let Some(old) = self.scene_copy.take() {
                 old.destroy(gl);
             }
+            if let Some(old) = self.bloom_a.take() {
+                old.destroy(gl);
+            }
+            if let Some(old) = self.bloom_b.take() {
+                old.destroy(gl);
+            }
+            for old in self.bloom_mips.drain(..) {
+                old.destroy(gl);
+            }
             for (_, old) in self.composites.drain() {
                 old.destroy(gl);
             }
-            self.scene = Some(Canvas::new(gl, w, h)?);
-            self.scene_alt = Some(Canvas::new(gl, w, h)?);
+            let scene = if want_hdr {
+                Canvas::new_hdr(gl, w, h)?
+            } else {
+                Canvas::new(gl, w, h)?
+            };
+            if want_hdr && !scene.hdr {
+                self.hdr_supported = false;
+            }
+            let scene_alt = if scene.hdr {
+                Canvas::new_hdr(gl, w, h)?
+            } else {
+                Canvas::new(gl, w, h)?
+            };
+            self.scene = Some(scene);
+            self.scene_alt = Some(scene_alt);
         }
         Ok(())
     }
@@ -5647,12 +6037,242 @@ impl SceneRenderer {
             p.set_vec2(gl, "u_uv_offset", uv_offset[0], uv_offset[1]);
             p.set_f32(gl, "u_flip_y", -1.0);
             p.set_vec4(gl, "u_bcs_hue", [0.0, 1.0, 1.0, 0.0]);
+            p.set_i32(gl, "u_has_bloom", 0);
             p.set_i32(gl, "u_tex", 0);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
             gl.bind_vertex_array(Some(self.quad_vao));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_bloom_pass(
+        &mut self,
+        gl: &glow::Context,
+        src_tex: glow::Texture,
+        dst_fbo: glow::Framebuffer,
+        dst_w: i32,
+        dst_h: i32,
+        mode: i32,
+        texel_step: [f32; 2],
+        threshold: f32,
+        strength: f32,
+        tint: [f32; 3],
+        blend_params: [f32; 4],
+    ) {
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dst_fbo));
+            gl.viewport(0, 0, dst_w, dst_h);
+            let p = &mut self.bloom_prog;
+            p.bind(gl);
+            p.set_i32(gl, "u_mode", mode);
+            p.set_vec2(gl, "u_texel_step", texel_step[0], texel_step[1]);
+            p.set_f32(gl, "u_threshold", threshold);
+            p.set_f32(gl, "u_strength", strength);
+            p.set_vec3(gl, "u_tint", tint[0], tint[1], tint[2]);
+            p.set_vec4(gl, "u_blend_params", blend_params);
+            p.set_i32(gl, "u_tex", 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
+            gl.bind_vertex_array(Some(self.quad_vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        }
+    }
+
+    fn render_bloom(&mut self, gl: &glow::Context) -> Result<Option<glow::Texture>> {
+        if !self.bloom.enabled {
+            return Ok(None);
+        }
+        let eff_strength = if self.bloom.hdr {
+            self.bloom.hdr_strength
+        } else {
+            self.bloom.strength
+        };
+        if eff_strength <= 1e-4 {
+            return Ok(None);
+        }
+        let (sw, sh, scene_tex, want_hdr) = {
+            let s = self.scene.as_ref().unwrap();
+            (s.w, s.h, s.tex, s.hdr)
+        };
+        unsafe {
+            gl.disable(glow::BLEND);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
+        }
+
+        if !self.bloom.hdr {
+            let bw = (sw / 4).max(1);
+            let bh = (sh / 4).max(1);
+            if self.bloom_a.as_ref().is_none_or(|c| c.w != bw || c.h != bh) {
+                if let Some(old) = self.bloom_a.take() {
+                    old.destroy(gl);
+                }
+                self.bloom_a = Some(Canvas::new(gl, bw, bh)?);
+            }
+            if self.bloom_b.as_ref().is_none_or(|c| c.w != bw || c.h != bh) {
+                if let Some(old) = self.bloom_b.take() {
+                    old.destroy(gl);
+                }
+                self.bloom_b = Some(Canvas::new(gl, bw, bh)?);
+            }
+            let (a_tex, a_fbo) = {
+                let c = self.bloom_a.as_ref().unwrap();
+                (c.tex, c.fbo)
+            };
+            let (b_tex, b_fbo) = {
+                let c = self.bloom_b.as_ref().unwrap();
+                (c.tex, c.fbo)
+            };
+            let tint = self.bloom.tint;
+            let threshold = self.bloom.threshold;
+            let strength = self.bloom.strength;
+            self.draw_bloom_pass(
+                gl,
+                scene_tex,
+                a_fbo,
+                bw,
+                bh,
+                0,
+                [1.0 / sw.max(1) as f32, 1.0 / sh.max(1) as f32],
+                threshold,
+                strength,
+                tint,
+                [0.0; 4],
+            );
+            self.draw_bloom_pass(
+                gl,
+                a_tex,
+                b_fbo,
+                bw,
+                bh,
+                1,
+                [2.0 / bw as f32, 0.0],
+                threshold,
+                strength,
+                tint,
+                [0.0; 4],
+            );
+            self.draw_bloom_pass(
+                gl,
+                b_tex,
+                a_fbo,
+                bw,
+                bh,
+                1,
+                [0.0, 2.0 / bh as f32],
+                threshold,
+                strength,
+                tint,
+                [0.0; 4],
+            );
+            return Ok(Some(a_tex));
+        }
+
+        let max_iters = self.bloom.hdr_iterations.clamp(1, 8);
+        let mut dims = Vec::with_capacity(max_iters);
+        let mut mw = (sw / 2).max(1);
+        let mut mh = (sh / 2).max(1);
+        for _ in 0..max_iters {
+            dims.push((mw, mh));
+            if mw <= 2 && mh <= 2 {
+                break;
+            }
+            mw = (mw / 2).max(1);
+            mh = (mh / 2).max(1);
+        }
+        let matches = self.bloom_mips.len() == dims.len()
+            && self
+                .bloom_mips
+                .iter()
+                .zip(&dims)
+                .all(|(c, &(dw, dh))| c.w == dw && c.h == dh && c.hdr == want_hdr);
+        if !matches {
+            for old in self.bloom_mips.drain(..) {
+                old.destroy(gl);
+            }
+            for &(dw, dh) in &dims {
+                let c = if want_hdr {
+                    Canvas::new_hdr(gl, dw, dh)?
+                } else {
+                    Canvas::new(gl, dw, dh)?
+                };
+                self.bloom_mips.push(c);
+            }
+        }
+        let mips: Vec<(glow::Texture, glow::Framebuffer, i32, i32)> = self
+            .bloom_mips
+            .iter()
+            .map(|c| (c.tex, c.fbo, c.w, c.h))
+            .collect();
+        let levels = mips.len();
+        if levels == 0 {
+            return Ok(None);
+        }
+
+        let threshold = self.bloom.hdr_threshold.max(0.0);
+        let knee = (threshold * self.bloom.hdr_feather.max(0.0)).max(1e-5);
+        let blend_params = [threshold, threshold - knee, 2.0 * knee, 0.25 / knee];
+        let strength = self.bloom.hdr_strength.max(0.0);
+        let tint = self.bloom.tint;
+
+        self.draw_bloom_pass(
+            gl,
+            scene_tex,
+            mips[0].1,
+            mips[0].2,
+            mips[0].3,
+            2,
+            [0.5 / sw.max(1) as f32, 0.5 / sh.max(1) as f32],
+            threshold,
+            strength,
+            tint,
+            blend_params,
+        );
+        for k in 1..levels {
+            self.draw_bloom_pass(
+                gl,
+                mips[k - 1].0,
+                mips[k].1,
+                mips[k].2,
+                mips[k].3,
+                3,
+                [0.5 / mips[k - 1].2.max(1) as f32, 0.5 / mips[k - 1].3.max(1) as f32],
+                threshold,
+                strength,
+                tint,
+                blend_params,
+            );
+        }
+        if levels > 1 {
+            let scatter = self.bloom.hdr_scatter.max(0.0);
+            let scatter_t = (scatter / (1.0 + scatter)).clamp(0.0, 0.92);
+            unsafe {
+                gl.enable(glow::BLEND);
+                gl.blend_color(0.0, 0.0, 0.0, scatter_t);
+                gl.blend_func(glow::CONSTANT_ALPHA, glow::ONE_MINUS_CONSTANT_ALPHA);
+            }
+            for k in (1..levels).rev() {
+                self.draw_bloom_pass(
+                    gl,
+                    mips[k].0,
+                    mips[k - 1].1,
+                    mips[k - 1].2,
+                    mips[k - 1].3,
+                    3,
+                    [0.5 / mips[k].2.max(1) as f32, 0.5 / mips[k].3.max(1) as f32],
+                    threshold,
+                    strength,
+                    tint,
+                    blend_params,
+                );
+            }
+            unsafe {
+                gl.disable(glow::BLEND);
+            }
+        }
+        Ok(Some(mips[0].0))
     }
 
     /// Parallax depth an object is actually drawn with.
@@ -5832,19 +6452,23 @@ impl SceneRenderer {
     }
 
     fn snapshot_scene_copy(&mut self, gl: &glow::Context) -> Result<glow::Texture> {
-        let (scene_w, scene_h, scene_fbo) = {
+        let (scene_w, scene_h, scene_fbo, scene_hdr) = {
             let scene = self.scene.as_ref().unwrap();
-            (scene.w, scene.h, scene.fbo)
+            (scene.w, scene.h, scene.fbo, scene.hdr)
         };
         let recreate = match &self.scene_copy {
-            Some(c) => c.w != scene_w || c.h != scene_h,
+            Some(c) => c.w != scene_w || c.h != scene_h || c.hdr != scene_hdr,
             None => true,
         };
         if recreate {
             if let Some(old) = self.scene_copy.take() {
                 old.destroy(gl);
             }
-            self.scene_copy = Some(Canvas::new(gl, scene_w, scene_h)?);
+            self.scene_copy = Some(if scene_hdr {
+                Canvas::new_hdr(gl, scene_w, scene_h)?
+            } else {
+                Canvas::new(gl, scene_w, scene_h)?
+            });
         }
         let copy_fbo = self.scene_copy.as_ref().unwrap().fbo;
         let copy_tex = self.scene_copy.as_ref().unwrap().tex;
@@ -6582,6 +7206,14 @@ impl Renderer for SceneRenderer {
         self.smooth_mouse[0] += (target_mx - self.smooth_mouse[0]) * lerp;
         self.smooth_mouse[1] += (target_my - self.smooth_mouse[1]) * lerp;
         let (cover_scale, cover_offset) = self.cover_uv_transform();
+        let raw_win_uv = [
+            ((target_mx + 1.0) * 0.5).clamp(0.0, 1.0),
+            ((1.0 - target_my) * 0.5).clamp(0.0, 1.0),
+        ];
+        let raw_mouse_uv = [
+            (cover_offset[0] + raw_win_uv[0] * cover_scale[0]).clamp(0.0, 1.0),
+            (cover_offset[1] + raw_win_uv[1] * cover_scale[1]).clamp(0.0, 1.0),
+        ];
         let win_mouse_uv = [
             (self.smooth_mouse[0] + 1.0) * 0.5,
             (1.0 - self.smooth_mouse[1]) * 0.5,
@@ -6594,6 +7226,10 @@ impl Renderer for SceneRenderer {
         let ortho_w = self.ortho_size[0].max(1.0);
         let ortho_h = self.ortho_size[1].max(1.0);
         let ortho = [ortho_w, ortho_h];
+        let cursor_world = [
+            raw_mouse_uv[0] * ortho_w,
+            (1.0 - raw_mouse_uv[1]) * ortho_h,
+        ];
         let pointer_world = [
             mouse_uv[0] * ortho_w,
             (1.0 - mouse_uv[1]) * ortho_h,
@@ -6690,12 +7326,15 @@ impl Renderer for SceneRenderer {
             }
         }
 
+        self.collect_cursor_events(cursor_world, raw_win_uv, info.mouse_down, time);
         self.tick_scripts(
             time,
             dt,
             daytime,
             now,
-            pointer_world,
+            cursor_world,
+            raw_win_uv,
+            info.mouse_down,
             ortho,
             &info.spectrum,
         );
@@ -7376,9 +8015,12 @@ impl Renderer for SceneRenderer {
             self.pool.put(gl, tmp);
         }
 
+        // Optional Wallpaper Engine bloom/HDR post-process before cover blit.
+        let bloom_tex = self.render_bloom(gl)?;
+
         // Blit the composed scene to the surface with aspect-ratio cover scaling.
         {
-            let scene = self.scene.as_ref().unwrap();
+            let scene_tex = self.scene.as_ref().unwrap().tex;
             unsafe {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.viewport(0, 0, self.width.max(1), self.height.max(1));
@@ -7392,7 +8034,16 @@ impl Renderer for SceneRenderer {
                 p.set_vec4(gl, "u_bcs_hue", self.bcs_hue);
                 p.set_i32(gl, "u_tex", 0);
                 gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(scene.tex));
+                gl.bind_texture(glow::TEXTURE_2D, Some(scene_tex));
+                if let Some(bt) = bloom_tex {
+                    p.set_i32(gl, "u_bloom", 1);
+                    p.set_i32(gl, "u_has_bloom", 1);
+                    gl.active_texture(glow::TEXTURE1);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(bt));
+                    gl.active_texture(glow::TEXTURE0);
+                } else {
+                    p.set_i32(gl, "u_has_bloom", 0);
+                }
                 gl.bind_vertex_array(Some(self.quad_vao));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
@@ -7477,6 +8128,15 @@ impl Renderer for SceneRenderer {
         if let Some(canvas) = self.scene_copy.take() {
             canvas.destroy(gl);
         }
+        if let Some(canvas) = self.bloom_a.take() {
+            canvas.destroy(gl);
+        }
+        if let Some(canvas) = self.bloom_b.take() {
+            canvas.destroy(gl);
+        }
+        for canvas in self.bloom_mips.drain(..) {
+            canvas.destroy(gl);
+        }
         for (_, canvas) in self.composites.drain() {
             canvas.destroy(gl);
         }
@@ -7501,6 +8161,7 @@ impl Renderer for SceneRenderer {
         self.composite_prog.destroy(gl);
         self.blend_prog.destroy(gl);
         self.copy_prog.destroy(gl);
+        self.bloom_prog.destroy(gl);
         self.particle_prog.destroy(gl);
         unsafe {
             gl.delete_vertex_array(self.quad_vao);
@@ -8105,5 +8766,100 @@ mod tests {
 
         let plain = json!({ "value": false, "script": "export function update() {}" });
         assert!(!raw_bool_field(Some(&plain), &props));
+    }
+
+    #[test]
+    fn parse_bloom_config_handles_sdr_hdr_defaults_and_user_props() {
+        let mut props = HashMap::new();
+        let def_cfg = parse_bloom_config(&json!({}), &props);
+        assert!(!def_cfg.enabled);
+        assert!(!def_cfg.hdr);
+        assert!((def_cfg.strength - 2.0).abs() < 1e-5);
+        assert!((def_cfg.threshold - 0.65).abs() < 1e-5);
+        assert_eq!(def_cfg.hdr_iterations, 8);
+
+        let general = json!({
+            "bloom": { "user": "u_bloom", "value": true },
+            "bloomstrength": { "user": "u_str", "value": 0.5 },
+            "bloomthreshold": 0.4,
+            "bloomtint": { "user": "u_tint", "value": "1 1 1" },
+            "hdr": { "user": "u_hdr", "value": false },
+            "bloomhdrstrength": 2.4,
+            "bloomhdrthreshold": 1.1,
+            "bloomhdrfeather": 0.25,
+            "bloomhdrscatter": 1.5,
+            "bloomhdriterations": 12
+        });
+        props.insert("u_bloom".into(), json!(true));
+        props.insert("u_str".into(), json!(1.75));
+        props.insert("u_tint".into(), json!("1 0.5 0.25"));
+        props.insert("u_hdr".into(), json!(true));
+        let cfg = parse_bloom_config(&general, &props);
+        assert!(cfg.enabled);
+        assert!(cfg.hdr);
+        assert!((cfg.strength - 1.75).abs() < 1e-5);
+        assert!((cfg.threshold - 0.4).abs() < 1e-5);
+        assert!((cfg.tint[0] - 1.0).abs() < 1e-4);
+        assert!((cfg.tint[1] - 0.5).abs() < 1e-4);
+        assert!((cfg.tint[2] - 0.25).abs() < 1e-4);
+        assert!((cfg.hdr_strength - 2.4).abs() < 1e-5);
+        assert!((cfg.hdr_threshold - 1.1).abs() < 1e-5);
+        assert!((cfg.hdr_feather - 0.25).abs() < 1e-5);
+        assert!((cfg.hdr_scatter - 1.5).abs() < 1e-5);
+        assert_eq!(cfg.hdr_iterations, 8);
+
+        props.insert("u_bloom".into(), json!(false));
+        assert!(!parse_bloom_config(&general, &props).enabled);
+    }
+
+    #[test]
+    fn scene_object_hit_test_handles_rotation_alignment_scale_and_solid() {
+        let pkg = PackageFs::default();
+        let _ = &pkg;
+        let now = sample_time(12, 0);
+        let mut obj = SceneObject {
+            id: Some(1),
+            name: "btn".into(),
+            transform: Affine::translate(200.0, 300.0)
+                .mul(Affine::rotate(std::f32::consts::FRAC_PI_2))
+                .mul(Affine::scale(2.0, 1.0)),
+            size: [100.0, 40.0],
+            align: [0.5, 0.0],
+            color: [1.0; 4],
+            brightness: 1.0,
+            blend: LayerBlend::Normal,
+            color_blend: 0,
+            parallax: [0.0, 0.0],
+            visible: parse_visible(None, &HashMap::new(), now),
+            solid: true,
+            dependencies: Vec::new(),
+            capture_composite: false,
+            effects: Vec::new(),
+            kind: ObjectKind::Solid,
+            anim: None,
+            sprite: None,
+            attach: None,
+            raw_idx: None,
+            raw_obj: serde_json::Value::Null,
+            parent_obj: None,
+            local_parts: ([200.0, 300.0, 0.0], [2.0, 1.0, 1.0], [0.0, 0.0, std::f32::consts::FRAC_PI_2]),
+            script_visible: None,
+            script_text_override: None,
+            script_sprite_frame: None,
+        };
+        // With align=[0.5, 0], local_center=(50, 0); scaled by (2,1) -> (100,0);
+        // rotated +90 deg -> (0, +100), so quad center is at (200, 400), covering
+        // x in [180, 220] and y in [300, 500].
+        let hit = obj.hit_test([205.0, 460.0], [0.0, 0.0]).expect("inside rotated scaled rect");
+        assert!((hit[0] - 30.0).abs() < 1e-3);
+        assert!((hit[1] + 5.0).abs() < 1e-3);
+        assert!(obj.hit_test([200.0, 260.0], [0.0, 0.0]).is_none());
+
+        // Parallax offset shifts hit test cleanly.
+        assert!(obj.hit_test([215.0, 460.0], [10.0, 0.0]).is_some());
+
+        // solid=false disables hit-testing even inside bounds.
+        obj.solid = false;
+        assert!(obj.hit_test([205.0, 460.0], [0.0, 0.0]).is_none());
     }
 }
