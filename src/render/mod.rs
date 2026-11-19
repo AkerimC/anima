@@ -4,6 +4,7 @@ pub mod anchors;
 pub mod character;
 pub mod gl;
 pub mod image;
+pub mod keytrack;
 pub mod model3d;
 pub mod scene;
 pub mod scenescript;

@@ -30,8 +30,10 @@ use serde::Deserialize;
 use crate::pkg::PackageFs;
 
 use super::gl::{bytemuck_cast, create_texture, Filter, Program};
+use super::keytrack::KeyTrack;
 use super::scenescript::{
-    EffectSeed, LayerFrame, LayerSeed, SceneScripts, ScriptField, ScriptOutput, ScriptTarget,
+    AnimLayerField, AnimLayerSeed, EffectSeed, LayerFrame, LayerSeed, PropAnimSeed, SceneScripts,
+    ScriptField, ScriptOutput, ScriptTarget, TexAnimSeed, VideoTexSeed,
 };
 use super::text;
 use super::we_effect::{Canvas, EffectContext, EffectInstance, TextureCache};
@@ -1115,6 +1117,18 @@ struct Emitter {
     spritesheet: Option<crate::pkg::SpritesheetMeta>,
     we_spec: Option<WeParticleSpec>,
     particles: Vec<Particle>,
+    base_count: usize,
+    base_ov_rate: f32,
+    base_ov_count: f32,
+    base_ov_alpha: f32,
+    base_ov_size: f32,
+    base_ov_speed: f32,
+    live_rate_mult: f32,
+    live_count_mult: f32,
+    live_alpha_mult: f32,
+    live_size_mult: f32,
+    live_speed_mult: f32,
+    live_brightness: f32,
 }
 
 impl Emitter {
@@ -1524,6 +1538,18 @@ impl Emitter {
             spritesheet,
             we_spec: Some(spec),
             particles,
+            base_count: count,
+            base_ov_rate: ov_rate,
+            base_ov_count: ov_count,
+            base_ov_alpha: ov_alpha,
+            base_ov_size: ov_size,
+            base_ov_speed: ov_speed,
+            live_rate_mult: 1.0,
+            live_count_mult: 1.0,
+            live_alpha_mult: 1.0,
+            live_size_mult: 1.0,
+            live_speed_mult: 1.0,
+            live_brightness: 1.0,
         }
     }
 
@@ -1669,6 +1695,77 @@ impl Emitter {
             spritesheet: None,
             we_spec: None,
             particles,
+            base_count: count,
+            base_ov_rate: 1.0,
+            base_ov_count: 1.0,
+            base_ov_alpha: 1.0,
+            base_ov_size: 1.0,
+            base_ov_speed: 1.0,
+            live_rate_mult: 1.0,
+            live_count_mult: 1.0,
+            live_alpha_mult: 1.0,
+            live_size_mult: 1.0,
+            live_speed_mult: 1.0,
+            live_brightness: 1.0,
+        }
+    }
+
+    fn reset_script_overrides(&mut self) {
+        self.live_rate_mult = 1.0;
+        self.live_count_mult = 1.0;
+        self.live_alpha_mult = 1.0;
+        self.live_size_mult = 1.0;
+        self.live_speed_mult = 1.0;
+        self.live_brightness = 1.0;
+    }
+
+    fn update_instance_override(&mut self, key: &str, value: &serde_json::Value) {
+        match key {
+            "color" | "colorn" => {
+                let c = crate::render::scenescript::prop_vec3(value, [1.0, 1.0, 1.0]);
+                self.update_color_mult(c);
+            }
+            "rate" => {
+                if let Some(v) = value_f32(value) {
+                    self.live_rate_mult = (v / self.base_ov_rate.max(1e-4)).clamp(0.0, 20.0);
+                }
+            }
+            "count" => {
+                if let Some(v) = value_f32(value) {
+                    self.live_count_mult = (v / self.base_ov_count.max(1e-4)).clamp(0.0, 20.0);
+                }
+            }
+            "alpha" => {
+                if let Some(v) = value_f32(value) {
+                    self.live_alpha_mult = (v / self.base_ov_alpha.max(1e-4)).clamp(0.0, 10.0);
+                }
+            }
+            "size" => {
+                if let Some(v) = value_f32(value) {
+                    self.live_size_mult = (v / self.base_ov_size.max(1e-4)).clamp(0.0, 10.0);
+                }
+            }
+            "speed" => {
+                if let Some(v) = value_f32(value) {
+                    self.live_speed_mult = (v / self.base_ov_speed.max(1e-4)).clamp(0.0, 10.0);
+                }
+            }
+            "brightness" => {
+                if let Some(v) = value_f32(value) {
+                    self.live_brightness = v.clamp(0.0, 10.0);
+                }
+            }
+            "lifetime" => {
+                if let Some(spec) = &mut self.we_spec {
+                    if let Some(v) = value_f32(value) {
+                        let ratio = (v / spec.life_max.max(0.1)).clamp(0.05, 10.0);
+                        for p in &mut self.particles {
+                            p.lifetime = (spec.life_max * ratio).max(0.1);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1705,23 +1802,40 @@ impl Emitter {
         } else {
             1.0
         };
-        let dtc = dt.clamp(0.0, 0.1) * boost;
+        let dtc = dt.clamp(0.0, 0.1) * boost * self.live_speed_mult.clamp(0.0, 10.0);
+        let alpha_mult = self.live_alpha_mult.clamp(0.0, 4.0);
+        let size_mult_ov = self.live_size_mult.clamp(0.0, 10.0);
+        let brightness_mult = self.live_brightness.clamp(0.0, 10.0);
 
         if let Some(spec) = &mut self.we_spec {
             if spec.lock_to_pointer {
                 spec.transform.tx = pointer_world[0];
                 spec.transform.ty = pointer_world[1];
             }
+            let target = ((self.base_count as f32) * self.live_rate_mult * self.live_count_mult)
+                .round()
+                .clamp(0.0, 4096.0) as usize;
+            let need = target.saturating_sub(self.particles.len()).min(64);
+            for _ in 0..need {
+                self.particles.push(spec.spawn(Some(0.0)));
+            }
             let t_scale_x = spec.transform.a.hypot(spec.transform.b);
             let t_scale_y = spec.transform.c.hypot(spec.transform.d);
             let t_scale = ((t_scale_x + t_scale_y) * 0.5).max(0.01);
             let t_rot = spec.transform.b.atan2(spec.transform.a);
 
-            for p in &mut self.particles {
-                p.age += dtc;
-                if p.age >= p.lifetime {
-                    *p = spec.spawn(None);
+            let mut pi = 0usize;
+            while pi < self.particles.len() {
+                self.particles[pi].age += dtc;
+                if self.particles[pi].age >= self.particles[pi].lifetime {
+                    if self.particles.len() > target {
+                        self.particles.swap_remove(pi);
+                        continue;
+                    }
+                    self.particles[pi] = spec.spawn(None);
                 }
+                let p = &mut self.particles[pi];
+                pi += 1;
                 let damp = (1.0 - spec.drag * dtc).clamp(0.0, 1.0);
                 p.vx = p.vx * damp + spec.gravity[0] * dtc;
                 p.vy = p.vy * damp + spec.gravity[1] * dtc;
@@ -1740,7 +1854,7 @@ impl Emitter {
                 p.rot += p.ang_vel * dtc;
 
                 let t_norm = (p.age / p.lifetime).clamp(0.0, 1.0);
-                let mut alpha = p.alpha;
+                let mut alpha = p.alpha * alpha_mult;
                 if spec.fade_in_time > 0.0 && t_norm < spec.fade_in_time {
                     alpha *= t_norm / spec.fade_in_time;
                 }
@@ -1748,16 +1862,17 @@ impl Emitter {
                     alpha *= (1.0 - t_norm) / (1.0 - spec.fade_out_time).max(1e-4);
                 }
 
-                let mut size_mult = 1.0f32;
+                let mut size_mult = size_mult_ov;
                 if let Some((st, et, sv, ev)) = spec.size_change {
-                    if t_norm <= st {
-                        size_mult = sv;
+                    let s = if t_norm <= st {
+                        sv
                     } else if t_norm >= et {
-                        size_mult = ev;
+                        ev
                     } else {
                         let u = (t_norm - st) / (et - st).max(1e-4);
-                        size_mult = sv + u * (ev - sv);
-                    }
+                        sv + u * (ev - sv)
+                    };
+                    size_mult *= s;
                 }
 
                 let world_pos = spec.transform.apply([p.x, p.y]);
@@ -1828,9 +1943,9 @@ impl Emitter {
                     axis_x[1],
                     axis_y[0],
                     axis_y[1],
-                    p.color[0],
-                    p.color[1],
-                    p.color[2],
+                    p.color[0] * brightness_mult,
+                    p.color[1] * brightness_mult,
+                    p.color[2] * brightness_mult,
                     alpha.clamp(0.0, 1.0),
                     uv_rect[0],
                     uv_rect[1],
@@ -1843,7 +1958,10 @@ impl Emitter {
 
         let sx = self.spread[0].max(1.0);
         let sy = self.spread[1].max(1.0);
-        for p in &mut self.particles {
+        let active_limit = ((self.particles.len() as f32) * self.live_rate_mult * self.live_count_mult)
+            .round()
+            .clamp(0.0, self.particles.len() as f32) as usize;
+        for p in self.particles.iter_mut().take(active_limit) {
             match self.kind {
                 ParticleKind::Snow => {
                     p.x += (p.vx + (time * 1.3 + p.phase).sin() * 0.08) * dtc;
@@ -1897,8 +2015,8 @@ impl Emitter {
                 _ => (p.size * ortho[1], p.size * ortho[1]),
             };
             let (s, c) = p.rot.sin_cos();
-            let hw = w * 0.5;
-            let hh = h * 0.5;
+            let hw = w * 0.5 * size_mult_ov;
+            let hh = h * 0.5 * size_mult_ov;
             out.extend_from_slice(&[
                 world_x,
                 world_y,
@@ -1906,10 +2024,10 @@ impl Emitter {
                 s * hw,
                 -s * hh,
                 c * hh,
-                p.color[0],
-                p.color[1],
-                p.color[2],
-                (p.alpha * twinkle).clamp(0.0, 1.0),
+                p.color[0] * brightness_mult,
+                p.color[1] * brightness_mult,
+                p.color[2] * brightness_mult,
+                (p.alpha * twinkle * alpha_mult).clamp(0.0, 1.0),
                 0.0,
                 0.0,
                 1.0,
@@ -1986,12 +2104,23 @@ struct TextLayer {
     raster_ppw: f32,
 }
 
+/// Per-layer authored/scripted metadata parallel to `PuppetAnimLayer`.
+struct PuppetLayerMeta {
+    visible_raw: Option<serde_json::Value>,
+    script_visible: Option<bool>,
+    blend_track: Option<KeyTrack>,
+    script_blend: Option<f32>,
+    rate_track: Option<KeyTrack>,
+    script_rate: Option<f32>,
+}
+
 enum ObjectKind {
     Image(glow::Texture),
     Puppet {
         mesh: Mesh,
         mdl: ParsedMdl,
         anim_layers: Vec<PuppetAnimLayer>,
+        anim_meta: Vec<PuppetLayerMeta>,
         texture: glow::Texture,
         tex_size: [u32; 2],
         bounds: ([f32; 2], [f32; 2]),
@@ -2046,6 +2175,8 @@ struct SceneObject {
     script_visible: Option<bool>,
     /// Persistent text produced by a `text` SceneScript (or side-effect write).
     script_text_override: Option<String>,
+    /// Explicit spritesheet frame set by `thisLayer.getTextureAnimation()`.
+    script_sprite_frame: Option<u32>,
 }
 
 /// A layer that follows a bone of its parent puppet, possibly animated.
@@ -2063,96 +2194,6 @@ struct AttachPoint {
 // ---------------------------------------------------------------------------
 // Object property animation (keyframes + simple time scripts)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct KeyTrack {
-    fps: f32,
-    length: f32,
-    mode: u8, // 0 loop, 1 mirror, 2 single
-    relative: bool,
-    curves: Vec<Vec<(f32, f32)>>,
-}
-
-impl KeyTrack {
-    fn parse(v: &serde_json::Value) -> Option<Self> {
-        let anim = v.get("animation")?.as_object()?;
-        let opts = anim.get("options").and_then(|o| o.as_object());
-        let fps = opts.and_then(|o| o.get("fps")).and_then(value_f32).unwrap_or(30.0).max(1.0);
-        let length = opts.and_then(|o| o.get("length")).and_then(value_f32).unwrap_or(60.0).max(1.0);
-        let mode = match opts.and_then(|o| o.get("mode")).and_then(|m| m.as_str()) {
-            Some("mirror") => 1,
-            Some("single") => 2,
-            _ => 0,
-        };
-        let relative = anim.get("relative").and_then(value_bool).unwrap_or(false);
-        let mut curves = Vec::new();
-        for key in ["c0", "c1", "c2"] {
-            let mut pts: Vec<(f32, f32)> = anim
-                .get(key)
-                .and_then(|c| c.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|k| Some((k.get("frame").and_then(value_f32)?, k.get("value").and_then(value_f32)?)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if pts.is_empty() {
-                break;
-            }
-            pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            curves.push(pts);
-        }
-        if curves.is_empty() {
-            return None;
-        }
-        Some(Self { fps, length, mode, relative, curves })
-    }
-
-    fn eval(&self, time: f32) -> [f32; 3] {
-        let raw = time * self.fps;
-        let frame = match self.mode {
-            1 => {
-                let period = self.length * 2.0;
-                let m = raw.rem_euclid(period);
-                if m > self.length { period - m } else { m }
-            }
-            2 => raw.clamp(0.0, self.length),
-            _ => raw.rem_euclid(self.length),
-        };
-        let mut out = [0.0f32; 3];
-        for (i, pts) in self.curves.iter().enumerate().take(3) {
-            out[i] = if frame <= pts[0].0 {
-                pts[0].1
-            } else {
-                let mut v = pts.last().map(|p| p.1).unwrap_or(0.0);
-                for w in pts.windows(2) {
-                    let ((f0, v0), (f1, v1)) = (w[0], w[1]);
-                    if frame <= f1 {
-                        let t = ((frame - f0) / (f1 - f0).max(1e-5)).clamp(0.0, 1.0);
-                        let s = t * t * (3.0 - 2.0 * t);
-                        v = v0 + (v1 - v0) * s;
-                        break;
-                    }
-                }
-                v
-            };
-        }
-        if self.curves.len() == 1 {
-            out[1] = out[0];
-            out[2] = out[0];
-        }
-        out
-    }
-
-    fn apply(&self, base: [f32; 3], time: f32) -> [f32; 3] {
-        let v = self.eval(time);
-        if self.relative {
-            [base[0] + v[0], base[1] + v[1], base[2] + v[2]]
-        } else {
-            v
-        }
-    }
-}
 
 /// Tiny evaluator for common time-driven property scripts (clock hands,
 /// second progress bars, continuous spin, and wave oscillations).
@@ -2336,9 +2377,61 @@ impl ObjAnim {
         any.then(|| Box::new(a))
     }
 
+    fn track(&self, field: ScriptField) -> Option<&KeyTrack> {
+        match field {
+            ScriptField::Origin => self.origin_track.as_ref(),
+            ScriptField::Scale => self.scale_track.as_ref(),
+            ScriptField::Angles => self.angles_track.as_ref(),
+            ScriptField::Alpha => self.alpha_track.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn track_mut(&mut self, field: ScriptField) -> Option<&mut KeyTrack> {
+        match field {
+            ScriptField::Origin => self.origin_track.as_mut(),
+            ScriptField::Scale => self.scale_track.as_mut(),
+            ScriptField::Angles => self.angles_track.as_mut(),
+            ScriptField::Alpha => self.alpha_track.as_mut(),
+            _ => None,
+        }
+    }
+
+    fn preserve_playback_from(&mut self, prev: &ObjAnim) {
+        if let (Some(n), Some(p)) = (&mut self.origin_track, &prev.origin_track) {
+            n.preserve_playback_from(p);
+        }
+        if let (Some(n), Some(p)) = (&mut self.scale_track, &prev.scale_track) {
+            n.preserve_playback_from(p);
+        }
+        if let (Some(n), Some(p)) = (&mut self.angles_track, &prev.angles_track) {
+            n.preserve_playback_from(p);
+        }
+        if let (Some(n), Some(p)) = (&mut self.alpha_track, &prev.alpha_track) {
+            n.preserve_playback_from(p);
+        }
+    }
+
+    fn advance_tracks(&mut self, dt: f32) {
+        if let Some(t) = &mut self.origin_track {
+            t.advance(dt);
+        }
+        if let Some(t) = &mut self.scale_track {
+            t.advance(dt);
+        }
+        if let Some(t) = &mut self.angles_track {
+            t.advance(dt);
+        }
+        if let Some(t) = &mut self.alpha_track {
+            t.advance(dt);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn apply_to_parts(
-        &self,
+        &mut self,
         parts: &mut ([f32; 3], [f32; 3], [f32; 3]),
+        dt: f32,
         time: f32,
         daytime: f32,
         now: text::LocalTime,
@@ -2347,8 +2440,9 @@ impl ObjAnim {
         skip_angles_script: bool,
     ) -> (bool, Option<f32>) {
         let mut changed = false;
-        if let Some(t) = &self.origin_track {
-            parts.0 = t.apply(self.origin, time);
+        if let Some(t) = &mut self.origin_track {
+            t.advance(dt);
+            parts.0 = t.apply3(self.origin);
             changed = true;
         } else if !skip_origin_script {
             if let Some(s) = &self.origin_script {
@@ -2356,8 +2450,9 @@ impl ObjAnim {
                 changed = true;
             }
         }
-        if let Some(t) = &self.scale_track {
-            parts.1 = t.apply(self.scale, time);
+        if let Some(t) = &mut self.scale_track {
+            t.advance(dt);
+            parts.1 = t.apply3(self.scale);
             changed = true;
         } else if !skip_scale_script {
             if let Some(s) = &self.scale_script {
@@ -2365,8 +2460,9 @@ impl ObjAnim {
                 changed = true;
             }
         }
-        if let Some(t) = &self.angles_track {
-            parts.2 = t.apply(self.angles, time);
+        if let Some(t) = &mut self.angles_track {
+            t.advance(dt);
+            parts.2 = t.apply3(self.angles);
             changed = true;
         } else if !skip_angles_script {
             if let Some(s) = &self.angles_script {
@@ -2376,10 +2472,10 @@ impl ObjAnim {
                 changed = true;
             }
         }
-        let alpha = self
-            .alpha_track
-            .as_ref()
-            .map(|t| t.apply([self.base_alpha; 3], time)[0].clamp(0.0, 1.0));
+        let alpha = self.alpha_track.as_mut().map(|t| {
+            t.advance(dt);
+            t.apply3([self.base_alpha; 3])[0].clamp(0.0, 1.0)
+        });
         (changed, alpha)
     }
 }
@@ -2487,8 +2583,12 @@ impl SceneObject {
         let frames = ss.frames.max(1);
         let cols = ss.cols.max(1);
         let rows = ss.rows.max(1);
-        let t = (time / ss.duration.max(0.01)).rem_euclid(1.0);
-        let idx = ((t * frames as f32) as u32).min(frames - 1);
+        let idx = if let Some(f) = self.script_sprite_frame {
+            f % frames
+        } else {
+            let t = (time / ss.duration.max(0.01)).rem_euclid(1.0);
+            ((t * frames as f32) as u32).min(frames - 1)
+        };
         let (us, vs) = (1.0 / cols as f32, 1.0 / rows as f32);
         [(idx % cols) as f32 * us, (idx / cols) as f32 * vs, us, vs]
     }
@@ -3159,6 +3259,7 @@ impl SceneRenderer {
                     local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
                     script_text_override: None,
+                    script_sprite_frame: None,
                 });
                 continue;
             }
@@ -3201,6 +3302,7 @@ impl SceneRenderer {
                         local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                         script_visible: None,
                         script_text_override: None,
+                        script_sprite_frame: None,
                     });
                 }
                 continue;
@@ -3243,6 +3345,7 @@ impl SceneRenderer {
                     local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
                     script_text_override: None,
+                    script_sprite_frame: None,
                 });
                 continue;
             }
@@ -3291,6 +3394,7 @@ impl SceneRenderer {
                     local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
                     script_text_override: None,
+                    script_sprite_frame: None,
                 });
                 continue;
             }
@@ -3330,6 +3434,7 @@ impl SceneRenderer {
                     local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
                     script_text_override: None,
+                    script_sprite_frame: None,
                 });
                 continue;
             }
@@ -3460,6 +3565,7 @@ impl SceneRenderer {
                     local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
                     script_text_override: None,
+                    script_sprite_frame: None,
                 });
                 continue;
             }
@@ -3499,41 +3605,76 @@ impl SceneRenderer {
                                 default_size[1].max(sym_bounds[1]),
                             ];
                         }
-                        let anim_layers: Vec<PuppetAnimLayer> = obj
-                            .get("animationlayers")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|layer| {
-                                        let vis = parse_visible(
-                                            layer.get("visible"),
-                                            &self.properties,
-                                            now,
-                                        )
-                                        .eval(&self.properties);
-                                        if !vis {
-                                            return None;
-                                        }
-                                        let anim_id = layer
-                                            .get("animation")
-                                            .and_then(|v| v.as_i64())
-                                            .map(|v| v as u32);
-                                        let rate = layer.get("rate").and_then(value_f32).unwrap_or(1.0);
-                                        let blend = layer.get("blend").and_then(value_f32).unwrap_or(1.0);
-                                        let additive = layer
-                                            .get("additive")
-                                            .and_then(value_bool)
-                                            .unwrap_or(false);
-                                        Some(PuppetAnimLayer {
-                                            anim_id,
-                                            rate,
-                                            blend,
-                                            additive,
-                                        })
+                        let mut anim_layers = Vec::new();
+                        let mut anim_meta = Vec::new();
+                        if let Some(arr) = obj.get("animationlayers").and_then(|v| v.as_array()) {
+                            for (layer_idx, layer) in arr.iter().enumerate() {
+                                let vis = parse_visible(
+                                    layer.get("visible"),
+                                    &self.properties,
+                                    now,
+                                )
+                                .eval(&self.properties);
+                                let anim_id = layer
+                                    .get("animation")
+                                    .and_then(|v| v.as_i64())
+                                    .map(|v| v as u32);
+                                let blend_track = layer.get("blend").and_then(KeyTrack::parse);
+                                let rate_track = layer.get("rate").and_then(KeyTrack::parse);
+                                let blend = blend_track
+                                    .as_ref()
+                                    .map(|t| t.eval()[0])
+                                    .unwrap_or_else(|| {
+                                        layer
+                                            .get("blend")
+                                            .map(|v| resolve_prop(v, &self.properties))
+                                            .as_ref()
+                                            .and_then(value_f32)
+                                            .unwrap_or(1.0)
                                     })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                                    .clamp(0.0, 1.0);
+                                let rate = rate_track
+                                    .as_ref()
+                                    .map(|t| t.eval()[0])
+                                    .unwrap_or_else(|| {
+                                        layer
+                                            .get("rate")
+                                            .map(|v| resolve_prop(v, &self.properties))
+                                            .as_ref()
+                                            .and_then(value_f32)
+                                            .unwrap_or(1.0)
+                                    });
+                                let additive = layer
+                                    .get("additive")
+                                    .and_then(value_bool)
+                                    .unwrap_or(false);
+                                anim_layers.push(PuppetAnimLayer {
+                                    scene_idx: layer_idx,
+                                    id: layer.get("id").and_then(|v| v.as_i64()),
+                                    name: layer
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    anim_id,
+                                    visible: vis,
+                                    rate,
+                                    blend,
+                                    additive,
+                                    playing: true,
+                                    frame: 0.0,
+                                    mirror_reverse: false,
+                                });
+                                anim_meta.push(PuppetLayerMeta {
+                                    visible_raw: layer.get("visible").cloned(),
+                                    script_visible: None,
+                                    blend_track,
+                                    script_blend: None,
+                                    rate_track,
+                                    script_rate: None,
+                                });
+                            }
+                        }
                         if parsed.has_animations() {
                             parsed.vertices = parsed.evaluate_vertices(0.0, &anim_layers);
                         }
@@ -3543,6 +3684,7 @@ impl SceneRenderer {
                                 bounds: mdl_bounds(&parsed.vertices),
                                 mdl: parsed,
                                 anim_layers,
+                                anim_meta,
                                 texture,
                                 tex_size: [tex_w, tex_h],
                             },
@@ -3610,6 +3752,7 @@ impl SceneRenderer {
                 local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                 script_visible: None,
                 script_text_override: None,
+                script_sprite_frame: None,
             });
         }
 
@@ -3664,6 +3807,7 @@ impl SceneRenderer {
                 local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                 script_visible: None,
                 script_text_override: None,
+                script_sprite_frame: None,
             });
         }
 
@@ -3891,8 +4035,24 @@ impl SceneRenderer {
         for obj in self.objects.iter_mut() {
             obj.script_visible = None;
             obj.script_text_override = None;
+            obj.script_sprite_frame = None;
             for eff in &mut obj.effects {
                 eff.clear_script_state();
+            }
+            match &mut obj.kind {
+                ObjectKind::Puppet { anim_meta, .. } => {
+                    for meta in anim_meta {
+                        meta.script_visible = None;
+                        meta.script_blend = None;
+                        meta.script_rate = None;
+                    }
+                }
+                ObjectKind::Particle(pidx) => {
+                    if let Some(em) = self.emitters.get_mut(*pidx) {
+                        em.reset_script_overrides();
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -3979,6 +4139,19 @@ impl SceneRenderer {
                 _ => String::new(),
             };
             let parent = obj.raw_obj.get("parent").and_then(parent_id);
+            let tex_anim = obj.sprite.map(|ss| TexAnimSeed {
+                frames: ss.frames.max(1),
+                duration: ss.duration.max(0.01),
+            });
+            let video_tex = match &obj.kind {
+                ObjectKind::Image(tex) => self.textures.video_by_texture(*tex).map(|vt| VideoTexSeed {
+                    duration: vt.duration() as f32,
+                    current_time: vt.current_time() as f32,
+                    playing: !vt.is_script_paused(),
+                    rate: vt.playback_rate(),
+                }),
+                _ => None,
+            };
             host.add_layer(&LayerSeed {
                 id,
                 name: obj.name.clone(),
@@ -3997,6 +4170,8 @@ impl SceneRenderer {
                 align: obj.align,
                 text,
                 parent,
+                tex_anim,
+                video_tex,
             });
             for eff in &obj.effects {
                 let raw_eff = obj
@@ -4022,6 +4197,50 @@ impl SceneRenderer {
                     name: eff.name.clone(),
                     visible: eff_vis,
                 });
+            }
+            if let ObjectKind::Puppet {
+                mdl, anim_layers, ..
+            } = &obj.kind
+            {
+                let raw_als = obj
+                    .raw_obj
+                    .get("animationlayers")
+                    .and_then(|v| v.as_array());
+                for al in anim_layers {
+                    let raw_al = raw_als.and_then(|arr| arr.get(al.scene_idx));
+                    let vis_has_script = raw_al
+                        .and_then(|ra| ra.get("visible"))
+                        .and_then(|v| v.get("script"))
+                        .and_then(|s| s.as_str())
+                        .is_some();
+                    let al_vis = if vis_has_script {
+                        raw_bool_field(raw_al.and_then(|ra| ra.get("visible")), &self.properties)
+                    } else {
+                        al.visible
+                    };
+                    let (frame_count, fps, duration, mode) = match mdl.find_anim(al.anim_id) {
+                        Some(anim) => {
+                            let fc = mdl.anim_frame_count(anim) as u32;
+                            let fps = anim.fps.max(1.0);
+                            let dur = (fc.saturating_sub(1) as f32) / fps;
+                            (fc, fps, dur, anim.mode.as_str())
+                        }
+                        None => (1, 30.0, 0.0, "loop"),
+                    };
+                    host.add_anim_layer(&AnimLayerSeed {
+                        layer_id: id,
+                        anim_layer_idx: al.scene_idx,
+                        id: al.id,
+                        name: al.name.clone(),
+                        visible: al_vis,
+                        blend: al.blend,
+                        rate: al.rate,
+                        frame_count,
+                        fps,
+                        duration,
+                        mode,
+                    });
+                }
             }
             // Any registered object can be mutated via side effects (`getLayer`, `enumerateLayers`).
             self.script_ids.insert(id, idx);
@@ -4070,7 +4289,19 @@ impl SceneRenderer {
                     continue;
                 };
                 let (initial, script_props) = field_script_defaults(field, v, &self.properties);
-                let bidx = host.add_property_script(id, field, script, initial, &script_props);
+                let prop_anim = obj
+                    .anim
+                    .as_deref()
+                    .and_then(|a| a.track(field))
+                    .map(PropAnimSeed::from_track);
+                let bidx = host.add_property_script(
+                    id,
+                    field,
+                    script,
+                    initial,
+                    &script_props,
+                    prop_anim.as_ref(),
+                );
                 if let Some(raw_sp) = v.get("scriptproperties").and_then(|p| p.as_object()) {
                     if !raw_sp.is_empty() {
                         self.script_binding_props.push((bidx, raw_sp.clone()));
@@ -4132,6 +4363,9 @@ impl SceneRenderer {
                                 };
                                 let raw_sp = cv.get("scriptproperties").and_then(|p| p.as_object());
                                 let script_props = resolve_script_props(raw_sp, &self.properties);
+                                let prop_anim = eff
+                                    .constant_track(pass_idx, ck)
+                                    .map(PropAnimSeed::from_track);
                                 let bidx = host.add_effect_constant_script(
                                     id,
                                     eff.scene_idx,
@@ -4140,6 +4374,7 @@ impl SceneRenderer {
                                     script,
                                     initial,
                                     &script_props,
+                                    prop_anim.as_ref(),
                                 );
                                 if let Some(sp) = raw_sp {
                                     if !sp.is_empty() {
@@ -4151,6 +4386,87 @@ impl SceneRenderer {
                             }
                         }
                     }
+                }
+            }
+            if let (ObjectKind::Puppet { anim_layers, .. }, Some(raw_als)) = (
+                &obj.kind,
+                raw.get("animationlayers").and_then(|v| v.as_array()),
+            ) {
+                for al in anim_layers {
+                    let Some(raw_al) = raw_als.get(al.scene_idx) else {
+                        continue;
+                    };
+                    for (field, key) in [
+                        (AnimLayerField::Visible, "visible"),
+                        (AnimLayerField::Blend, "blend"),
+                        (AnimLayerField::Rate, "rate"),
+                    ] {
+                        let Some(v) = raw_al.get(key) else {
+                            continue;
+                        };
+                        let Some(script) = v.get("script").and_then(|s| s.as_str()) else {
+                            continue;
+                        };
+                        let initial = match field {
+                            AnimLayerField::Visible => {
+                                serde_json::Value::Bool(raw_bool_field(Some(v), &self.properties))
+                            }
+                            AnimLayerField::Blend => serde_json::Value::from(
+                                value_f32(&resolve_prop(v, &self.properties)).unwrap_or(al.blend),
+                            ),
+                            AnimLayerField::Rate => serde_json::Value::from(
+                                value_f32(&resolve_prop(v, &self.properties)).unwrap_or(al.rate),
+                            ),
+                        };
+                        let raw_sp = v.get("scriptproperties").and_then(|p| p.as_object());
+                        let script_props = resolve_script_props(raw_sp, &self.properties);
+                        let bidx = host.add_anim_layer_script(
+                            id,
+                            al.scene_idx,
+                            field,
+                            script,
+                            initial,
+                            &script_props,
+                            None,
+                        );
+                        if let Some(sp) = raw_sp {
+                            if !sp.is_empty() {
+                                self.script_binding_props.push((bidx, sp.clone()));
+                            }
+                        }
+                        bindings += 1;
+                        has = true;
+                    }
+                }
+            }
+            if let Some(inst) = raw.get("instanceoverride").and_then(|v| v.as_object()) {
+                for (ok, ov) in inst {
+                    let Some(script) = ov.get("script").and_then(|s| s.as_str()) else {
+                        continue;
+                    };
+                    let key_lower = ok.to_ascii_lowercase();
+                    let initial = if ov.get("user").is_some() {
+                        let r = resolve_prop(ov, &self.properties);
+                        r.get("value").cloned().unwrap_or(r)
+                    } else if let Some(v) = ov.get("value") {
+                        let r = resolve_prop(v, &self.properties);
+                        r.get("value").cloned().unwrap_or(r)
+                    } else if matches!(key_lower.as_str(), "color" | "colorn") {
+                        serde_json::json!([1.0, 1.0, 1.0])
+                    } else {
+                        serde_json::json!(1.0)
+                    };
+                    let raw_sp = ov.get("scriptproperties").and_then(|p| p.as_object());
+                    let script_props = resolve_script_props(raw_sp, &self.properties);
+                    let bidx =
+                        host.add_instance_override_script(id, ok, script, initial, &script_props);
+                    if let Some(sp) = raw_sp {
+                        if !sp.is_empty() {
+                            self.script_binding_props.push((bidx, sp.clone()));
+                        }
+                    }
+                    bindings += 1;
+                    has = true;
                 }
             }
             if has {
@@ -4255,6 +4571,185 @@ impl SceneRenderer {
                         eff.set_script_constant(pass_idx, &key, out.value);
                     }
                 }
+                ScriptTarget::LayerAnimControl { id, field } => {
+                    let Some(&idx) = self.script_ids.get(&id) else {
+                        continue;
+                    };
+                    let obj = &mut self.objects[idx];
+                    if let Some(anim) = obj.anim.as_deref_mut() {
+                        let (base_origin, base_scale, base_angles, base_alpha) =
+                            (anim.origin, anim.scale, anim.angles, anim.base_alpha);
+                        if let Some(track) = anim.track_mut(field) {
+                            apply_keytrack_ctrl(track, &out.value);
+                            match field {
+                                ScriptField::Origin => {
+                                    obj.local_parts.0 = track.apply3(base_origin);
+                                    transforms_dirty = true;
+                                }
+                                ScriptField::Scale => {
+                                    obj.local_parts.1 = track.apply3(base_scale);
+                                    transforms_dirty = true;
+                                }
+                                ScriptField::Angles => {
+                                    obj.local_parts.2 = track.apply3(base_angles);
+                                    transforms_dirty = true;
+                                }
+                                ScriptField::Alpha => {
+                                    obj.color[3] =
+                                        track.apply3([base_alpha; 3])[0].clamp(0.0, 1.0);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                ScriptTarget::EffectConstAnimControl {
+                    layer_id,
+                    effect_idx,
+                    pass_idx,
+                    key,
+                } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let Some(eff) = self.objects[idx]
+                        .effects
+                        .iter_mut()
+                        .find(|e| e.scene_idx == effect_idx)
+                    {
+                        if let Some(track) = eff.constant_track_mut(pass_idx, &key) {
+                            apply_keytrack_ctrl(track, &out.value);
+                        }
+                    }
+                }
+                ScriptTarget::TextureAnimation { layer_id } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let Some(f) = out.value.get("frame").and_then(|v| v.as_f64()) {
+                        self.objects[idx].script_sprite_frame = Some(f.max(0.0) as u32);
+                    }
+                }
+                ScriptTarget::VideoTexture { layer_id } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let ObjectKind::Image(tex) = self.objects[idx].kind {
+                        if let Some(vt) = self.textures.video_by_texture_mut(tex) {
+                            if let Some(playing) =
+                                out.value.get("playing").and_then(|v| v.as_bool())
+                            {
+                                vt.set_script_paused(!playing);
+                            }
+                            if let Some(rate) = out.value.get("rate").and_then(|v| v.as_f64()) {
+                                vt.set_playback_rate(rate as f32);
+                            }
+                            if let Some(seek) = out.value.get("seek").and_then(|v| v.as_f64()) {
+                                vt.set_current_time(seek);
+                            }
+                        }
+                    }
+                }
+                ScriptTarget::PuppetAnimLayerField {
+                    layer_id,
+                    anim_layer_idx,
+                    field,
+                } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let ObjectKind::Puppet {
+                        anim_layers,
+                        anim_meta,
+                        ..
+                    } = &mut self.objects[idx].kind
+                    {
+                        if let Some(pos) = anim_layers
+                            .iter()
+                            .position(|l| l.scene_idx == anim_layer_idx)
+                        {
+                            match field {
+                                AnimLayerField::Visible => {
+                                    let v = out.value.as_bool().unwrap_or(true);
+                                    anim_meta[pos].script_visible = Some(v);
+                                    anim_layers[pos].visible = v;
+                                }
+                                AnimLayerField::Blend => {
+                                    let b =
+                                        (out.value.as_f64().unwrap_or(1.0) as f32).clamp(0.0, 1.0);
+                                    anim_meta[pos].script_blend = Some(b);
+                                    anim_layers[pos].blend = b;
+                                }
+                                AnimLayerField::Rate => {
+                                    let r = out.value.as_f64().unwrap_or(1.0) as f32;
+                                    if r.is_finite() {
+                                        anim_meta[pos].script_rate = Some(r);
+                                        anim_layers[pos].rate = r;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ScriptTarget::PuppetAnimLayerControl {
+                    layer_id,
+                    anim_layer_idx,
+                } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let ObjectKind::Puppet {
+                        mdl,
+                        anim_layers,
+                        anim_meta,
+                        ..
+                    } = &mut self.objects[idx].kind
+                    {
+                        if let Some(pos) = anim_layers
+                            .iter()
+                            .position(|l| l.scene_idx == anim_layer_idx)
+                        {
+                            let al = &mut anim_layers[pos];
+                            if let Some(playing) =
+                                out.value.get("playing").and_then(|v| v.as_bool())
+                            {
+                                al.playing = playing;
+                            }
+                            if let Some(frame) = out.value.get("frame").and_then(|v| v.as_f64()) {
+                                let max_idx = mdl
+                                    .find_anim(al.anim_id)
+                                    .map(|a| mdl.anim_frame_count(a).saturating_sub(1) as f32)
+                                    .unwrap_or(0.0);
+                                al.frame = (frame as f32).clamp(0.0, max_idx.max(0.0));
+                            }
+                            if let Some(mr) =
+                                out.value.get("mirrorReverse").and_then(|v| v.as_bool())
+                            {
+                                al.mirror_reverse = mr;
+                            }
+                            if anim_meta[pos].rate_track.is_none()
+                                && anim_meta[pos].script_rate.is_none()
+                            {
+                                if let Some(rate) = out.value.get("rate").and_then(|v| v.as_f64()) {
+                                    let r = rate as f32;
+                                    if r.is_finite() {
+                                        al.rate = r;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ScriptTarget::InstanceOverride { layer_id, key } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let ObjectKind::Particle(pidx) = self.objects[idx].kind {
+                        if let Some(em) = self.emitters.get_mut(pidx) {
+                            em.update_instance_override(&key, &out.value);
+                        }
+                    }
+                }
             }
         }
         if transforms_dirty {
@@ -4293,6 +4788,13 @@ impl SceneRenderer {
                     .unwrap_or_else(|| layer.evaluate(props, now)),
                 _ => obj.script_text_override.clone().unwrap_or_default(),
             };
+            let video_time = match &obj.kind {
+                ObjectKind::Image(tex) => self
+                    .textures
+                    .video_by_texture(*tex)
+                    .map(|vt| (vt.current_time() as f32, vt.duration() as f32)),
+                _ => None,
+            };
             self.script_frames.push(LayerFrame {
                 id,
                 visible,
@@ -4306,6 +4808,7 @@ impl SceneRenderer {
                 ],
                 color,
                 text,
+                video_time,
             });
         }
 
@@ -4633,6 +5136,7 @@ impl SceneRenderer {
                 ),
                 script_visible: None,
                 script_text_override: None,
+                script_sprite_frame: None,
             });
         }
         for p in doc.particles {
@@ -4672,6 +5176,7 @@ impl SceneRenderer {
                 local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                 script_visible: None,
                 script_text_override: None,
+                script_sprite_frame: None,
             });
         }
         Ok(())
@@ -4909,14 +5414,26 @@ impl SceneRenderer {
                 }
                 ObjectKind::Particle(idx) => {
                     obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
-                    if let Some(color_mult) = raw
-                        .get("instanceoverride")
-                        .and_then(|o| o.get("colorn").or_else(|| o.get("color")))
-                        .or_else(|| raw.get("color"))
-                        .map(|c| parse_color(&resolve_prop(c, &self.properties), [1.0, 1.0, 1.0]))
-                    {
-                        if let Some(em) = self.emitters.get_mut(*idx) {
-                            em.update_color_mult(color_mult);
+                    let color_scripted = self.scripts.is_some()
+                        && raw.get("instanceoverride").is_some_and(|io| {
+                            io.get("colorn")
+                                .or_else(|| io.get("color"))
+                                .and_then(|v| v.get("script"))
+                                .and_then(|s| s.as_str())
+                                .is_some()
+                        });
+                    if !color_scripted {
+                        if let Some(color_mult) = raw
+                            .get("instanceoverride")
+                            .and_then(|o| o.get("colorn").or_else(|| o.get("color")))
+                            .or_else(|| raw.get("color"))
+                            .map(|c| {
+                                parse_color(&resolve_prop(c, &self.properties), [1.0, 1.0, 1.0])
+                            })
+                        {
+                            if let Some(em) = self.emitters.get_mut(*idx) {
+                                em.update_color_mult(color_mult);
+                            }
                         }
                     }
                 }
@@ -4942,10 +5459,7 @@ impl SceneRenderer {
                         layer.raster_ppw = -1.0;
                     }
                 }
-                ObjectKind::Image(_)
-                | ObjectKind::Puppet { .. }
-                | ObjectKind::Solid
-                | ObjectKind::CompositeRef(_) => {
+                ObjectKind::Image(_) | ObjectKind::Solid | ObjectKind::CompositeRef(_) => {
                     if !has_binding(obj_id, ScriptField::Color) {
                         let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
                         obj.color[0] = c[0];
@@ -4956,6 +5470,51 @@ impl SceneRenderer {
                     obj.brightness =
                         eval_brightness_field(raw.get("brightness"), &self.properties, 1.0);
                     obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
+                }
+                ObjectKind::Puppet {
+                    anim_layers,
+                    anim_meta,
+                    ..
+                } => {
+                    if !has_binding(obj_id, ScriptField::Color) {
+                        let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
+                        obj.color[0] = c[0];
+                        obj.color[1] = c[1];
+                        obj.color[2] = c[2];
+                    }
+                    obj.color[3] = alpha;
+                    obj.brightness =
+                        eval_brightness_field(raw.get("brightness"), &self.properties, 1.0);
+                    obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
+                    if let Some(raw_als) = raw.get("animationlayers").and_then(|v| v.as_array()) {
+                        for (al, meta) in anim_layers.iter_mut().zip(anim_meta.iter()) {
+                            let Some(raw_al) = raw_als.get(al.scene_idx) else {
+                                continue;
+                            };
+                            if meta.script_visible.is_none() {
+                                al.visible =
+                                    parse_visible(meta.visible_raw.as_ref(), &self.properties, now)
+                                        .eval(&self.properties);
+                            }
+                            if meta.script_blend.is_none() && meta.blend_track.is_none() {
+                                al.blend = raw_al
+                                    .get("blend")
+                                    .map(|v| resolve_prop(v, &self.properties))
+                                    .as_ref()
+                                    .and_then(value_f32)
+                                    .unwrap_or(1.0)
+                                    .clamp(0.0, 1.0);
+                            }
+                            if meta.script_rate.is_none() && meta.rate_track.is_none() {
+                                al.rate = raw_al
+                                    .get("rate")
+                                    .map(|v| resolve_prop(v, &self.properties))
+                                    .as_ref()
+                                    .and_then(value_f32)
+                                    .unwrap_or(1.0);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -4996,7 +5555,8 @@ impl SceneRenderer {
                                 if scale[1] == 0.0 { 1.0 } else { scale[1] },
                             ));
                     } else if !matches!(obj.kind, ObjectKind::Post | ObjectKind::Particle(_)) {
-                        obj.anim = ObjAnim::parse(
+                        let prev_anim = obj.anim.take();
+                        let mut next_anim = ObjAnim::parse(
                             raw,
                             origin,
                             scale,
@@ -5004,6 +5564,10 @@ impl SceneRenderer {
                             &self.properties,
                             now,
                         );
+                        if let (Some(n), Some(p)) = (&mut next_anim, &prev_anim) {
+                            n.preserve_playback_from(p);
+                        }
+                        obj.anim = next_anim;
                     }
                 }
             }
@@ -5522,6 +6086,28 @@ impl TextLayer {
 // Loading helpers
 // ---------------------------------------------------------------------------
 
+fn apply_keytrack_ctrl(track: &mut KeyTrack, val: &serde_json::Value) {
+    let playing = val
+        .get("playing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(track.playing);
+    let frame = val
+        .get("frame")
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32)
+        .unwrap_or(track.frame);
+    let rate = val
+        .get("rate")
+        .and_then(|v| v.as_f64())
+        .map(|r| r as f32)
+        .unwrap_or(track.rate);
+    let mirror_reverse = val
+        .get("mirrorReverse")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(track.mirror_reverse);
+    track.apply_script_state(playing, frame, rate, mirror_reverse);
+}
+
 /// Normalise a Wallpaper Engine `parent` field to an object id.
 fn parent_id(v: &serde_json::Value) -> Option<i64> {
     v.as_i64()
@@ -5565,6 +6151,26 @@ fn visit_object_scripts(raw: &serde_json::Value, mut f: impl FnMut(&str)) {
                         }
                     }
                 }
+            }
+        }
+    }
+    if let Some(als) = raw.get("animationlayers").and_then(|a| a.as_array()) {
+        for al in als {
+            for key in ["visible", "blend", "rate"] {
+                if let Some(script) = al
+                    .get(key)
+                    .and_then(|v| v.get("script"))
+                    .and_then(|s| s.as_str())
+                {
+                    f(script);
+                }
+            }
+        }
+    }
+    if let Some(inst) = raw.get("instanceoverride").and_then(|o| o.as_object()) {
+        for ov in inst.values() {
+            if let Some(script) = ov.get("script").and_then(|s| s.as_str()) {
+                f(script);
             }
         }
     }
@@ -6010,7 +6616,42 @@ impl Renderer for SceneRenderer {
         {
             let mut transforms_dirty = false;
             for i in 0..self.objects.len() {
+                for eff in &mut self.objects[i].effects {
+                    eff.advance_animations(dt);
+                }
+                if let ObjectKind::Puppet {
+                    mdl,
+                    anim_layers,
+                    anim_meta,
+                    ..
+                } = &mut self.objects[i].kind
+                {
+                    let props = &self.properties;
+                    for (al, meta) in anim_layers.iter_mut().zip(anim_meta.iter_mut()) {
+                        al.visible = meta.script_visible.unwrap_or_else(|| {
+                            parse_visible(meta.visible_raw.as_ref(), props, now).eval(props)
+                        });
+                        if let Some(sb) = meta.script_blend {
+                            al.blend = sb;
+                        } else if let Some(track) = &mut meta.blend_track {
+                            track.advance(dt);
+                            al.blend = track.eval()[0].clamp(0.0, 1.0);
+                        }
+                        if let Some(sr) = meta.script_rate {
+                            al.rate = sr;
+                        } else if let Some(track) = &mut meta.rate_track {
+                            track.advance(dt);
+                            al.rate = track.eval()[0];
+                        }
+                    }
+                    if mdl.has_animations() {
+                        mdl.advance_layers(dt, anim_layers);
+                    }
+                }
                 if !self.is_obj_visible(i) && !self.objects[i].capture_composite {
+                    if let Some(anim) = &mut self.objects[i].anim {
+                        anim.advance_tracks(dt);
+                    }
                     continue;
                 }
                 let obj_id = self.objects[i].id;
@@ -6023,10 +6664,11 @@ impl Renderer for SceneRenderer {
                 let skip_scale = has_script(ScriptField::Scale);
                 let skip_angles = has_script(ScriptField::Angles);
                 let obj = &mut self.objects[i];
-                if let Some(anim) = &obj.anim {
+                if let Some(anim) = &mut obj.anim {
                     let mut parts = obj.local_parts;
                     let (changed, alpha) = anim.apply_to_parts(
                         &mut parts,
+                        dt,
                         time,
                         daytime,
                         now,
@@ -7371,7 +8013,7 @@ mod tests {
                 "script": "export function update(value) { value.z = engine.runtime * 20; return value; }"
             }
         });
-        let anim = ObjAnim::parse(
+        let mut anim = ObjAnim::parse(
             &raw,
             [0.0; 3],
             [1.0; 3],
@@ -7383,16 +8025,73 @@ mod tests {
 
         // When QuickJS owns `angles`, `apply_to_parts` leaves scripted parts untouched.
         let mut parts_owned = ([0.0; 3], [1.0; 3], [0.0, 0.0, 0.25]);
-        let (changed, _) = anim.apply_to_parts(&mut parts_owned, 2.0, 0.5, now, false, false, true);
+        let (changed, _) =
+            anim.apply_to_parts(&mut parts_owned, 0.016, 2.0, 0.5, now, false, false, true);
         assert!(!changed);
         assert!((parts_owned.2[2] - 0.25).abs() < 1e-6);
 
         // When QuickJS does NOT own `angles`, legacy PropScript still drives it.
         let mut parts_legacy = ([0.0; 3], [1.0; 3], [0.0; 3]);
         let (changed_legacy, _) =
-            anim.apply_to_parts(&mut parts_legacy, 2.0, 0.5, now, false, false, false);
+            anim.apply_to_parts(&mut parts_legacy, 0.016, 2.0, 0.5, now, false, false, false);
         assert!(changed_legacy);
         assert!((parts_legacy.2[2] - 40.0f32.to_radians()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn anim_layer_and_instance_override_scripts_discovered_and_startpaused_track_holds() {
+        let puppet_with_al_script = json!({
+            "id": 77,
+            "animationlayers": [
+                {
+                    "blend": {
+                        "script": "export function update() { return thisScene.getLayer('Controller').alpha; }"
+                    }
+                }
+            ]
+        });
+        assert!(object_has_script(&puppet_with_al_script));
+        assert_eq!(
+            layer_script_refs(&puppet_with_al_script),
+            vec!["Controller".to_string()]
+        );
+
+        let particle_with_io_script = json!({
+            "id": 88,
+            "instanceoverride": {
+                "rate": {
+                    "script": "export function update() { return thisScene.getLayer('Driver').scale.x; }"
+                }
+            }
+        });
+        assert!(object_has_script(&particle_with_io_script));
+        assert_eq!(
+            layer_script_refs(&particle_with_io_script),
+            vec!["Driver".to_string()]
+        );
+
+        let props = HashMap::new();
+        let now = sample_time(12, 0);
+        let paused_raw = json!({
+            "alpha": {
+                "animation": {
+                    "options": { "fps": 10, "length": 10, "mode": "single", "startpaused": true },
+                    "c0": [
+                        { "frame": 0, "value": 0.2, "front": { "enabled": false } },
+                        { "frame": 10, "value": 1.0, "back": { "enabled": false } }
+                    ]
+                }
+            }
+        });
+        let mut anim = ObjAnim::parse(&paused_raw, [0.0; 3], [1.0; 3], [0.0; 3], &props, now)
+            .expect("keytracked alpha parsed");
+        let mut parts = ([0.0; 3], [1.0; 3], [0.0; 3]);
+        let (_, a0) = anim.apply_to_parts(&mut parts, 0.5, 0.5, 0.5, now, false, false, false);
+        assert!((a0.unwrap() - 0.2).abs() < 1e-4, "paused track should hold initial value");
+
+        anim.track_mut(ScriptField::Alpha).unwrap().play();
+        let (_, a1) = anim.apply_to_parts(&mut parts, 0.5, 1.0, 0.5, now, false, false, false);
+        assert!((a1.unwrap() - 0.6).abs() < 1e-4, "playing track should advance to midpoint");
     }
 
     #[test]

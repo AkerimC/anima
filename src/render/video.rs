@@ -634,6 +634,8 @@ pub struct VideoTexture {
     h: i32,
     first_frame: bool,
     paused: bool,
+    script_paused: bool,
+    script_speed: f32,
     frames_drawn: u32,
     decoder_logged: bool,
     /// Dedicated Wayland connection handed to libva (`vaGetDisplayWl`), so its
@@ -687,6 +689,8 @@ impl VideoTexture {
             h,
             first_frame: true,
             paused: false,
+            script_paused: false,
+            script_speed: 1.0,
             frames_drawn: 0,
             decoder_logged: false,
             wl_display: ptr::null_mut(),
@@ -817,16 +821,86 @@ impl VideoTexture {
         (self.w as u32, self.h as u32)
     }
 
+    pub fn set_script_paused(&mut self, paused: bool) {
+        self.script_paused = paused;
+        if !self.handle.is_null() && paused != self.paused {
+            unsafe {
+                let _ = set_prop(self.handle, "pause", if paused { "yes" } else { "no" });
+            }
+            self.paused = paused;
+        }
+    }
+
+    pub fn is_script_paused(&self) -> bool {
+        self.script_paused
+    }
+
+    pub fn set_playback_rate(&mut self, rate: f32) {
+        let clamped = rate.clamp(0.05, 16.0);
+        if (clamped - self.script_speed).abs() > 1e-3 {
+            self.script_speed = clamped;
+            if !self.handle.is_null() {
+                unsafe {
+                    let _ = set_prop(self.handle, "speed", &format!("{clamped:.4}"));
+                }
+            }
+        }
+    }
+
+    pub fn playback_rate(&self) -> f32 {
+        self.script_speed
+    }
+
+    pub fn set_current_time(&mut self, secs: f64) {
+        let t = secs.max(0.0);
+        if !self.handle.is_null() && t.is_finite() {
+            unsafe {
+                let _ = set_prop(self.handle, "time-pos", &format!("{t:.4}"));
+            }
+        }
+    }
+
+    fn read_f64_prop(&self, prop: &str) -> f64 {
+        if self.handle.is_null() {
+            return 0.0;
+        }
+        unsafe {
+            let Ok(name) = CString::new(prop) else {
+                return 0.0;
+            };
+            let value = mpv_get_property_string(self.handle, name.as_ptr());
+            if value.is_null() {
+                return 0.0;
+            }
+            let parsed = cstr(value).trim().parse::<f64>().unwrap_or(0.0);
+            mpv_free(value as *mut c_void);
+            if parsed.is_finite() { parsed } else { 0.0 }
+        }
+    }
+
+    pub fn current_time(&self) -> f64 {
+        self.read_f64_prop("time-pos")
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.read_f64_prop("duration")
+    }
+
     /// Render the current frame into the texture.  Returns whether a new frame
     /// was drawn.
     pub fn update(&mut self, gl: &glow::Context, paused: bool) -> bool {
         if self.render_ctx.is_null() || self.handle.is_null() {
             return false;
         }
-        if paused != self.paused {
-            self.paused = paused;
+        let eff_paused = paused || self.script_paused;
+        if eff_paused != self.paused {
+            self.paused = eff_paused;
             unsafe {
-                let _ = set_prop(self.handle, "pause", if paused { "yes" } else { "no" });
+                let _ = set_prop(
+                    self.handle,
+                    "pause",
+                    if eff_paused { "yes" } else { "no" },
+                );
             }
         }
         if self.paused {

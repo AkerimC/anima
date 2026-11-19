@@ -56,6 +56,88 @@ impl ScriptField {
     }
 }
 
+/// Puppet animation layer fields that SceneScript may drive directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnimLayerField {
+    Visible,
+    Blend,
+    Rate,
+}
+
+impl AnimLayerField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnimLayerField::Visible => "visible",
+            AnimLayerField::Blend => "blend",
+            AnimLayerField::Rate => "rate",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "visible" => Some(Self::Visible),
+            "blend" => Some(Self::Blend),
+            "rate" => Some(Self::Rate),
+            _ => None,
+        }
+    }
+}
+
+/// Spritesheet / animated texture metadata exposed to `thisLayer.getTextureAnimation()`.
+#[derive(Debug, Clone, Copy)]
+pub struct TexAnimSeed {
+    pub frames: u32,
+    pub duration: f32,
+}
+
+/// Video texture metadata exposed to `thisLayer.getVideoTexture()`.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoTexSeed {
+    pub duration: f32,
+    pub current_time: f32,
+    pub playing: bool,
+    pub rate: f32,
+}
+
+/// Property keyframe track metadata exposed to `thisObject.getAnimation()`.
+#[derive(Debug, Clone)]
+pub struct PropAnimSeed {
+    pub name: String,
+    pub fps: f32,
+    pub length: f32,
+    pub mode: &'static str,
+    pub start_paused: bool,
+}
+
+impl PropAnimSeed {
+    pub fn from_track(t: &super::keytrack::KeyTrack) -> Self {
+        Self {
+            name: t.name.clone(),
+            fps: t.fps,
+            length: t.length,
+            mode: t.mode_str(),
+            start_paused: t.start_paused,
+        }
+    }
+}
+
+/// Puppet animation layer metadata exposed to `thisLayer.getAnimationLayer(...)`
+/// and `thisObject` in `animationlayers[]` scripts.
+#[derive(Debug, Clone)]
+pub struct AnimLayerSeed {
+    pub layer_id: i64,
+    pub anim_layer_idx: usize,
+    pub id: Option<i64>,
+    pub name: String,
+    pub visible: bool,
+    pub blend: f32,
+    pub rate: f32,
+    pub frame_count: u32,
+    pub fps: f32,
+    pub duration: f32,
+    pub mode: &'static str,
+}
+
 /// A layer as the scripts see it (`thisLayer` / `thisScene.getLayer()`).
 #[derive(Debug, Clone)]
 pub struct LayerSeed {
@@ -72,6 +154,8 @@ pub struct LayerSeed {
     pub align: [f32; 2],
     pub text: String,
     pub parent: Option<i64>,
+    pub tex_anim: Option<TexAnimSeed>,
+    pub video_tex: Option<VideoTexSeed>,
 }
 
 /// An effect instance as scripts see it (`thisObject` / `thisLayer.getEffect()`).
@@ -95,6 +179,7 @@ pub struct LayerFrame {
     pub angles: [f32; 3],
     pub color: [f32; 3],
     pub text: String,
+    pub video_time: Option<(f32, f32)>,
 }
 
 /// Destination property targeted by a [`ScriptOutput`].
@@ -112,6 +197,35 @@ pub enum ScriptTarget {
         layer_id: i64,
         effect_idx: usize,
         pass_idx: usize,
+        key: String,
+    },
+    LayerAnimControl {
+        id: i64,
+        field: ScriptField,
+    },
+    EffectConstAnimControl {
+        layer_id: i64,
+        effect_idx: usize,
+        pass_idx: usize,
+        key: String,
+    },
+    TextureAnimation {
+        layer_id: i64,
+    },
+    VideoTexture {
+        layer_id: i64,
+    },
+    PuppetAnimLayerField {
+        layer_id: i64,
+        anim_layer_idx: usize,
+        field: AnimLayerField,
+    },
+    PuppetAnimLayerControl {
+        layer_id: i64,
+        anim_layer_idx: usize,
+    },
+    InstanceOverride {
+        layer_id: i64,
         key: String,
     },
 }
@@ -189,6 +303,8 @@ struct HostOutput {
     effect_idx: usize,
     #[serde(default, rename = "passIdx")]
     pass_idx: usize,
+    #[serde(default, rename = "animLayerIdx")]
+    anim_layer_idx: usize,
     #[serde(default)]
     key: String,
     value: Value,
@@ -227,7 +343,7 @@ impl SceneScripts {
     }
 
     pub fn add_layer(&mut self, seed: &LayerSeed) {
-        let payload = json!({
+        let mut payload = json!({
             "id": seed.id,
             "name": seed.name,
             "kind": seed.kind,
@@ -242,6 +358,25 @@ impl SceneScripts {
             "text": seed.text,
             "parent": seed.parent,
         });
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(ta) = seed.tex_anim {
+                obj.insert(
+                    "texAnim".into(),
+                    json!({ "frames": ta.frames, "duration": ta.duration }),
+                );
+            }
+            if let Some(vt) = seed.video_tex {
+                obj.insert(
+                    "videoTex".into(),
+                    json!({
+                        "duration": vt.duration,
+                        "currentTime": vt.current_time,
+                        "playing": vt.playing,
+                        "rate": vt.rate,
+                    }),
+                );
+            }
+        }
         if let Err(err) = self.call_unit("__WE_addLayer", &payload.to_string()) {
             self.report_once(usize::MAX, "layer", &err);
         }
@@ -262,6 +397,40 @@ impl SceneScripts {
         }
     }
 
+    /// Register a puppet animation layer on an already-added layer so scripts
+    /// can access `thisLayer.getAnimationLayer(...)` and `animationlayers[]` bindings.
+    pub fn add_anim_layer(&mut self, seed: &AnimLayerSeed) {
+        let payload = json!({
+            "layerId": seed.layer_id,
+            "animLayerIdx": seed.anim_layer_idx,
+            "id": seed.id,
+            "name": seed.name,
+            "visible": seed.visible,
+            "blend": seed.blend,
+            "rate": seed.rate,
+            "frameCount": seed.frame_count,
+            "fps": seed.fps,
+            "duration": seed.duration,
+            "mode": seed.mode,
+        });
+        if let Err(err) = self.call_unit("__WE_addAnimLayer", &payload.to_string()) {
+            self.report_once(usize::MAX, "animLayer", &err);
+        }
+    }
+
+    fn prop_anim_json(pa: Option<&PropAnimSeed>) -> Value {
+        match pa {
+            Some(a) => json!({
+                "name": a.name,
+                "fps": a.fps,
+                "length": a.length,
+                "mode": a.mode,
+                "startPaused": a.start_paused,
+            }),
+            None => Value::Null,
+        }
+    }
+
     /// Compile and register one layer property script without running `init()` yet.
     /// Call [`Self::finalize_init`] after all layers, effects and scripts are added.
     pub fn add_property_script(
@@ -271,6 +440,7 @@ impl SceneScripts {
         script: &str,
         initial: Value,
         script_props: &serde_json::Map<String, Value>,
+        prop_anim: Option<&PropAnimSeed>,
     ) -> usize {
         let payload = json!({
             "kind": "layer",
@@ -279,6 +449,7 @@ impl SceneScripts {
             "source": script,
             "initial": initial,
             "scriptProperties": script_props,
+            "propAnim": Self::prop_anim_json(prop_anim),
         });
         self.register_binding(ScriptTarget::Layer { id, field }, &payload)
     }
@@ -320,6 +491,7 @@ impl SceneScripts {
         script: &str,
         initial: Value,
         script_props: &serde_json::Map<String, Value>,
+        prop_anim: Option<&PropAnimSeed>,
     ) -> usize {
         let key_lower = key.to_ascii_lowercase();
         let payload = json!({
@@ -331,12 +503,72 @@ impl SceneScripts {
             "source": script,
             "initial": initial,
             "scriptProperties": script_props,
+            "propAnim": Self::prop_anim_json(prop_anim),
         });
         self.register_binding(
             ScriptTarget::EffectConstant {
                 layer_id,
                 effect_idx,
                 pass_idx,
+                key: key_lower,
+            },
+            &payload,
+        )
+    }
+
+    /// Compile and register a script driving `animationlayers[anim_layer_idx].{visible,blend,rate}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_anim_layer_script(
+        &mut self,
+        layer_id: i64,
+        anim_layer_idx: usize,
+        field: AnimLayerField,
+        script: &str,
+        initial: Value,
+        script_props: &serde_json::Map<String, Value>,
+        prop_anim: Option<&PropAnimSeed>,
+    ) -> usize {
+        let payload = json!({
+            "kind": "anim_layer",
+            "layerId": layer_id,
+            "animLayerIdx": anim_layer_idx,
+            "field": field.as_str(),
+            "source": script,
+            "initial": initial,
+            "scriptProperties": script_props,
+            "propAnim": Self::prop_anim_json(prop_anim),
+        });
+        self.register_binding(
+            ScriptTarget::PuppetAnimLayerField {
+                layer_id,
+                anim_layer_idx,
+                field,
+            },
+            &payload,
+        )
+    }
+
+    /// Compile and register a script driving `instanceoverride[key]` on a particle layer.
+    pub fn add_instance_override_script(
+        &mut self,
+        layer_id: i64,
+        key: &str,
+        script: &str,
+        initial: Value,
+        script_props: &serde_json::Map<String, Value>,
+    ) -> usize {
+        let key_lower = key.to_ascii_lowercase();
+        let payload = json!({
+            "kind": "instance_override",
+            "layerId": layer_id,
+            "key": key_lower,
+            "source": script,
+            "initial": initial,
+            "scriptProperties": script_props,
+        });
+        self.register_binding(
+            ScriptTarget::InstanceOverride {
+                layer_id,
                 key: key_lower,
             },
             &payload,
@@ -495,7 +727,7 @@ impl SceneScripts {
 
         let mut layer_json = Vec::with_capacity(layers.len());
         for l in layers {
-            layer_json.push(json!({
+            let mut item = json!({
                 "id": l.id,
                 "visible": l.visible,
                 "alpha": l.alpha,
@@ -504,7 +736,13 @@ impl SceneScripts {
                 "angles": l.angles,
                 "color": l.color,
                 "text": l.text,
-            }));
+            });
+            if let Some((ct, dur)) = l.video_time {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("videoTime".into(), json!([ct, dur]));
+                }
+            }
+            layer_json.push(item);
         }
         let mut payload = json!({
             "runtime": runtime,
@@ -580,6 +818,45 @@ impl SceneScripts {
                     pass_idx: entry.pass_idx,
                     key: entry.key.to_ascii_lowercase(),
                 },
+                "layer_anim_ctrl" => {
+                    let Some(field) = ScriptField::from_str(&entry.field) else {
+                        continue;
+                    };
+                    ScriptTarget::LayerAnimControl {
+                        id: entry.id,
+                        field,
+                    }
+                }
+                "effect_const_anim_ctrl" => ScriptTarget::EffectConstAnimControl {
+                    layer_id: entry.layer_id,
+                    effect_idx: entry.effect_idx,
+                    pass_idx: entry.pass_idx,
+                    key: entry.key.to_ascii_lowercase(),
+                },
+                "tex_anim" => ScriptTarget::TextureAnimation {
+                    layer_id: entry.layer_id,
+                },
+                "video_tex" => ScriptTarget::VideoTexture {
+                    layer_id: entry.layer_id,
+                },
+                "anim_layer_field" => {
+                    let Some(field) = AnimLayerField::from_str(&entry.field) else {
+                        continue;
+                    };
+                    ScriptTarget::PuppetAnimLayerField {
+                        layer_id: entry.layer_id,
+                        anim_layer_idx: entry.anim_layer_idx,
+                        field,
+                    }
+                }
+                "anim_layer_ctrl" => ScriptTarget::PuppetAnimLayerControl {
+                    layer_id: entry.layer_id,
+                    anim_layer_idx: entry.anim_layer_idx,
+                },
+                "instance_override" => ScriptTarget::InstanceOverride {
+                    layer_id: entry.layer_id,
+                    key: entry.key.to_ascii_lowercase(),
+                },
                 _ => continue,
             };
             out.push(ScriptOutput {
@@ -604,7 +881,8 @@ impl SceneScripts {
             log::warn!("scenescript: {kind}: {err}");
         } else if let Some(b) = self.bindings.get(idx) {
             match &b.target {
-                ScriptTarget::Layer { id, field } => {
+                ScriptTarget::Layer { id, field }
+                | ScriptTarget::LayerAnimControl { id, field } => {
                     log::warn!("scenescript: {} on object {id}: {err}", field.as_str());
                 }
                 ScriptTarget::EffectVisible {
@@ -620,10 +898,43 @@ impl SceneScripts {
                     effect_idx,
                     pass_idx,
                     key,
+                }
+                | ScriptTarget::EffectConstAnimControl {
+                    layer_id,
+                    effect_idx,
+                    pass_idx,
+                    key,
                 } => {
                     log::warn!(
                         "scenescript: effect[{effect_idx}].pass[{pass_idx}].{key} on object {layer_id}: {err}"
                     );
+                }
+                ScriptTarget::TextureAnimation { layer_id } => {
+                    log::warn!("scenescript: texAnim on object {layer_id}: {err}");
+                }
+                ScriptTarget::VideoTexture { layer_id } => {
+                    log::warn!("scenescript: videoTex on object {layer_id}: {err}");
+                }
+                ScriptTarget::PuppetAnimLayerField {
+                    layer_id,
+                    anim_layer_idx,
+                    field,
+                } => {
+                    log::warn!(
+                        "scenescript: animationlayers[{anim_layer_idx}].{} on object {layer_id}: {err}",
+                        field.as_str()
+                    );
+                }
+                ScriptTarget::PuppetAnimLayerControl {
+                    layer_id,
+                    anim_layer_idx,
+                } => {
+                    log::warn!(
+                        "scenescript: animationlayers[{anim_layer_idx}] on object {layer_id}: {err}"
+                    );
+                }
+                ScriptTarget::InstanceOverride { layer_id, key } => {
+                    log::warn!("scenescript: instanceoverride.{key} on object {layer_id}: {err}");
                 }
             }
         } else {
@@ -1016,7 +1327,8 @@ const PRELUDE: &str = r#"
       interval: interval,
       cancelled: false,
       layer: globalThis.thisLayer,
-      obj: globalThis.thisObject
+      obj: globalThis.thisObject,
+      binding: currentBinding
     });
     function cancel() { removeTimer(id); }
     cancel.__timerId = id;
@@ -1232,7 +1544,12 @@ const PRELUDE: &str = r#"
   var layers = {};
   var layerOrder = [];
   var allEffects = [];
+  var allAnimLayers = [];
+  var allKeyAnims = [];
+  var allTexAnims = [];
+  var allVideoTexs = [];
   var scripts = [];
+  var currentBinding = null;
 
   function layerByRef(ref) {
     if (ref == null) return undefined;
@@ -1245,9 +1562,34 @@ const PRELUDE: &str = r#"
     return undefined;
   }
 
+  function addEndedHandler(list, fn) {
+    if (typeof fn === 'function' && list.indexOf(fn) === -1) list.push(fn);
+  }
+  function removeEndedHandler(list, fn) {
+    var i = list.indexOf(fn);
+    if (i >= 0) list.splice(i, 1);
+  }
+  function fireEndedHandlers(a) {
+    if (!a.__endedCallbacks || !a.__endedCallbacks.length) return;
+    var prevScene = globalThis.thisScene;
+    var prevLayer = globalThis.thisLayer;
+    var prevObj = globalThis.thisObject;
+    var cbs = a.__endedCallbacks.slice();
+    if (a.__layer !== undefined) globalThis.thisLayer = a.__layer;
+    if (a.__obj !== undefined) globalThis.thisObject = a.__obj;
+    globalThis.thisScene = scene;
+    for (var i = 0; i < cbs.length; i++) {
+      try { cbs[i](); } catch (_err) {}
+    }
+    globalThis.thisScene = prevScene;
+    globalThis.thisLayer = prevLayer;
+    globalThis.thisObject = prevObj;
+  }
+
   function animStub() {
     var a = {
       rate: 1, currentFrame: 0, frameCount: 0, duration: 0, __playing: false,
+      __endedCallbacks: [],
       play: function () { a.__playing = true; },
       pause: function () { a.__playing = false; },
       stop: function () { a.__playing = false; a.currentFrame = 0; },
@@ -1255,7 +1597,10 @@ const PRELUDE: &str = r#"
       setFrame: function (f) { a.currentFrame = num(f, 0); },
       getFrame: function () { return a.currentFrame; },
       setPlaybackRate: function (r) { a.rate = num(r, 1); },
-      getPlaybackRate: function () { return a.rate; }
+      getPlaybackRate: function () { return a.rate; },
+      addEndedCallback: function (fn) { addEndedHandler(a.__endedCallbacks, fn); },
+      removeEndedCallback: function (fn) { removeEndedHandler(a.__endedCallbacks, fn); },
+      getAnimation: function () { return a; }
     };
     return a;
   }
@@ -1274,6 +1619,11 @@ const PRELUDE: &str = r#"
       setMuted: function (m) { v.muted = !!m; },
       isMuted: function () { return v.muted; }
     };
+    Object.defineProperty(v, 'rate', {
+      get: function () { return v.playbackRate; },
+      set: function (r) { v.setPlaybackRate(r); },
+      enumerable: true
+    });
     return v;
   }
 
@@ -1292,6 +1642,241 @@ const PRELUDE: &str = r#"
     return s;
   }
 
+  function makeKeyAnim(meta, ctrlKind, ctrlTarget) {
+    var fps = Math.max(1, num(meta.fps, 30));
+    var frameCount = num(meta.frameCount !== undefined ? meta.frameCount : meta.length, 60);
+    var maxFrame = Math.max(0, num(meta.maxFrame !== undefined ? meta.maxFrame : frameCount, 0));
+    var duration = meta.duration !== undefined && num(meta.duration, 0) > 0
+      ? num(meta.duration, 0)
+      : (maxFrame / fps);
+    var mode = meta.mode || 'loop';
+    var a = {
+      name: meta.name || '',
+      fps: fps,
+      frameCount: frameCount,
+      duration: duration,
+      mode: mode,
+      __maxFrame: maxFrame,
+      __playing: !meta.startPaused,
+      __rate: meta.rate !== undefined ? num(meta.rate, 1) : 1,
+      __frame: 0,
+      __mirrorReverse: false,
+      __dirty: false,
+      __endedCallbacks: [],
+      __ctrlKind: ctrlKind,
+      __ctrlTarget: ctrlTarget,
+      __layer: meta.layer,
+      __obj: meta.obj,
+      play: function () {
+        if (a.mode === 'single') {
+          if (a.__rate >= 0 && a.__frame >= a.__maxFrame - 1e-4) a.__frame = 0;
+          else if (a.__rate < 0 && a.__frame <= 1e-4) a.__frame = a.__maxFrame;
+        }
+        a.__playing = true;
+        a.__dirty = true;
+      },
+      pause: function () { a.__playing = false; a.__dirty = true; },
+      stop: function () {
+        a.__playing = false;
+        a.__frame = 0;
+        a.__mirrorReverse = false;
+        a.__dirty = true;
+      },
+      isPlaying: function () { return a.__playing; },
+      setFrame: function (f) {
+        a.__frame = Math.max(0, Math.min(a.__maxFrame, num(f, 0)));
+        a.__mirrorReverse = false;
+        a.__dirty = true;
+      },
+      getFrame: function () { return a.__frame; },
+      setPlaybackRate: function (r) {
+        var nr = num(r, 1);
+        if (isFinite(nr)) { a.__rate = nr; a.__dirty = true; }
+      },
+      getPlaybackRate: function () { return a.__rate; },
+      addEndedCallback: function (fn) { addEndedHandler(a.__endedCallbacks, fn); },
+      removeEndedCallback: function (fn) { removeEndedHandler(a.__endedCallbacks, fn); },
+      getAnimation: function () { return a; }
+    };
+    Object.defineProperty(a, 'rate', {
+      get: function () { return a.__rate; },
+      set: function (r) { a.setPlaybackRate(r); },
+      enumerable: true
+    });
+    Object.defineProperty(a, 'currentFrame', {
+      get: function () { return a.__frame; },
+      set: function (f) { a.setFrame(f); },
+      enumerable: true
+    });
+    allKeyAnims.push(a);
+    return a;
+  }
+
+  function advanceKeyAnim(a, dt) {
+    if (!a.__playing || dt <= 0 || a.__rate === 0 || a.__maxFrame <= 0) return;
+    var delta = dt * a.fps * a.__rate;
+    var len = a.__maxFrame;
+    if (a.mode === 'single') {
+      var next = a.__frame + delta;
+      if (delta >= 0 && next >= len) {
+        a.__frame = len;
+        a.__playing = false;
+        fireEndedHandlers(a);
+      } else if (delta < 0 && next <= 0) {
+        a.__frame = 0;
+        a.__playing = false;
+        fireEndedHandlers(a);
+      } else {
+        a.__frame = next;
+      }
+    } else if (a.mode === 'mirror') {
+      var period = Math.max(len * 2, 1e-4);
+      var phase = a.__mirrorReverse ? (period - a.__frame) : a.__frame;
+      var m = ((phase + delta) % period + period) % period;
+      if (m <= len) {
+        a.__frame = m;
+        a.__mirrorReverse = false;
+      } else {
+        a.__frame = period - m;
+        a.__mirrorReverse = true;
+      }
+    } else {
+      a.__frame = ((a.__frame + delta) % len + len) % len;
+    }
+  }
+
+  function makeTexAnim(layerId, meta) {
+    var frames = Math.max(1, Math.round(num(meta.frames, 1)));
+    var dur = Math.max(0.01, num(meta.duration, 1));
+    var a = {
+      frameCount: frames,
+      duration: dur,
+      __layerId: layerId,
+      __fps: frames / dur,
+      __playing: true,
+      __rate: 1,
+      __frame: 0,
+      __controlled: false,
+      __dirty: false,
+      __lastEmittedFrame: -1,
+      __endedCallbacks: [],
+      play: function () { a.__playing = true; a.__controlled = true; a.__dirty = true; },
+      pause: function () { a.__playing = false; a.__controlled = true; a.__dirty = true; },
+      stop: function () {
+        a.__playing = false;
+        a.__frame = 0;
+        a.__controlled = true;
+        a.__dirty = true;
+      },
+      isPlaying: function () { return a.__playing; },
+      setFrame: function (f) {
+        var fc = Math.max(1, a.frameCount);
+        var nf = Math.max(0, Math.min(fc - 1, Math.floor(num(f, 0))));
+        a.__frame = nf;
+        a.__controlled = true;
+        a.__dirty = true;
+      },
+      getFrame: function () { return Math.floor(a.__frame); },
+      setPlaybackRate: function (r) {
+        var nr = num(r, 1);
+        a.__controlled = true;
+        if (nr !== a.__rate) { a.__rate = nr; a.__dirty = true; }
+      },
+      getPlaybackRate: function () { return a.__rate; },
+      addEndedCallback: function (fn) { addEndedHandler(a.__endedCallbacks, fn); },
+      removeEndedCallback: function (fn) { removeEndedHandler(a.__endedCallbacks, fn); },
+      getAnimation: function () { return a; }
+    };
+    Object.defineProperty(a, 'rate', {
+      get: function () { return a.__rate; },
+      set: function (r) { a.setPlaybackRate(r); },
+      enumerable: true
+    });
+    Object.defineProperty(a, 'currentFrame', {
+      get: function () { return a.getFrame(); },
+      set: function (f) { a.setFrame(f); },
+      enumerable: true
+    });
+    allTexAnims.push(a);
+    return a;
+  }
+
+  function advanceTexAnim(a, dt, runtime) {
+    var fc = Math.max(1, a.frameCount);
+    if (a.__controlled) {
+      if (a.__playing && a.__rate !== 0 && dt > 0) {
+        a.__frame = ((a.__frame + dt * a.__fps * a.__rate) % fc + fc) % fc;
+      }
+    } else if (fc > 1) {
+      var u = ((runtime / a.duration) % 1 + 1) % 1;
+      a.__frame = Math.min(fc - 1, Math.floor(u * fc));
+    }
+  }
+
+  function makeVideoTex(layerId, meta) {
+    var v = {
+      currentTime: num(meta.currentTime, 0),
+      duration: Math.max(0, num(meta.duration, 0)),
+      playbackRate: num(meta.rate, 1),
+      __playing: meta.playing !== false,
+      muted: true,
+      volume: 0,
+      __layerId: layerId,
+      __real: true,
+      __dirty: false,
+      __pendingSeek: null,
+      play: function () {
+        if (!v.__playing) { v.__playing = true; v.__dirty = true; }
+      },
+      pause: function () {
+        if (v.__playing) { v.__playing = false; v.__dirty = true; }
+      },
+      stop: function () {
+        v.__playing = false;
+        v.currentTime = 0;
+        v.__pendingSeek = 0;
+        v.__dirty = true;
+      },
+      isPlaying: function () { return v.__playing; },
+      setCurrentTime: function (t) {
+        var nt = Math.max(0, num(t, 0));
+        v.currentTime = nt;
+        v.__pendingSeek = nt;
+        v.__dirty = true;
+      },
+      getCurrentTime: function () { return v.currentTime; },
+      setPlaybackRate: function (r) {
+        var nr = num(r, 1);
+        if (Math.abs(nr - v.playbackRate) > 1e-4) {
+          v.playbackRate = nr;
+          v.__dirty = true;
+        }
+      },
+      getPlaybackRate: function () { return v.playbackRate; },
+      setMuted: function (m) { v.muted = !!m; },
+      isMuted: function () { return v.muted; }
+    };
+    Object.defineProperty(v, 'rate', {
+      get: function () { return v.playbackRate; },
+      set: function (r) { v.setPlaybackRate(r); },
+      enumerable: true
+    });
+    allVideoTexs.push(v);
+    return v;
+  }
+
+  function findNamedAnim(list, ref) {
+    var s = String(ref || '');
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].name === s) return list[i];
+    }
+    var sl = s.toLowerCase();
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].name.toLowerCase() === sl) return list[i];
+    }
+    return null;
+  }
+
   function makeLayer(id, name) {
     var _size = new Vec2(0, 0);
     var l = {
@@ -1301,20 +1886,19 @@ const PRELUDE: &str = r#"
       text: '', pointsize: 0, cursorDetected: false, clicked: false, kind: '',
       __parent: null, __tex: null, __video: null, __layerFile: null,
       __effects: {}, __effectList: [],
+      __animLayers: {}, __animLayerList: [],
+      __propAnims: [],
       getParent: function () { return l.__parent || null; },
       getEffect: function (ref) {
         if (typeof ref === 'number') return l.__effects[String(ref)] || l.__effectList[ref] || null;
-        var s = String(ref || '');
-        for (var i = 0; i < l.__effectList.length; i++) {
-          if (l.__effectList[i].name === s) return l.__effectList[i];
-        }
-        var sl = s.toLowerCase();
-        for (var i = 0; i < l.__effectList.length; i++) {
-          if (l.__effectList[i].name.toLowerCase() === sl) return l.__effectList[i];
-        }
-        return null;
+        return findNamedAnim(l.__effectList, ref);
       },
       getEffectCount: function () { return l.__effectList.length; },
+      getAnimationLayer: function (ref) {
+        if (typeof ref === 'number') return l.__animLayers[String(ref)] || l.__animLayerList[ref] || null;
+        return findNamedAnim(l.__animLayerList, ref);
+      },
+      getAnimationLayerCount: function () { return l.__animLayerList.length; },
       getTextureAnimation: function () {
         if (!l.__tex) { l.__tex = animStub(); l.__tex.frameCount = 1; }
         return l.__tex;
@@ -1323,7 +1907,15 @@ const PRELUDE: &str = r#"
         if (!l.__video) l.__video = videoStub();
         return l.__video;
       },
-      getAnimation: function () { return l.getTextureAnimation(); },
+      getAnimation: function (ref) {
+        if (ref === undefined && currentBinding && currentBinding.propAnim && currentBinding.layer === l) {
+          return currentBinding.propAnim;
+        }
+        if (ref !== undefined) {
+          return findNamedAnim(l.__propAnims, ref) || l.getAnimationLayer(ref) || null;
+        }
+        return l.__propAnims[0] || l.__animLayerList[0] || l.getTextureAnimation();
+      },
       getSound: function () { return soundStub(); },
       getLayerFile: function () { return l.__layerFile; },
       getTransformMatrix: function () {
@@ -1458,7 +2050,20 @@ const PRELUDE: &str = r#"
     return snap;
   }
 
-  function collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors) {
+  function snapshotAnimLayers() {
+    var snap = [];
+    for (var i = 0; i < allAnimLayers.length; i++) {
+      var al = allAnimLayers[i];
+      snap.push({
+        visible: !!al.visible,
+        blend: num(al.blend, 1),
+        rate: num(al.__rate, 1)
+      });
+    }
+    return snap;
+  }
+
+  function collectOutputs(preLayers, preEffects, preAnimLayers, forcedLayers, forcedEffects, forcedAnimLayers, errors) {
     var outputs = [];
     for (var i = 0; i < layerOrder.length; i++) {
       var idStr = layerOrder[i];
@@ -1502,15 +2107,116 @@ const PRELUDE: &str = r#"
       }
     }
 
+    for (var ai = 0; ai < allAnimLayers.length; ai++) {
+      var al = allAnimLayers[ai];
+      var pa = preAnimLayers[ai];
+      var aKey = al.__layerId + ':' + al.__animLayerIdx;
+      var curVis = !!al.visible;
+      if (curVis !== pa.visible || forcedAnimLayers[aKey + ':visible']) {
+        outputs.push({
+          kind: 'anim_layer_field',
+          layerId: al.__layerId,
+          animLayerIdx: al.__animLayerIdx,
+          field: 'visible',
+          value: curVis
+        });
+      }
+      var curBlend = num(al.blend, 1);
+      if (curBlend !== pa.blend || forcedAnimLayers[aKey + ':blend']) {
+        outputs.push({
+          kind: 'anim_layer_field',
+          layerId: al.__layerId,
+          animLayerIdx: al.__animLayerIdx,
+          field: 'blend',
+          value: curBlend
+        });
+      }
+      var curRate = num(al.__rate, 1);
+      if (curRate !== pa.rate || forcedAnimLayers[aKey + ':rate']) {
+        outputs.push({
+          kind: 'anim_layer_field',
+          layerId: al.__layerId,
+          animLayerIdx: al.__animLayerIdx,
+          field: 'rate',
+          value: curRate
+        });
+      }
+    }
+
+    for (var ka = 0; ka < allKeyAnims.length; ka++) {
+      var a = allKeyAnims[ka];
+      if (!a.__dirty || !a.__ctrlKind) continue;
+      a.__dirty = false;
+      var payload = {
+        kind: a.__ctrlKind,
+        value: {
+          playing: !!a.__playing,
+          frame: num(a.__frame, 0),
+          rate: num(a.__rate, 1),
+          mirrorReverse: !!a.__mirrorReverse
+        }
+      };
+      var tgt = a.__ctrlTarget || {};
+      for (var tk in tgt) {
+        if (Object.prototype.hasOwnProperty.call(tgt, tk)) payload[tk] = tgt[tk];
+      }
+      outputs.push(payload);
+    }
+
+    for (var ta = 0; ta < allTexAnims.length; ta++) {
+      var tx = allTexAnims[ta];
+      if (!tx.__controlled) continue;
+      var curF = Math.floor(num(tx.__frame, 0));
+      if (tx.__dirty || (tx.__playing && tx.__rate !== 0 && curF !== tx.__lastEmittedFrame)) {
+        tx.__dirty = false;
+        tx.__lastEmittedFrame = curF;
+        outputs.push({
+          kind: 'tex_anim',
+          layerId: tx.__layerId,
+          value: {
+            frame: curF,
+            playing: !!tx.__playing,
+            rate: num(tx.__rate, 1)
+          }
+        });
+      }
+    }
+
+    for (var vt = 0; vt < allVideoTexs.length; vt++) {
+      var vd = allVideoTexs[vt];
+      if (!vd.__dirty) continue;
+      vd.__dirty = false;
+      var sk = vd.__pendingSeek;
+      vd.__pendingSeek = null;
+      outputs.push({
+        kind: 'video_tex',
+        layerId: vd.__layerId,
+        value: {
+          playing: !!vd.__playing,
+          rate: num(vd.playbackRate, 1),
+          seek: sk
+        }
+      });
+    }
+
     for (var s = 0; s < scripts.length; s++) {
       var b = scripts[s];
-      if (!b.dead && b.kind === 'effect_const' && b.dirty) {
+      if (b.dead || !b.dirty) continue;
+      if (b.kind === 'effect_const') {
         b.dirty = false;
         outputs.push({
           kind: 'effect_const',
           layerId: b.layerId,
           effectIdx: b.effectIdx,
           passIdx: b.passIdx,
+          key: b.key,
+          value: serializeConstValue(b.current)
+        });
+      } else if (b.kind === 'instance_override') {
+        b.dirty = false;
+        outputs.push({
+          kind: 'instance_override',
+          layerId: b.layerId,
           key: b.key,
           value: serializeConstValue(b.current)
         });
@@ -1524,7 +2230,7 @@ const PRELUDE: &str = r#"
     });
   }
 
-  function applyBindingValue(b, ret, forcedLayers, forcedEffects) {
+  function applyBindingValue(b, ret, forcedLayers, forcedEffects, forcedAnimLayers) {
     if (ret === undefined) return;
     if (b.kind === 'layer') {
       var norm = normalizeField(b.field, ret);
@@ -1533,9 +2239,13 @@ const PRELUDE: &str = r#"
     } else if (b.kind === 'effect_visible') {
       b.effect.visible = !!ret;
       forcedEffects[b.layerId + ':' + b.effectIdx] = true;
-    } else if (b.kind === 'effect_const') {
+    } else if (b.kind === 'effect_const' || b.kind === 'instance_override') {
       b.current = normalizeConstValue(ret, b.valueKind);
       b.dirty = true;
+    } else if (b.kind === 'anim_layer') {
+      if (b.field === 'visible') b.animLayer.visible = !!ret;
+      else b.animLayer[b.field] = num(ret, b.initial);
+      forcedAnimLayers[b.layerId + ':' + b.animLayerIdx + ':' + b.field] = true;
     }
   }
 
@@ -1560,8 +2270,10 @@ const PRELUDE: &str = r#"
       globalThis.thisScene = scene;
       globalThis.thisLayer = due.layer;
       globalThis.thisObject = due.obj;
+      currentBinding = due.binding || null;
       try { due.fn(); } catch (_err) {}
     }
+    currentBinding = null;
   }
 
   var init = {
@@ -1579,6 +2291,8 @@ const PRELUDE: &str = r#"
       l.alignment = new Vec2(d.align && d.align[0], d.align && d.align[1]);
       l.text = d.text || '';
       l.__parentId = d.parent;
+      if (d.texAnim) l.__tex = makeTexAnim(d.id, d.texAnim);
+      if (d.videoTex) l.__video = makeVideoTex(d.id, d.videoTex);
       layers[String(d.id)] = l;
       layerOrder.push(String(d.id));
       return true;
@@ -1595,12 +2309,49 @@ const PRELUDE: &str = r#"
         __layer: layer,
         __layerId: d.layerId,
         __effectIdx: d.effectIdx,
+        __propAnims: [],
         getLayer: function () { return layer; },
-        getAnimation: animStub
+        getAnimation: function (ref) {
+          if (ref === undefined && currentBinding && currentBinding.propAnim && currentBinding.effect === eff) {
+            return currentBinding.propAnim;
+          }
+          if (ref !== undefined) return findNamedAnim(eff.__propAnims, ref) || null;
+          return eff.__propAnims[0] || animStub();
+        }
       };
       layer.__effects[String(d.effectIdx)] = eff;
       layer.__effectList.push(eff);
       allEffects.push(eff);
+      return true;
+    },
+    addAnimLayer: function (jsonText) {
+      var d = JSON.parse(jsonText);
+      var layer = layers[String(d.layerId)];
+      if (!layer) return false;
+      var fc = Math.max(1, num(d.frameCount, 1));
+      var al = makeKeyAnim({
+        name: d.name || '',
+        fps: num(d.fps, 30),
+        frameCount: fc,
+        maxFrame: Math.max(0, fc - 1),
+        duration: num(d.duration, 0),
+        mode: d.mode || 'loop',
+        startPaused: false,
+        rate: num(d.rate, 1),
+        layer: layer,
+        obj: null
+      }, 'anim_layer_ctrl', { layerId: d.layerId, animLayerIdx: d.animLayerIdx });
+      al.id = d.id != null ? d.id : d.animLayerIdx;
+      al.visible = d.visible !== false;
+      al.blend = num(d.blend, 1);
+      al.__layer = layer;
+      al.__layerId = d.layerId;
+      al.__animLayerIdx = d.animLayerIdx;
+      al.__obj = al;
+      al.getLayer = function () { return layer; };
+      layer.__animLayers[String(d.animLayerIdx)] = al;
+      layer.__animLayerList.push(al);
+      allAnimLayers.push(al);
       return true;
     },
     linkParents: function () {
@@ -1617,6 +2368,67 @@ const PRELUDE: &str = r#"
       var eff = (kind === 'effect_visible' || kind === 'effect_const') && layer
         ? (layer.__effects[String(d.effectIdx)] || null)
         : null;
+      var al = kind === 'anim_layer' && layer
+        ? (layer.__animLayers[String(d.animLayerIdx)] || null)
+        : null;
+
+      var propAnim = null;
+      if (d.propAnim) {
+        if (kind === 'layer' && layer) {
+          propAnim = makeKeyAnim({
+            name: d.propAnim.name || '',
+            fps: d.propAnim.fps,
+            length: d.propAnim.length,
+            maxFrame: d.propAnim.length,
+            mode: d.propAnim.mode,
+            startPaused: !!d.propAnim.startPaused,
+            layer: layer,
+            obj: layer
+          }, 'layer_anim_ctrl', { id: d.id, field: d.field });
+          layer.__propAnims.push(propAnim);
+        } else if (kind === 'effect_const' && eff) {
+          propAnim = makeKeyAnim({
+            name: d.propAnim.name || '',
+            fps: d.propAnim.fps,
+            length: d.propAnim.length,
+            maxFrame: d.propAnim.length,
+            mode: d.propAnim.mode,
+            startPaused: !!d.propAnim.startPaused,
+            layer: layer,
+            obj: eff
+          }, 'effect_const_anim_ctrl', {
+            layerId: d.layerId,
+            effectIdx: d.effectIdx,
+            passIdx: d.passIdx,
+            key: d.key || ''
+          });
+          eff.__propAnims.push(propAnim);
+        }
+      } else if (kind === 'anim_layer' && al) {
+        propAnim = al;
+      }
+
+      var entry = {
+        kind: kind,
+        id: d.id || 0,
+        field: d.field || '',
+        layerId: d.layerId || 0,
+        effectIdx: d.effectIdx || 0,
+        passIdx: d.passIdx || 0,
+        animLayerIdx: d.animLayerIdx || 0,
+        key: d.key || '',
+        mod: null,
+        layer: layer,
+        effect: eff,
+        animLayer: al,
+        propAnim: propAnim,
+        scriptPropsObj: null,
+        scriptPropTypes: {},
+        dead: false,
+        error: null,
+        dirty: false
+      };
+
       var prepared = prepare(d.source);
       var mod = null;
       var compileErr = null;
@@ -1625,7 +2437,8 @@ const PRELUDE: &str = r#"
       globalThis.__WE_current_sp_meta = spMeta;
       globalThis.thisScene = scene;
       globalThis.thisLayer = layer;
-      globalThis.thisObject = eff || layer;
+      globalThis.thisObject = al || eff || layer;
+      currentBinding = entry;
       try {
         var factory = (0, eval)('(function(){\n' + prepared.body + '\nreturn {' +
           prepared.names.map(function (n) {
@@ -1637,30 +2450,21 @@ const PRELUDE: &str = r#"
       } finally {
         globalThis.__WE_binding_props = {};
         globalThis.__WE_current_sp_meta = null;
+        currentBinding = null;
       }
 
-      var entry = {
-        kind: kind,
-        id: d.id || 0,
-        field: d.field || '',
-        layerId: d.layerId || 0,
-        effectIdx: d.effectIdx || 0,
-        passIdx: d.passIdx || 0,
-        key: d.key || '',
-        mod: mod,
-        layer: layer,
-        effect: eff,
-        scriptPropsObj: spMeta.props,
-        scriptPropTypes: spMeta.types,
-        dead: !!compileErr,
-        error: compileErr,
-        dirty: false
-      };
+      entry.mod = mod;
+      entry.scriptPropsObj = spMeta.props;
+      entry.scriptPropTypes = spMeta.types;
+      entry.dead = !!compileErr;
+      entry.error = compileErr;
 
       if (kind === 'layer') {
         entry.initial = normalizeField(d.field, d.initial);
       } else if (kind === 'effect_visible') {
         entry.initial = !!d.initial;
+      } else if (kind === 'anim_layer') {
+        entry.initial = d.field === 'visible' ? !!d.initial : num(d.initial, 1);
       } else {
         var ci = parseConstInitial(d.initial);
         entry.initial = ci.value;
@@ -1677,14 +2481,16 @@ const PRELUDE: &str = r#"
     finalizeInit: function () {
       var preLayers = snapshotLayers();
       var preEffects = snapshotEffects();
+      var preAnimLayers = snapshotAnimLayers();
       var forcedLayers = {};
       var forcedEffects = {};
+      var forcedAnimLayers = {};
       var errors = [];
 
       for (var k = 0; k < scripts.length; k++) {
         var b = scripts[k];
         if (b.dead) continue;
-        if (b.kind === 'layer' && !b.layer) {
+        if ((b.kind === 'layer' || b.kind === 'instance_override') && !b.layer) {
           b.dead = true;
           errors.push({ idx: k, kind: 'init', message: 'layer missing' });
           continue;
@@ -1694,23 +2500,31 @@ const PRELUDE: &str = r#"
           errors.push({ idx: k, kind: 'init', message: 'effect missing' });
           continue;
         }
+        if (b.kind === 'anim_layer' && !b.animLayer) {
+          b.dead = true;
+          errors.push({ idx: k, kind: 'init', message: 'animLayer missing' });
+          continue;
+        }
         if (b.mod && typeof b.mod.init === 'function') {
           try {
             globalThis.thisScene = scene;
             globalThis.thisLayer = b.layer;
-            globalThis.thisObject = b.effect || b.layer;
+            globalThis.thisObject = b.animLayer || b.effect || b.layer;
+            currentBinding = b;
             var arg = copyConstValue(b.initial);
             var ret = b.mod.init(arg);
-            if (b.kind === 'effect_const' && ret === undefined &&
+            if ((b.kind === 'effect_const' || b.kind === 'instance_override') && ret === undefined &&
               (arg instanceof Vec2 || arg instanceof Vec3 || arg instanceof Vec4) &&
               !arg.equals(b.initial)) {
               ret = arg;
             }
-            applyBindingValue(b, ret, forcedLayers, forcedEffects);
+            applyBindingValue(b, ret, forcedLayers, forcedEffects, forcedAnimLayers);
           } catch (e) {
             b.dead = true;
             b.error = errText(e);
             errors.push({ idx: k, kind: 'init', message: b.error });
+          } finally {
+            currentBinding = null;
           }
         }
       }
@@ -1722,17 +2536,20 @@ const PRELUDE: &str = r#"
           try {
             globalThis.thisScene = scene;
             globalThis.thisLayer = b.layer;
-            globalThis.thisObject = b.effect || b.layer;
+            globalThis.thisObject = b.animLayer || b.effect || b.layer;
+            currentBinding = b;
             b.mod.applyUserProperties(userProperties);
           } catch (e) {
             b.dead = true;
             b.error = errText(e);
             errors.push({ idx: k, kind: 'applyUserProperties', message: b.error });
+          } finally {
+            currentBinding = null;
           }
         }
       }
 
-      return collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors);
+      return collectOutputs(preLayers, preEffects, preAnimLayers, forcedLayers, forcedEffects, forcedAnimLayers, errors);
     },
     applyUserProperties: function (jsonText) {
       var d = JSON.parse(jsonText);
@@ -1746,8 +2563,10 @@ const PRELUDE: &str = r#"
 
       var preLayers = snapshotLayers();
       var preEffects = snapshotEffects();
+      var preAnimLayers = snapshotAnimLayers();
       var forcedLayers = {};
       var forcedEffects = {};
+      var forcedAnimLayers = {};
       var errors = [];
 
       for (var k = 0; k < scripts.length; k++) {
@@ -1774,17 +2593,20 @@ const PRELUDE: &str = r#"
           try {
             globalThis.thisScene = scene;
             globalThis.thisLayer = b.layer;
-            globalThis.thisObject = b.effect || b.layer;
+            globalThis.thisObject = b.animLayer || b.effect || b.layer;
+            currentBinding = b;
             b.mod.applyUserProperties(changed);
           } catch (e) {
             b.dead = true;
             b.error = errText(e);
             errors.push({ idx: k, kind: 'applyUserProperties', message: b.error });
+          } finally {
+            currentBinding = null;
           }
         }
       }
 
-      return collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors);
+      return collectOutputs(preLayers, preEffects, preAnimLayers, forcedLayers, forcedEffects, forcedAnimLayers, errors);
     },
     tick: function (jsonText) {
       var s = JSON.parse(jsonText);
@@ -1813,20 +2635,30 @@ const PRELUDE: &str = r#"
         l.angles = parseVec(d.angles);
         l.color = parseVec(d.color);
         l.text = d.text || '';
+        if (d.videoTime && l.__video && l.__video.__real) {
+          l.__video.currentTime = num(d.videoTime[0], l.__video.currentTime);
+          if (num(d.videoTime[1], 0) > 0) l.__video.duration = num(d.videoTime[1], l.__video.duration);
+        }
       }
 
       var preLayers = snapshotLayers();
       var preEffects = snapshotEffects();
+      var preAnimLayers = snapshotAnimLayers();
       var forcedLayers = {};
       var forcedEffects = {};
+      var forcedAnimLayers = {};
       var errors = [];
+
+      var dt = num(s.frametime, 0);
+      for (var ka = 0; ka < allKeyAnims.length; ka++) advanceKeyAnim(allKeyAnims[ka], dt);
+      for (var ta = 0; ta < allTexAnims.length; ta++) advanceTexAnim(allTexAnims[ta], dt, e.runtime);
 
       runTimers();
 
       for (var k = 0; k < scripts.length; k++) {
         var b = scripts[k];
         if (b.dead) continue;
-        if (b.kind === 'layer' && !b.layer) {
+        if ((b.kind === 'layer' || b.kind === 'instance_override') && !b.layer) {
           b.dead = true;
           errors.push({ idx: k, kind: 'runtime', message: 'layer missing' });
           continue;
@@ -1836,12 +2668,18 @@ const PRELUDE: &str = r#"
           errors.push({ idx: k, kind: 'runtime', message: 'effect missing' });
           continue;
         }
+        if (b.kind === 'anim_layer' && !b.animLayer) {
+          b.dead = true;
+          errors.push({ idx: k, kind: 'runtime', message: 'animLayer missing' });
+          continue;
+        }
         if (!b.mod || typeof b.mod.update !== 'function') continue;
 
         try {
           globalThis.thisScene = scene;
           globalThis.thisLayer = b.layer;
-          globalThis.thisObject = b.effect || b.layer;
+          globalThis.thisObject = b.animLayer || b.effect || b.layer;
+          currentBinding = b;
 
           if (b.kind === 'layer') {
             var layer = b.layer;
@@ -1869,24 +2707,35 @@ const PRELUDE: &str = r#"
             var res = b.mod.update(!!b.effect.visible);
             if (res !== undefined) b.effect.visible = !!res;
             forcedEffects[b.layerId + ':' + b.effectIdx] = true;
-          } else if (b.kind === 'effect_const') {
+          } else if (b.kind === 'anim_layer') {
+            var curVal = b.field === 'visible' ? !!b.animLayer.visible : num(b.animLayer[b.field], 1);
+            var res = b.mod.update(curVal);
+            if (res !== undefined) {
+              if (b.field === 'visible') b.animLayer.visible = !!res;
+              else b.animLayer[b.field] = num(res, curVal);
+            }
+            forcedAnimLayers[b.layerId + ':' + b.animLayerIdx + ':' + b.field] = true;
+          } else if (b.kind === 'effect_const' || b.kind === 'instance_override') {
             var arg = copyConstValue(b.current);
             var res = b.mod.update(arg);
             if (res !== undefined && res !== null) {
               b.current = normalizeConstValue(res, b.valueKind);
+              b.dirty = true;
             } else if ((arg instanceof Vec2 || arg instanceof Vec3 || arg instanceof Vec4) &&
               !arg.equals(b.current)) {
               b.current = arg;
+              b.dirty = true;
             }
-            b.dirty = true;
           }
         } catch (err) {
           b.dead = true;
           b.error = errText(err);
           errors.push({ idx: k, kind: 'runtime', message: b.error });
+        } finally {
+          currentBinding = null;
         }
       }
-      return collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors);
+      return collectOutputs(preLayers, preEffects, preAnimLayers, forcedLayers, forcedEffects, forcedAnimLayers, errors);
     }
   };
 
@@ -1898,6 +2747,7 @@ const PRELUDE: &str = r#"
   };
   globalThis.__WE_addLayer = init.addLayer;
   globalThis.__WE_addEffect = init.addEffect;
+  globalThis.__WE_addAnimLayer = init.addAnimLayer;
   globalThis.__WE_addScript = init.addScript;
   globalThis.__WE_finalizeInit = init.finalizeInit;
   globalThis.__WE_applyUserProperties = init.applyUserProperties;
@@ -1955,6 +2805,8 @@ mod tests {
             align: [0.0, 0.0],
             text: String::new(),
             parent: None,
+            tex_anim: None,
+            video_tex: None,
         }
     }
 
@@ -1968,6 +2820,7 @@ mod tests {
             angles: [0.0, 0.0, 0.0],
             color: [1.0, 1.0, 1.0],
             text: String::new(),
+            video_time: None,
         }
     }
 
@@ -1981,6 +2834,7 @@ mod tests {
             "'use strict';\nexport function update(value) {\n  let second = new Date().getSeconds();\n  value.x = second / 60;\n  return value;\n}\n",
             json!(null),
             &serde_json::Map::new(),
+            None,
         );
         let out = host.tick(
             0.0,
@@ -2014,6 +2868,7 @@ mod tests {
             "export function update() { return 'hello ' + engine.canvasSize.x; }",
             json!("authored"),
             &serde_json::Map::new(),
+            None,
         );
         let out = host.tick(
             0.0,
@@ -2039,6 +2894,7 @@ mod tests {
             "export function update() { const now = new Date(); thisLayer.visible = now.getMonth() === 0; }",
             json!(true),
             &serde_json::Map::new(),
+            None,
         );
         let out = host.tick(
             0.0,
@@ -2066,6 +2922,7 @@ mod tests {
             "import * as WEMath from 'WEMath';\nexport var scriptProperties = createScriptProperties().addSlider({ name: 'speed', value: 0.5 }).finish();\nexport function update() { return WEMath.mix(0, 1, scriptProperties.speed / 2.5); }",
             json!(0.0),
             &serde_json::Map::new(),
+            None,
         );
         let out = host.tick(
             0.0,
@@ -2092,6 +2949,7 @@ mod tests {
             "export function update() { var l = thisScene.getLayer('right-hand'); return l ? l.name : 'missing'; }",
             json!(""),
             &serde_json::Map::new(),
+            None,
         );
         let out = host.tick(
             0.0,
@@ -2118,6 +2976,7 @@ mod tests {
             "export var scriptProperties = createScriptProperties().addSlider({ name: 'fill', value: 1 }).finish();\nexport function update() { return scriptProperties.fill; }",
             json!(1.0),
             &props,
+            None,
         );
         let out = host.tick(
             0.0,
@@ -2143,6 +3002,7 @@ mod tests {
             "export function update() { return nope(); }",
             json!(1.0),
             &serde_json::Map::new(),
+            None,
         );
         let layers = [frame(9)];
         let _ = host.tick(
@@ -2185,6 +3045,7 @@ mod tests {
             "import * as WEColor from 'WEColor';\nexport function update() {\n  shared.primaryColor = WEColor.hsv2rgb({ x: 0.0, y: 1.0, z: 1.0 });\n  return 1.0;\n}",
             json!(1.0),
             &serde_json::Map::new(),
+            None,
         );
         host.add_effect_constant_script(
             10,
@@ -2194,6 +3055,7 @@ mod tests {
             "export function update() { return shared.primaryColor; }",
             json!("0 0 1"),
             &serde_json::Map::new(),
+            None,
         );
         host.add_effect_constant_script(
             10,
@@ -2203,6 +3065,7 @@ mod tests {
             "export function update(v) { return v * 0.5; }",
             json!(1.0),
             &serde_json::Map::new(),
+            None,
         );
         let _ = host.finalize_init();
         let out = host.tick(
@@ -2345,6 +3208,7 @@ mod tests {
             "const b16 = engine.registerAudioBuffers(engine.AUDIO_RESOLUTION_16);\nconst b32 = engine.registerAudioBuffers(engine.AUDIO_RESOLUTION_32);\nconst b64 = engine.registerAudioBuffers(engine.AUDIO_RESOLUTION_64);\nexport function update() { return new Vec3(b16.average[0], b32.left[0], b64.right[63]); }",
             json!("1 1 1"),
             &serde_json::Map::new(),
+            None,
         );
         let _ = host.finalize_init();
         assert!(host.uses_audio());
@@ -2383,6 +3247,7 @@ mod tests {
             "export function init(v) { return 0.4; }\nexport function update(v) { thisScene.getLayer('target').visible = false; return v; }",
             json!(1.0),
             &serde_json::Map::new(),
+            None,
         );
         let init_out = host.finalize_init();
         assert!(init_out.iter().any(|o| {
@@ -2428,6 +3293,7 @@ mod tests {
             "let calls = 0;\nexport var scriptProperties = createScriptProperties().addSlider({ name: 'speed', value: 1 }).finish();\nexport function applyUserProperties(changed) { calls++; shared.calls = calls; }\nexport function update() { return scriptProperties.speed * 0.1 + shared.calls; }",
             json!(1.0),
             &sp,
+            None,
         );
         let _ = host.finalize_init();
 
@@ -2470,6 +3336,7 @@ mod tests {
             "export function mediaThumbnailChanged(e) { thisObject.getAnimation().play(); }",
             json!(1.0),
             &serde_json::Map::new(),
+            None,
         );
         let init_out = host.finalize_init();
         assert!(init_out.is_empty());
@@ -2513,6 +3380,7 @@ mod tests {
             "const topLayerSelf = (thisLayer === thisObject && thisLayer.name === 'layerA');\nexport function update() {\n  let s = thisLayer.size;\n  s.x *= 0.5;\n  return new Vec3(s.x, thisLayer.size.x, (topLayerSelf && shared.topOk && shared.timerOk) ? 1 : 0);\n}",
             json!("0 0 0"),
             &serde_json::Map::new(),
+            None,
         );
         host.add_property_script(
             71,
@@ -2520,6 +3388,7 @@ mod tests {
             "export function update() { return 0.75; }",
             json!(1.0),
             &serde_json::Map::new(),
+            None,
         );
 
         let _ = host.finalize_init();
@@ -2574,9 +3443,340 @@ mod tests {
         assert!((arr2[2].as_f64().unwrap() - 1.0).abs() < 1e-5);
     }
 
-    /// Compile and tick every SceneScript (layer properties, effect visibility
-    /// and effect constant shaders) in the local Wallpaper Engine Workshop
-    /// library.  Ignored by default: needs the workshop files.
+    #[test]
+    fn property_get_animation_startpaused_play_and_single_replay() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(80, "vinyl"));
+        host.add_effect(&EffectSeed {
+            layer_id: 80,
+            effect_idx: 0,
+            id: Some(800),
+            name: "blend".into(),
+            visible: true,
+        });
+        let pa_layer = PropAnimSeed {
+            name: "Fade".into(),
+            fps: 10.0,
+            length: 10.0,
+            mode: "single",
+            start_paused: true,
+        };
+        let pa_eff = PropAnimSeed {
+            name: "Spin".into(),
+            fps: 10.0,
+            length: 10.0,
+            mode: "single",
+            start_paused: true,
+        };
+        host.add_property_script(
+            80,
+            ScriptField::Alpha,
+            "let ended = 0;\nlet ani;\nexport function init() {\n  ani = thisObject.getAnimation();\n  ani.addEndedCallback(() => { ended++; ani.stop(); ani.play(); });\n  engine.setTimeout(() => { ani.play(); }, 100);\n}\nexport function update(v) {\n  shared.alphaEnded = ended;\n  return v;\n}",
+            json!(1.0),
+            &serde_json::Map::new(),
+            Some(&pa_layer),
+        );
+        host.add_effect_constant_script(
+            80,
+            0,
+            0,
+            "multiply",
+            "let triggered = false;\nexport function init() {\n  let ea = thisObject.getAnimation();\n  engine.setTimeout(() => { if (!triggered) { triggered = true; ea.play(); } }, 50);\n}",
+            json!(1.0),
+            &serde_json::Map::new(),
+            Some(&pa_eff),
+        );
+        let init_out = host.finalize_init();
+        assert!(init_out.is_empty());
+
+        // t=0.10: both timers fire -> play() emitted for layer & effect constant.
+        let out1 = host.tick(
+            0.10,
+            0.10,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(80)],
+        );
+        assert!(out1.iter().any(|o| {
+            o.target == ScriptTarget::LayerAnimControl { id: 80, field: ScriptField::Alpha }
+                && o.value.get("playing") == Some(&json!(true))
+        }));
+        assert!(out1.iter().any(|o| {
+            o.target
+                == ScriptTarget::EffectConstAnimControl {
+                    layer_id: 80,
+                    effect_idx: 0,
+                    pass_idx: 0,
+                    key: "multiply".into(),
+                }
+                && o.value.get("playing") == Some(&json!(true))
+        }));
+
+        // t=1.20 (dt=1.10 -> 11 frames): single animation completes, ended callback replays from 0!
+        let out2 = host.tick(
+            1.20,
+            1.10,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(80)],
+        );
+        let replay = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::LayerAnimControl { id: 80, field: ScriptField::Alpha })
+            .expect("replay control emitted from endedCallback");
+        assert_eq!(replay.value.get("playing"), Some(&json!(true)));
+        assert!((replay.value.get("frame").unwrap().as_f64().unwrap() - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn texture_animation_set_frame_stop_rate_and_get_frame() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        let mut s = seed(85, "outline");
+        s.tex_anim = Some(TexAnimSeed {
+            frames: 32,
+            duration: 6.4,
+        });
+        host.add_layer(&s);
+        host.add_property_script(
+            85,
+            ScriptField::Alpha,
+            "let anim;\nexport function init() {\n  anim = thisLayer.getTextureAnimation();\n  anim.stop();\n  anim.setFrame(3);\n  engine.setTimeout(() => { anim.rate = 10; anim.play(); }, 100);\n}\nexport function update(v) {\n  if (anim.getFrame() >= 8) anim.stop();\n  return v;\n}",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+        let init_out = host.finalize_init();
+        let tex0 = init_out
+            .iter()
+            .find(|o| o.target == ScriptTarget::TextureAnimation { layer_id: 85 })
+            .expect("initial tex anim state");
+        assert_eq!(tex0.value.get("frame"), Some(&json!(3)));
+        assert_eq!(tex0.value.get("playing"), Some(&json!(false)));
+
+        // t=0.10: timer calls play() with rate=10 (50 fps) and advances cleanly.
+        let out1 = host.tick(
+            0.10,
+            0.05,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(85)],
+        );
+        let tex1 = out1
+            .iter()
+            .find(|o| o.target == ScriptTarget::TextureAnimation { layer_id: 85 })
+            .expect("playing tex anim");
+        assert_eq!(tex1.value.get("playing"), Some(&json!(true)));
+        assert!((tex1.value.get("rate").unwrap().as_f64().unwrap() - 10.0).abs() < 1e-4);
+
+        // t=0.25 (dt=0.15s * 50fps = +7.5 frames -> frame >= 8 -> stopped at frame 0!).
+        let out2 = host.tick(
+            0.25,
+            0.15,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(85)],
+        );
+        let tex2 = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::TextureAnimation { layer_id: 85 })
+            .expect("stopped tex anim");
+        assert_eq!(tex2.value.get("playing"), Some(&json!(false)));
+        assert_eq!(tex2.value.get("frame"), Some(&json!(0)));
+    }
+
+    #[test]
+    fn puppet_animation_layer_scripts_phase_offset_and_blend() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(90, "wing"));
+        host.add_anim_layer(&AnimLayerSeed {
+            layer_id: 90,
+            anim_layer_idx: 0,
+            id: Some(901),
+            name: "Flap".into(),
+            visible: true,
+            blend: 1.0,
+            rate: 1.0,
+            frame_count: 100,
+            fps: 30.0,
+            duration: 99.0 / 30.0,
+            mode: "loop",
+        });
+        host.add_anim_layer_script(
+            90,
+            0,
+            AnimLayerField::Visible,
+            "export var scriptProperties = createScriptProperties().addSlider({ name: 'percentage', value: 0.5 }).finish();\nexport function init(v) {\n  const ani = 'addEndedCallback' in thisObject ? thisObject : thisObject.getAnimation();\n  ani.play();\n  ani.setFrame(ani.frameCount * scriptProperties.percentage);\n  return v;\n}",
+            json!(true),
+            &serde_json::Map::new(),
+            None,
+        );
+        host.add_anim_layer_script(
+            90,
+            0,
+            AnimLayerField::Blend,
+            "export function update() { return 0.42; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+        let init_out = host.finalize_init();
+        let ctrl = init_out
+            .iter()
+            .find(|o| {
+                o.target
+                    == ScriptTarget::PuppetAnimLayerControl {
+                        layer_id: 90,
+                        anim_layer_idx: 0,
+                    }
+            })
+            .expect("puppet phase offset control");
+        assert_eq!(ctrl.value.get("playing"), Some(&json!(true)));
+        assert!((ctrl.value.get("frame").unwrap().as_f64().unwrap() - 50.0).abs() < 1e-4);
+
+        let tick_out = host.tick(
+            0.05,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(90)],
+        );
+        let blend = tick_out
+            .iter()
+            .find(|o| {
+                o.target
+                    == ScriptTarget::PuppetAnimLayerField {
+                        layer_id: 90,
+                        anim_layer_idx: 0,
+                        field: AnimLayerField::Blend,
+                    }
+            })
+            .expect("blend field output");
+        assert!((blend.value.as_f64().unwrap() - 0.42).abs() < 1e-5);
+    }
+
+    #[test]
+    fn instance_override_script_drives_rate_and_colorn() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(95, "rain"));
+        host.add_instance_override_script(
+            95,
+            "rate",
+            "export function update() { return 0.35; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+        );
+        host.add_instance_override_script(
+            95,
+            "colorn",
+            "export function update() { return new Vec3(0.2, 0.4, 0.8); }",
+            json!("1 1 1"),
+            &serde_json::Map::new(),
+        );
+        let _ = host.finalize_init();
+        let out = host.tick(
+            0.05,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(95)],
+        );
+        let rate = out
+            .iter()
+            .find(|o| o.target == ScriptTarget::InstanceOverride { layer_id: 95, key: "rate".into() })
+            .expect("rate override");
+        assert!((rate.value.as_f64().unwrap() - 0.35).abs() < 1e-5);
+        let col = out
+            .iter()
+            .find(|o| o.target == ScriptTarget::InstanceOverride { layer_id: 95, key: "colorn".into() })
+            .expect("colorn override");
+        let arr = col.value.as_array().unwrap();
+        assert!((arr[2].as_f64().unwrap() - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn video_texture_script_pause_seek_and_rate() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        let mut s = seed(99, "vid");
+        s.video_tex = Some(VideoTexSeed {
+            duration: 12.0,
+            current_time: 0.0,
+            playing: true,
+            rate: 1.0,
+        });
+        host.add_layer(&s);
+        host.add_property_script(
+            99,
+            ScriptField::Visible,
+            "let vid;\nexport function init() {\n  vid = thisLayer.getVideoTexture();\n  vid.pause();\n  vid.setCurrentTime(vid.duration * 0.25);\n  engine.setTimeout(() => { vid.setPlaybackRate(1.5); vid.play(); }, 100);\n}\nexport function update(v) {\n  shared.vidTime = vid.getCurrentTime();\n  return v;\n}",
+            json!(true),
+            &serde_json::Map::new(),
+            None,
+        );
+        let init_out = host.finalize_init();
+        let v0 = init_out
+            .iter()
+            .find(|o| o.target == ScriptTarget::VideoTexture { layer_id: 99 })
+            .expect("initial video control");
+        assert_eq!(v0.value.get("playing"), Some(&json!(false)));
+        assert!((v0.value.get("seek").unwrap().as_f64().unwrap() - 3.0).abs() < 1e-4);
+
+        // Next tick with real video_time update and no script change -> no redundant seek emission!
+        let mut f = frame(99);
+        f.video_time = Some((3.0, 12.0));
+        let out1 = host.tick(
+            0.05,
+            0.05,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[f.clone()],
+        );
+        assert!(out1.iter().all(|o| o.target != ScriptTarget::VideoTexture { layer_id: 99 }));
+
+        // t=0.15: timeout resumes playback at rate=1.5 with seek == null.
+        let out2 = host.tick(
+            0.15,
+            0.05,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[f],
+        );
+        let v2 = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::VideoTexture { layer_id: 99 })
+            .expect("resumed video control");
+        assert_eq!(v2.value.get("playing"), Some(&json!(true)));
+        assert!((v2.value.get("rate").unwrap().as_f64().unwrap() - 1.5).abs() < 1e-4);
+        assert_eq!(v2.value.get("seek"), Some(&Value::Null));
+    }
+
+    /// Compile and tick every SceneScript (layer properties, effect visibility,
+    /// effect constant shaders, puppet animation layers, and particle instance
+    /// overrides) in the local Wallpaper Engine Workshop library.
+    /// Ignored by default: needs the workshop files.
     #[test]
     #[ignore = "requires the Wallpaper Engine workshop library"]
     fn workshop_scripts_compile_and_tick() {
@@ -2590,6 +3790,8 @@ mod tests {
         let mut layer_bindings = 0usize;
         let mut effect_vis_bindings = 0usize;
         let mut effect_const_bindings = 0usize;
+        let mut anim_layer_bindings = 0usize;
+        let mut inst_ov_bindings = 0usize;
         let mut audio_scenes = 0usize;
         let mut failures = 0usize;
         let mut reports: Vec<String> = Vec::new();
@@ -2679,6 +3881,8 @@ mod tests {
                     align: [0.0, 0.0],
                     text: String::new(),
                     parent,
+                    tex_anim: None,
+                    video_tex: None,
                 });
                 if let Some(effects) = obj.get("effects").and_then(|e| e.as_array()) {
                     for (eidx, ef) in effects.iter().enumerate() {
@@ -2695,6 +3899,27 @@ mod tests {
                         });
                     }
                 }
+                if let Some(als) = obj.get("animationlayers").and_then(|a| a.as_array()) {
+                    for (aidx, al) in als.iter().enumerate() {
+                        host.add_anim_layer(&AnimLayerSeed {
+                            layer_id: id,
+                            anim_layer_idx: aidx,
+                            id: al.get("id").and_then(|v| v.as_i64()),
+                            name: al
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            visible: al.get("visible").and_then(|v| v.as_bool()).unwrap_or(true),
+                            blend: al.get("blend").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                            rate: al.get("rate").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                            frame_count: 300,
+                            fps: 30.0,
+                            duration: 10.0,
+                            mode: "loop",
+                        });
+                    }
+                }
                 frames.push(LayerFrame {
                     id,
                     visible: true,
@@ -2704,6 +3929,7 @@ mod tests {
                     angles: vec("angles", [0.0; 3]),
                     color: vec("color", [1.0; 3]),
                     text: String::new(),
+                    video_time: None,
                 });
             }
             host.link_parents();
@@ -2728,7 +3954,9 @@ mod tests {
                         .cloned()
                         .unwrap_or_default();
                     let initial = def.get("value").cloned().unwrap_or(Value::Null);
-                    host.add_property_script(id, field, script, initial, &sp);
+                    let pa = super::super::keytrack::KeyTrack::parse(def)
+                        .map(|t| PropAnimSeed::from_track(&t));
+                    host.add_property_script(id, field, script, initial, &sp, pa.as_ref());
                     layer_bindings += 1;
                 }
                 if let Some(effects) = obj.get("effects").and_then(|e| e.as_array()) {
@@ -2765,13 +3993,68 @@ mod tests {
                                         .cloned()
                                         .unwrap_or_default();
                                     let initial = cv.get("value").cloned().unwrap_or(json!(0.0));
+                                    let pa = super::super::keytrack::KeyTrack::parse(cv)
+                                        .map(|t| PropAnimSeed::from_track(&t));
                                     host.add_effect_constant_script(
-                                        id, eidx, pidx, ck, script, initial, &sp,
+                                        id, eidx, pidx, ck, script, initial, &sp, pa.as_ref(),
                                     );
                                     effect_const_bindings += 1;
                                 }
                             }
                         }
+                    }
+                }
+                if let Some(als) = obj.get("animationlayers").and_then(|a| a.as_array()) {
+                    for (aidx, al) in als.iter().enumerate() {
+                        for (field, key) in [
+                            (AnimLayerField::Visible, "visible"),
+                            (AnimLayerField::Blend, "blend"),
+                            (AnimLayerField::Rate, "rate"),
+                        ] {
+                            let Some(def) = al.get(key) else { continue };
+                            let Some(script) = def.get("script").and_then(|s| s.as_str()) else {
+                                continue;
+                            };
+                            let sp = def
+                                .get("scriptproperties")
+                                .and_then(|v| v.as_object())
+                                .cloned()
+                                .unwrap_or_default();
+                            let initial = def.get("value").cloned().unwrap_or_else(|| {
+                                if field == AnimLayerField::Visible {
+                                    json!(true)
+                                } else {
+                                    json!(1.0)
+                                }
+                            });
+                            let pa = super::super::keytrack::KeyTrack::parse(def)
+                                .map(|t| PropAnimSeed::from_track(&t));
+                            host.add_anim_layer_script(
+                                id,
+                                aidx,
+                                field,
+                                script,
+                                initial,
+                                &sp,
+                                pa.as_ref(),
+                            );
+                            anim_layer_bindings += 1;
+                        }
+                    }
+                }
+                if let Some(io) = obj.get("instanceoverride").and_then(|v| v.as_object()) {
+                    for (ok, ov) in io {
+                        let Some(script) = ov.get("script").and_then(|s| s.as_str()) else {
+                            continue;
+                        };
+                        let sp = ov
+                            .get("scriptproperties")
+                            .and_then(|v| v.as_object())
+                            .cloned()
+                            .unwrap_or_default();
+                        let initial = ov.get("value").cloned().unwrap_or(json!(1.0));
+                        host.add_instance_override_script(id, ok, script, initial, &sp);
+                        inst_ov_bindings += 1;
                     }
                 }
             }
@@ -2802,9 +4085,13 @@ mod tests {
                 ));
             }
         }
-        let bindings = layer_bindings + effect_vis_bindings + effect_const_bindings;
+        let bindings = layer_bindings
+            + effect_vis_bindings
+            + effect_const_bindings
+            + anim_layer_bindings
+            + inst_ov_bindings;
         eprintln!(
-            "workshop: {scenes} scenes ({audio_scenes} audio), {bindings} bindings (layer={layer_bindings}, eff_vis={effect_vis_bindings}, eff_const={effect_const_bindings}), {failures} failures\n{}",
+            "workshop: {scenes} scenes ({audio_scenes} audio), {bindings} bindings (layer={layer_bindings}, eff_vis={effect_vis_bindings}, eff_const={effect_const_bindings}, anim_layer={anim_layer_bindings}, inst_ov={inst_ov_bindings}), {failures} failures\n{}",
             reports.join("\n")
         );
         assert!(bindings > 100, "expected the workshop library to be present");

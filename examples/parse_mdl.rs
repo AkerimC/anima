@@ -108,15 +108,25 @@ fn main() {
         .fold(0.0, f32::max);
     println!("evaluate(t=0) vs base pose max err: {:.4}", e0);
     for anim in m.anims.iter().take(4) {
-        let layer = anima::render::we_model::PuppetAnimLayer {
+        let mut layer = anima::render::we_model::PuppetAnimLayer {
+            scene_idx: 0,
+            id: None,
+            name: String::new(),
             anim_id: Some(anim.id),
+            visible: true,
             rate: 1.0,
             blend: 1.0,
             additive: true,
+            playing: true,
+            frame: 0.0,
+            mirror_reverse: false,
         };
         let mut max = 0.0f32;
         for step in 0..20 {
             let t = step as f32 * 0.1;
+            if step > 0 {
+                m.advance_layers(0.1, std::slice::from_mut(&mut layer));
+            }
             let v = m.evaluate_vertices(t, std::slice::from_ref(&layer));
             for (p, q) in v.iter().zip(skin(&m, &m.base_pose)) {
                 max = max.max(((p.pos[0] - q[0]).powi(2) + (p.pos[1] - q[1]).powi(2)).sqrt());

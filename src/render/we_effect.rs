@@ -140,6 +140,17 @@ impl TextureCache {
         }
     }
 
+    pub fn video_by_texture(&self, tex: glow::Texture) -> Option<&super::video::VideoTexture> {
+        self.videos.iter().find(|v| v.texture() == tex)
+    }
+
+    pub fn video_by_texture_mut(
+        &mut self,
+        tex: glow::Texture,
+    ) -> Option<&mut super::video::VideoTexture> {
+        self.videos.iter_mut().find(|v| v.texture() == tex)
+    }
+
     /// Delete every cached texture.  Requires a current GL context.
     pub fn clear(&mut self, gl: &glow::Context) {
         for (_, cached) in self.map.drain() {
@@ -4566,6 +4577,8 @@ struct EffectPass {
     textures: Vec<Option<String>>,
     /// constant key -> value.
     constants: HashMap<String, Value>,
+    /// Keyframe animation tracks parsed from `constants` (`key` lowercased).
+    anim_constants: HashMap<String, super::keytrack::KeyTrack>,
     /// Per-frame constant overrides produced by SceneScript (`key` lowercased).
     script_constants: HashMap<String, Value>,
     /// combo definitions for this pass.
@@ -4845,6 +4858,12 @@ impl EffectInstance {
                     constants.insert(k.to_ascii_lowercase(), v.clone());
                 }
             }
+            let mut anim_constants = HashMap::new();
+            for (k, v) in &constants {
+                if let Some(track) = super::keytrack::KeyTrack::parse(v) {
+                    anim_constants.insert(k.clone(), track);
+                }
+            }
 
             let mut binds = HashMap::new();
             if let Some(b) = def_pass.get("bind").and_then(|v| v.as_array()) {
@@ -4866,6 +4885,7 @@ impl EffectInstance {
                     .map(str::to_string),
                 textures,
                 constants,
+                anim_constants,
                 script_constants: HashMap::new(),
                 combos,
             });
@@ -4930,6 +4950,33 @@ impl EffectInstance {
         for pass in &mut self.passes {
             pass.script_constants.clear();
         }
+    }
+
+    /// Advance every keyframe-animated shader constant across all passes by `dt` seconds.
+    pub fn advance_animations(&mut self, dt: f32) {
+        for pass in &mut self.passes {
+            for track in pass.anim_constants.values_mut() {
+                track.advance(dt);
+            }
+        }
+    }
+
+    pub fn constant_track(&self, pass_idx: usize, key: &str) -> Option<&super::keytrack::KeyTrack> {
+        self.passes
+            .get(pass_idx)?
+            .anim_constants
+            .get(&key.to_ascii_lowercase())
+    }
+
+    pub fn constant_track_mut(
+        &mut self,
+        pass_idx: usize,
+        key: &str,
+    ) -> Option<&mut super::keytrack::KeyTrack> {
+        self.passes
+            .get_mut(pass_idx)?
+            .anim_constants
+            .get_mut(&key.to_ascii_lowercase())
     }
 
     /// Best fallback initial value for a pass constant (authored constant or shader default).
@@ -5317,10 +5364,15 @@ impl EffectInstance {
                     continue;
                 }
 
-                let resolved = if let Some(script_val) = lookup_uniform_constant(spec, &pass.script_constants) {
+                let resolved = if let Some(script_val) =
+                    lookup_uniform_map(spec, &pass.script_constants).cloned()
+                {
                     script_val
-                } else if let Some(raw_value) =
-                    lookup_uniform_constant(spec, &pass.constants).or_else(|| spec.default.clone())
+                } else if let Some(track) = lookup_uniform_map(spec, &pass.anim_constants) {
+                    track.eval_value()
+                } else if let Some(raw_value) = lookup_uniform_map(spec, &pass.constants)
+                    .cloned()
+                    .or_else(|| spec.default.clone())
                 {
                     eval_dynamic_constant(&raw_value, ctx)
                 } else {
@@ -5349,15 +5401,14 @@ impl EffectInstance {
     }
 }
 
-fn lookup_uniform_constant(spec: &UniformSpec, map: &HashMap<String, Value>) -> Option<Value> {
+fn lookup_uniform_map<'a, T>(spec: &UniformSpec, map: &'a HashMap<String, T>) -> Option<&'a T> {
     if map.is_empty() {
         return None;
     }
-    let lookup_mat = |m: &str| -> Option<Value> {
+    let lookup_mat = |m: &str| -> Option<&'a T> {
         let ml = m.to_ascii_lowercase();
         map.get(&ml)
             .or_else(|| map.get(&format!("ui_editor_properties_{ml}")))
-            .cloned()
     };
     spec.material
         .as_deref()
@@ -5367,7 +5418,6 @@ fn lookup_uniform_constant(spec: &UniformSpec, map: &HashMap<String, Value>) -> 
             spec.label
                 .as_ref()
                 .and_then(|l| map.get(&l.to_ascii_lowercase()))
-                .cloned()
         })
         .or_else(|| {
             let short = spec
@@ -5376,8 +5426,13 @@ fn lookup_uniform_constant(spec: &UniformSpec, map: &HashMap<String, Value>) -> 
                 .or_else(|| spec.name.strip_prefix("u_"))
                 .unwrap_or(&spec.name)
                 .to_ascii_lowercase();
-            map.get(&short).cloned()
+            map.get(&short)
         })
+}
+
+#[cfg(test)]
+fn lookup_uniform_constant(spec: &UniformSpec, map: &HashMap<String, Value>) -> Option<Value> {
+    lookup_uniform_map(spec, map).cloned()
 }
 
 fn resolve_effect_user_prop(val: &Value, props: &HashMap<String, Value>) -> Value {
@@ -6077,5 +6132,59 @@ void main() {
             lookup_uniform_constant(&spec_ui, &constants),
             Some(Value::from(2.0))
         );
+    }
+
+    #[test]
+    fn anim_constants_playback_and_script_precedence() {
+        let spec = UniformSpec {
+            name: "g_Multiply".into(),
+            kind: UniformKind::Float,
+            material: Some("multiply".into()),
+            alt_materials: Vec::new(),
+            label: None,
+            default: Some(Value::from(1.0)),
+            default_tex: None,
+            slot: None,
+        };
+        let mut constants = HashMap::new();
+        constants.insert("multiply".to_string(), Value::from(0.25));
+        let mut anim_constants = HashMap::new();
+        let mut track = super::super::keytrack::KeyTrack::parse(&serde_json::json!({
+            "animation": {
+                "options": { "fps": 10, "length": 10, "mode": "single", "startpaused": true },
+                "c0": [
+                    { "frame": 0, "value": 1.0, "front": { "enabled": false } },
+                    { "frame": 10, "value": 0.0, "back": { "enabled": false } }
+                ]
+            }
+        }))
+        .expect("track");
+        let mut script_constants = HashMap::new();
+
+        // While paused at frame 0, anim_constants overrides constants.
+        track.advance(0.5);
+        anim_constants.insert("multiply".to_string(), track.clone());
+        let val_paused = lookup_uniform_map(&spec, &script_constants)
+            .cloned()
+            .or_else(|| lookup_uniform_map(&spec, &anim_constants).map(|t| t.eval_value()))
+            .or_else(|| lookup_uniform_map(&spec, &constants).cloned());
+        assert_eq!(val_paused, Some(serde_json::json!(1.0)));
+
+        // After play() + advance(0.5s), frame = 5 -> linear value 0.5.
+        anim_constants.get_mut("multiply").unwrap().play();
+        anim_constants.get_mut("multiply").unwrap().advance(0.5);
+        let val_playing = lookup_uniform_map(&spec, &script_constants)
+            .cloned()
+            .or_else(|| lookup_uniform_map(&spec, &anim_constants).map(|t| t.eval_value()))
+            .or_else(|| lookup_uniform_map(&spec, &constants).cloned());
+        assert!((val_playing.unwrap().as_f64().unwrap() - 0.5).abs() < 1e-4);
+
+        // Explicit script_constants takes top precedence.
+        script_constants.insert("multiply".to_string(), serde_json::json!(0.9));
+        let val_script = lookup_uniform_map(&spec, &script_constants)
+            .cloned()
+            .or_else(|| lookup_uniform_map(&spec, &anim_constants).map(|t| t.eval_value()))
+            .or_else(|| lookup_uniform_map(&spec, &constants).cloned());
+        assert!((val_script.unwrap().as_f64().unwrap() - 0.9).abs() < 1e-5);
     }
 }

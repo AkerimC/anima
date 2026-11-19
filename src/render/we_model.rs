@@ -61,6 +61,16 @@ pub enum AnimMode {
     Single,
 }
 
+impl AnimMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnimMode::Loop => "loop",
+            AnimMode::Mirror => "mirror",
+            AnimMode::Single => "single",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MdlaAnim {
     pub id: u32,
@@ -68,14 +78,22 @@ pub struct MdlaAnim {
     pub fps: f32,
     pub frame_count: usize,
     pub tracks: Vec<Vec<BonePose>>,
+    pub bone_animated: Vec<bool>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PuppetAnimLayer {
+    pub scene_idx: usize,
+    pub id: Option<i64>,
+    pub name: String,
     pub anim_id: Option<u32>,
+    pub visible: bool,
     pub rate: f32,
     pub blend: f32,
     pub additive: bool,
+    pub playing: bool,
+    pub frame: f32,
+    pub mirror_reverse: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +168,76 @@ impl ParsedMdl {
         Some(mat2d_mul(world[idx], self.bones[idx].attachment))
     }
 
-    /// Bone poses at `time`, starting from the assembled rest pose.
+    pub fn find_anim(&self, anim_id: Option<u32>) -> Option<&MdlaAnim> {
+        match anim_id {
+            Some(id) => self.anims.iter().find(|a| a.id == id),
+            None => self.anims.first(),
+        }
+    }
+
+    pub fn anim_frame_count(&self, anim: &MdlaAnim) -> usize {
+        anim.tracks
+            .first()
+            .map(|t| t.len())
+            .unwrap_or(anim.frame_count)
+            .max(1)
+    }
+
+    /// Advance playback state on visible, playing puppet animation layers.
+    pub fn advance_layers(&self, dt: f32, layers: &mut [PuppetAnimLayer]) {
+        if dt <= 0.0 {
+            return;
+        }
+        for layer in layers {
+            if !layer.visible || !layer.playing || layer.rate == 0.0 {
+                continue;
+            }
+            let Some(anim) = self.find_anim(layer.anim_id) else {
+                continue;
+            };
+            let max_idx = (self.anim_frame_count(anim).saturating_sub(1)) as f32;
+            if max_idx <= 0.0 {
+                continue;
+            }
+            let delta = dt * anim.fps * layer.rate;
+            match anim.mode {
+                AnimMode::Loop => {
+                    layer.frame = (layer.frame + delta).rem_euclid(max_idx);
+                }
+                AnimMode::Single => {
+                    let next = layer.frame + delta;
+                    if delta >= 0.0 && next >= max_idx {
+                        layer.frame = max_idx;
+                        layer.playing = false;
+                    } else if delta < 0.0 && next <= 0.0 {
+                        layer.frame = 0.0;
+                        layer.playing = false;
+                    } else {
+                        layer.frame = next;
+                    }
+                }
+                AnimMode::Mirror => {
+                    let period = (2.0 * max_idx).max(1e-4);
+                    let phase = if layer.mirror_reverse {
+                        period - layer.frame
+                    } else {
+                        layer.frame
+                    };
+                    let m = (phase + delta).rem_euclid(period);
+                    if m <= max_idx {
+                        layer.frame = m;
+                        layer.mirror_reverse = false;
+                    } else {
+                        layer.frame = period - m;
+                        layer.mirror_reverse = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bone poses at `time`, starting from the assembled rest pose and applying
+    /// non-additive base layers followed by additive overlay layers.
     pub fn evaluate_pose(&self, time: f32, layers: &[PuppetAnimLayer]) -> Vec<BonePose> {
         // The assembled rest pose: the MDLS reference array when present, otherwise
         // the first keyframe of the first clip (see `compute_base_pose`).
@@ -162,19 +249,64 @@ impl ParsedMdl {
             if let Some(anim) = self.anims.first() {
                 accumulate_anim(&mut pose, anim, time, 1.0);
             }
-        } else {
-            for layer in layers {
-                if layer.blend <= 0.0001 {
+            return pose;
+        }
+
+        // Pass 1: non-additive base layers lerp toward target pose on their animated bones.
+        for layer in layers {
+            if layer.additive || !layer.visible || layer.blend <= 0.0001 {
+                continue;
+            }
+            let Some(anim) = self.find_anim(layer.anim_id) else {
+                continue;
+            };
+            let w = layer.blend.clamp(0.0, 1.0);
+            for b in 0..pose.len().min(anim.tracks.len()) {
+                if !anim.bone_animated.get(b).copied().unwrap_or(true) {
                     continue;
                 }
-                let anim = match layer.anim_id {
-                    Some(id) => self.anims.iter().find(|a| a.id == id),
-                    None => self.anims.first(),
-                };
-                let Some(anim) = anim else {
+                let track = &anim.tracks[b];
+                let Some(&first) = track.first() else {
                     continue;
                 };
-                accumulate_anim(&mut pose, anim, time * layer.rate.max(0.0), layer.blend);
+                let kf = sample_track_at_frame(track, layer.frame);
+                let base = self.base_pose.get(b).copied().unwrap_or(first);
+                let target = BonePose {
+                    tx: base.tx + (kf.tx - first.tx),
+                    ty: base.ty + (kf.ty - first.ty),
+                    rz: base.rz + (kf.rz - first.rz),
+                    sx: base.sx + (kf.sx - first.sx),
+                    sy: base.sy + (kf.sy - first.sy),
+                };
+                pose[b] = BonePose {
+                    tx: pose[b].tx + (target.tx - pose[b].tx) * w,
+                    ty: pose[b].ty + (target.ty - pose[b].ty) * w,
+                    rz: pose[b].rz + (target.rz - pose[b].rz) * w,
+                    sx: pose[b].sx + (target.sx - pose[b].sx) * w,
+                    sy: pose[b].sy + (target.sy - pose[b].sy) * w,
+                };
+            }
+        }
+
+        // Pass 2: additive overlay layers accumulate relative deltas on top of Pass 1.
+        for layer in layers {
+            if !layer.additive || !layer.visible || layer.blend <= 0.0001 {
+                continue;
+            }
+            let Some(anim) = self.find_anim(layer.anim_id) else {
+                continue;
+            };
+            for b in 0..pose.len().min(anim.tracks.len()) {
+                let track = &anim.tracks[b];
+                let Some(&first) = track.first() else {
+                    continue;
+                };
+                let kf = sample_track_at_frame(track, layer.frame);
+                pose[b].tx += layer.blend * (kf.tx - first.tx);
+                pose[b].ty += layer.blend * (kf.ty - first.ty);
+                pose[b].rz += layer.blend * (kf.rz - first.rz);
+                pose[b].sx += layer.blend * (kf.sx - first.sx);
+                pose[b].sy += layer.blend * (kf.sy - first.sy);
             }
         }
 
@@ -726,12 +858,28 @@ fn parse_mdla(bytes: &[u8], from: usize, expected_bones: usize) -> Option<Vec<Md
         if !ok {
             break;
         }
+        let bone_animated = tracks
+            .iter()
+            .map(|track| {
+                let Some(&f0) = track.first() else {
+                    return false;
+                };
+                track.iter().skip(1).any(|f| {
+                    (f.tx - f0.tx).abs() > 1e-5
+                        || (f.ty - f0.ty).abs() > 1e-5
+                        || (f.rz - f0.rz).abs() > 1e-5
+                        || (f.sx - f0.sx).abs() > 1e-5
+                        || (f.sy - f0.sy).abs() > 1e-5
+                })
+            })
+            .collect();
         anims.push(MdlaAnim {
             id,
             mode,
             fps,
             frame_count,
             tracks,
+            bone_animated,
         });
         p = pos;
     }
@@ -782,6 +930,33 @@ fn accumulate_anim(pose: &mut [BonePose], anim: &MdlaAnim, time: f32, blend: f32
     }
 }
 
+fn sample_track_at_frame(track: &[BonePose], frame: f32) -> BonePose {
+    if track.is_empty() {
+        return BonePose {
+            sx: 1.0,
+            sy: 1.0,
+            ..Default::default()
+        };
+    }
+    if track.len() == 1 {
+        return track[0];
+    }
+    let max_idx = (track.len() - 1) as f32;
+    let f = frame.clamp(0.0, max_idx);
+    let i0 = (f.floor() as usize).min(track.len() - 1);
+    let i1 = (i0 + 1).min(track.len() - 1);
+    let frac = f - (i0 as f32);
+    let a = track[i0];
+    let b = track[i1];
+    BonePose {
+        tx: a.tx + (b.tx - a.tx) * frac,
+        ty: a.ty + (b.ty - a.ty) * frac,
+        rz: a.rz + (b.rz - a.rz) * frac,
+        sx: a.sx + (b.sx - a.sx) * frac,
+        sy: a.sy + (b.sy - a.sy) * frac,
+    }
+}
+
 fn sample_track(
     track: &[BonePose],
     fps: f32,
@@ -814,18 +989,7 @@ fn sample_track(
         }
         AnimMode::Single => raw_f.min(max_idx),
     };
-    let i0 = (f.floor() as usize).min(track.len() - 1);
-    let i1 = (i0 + 1).min(track.len() - 1);
-    let frac = f - (i0 as f32);
-    let a = track[i0];
-    let b = track[i1];
-    BonePose {
-        tx: a.tx + (b.tx - a.tx) * frac,
-        ty: a.ty + (b.ty - a.ty) * frac,
-        rz: a.rz + (b.rz - a.rz) * frac,
-        sx: a.sx + (b.sx - a.sx) * frac,
-        sy: a.sy + (b.sy - a.sy) * frac,
-    }
+    sample_track_at_frame(track, f)
 }
 
 fn skin_vertices(raw: &[RawVertex], bones: &[MdlsBone], poses: &[BonePose]) -> Vec<MeshVertex> {
@@ -871,4 +1035,190 @@ fn skin_vertices(raw: &[RawVertex], bones: &[MdlsBone], poses: &[BonePose]) -> V
         out.push(MeshVertex { pos, uv: rv.uv });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bone(tx: f32, ty: f32) -> BonePose {
+        BonePose {
+            tx,
+            ty,
+            rz: 0.0,
+            sx: 1.0,
+            sy: 1.0,
+        }
+    }
+
+    fn test_mdl() -> ParsedMdl {
+        // 2 bones.
+        // Clip 1 (id 1): bone 0 moves 0 -> 10, bone 1 stays at 0 (not animated).
+        // Clip 2 (id 2): bone 0 moves 0 -> 20, bone 1 stays at 0 (override clip).
+        // Clip 3 (id 3): bone 0 moves 0 -> 2, bone 1 moves 0 -> 5 (additive clip).
+        let bones = vec![
+            MdlsBone {
+                parent: -1,
+                name: "b0".into(),
+                attachment: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                rest_local: bone(0.0, 0.0),
+                inv_rest_world: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            },
+            MdlsBone {
+                parent: -1,
+                name: "b1".into(),
+                attachment: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                rest_local: bone(0.0, 0.0),
+                inv_rest_world: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            },
+        ];
+        let base_pose = vec![bone(100.0, 0.0), bone(50.0, 0.0)];
+        let anims = vec![
+            MdlaAnim {
+                id: 1,
+                mode: AnimMode::Loop,
+                fps: 10.0,
+                frame_count: 11,
+                tracks: vec![vec![bone(0.0, 0.0), bone(10.0, 0.0)], vec![bone(0.0, 0.0), bone(0.0, 0.0)]],
+                bone_animated: vec![true, false],
+            },
+            MdlaAnim {
+                id: 2,
+                mode: AnimMode::Single,
+                fps: 10.0,
+                frame_count: 11,
+                tracks: vec![vec![bone(0.0, 0.0), bone(20.0, 0.0)], vec![bone(0.0, 0.0), bone(0.0, 0.0)]],
+                bone_animated: vec![true, false],
+            },
+            MdlaAnim {
+                id: 3,
+                mode: AnimMode::Mirror,
+                fps: 10.0,
+                frame_count: 11,
+                tracks: vec![vec![bone(0.0, 0.0), bone(2.0, 0.0)], vec![bone(0.0, 0.0), bone(5.0, 0.0)]],
+                bone_animated: vec![true, true],
+            },
+        ];
+        ParsedMdl {
+            vertices: Vec::new(),
+            raw_vertices: Vec::new(),
+            bones,
+            base_pose,
+            anims,
+            indices: Vec::new(),
+            bounds_min: [0.0; 2],
+            bounds_max: [0.0; 2],
+            material: None,
+        }
+    }
+
+    #[test]
+    fn non_additive_overrides_and_additive_adds() {
+        let mdl = test_mdl();
+        let layers = vec![
+            PuppetAnimLayer {
+                scene_idx: 0,
+                id: Some(10),
+                name: "base1".into(),
+                anim_id: Some(1),
+                visible: true,
+                rate: 1.0,
+                blend: 1.0,
+                additive: false,
+                playing: true,
+                frame: 1.0, // clip 1 frame 1 -> +10 on bone 0
+                mirror_reverse: false,
+            },
+            PuppetAnimLayer {
+                scene_idx: 1,
+                id: Some(11),
+                name: "base2".into(),
+                anim_id: Some(2),
+                visible: true,
+                rate: 1.0,
+                blend: 1.0,
+                additive: false,
+                playing: true,
+                frame: 1.0, // clip 2 frame 1 -> overrides bone 0 to 100 + 20 = 120 (NOT 130)
+                mirror_reverse: false,
+            },
+            PuppetAnimLayer {
+                scene_idx: 2,
+                id: Some(12),
+                name: "add".into(),
+                anim_id: Some(3),
+                visible: true,
+                rate: 1.0,
+                blend: 1.0,
+                additive: true,
+                playing: true,
+                frame: 1.0, // clip 3 additive -> +2 on bone 0 (122), +5 on bone 1 (55)
+                mirror_reverse: false,
+            },
+        ];
+        let pose = mdl.evaluate_pose(0.0, &layers);
+        assert!((pose[0].tx - 122.0).abs() < 1e-4, "bone 0 = {}", pose[0].tx);
+        assert!((pose[1].tx - 55.0).abs() < 1e-4, "bone 1 = {}", pose[1].tx);
+    }
+
+    #[test]
+    fn advance_layers_handles_visibility_pause_rate_phase_and_modes() {
+        let mut mdl = test_mdl();
+        // Make each track 11 frames long so max_idx = 10.
+        for a in &mut mdl.anims {
+            a.tracks[0] = (0..=10).map(|i| bone(i as f32, 0.0)).collect();
+        }
+        let mut layers = vec![
+            PuppetAnimLayer {
+                scene_idx: 0,
+                id: None,
+                name: "loop_hidden".into(),
+                anim_id: Some(1),
+                visible: false,
+                rate: 1.0,
+                blend: 1.0,
+                additive: false,
+                playing: true,
+                frame: 3.0, // preserved phase offset
+                mirror_reverse: false,
+            },
+            PuppetAnimLayer {
+                scene_idx: 1,
+                id: None,
+                name: "single_half".into(),
+                anim_id: Some(2),
+                visible: true,
+                rate: 0.5,
+                blend: 1.0,
+                additive: false,
+                playing: true,
+                frame: 5.0,
+                mirror_reverse: false,
+            },
+            PuppetAnimLayer {
+                scene_idx: 2,
+                id: None,
+                name: "mirror".into(),
+                anim_id: Some(3),
+                visible: true,
+                rate: 1.0,
+                blend: 1.0,
+                additive: false,
+                playing: true,
+                frame: 0.0,
+                mirror_reverse: false,
+            },
+        ];
+
+        // dt = 1.2s at 10 fps -> 12 frames at rate 1.0.
+        mdl.advance_layers(1.2, &mut layers);
+        // Hidden layer did not advance (frame stays 3.0).
+        assert!((layers[0].frame - 3.0).abs() < 1e-5);
+        // Single at rate 0.5: 5.0 + 12*0.5 = 11.0 -> clamped to 10.0 and stopped.
+        assert!((layers[1].frame - 10.0).abs() < 1e-4);
+        assert!(!layers[1].playing);
+        // Mirror at rate 1.0: 0 + 12 mod 20 = 12 -> 20 - 12 = 8.0 in reverse.
+        assert!((layers[2].frame - 8.0).abs() < 1e-4);
+        assert!(layers[2].mirror_reverse);
+    }
 }
