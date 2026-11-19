@@ -15,6 +15,7 @@ pub mod video;
 pub mod web;
 pub mod we_effect;
 pub mod we_model;
+pub mod we_particle;
 
 /// Per-frame state handed to every renderer.
 #[derive(Debug, Clone)]

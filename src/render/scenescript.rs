@@ -395,6 +395,8 @@ pub struct SceneScripts {
     cursor_layers: HashSet<i64>,
     /// Whether `finalize_init()` has executed `init()` + startup `applyUserProperties()`.
     initialized: bool,
+    /// Latest dirty `localStorage` snapshot emitted by scripts, waiting to be flushed to disk.
+    pending_storage: Option<Value>,
 }
 
 struct Binding {
@@ -423,6 +425,8 @@ struct HostResponse {
     outputs: Vec<HostOutput>,
     #[serde(default, rename = "usesAudio")]
     uses_audio: bool,
+    #[serde(default)]
+    storage: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -461,6 +465,14 @@ impl SceneScripts {
     /// Create the QuickJS host.  Returns `None` when the runtime cannot start
     /// (never fatal for rendering — the scene simply keeps authored values).
     pub fn new(user_properties: &serde_json::Map<String, Value>) -> Option<Self> {
+        Self::new_with_storage(user_properties, None)
+    }
+
+    /// Create the QuickJS host seeded with persisted `localStorage` state.
+    pub fn new_with_storage(
+        user_properties: &serde_json::Map<String, Value>,
+        initial_storage: Option<&Value>,
+    ) -> Option<Self> {
         let rt = Runtime::new().ok()?;
         let ctx = Context::full(&rt).ok()?;
         if let Err(err) = ctx.with(|ctx| -> rquickjs::Result<()> {
@@ -469,7 +481,15 @@ impl SceneScripts {
             log::warn!("scenescript: prelude failed: {err}");
             return None;
         }
-        let seed = json!({ "userProperties": user_properties });
+        let mut seed_map = serde_json::Map::new();
+        seed_map.insert(
+            "userProperties".into(),
+            Value::Object(user_properties.clone()),
+        );
+        if let Some(st) = initial_storage {
+            seed_map.insert("storage".into(), st.clone());
+        }
+        let seed = Value::Object(seed_map);
         if let Err(err) = ctx.with(|ctx| -> rquickjs::Result<()> {
             let globals = ctx.globals();
             let f: Function = globals.get("__WE_init")?;
@@ -488,6 +508,7 @@ impl SceneScripts {
             uses_media: false,
             cursor_layers: HashSet::new(),
             initialized: false,
+            pending_storage: None,
         })
     }
 
@@ -1032,12 +1053,20 @@ impl SceneScripts {
         }
     }
 
+    /// Take the latest dirty `localStorage` snapshot emitted by scripts, if any.
+    pub fn take_storage_update(&mut self) -> Option<Value> {
+        self.pending_storage.take()
+    }
+
     fn parse_host_response(&mut self, raw: &str) -> Vec<ScriptOutput> {
         let Ok(resp) = serde_json::from_str::<HostResponse>(raw) else {
             self.report_once(usize::MAX, "tick-output", "invalid JSON from script host");
             return Vec::new();
         };
         self.uses_audio |= resp.uses_audio;
+        if let Some(st) = resp.storage {
+            self.pending_storage = Some(st);
+        }
 
         for err in resp.errors {
             if let Some(b) = self.bindings.get(err.idx) {
@@ -1682,13 +1711,79 @@ const PRELUDE: &str = r#"
 
   globalThis.shared = {};
 
-  // Wallpaper Engine persists small values with get/set/remove.
+  // Wallpaper Engine persists small values (including Vec2/3/4) with get/set/delete.
   var storage = {};
+  var storageDirty = false;
+  function serializeStorageVal(v, depth) {
+    if (depth > 8 || v === undefined || typeof v === 'function') return undefined;
+    if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v;
+    if (v instanceof Vec2) return { __weVec: 2, v: [num(v.x, 0), num(v.y, 0)] };
+    if (v instanceof Vec3) return { __weVec: 3, v: [num(v.x, 0), num(v.y, 0), num(v.z, 0)] };
+    if (v instanceof Vec4) return { __weVec: 4, v: [num(v.x, 0), num(v.y, 0), num(v.z, 0), num(v.w, 0)] };
+    if (Array.isArray(v)) {
+      var arr = [];
+      for (var i = 0; i < v.length; i++) {
+        var sv = serializeStorageVal(v[i], depth + 1);
+        arr.push(sv === undefined ? null : sv);
+      }
+      return arr;
+    }
+    if (typeof v === 'object') {
+      var out = {};
+      for (var k in v) {
+        if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+        var sv2 = serializeStorageVal(v[k], depth + 1);
+        if (sv2 !== undefined) out[k] = sv2;
+      }
+      return out;
+    }
+    return undefined;
+  }
+  function deserializeStorageVal(v, depth) {
+    if (depth > 8 || v === null || typeof v !== 'object') return v;
+    if (Array.isArray(v)) {
+      return v.map(function (item) { return deserializeStorageVal(item, depth + 1); });
+    }
+    if (v.__weVec === 2 && Array.isArray(v.v)) return new Vec2(v.v[0], v.v[1]);
+    if (v.__weVec === 3 && Array.isArray(v.v)) return new Vec3(v.v[0], v.v[1], v.v[2]);
+    if (v.__weVec === 4 && Array.isArray(v.v)) return new Vec4(v.v[0], v.v[1], v.v[2], v.v[3]);
+    var out = {};
+    for (var k in v) {
+      if (Object.prototype.hasOwnProperty.call(v, k)) {
+        out[k] = deserializeStorageVal(v[k], depth + 1);
+      }
+    }
+    return out;
+  }
+  function cloneStorageOut(v) {
+    if (v instanceof Vec2 || v instanceof Vec3 || v instanceof Vec4) return v.copy();
+    return v;
+  }
+  function lsRemove(k) {
+    var key = String(k);
+    if (Object.prototype.hasOwnProperty.call(storage, key)) {
+      delete storage[key];
+      storageDirty = true;
+    }
+  }
   globalThis.localStorage = {
-    get: function (k, d) { var v = storage[k]; return v === undefined ? (d === undefined ? null : d) : v; },
-    set: function (k, v) { storage[k] = v; },
-    remove: function (k) { delete storage[k]; },
-    clear: function () { storage = {}; }
+    LOCATION_SCREEN: 0,
+    LOCATION_GLOBAL: 1,
+    get: function (k) {
+      var key = String(k);
+      if (!Object.prototype.hasOwnProperty.call(storage, key)) return undefined;
+      return cloneStorageOut(storage[key]);
+    },
+    set: function (k, v) {
+      storage[String(k)] = v instanceof Vec2 || v instanceof Vec3 || v instanceof Vec4 ? v.copy() : v;
+      storageDirty = true;
+    },
+    delete: lsRemove,
+    remove: lsRemove,
+    clear: function () {
+      storage = {};
+      storageDirty = true;
+    }
   };
 
   globalThis.console = {
@@ -2546,11 +2641,16 @@ const PRELUDE: &str = r#"
       }
     }
 
-    return JSON.stringify({
+    var resp = {
       errors: errors,
       outputs: outputs,
       usesAudio: audioRegistered
-    });
+    };
+    if (storageDirty) {
+      storageDirty = false;
+      resp.storage = serializeStorageVal(storage, 0);
+    }
+    return JSON.stringify(resp);
   }
 
   function applyBindingValue(b, ret, forcedLayers, forcedEffects, forcedAnimLayers) {
@@ -3194,6 +3294,14 @@ const PRELUDE: &str = r#"
     var d = JSON.parse(jsonText);
     userProperties = d.userProperties || {};
     globalThis.engine.userProperties = userProperties;
+    if (d.storage && typeof d.storage === 'object') {
+      for (var sk in d.storage) {
+        if (Object.prototype.hasOwnProperty.call(d.storage, sk)) {
+          storage[sk] = deserializeStorageVal(d.storage[sk], 0);
+        }
+      }
+      storageDirty = false;
+    }
     return true;
   };
   globalThis.__WE_addLayer = init.addLayer;
@@ -4629,6 +4737,71 @@ export function update(value) {
             .find(|o| o.target == ScriptTarget::SoundControl { layer_id: 301 })
             .expect("stop sound_ctrl emitted");
         assert_eq!(sc3.value.get("action"), Some(&json!("stop")));
+    }
+
+    #[test]
+    fn local_storage_persists_primitives_and_vectors_across_hosts() {
+        let props = serde_json::Map::new();
+        let mut h1 = SceneScripts::new(&props).expect("host1");
+        h1.add_layer(&seed(401, "saved"));
+        h1.link_parents();
+        h1.add_property_script(
+            401,
+            ScriptField::Alpha,
+            "'use strict';
+export function init(value) {
+  localStorage.set('pos', new Vec3(12, 34, 56));
+  localStorage.set('flag', true);
+  localStorage.set('count', 7);
+  localStorage.set('temp', 'x');
+  localStorage.delete('temp');
+  return value;
+}
+export function update(value) { return value; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+        let _ = h1.finalize_init();
+        assert_eq!(h1.failures(), 0, "host1 failed: {:?}", h1.errors());
+        let snapshot = h1.take_storage_update().expect("storage update emitted");
+
+        let mut h2 = SceneScripts::new_with_storage(&props, Some(&snapshot)).expect("host2");
+        h2.add_layer(&seed(402, "loaded"));
+        h2.link_parents();
+        h2.add_property_script(
+            402,
+            ScriptField::Origin,
+            "'use strict';
+export function update(value) {
+  var p = localStorage.get('pos');
+  if (!(p instanceof Vec3)) throw new Error('expected Vec3 from localStorage');
+  if (localStorage.get('flag') !== true) throw new Error('expected flag true');
+  if (localStorage.get('count') !== 7) throw new Error('expected count 7');
+  if (localStorage.get('temp') !== undefined) throw new Error('expected deleted key to be undefined');
+  if (localStorage.LOCATION_SCREEN !== 0 || localStorage.LOCATION_GLOBAL !== 1) throw new Error('bad LOCATION_*');
+  return p;
+}",
+            json!([0.0, 0.0, 0.0]),
+            &serde_json::Map::new(),
+            None,
+        );
+        let out = h2.tick(
+            0.016,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(402)],
+        );
+        assert_eq!(h2.failures(), 0, "host2 failed: {:?}", h2.errors());
+        let orig = out
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 402, field: ScriptField::Origin })
+            .expect("origin restored from persisted Vec3");
+        assert_eq!(prop_vec3(&orig.value, [0.0; 3]), [12.0, 34.0, 56.0]);
     }
 
     /// Compile and tick every SceneScript (layer properties, effect visibility,
