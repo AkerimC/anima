@@ -203,30 +203,47 @@ pub fn load_font(pkg: &PackageFs, path: &str) -> Option<FontVec> {
     None
 }
 
-/// Lay out and rasterise `text`.
-///
-/// `font_px` is the font size in *texture pixels*, `padding_px` is the padding
-/// in the same space.  The returned bitmap is top-down (row 0 = top).
-#[allow(clippy::too_many_arguments)]
-pub fn rasterize(
-    font: &FontVec,
-    text: &str,
-    font_px: f32,
-    padding_px: f32,
-    spacing: [f32; 2],
-    h_align: HAlign,
-    v_align: VAlign,
-    max_width_px: Option<f32>,
-    max_rows: usize,
-    fixed_size: Option<[u32; 2]>,
-) -> RasterizedText {
-    let font_px = font_px.clamp(1.0, 4096.0);
-    let px = PxScale::from(font_px);
-    let scaled = font.as_scaled(px);
-    let line_height = (scaled.ascent() - scaled.descent() + scaled.line_gap() + spacing[1])
-        .max(font_px * 0.5);
-    let pad = padding_px.max(0.0);
+#[derive(Debug, Clone, Copy)]
+pub struct RasterizeOptions {
+    pub padding_px: [f32; 2],
+    pub spacing: [f32; 2],
+    pub h_align: HAlign,
+    pub v_align: VAlign,
+    pub max_width_px: Option<f32>,
+    pub max_rows: usize,
+    pub use_ellipsis: bool,
+    pub fixed_size: Option<[u32; 2]>,
+}
 
+fn split_token_to_width(
+    font: &FontVec,
+    px: PxScale,
+    token: &str,
+    spacing_x: f32,
+    max_w: f32,
+    out: &mut Vec<String>,
+) -> String {
+    let mut cur = String::new();
+    for ch in token.chars() {
+        let mut next = cur.clone();
+        next.push(ch);
+        if !cur.is_empty() && measure_line(font, px, &next, spacing_x) > max_w {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch);
+    }
+    cur
+}
+
+fn wrap_and_truncate_lines(
+    font: &FontVec,
+    px: PxScale,
+    text: &str,
+    spacing_x: f32,
+    max_width_inner: Option<f32>,
+    max_rows: usize,
+    use_ellipsis: bool,
+) -> Vec<String> {
     let mut lines: Vec<String> = text
         .split('\n')
         .map(|l| l.trim_end_matches('\r').to_string())
@@ -235,67 +252,137 @@ pub fn rasterize(
         lines.push(String::new());
     }
 
-    // Word-wrap when the layer has a width limit.
-    if let Some(max_w) = max_width_px {
-        let max_w = (max_w - 2.0 * pad).max(font_px * 0.5);
+    // Word-wrap when the layer has a width limit; break overly long words/CJK across chars.
+    if let Some(max_w) = max_width_inner {
         let mut wrapped = Vec::new();
         for line in &lines {
-            if measure_line(font, px, line, spacing[0]) <= max_w || line.is_empty() {
+            if line.is_empty() || measure_line(font, px, line, spacing_x) <= max_w {
                 wrapped.push(line.clone());
                 continue;
             }
             let mut current = String::new();
             for word in line.split_inclusive(' ') {
-                if !current.is_empty()
-                    && measure_line(font, px, &format!("{current}{word}"), spacing[0]) > max_w
-                {
+                let candidate = format!("{current}{word}");
+                if measure_line(font, px, &candidate, spacing_x) <= max_w {
+                    current = candidate;
+                    continue;
+                }
+                if !current.is_empty() {
                     wrapped.push(current.trim_end().to_string());
                     current.clear();
                 }
-                current.push_str(word);
+                let trimmed = word.trim_end();
+                if measure_line(font, px, trimmed, spacing_x) > max_w {
+                    let rem = split_token_to_width(font, px, trimmed, spacing_x, max_w, &mut wrapped);
+                    if word.ends_with(' ') {
+                        current = rem;
+                        current.push(' ');
+                    } else if !rem.is_empty() {
+                        wrapped.push(rem);
+                    }
+                } else {
+                    current.push_str(word);
+                }
             }
             if !current.is_empty() {
                 wrapped.push(current.trim_end().to_string());
             }
         }
+        if wrapped.is_empty() {
+            wrapped.push(String::new());
+        }
         lines = wrapped;
     }
-    if max_rows > 0 && lines.len() > max_rows {
+
+    let truncated = max_rows > 0 && lines.len() > max_rows;
+    if truncated {
         lines.truncate(max_rows);
     }
+    if truncated && use_ellipsis {
+        if let Some(last) = lines.last_mut() {
+            let mut base = last.trim_end().to_string();
+            if let Some(max_w) = max_width_inner {
+                loop {
+                    let cand = format!("{base}...");
+                    if measure_line(font, px, &cand, spacing_x) <= max_w {
+                        *last = cand;
+                        break;
+                    }
+                    if base.pop().is_none() {
+                        *last = "...".to_string();
+                        break;
+                    }
+                    while base.ends_with(char::is_whitespace) {
+                        base.pop();
+                    }
+                }
+            } else {
+                *last = format!("{base}...");
+            }
+        }
+    }
+    lines
+}
+
+/// Lay out and rasterise `text` with full layout options.
+pub fn rasterize_with_options(
+    font: &FontVec,
+    text: &str,
+    font_px: f32,
+    opts: RasterizeOptions,
+) -> RasterizedText {
+    let font_px = font_px.clamp(1.0, 4096.0);
+    let px = PxScale::from(font_px);
+    let scaled = font.as_scaled(px);
+    let line_height = (scaled.ascent() - scaled.descent() + scaled.line_gap() + opts.spacing[1])
+        .max(font_px * 0.5);
+    let pad_x = opts.padding_px[0].max(0.0);
+    let pad_y = opts.padding_px[1].max(0.0);
+    let max_width_inner = opts
+        .max_width_px
+        .map(|max_w| (max_w - 2.0 * pad_x).max(font_px * 0.5));
+    let lines = wrap_and_truncate_lines(
+        font,
+        px,
+        text,
+        opts.spacing[0],
+        max_width_inner,
+        opts.max_rows,
+        opts.use_ellipsis,
+    );
 
     let text_w = lines
         .iter()
-        .map(|l| measure_line(font, px, l, spacing[0]))
+        .map(|l| measure_line(font, px, l, opts.spacing[0]))
         .fold(0.0f32, f32::max);
     let text_h = line_height * lines.len() as f32;
 
-    let w = match fixed_size {
+    let w = match opts.fixed_size {
         Some([fw, _]) => fw.max(1).min(8192),
-        None => (text_w + 2.0 * pad).ceil().clamp(1.0, 8192.0) as u32,
+        None => (text_w + 2.0 * pad_x).ceil().clamp(1.0, 8192.0) as u32,
     };
-    let h = match fixed_size {
+    let h = match opts.fixed_size {
         Some([_, fh]) => fh.max(1).min(8192),
-        None => (text_h + 2.0 * pad).ceil().clamp(1.0, 8192.0) as u32,
+        None => (text_h + 2.0 * pad_y).ceil().clamp(1.0, 8192.0) as u32,
     };
     let mut pixels = vec![0u8; (w * h * 4) as usize];
 
-    let top = match v_align {
-        VAlign::Top => pad,
-        VAlign::Bottom => h as f32 - pad - text_h,
+    let top = match opts.v_align {
+        VAlign::Top => pad_y,
+        VAlign::Bottom => h as f32 - pad_y - text_h,
         VAlign::Center => (h as f32 - text_h) * 0.5,
     };
 
     for (line_idx, line) in lines.iter().enumerate() {
-        let line_w = measure_line(font, px, line, spacing[0]);
-        let line_x = match h_align {
-            HAlign::Left => pad,
-            HAlign::Right => w as f32 - pad - line_w,
+        let line_w = measure_line(font, px, line, opts.spacing[0]);
+        let line_x = match opts.h_align {
+            HAlign::Left => pad_x,
+            HAlign::Right => w as f32 - pad_x - line_w,
             HAlign::Center => (w as f32 - line_w) * 0.5,
         };
         let baseline = top + line_idx as f32 * line_height + scaled.ascent();
 
-        layout_line(font, px, line, line_x, spacing[0], |resolved, id, pen_x| {
+        layout_line(font, px, line, line_x, opts.spacing[0], |resolved, id, pen_x| {
             let glyph: Glyph = id.with_scale_and_position(px, ab_glyph::point(pen_x, baseline));
             if let Some(outline) = resolved.outline_glyph(glyph) {
                 let bounds = outline.px_bounds();
@@ -322,6 +409,40 @@ pub fn rasterize(
         height: h,
         pixels,
     }
+}
+
+/// Lay out and rasterise `text`.
+///
+/// `font_px` is the font size in *texture pixels*, `padding_px` is the padding
+/// in the same space.  The returned bitmap is top-down (row 0 = top).
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize(
+    font: &FontVec,
+    text: &str,
+    font_px: f32,
+    padding_px: f32,
+    spacing: [f32; 2],
+    h_align: HAlign,
+    v_align: VAlign,
+    max_width_px: Option<f32>,
+    max_rows: usize,
+    fixed_size: Option<[u32; 2]>,
+) -> RasterizedText {
+    rasterize_with_options(
+        font,
+        text,
+        font_px,
+        RasterizeOptions {
+            padding_px: [padding_px, padding_px],
+            spacing,
+            h_align,
+            v_align,
+            max_width_px,
+            max_rows,
+            use_ellipsis: false,
+            fixed_size,
+        },
+    )
 }
 
 /// Width of the widest line at the given pixel size.
@@ -1410,5 +1531,60 @@ mod tests {
         );
         let non_zero_alpha = raster.pixels.iter().skip(3).step_by(4).filter(|&&a| a > 0).count();
         assert!(non_zero_alpha > 50, "expected CJK/symbol glyphs to draw pixels, got {non_zero_alpha}");
+    }
+
+    #[test]
+    fn wrap_and_ellipsis_respects_max_width_and_max_rows() {
+        let pkg = PackageFs::open(&std::env::temp_dir()).expect("open temp pkg");
+        let font = load_font(&pkg, "systemfont_arial").expect("load fallback font");
+        let px = PxScale::from(24.0);
+
+        let lines_fit = wrap_and_truncate_lines(&font, px, "Hello world", 0.0, Some(600.0), 1, true);
+        assert_eq!(lines_fit, vec!["Hello world"]);
+
+        let lines_trunc = wrap_and_truncate_lines(
+            &font,
+            px,
+            "One Two Three Four Five Six Seven Eight",
+            0.0,
+            Some(160.0),
+            1,
+            true,
+        );
+        assert_eq!(lines_trunc.len(), 1);
+        assert!(lines_trunc[0].ends_with("..."), "expected ellipsis in {:?}", lines_trunc);
+        assert!(measure_line(&font, px, &lines_trunc[0], 0.0) <= 160.0 + 0.5);
+
+        let lines_long_word = wrap_and_truncate_lines(
+            &font,
+            px,
+            "一二三四五六七八九十一二三四五",
+            0.0,
+            Some(120.0),
+            0,
+            false,
+        );
+        assert!(lines_long_word.len() >= 2, "expected unbreakable CJK token to split: {:?}", lines_long_word);
+        for l in &lines_long_word {
+            assert!(measure_line(&font, px, l, 0.0) <= 120.0 + 0.5);
+        }
+
+        let raster = rasterize_with_options(
+            &font,
+            "A very long artist or track title for truncation check",
+            24.0,
+            RasterizeOptions {
+                padding_px: [8.0, 4.0],
+                spacing: [0.0, 0.0],
+                h_align: HAlign::Left,
+                v_align: VAlign::Center,
+                max_width_px: Some(150.0),
+                max_rows: 1,
+                use_ellipsis: true,
+                fixed_size: Some([150, 48]),
+            },
+        );
+        assert_eq!((raster.width, raster.height), (150, 48));
+        assert!(raster.pixels.iter().skip(3).step_by(4).any(|&a| a > 0));
     }
 }

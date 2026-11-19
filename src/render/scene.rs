@@ -1149,11 +1149,18 @@ struct TextLayer {
     raw_text_def: serde_json::Value,
     props: HashMap<String, serde_json::Value>,
     font: Option<ab_glyph::FontVec>,
+    font_path: String,
     point_size: f32,
     spacing: [f32; 2],
     padding: [f32; 2],
     max_width: f32,
     limit_width: bool,
+    limit_rows: bool,
+    max_rows: usize,
+    limit_use_ellipsis: bool,
+    opaque_background: bool,
+    background_color: [f32; 3],
+    background_brightness: f32,
     h_align: text::HAlign,
     v_align: text::VAlign,
     box_size: [f32; 2],
@@ -1727,7 +1734,12 @@ impl SceneObject {
                 index_count: mesh.index_count,
                 texture: *texture,
             },
-            ObjectKind::Text(layer) => DrawKind::Text(layer.texture),
+            ObjectKind::Text(layer) => DrawKind::Text {
+                texture: layer.texture,
+                bg: layer
+                    .opaque_background
+                    .then_some((layer.background_color, layer.background_brightness)),
+            },
             ObjectKind::Solid => DrawKind::Solid,
             ObjectKind::Particle(_)
             | ObjectKind::Sound(_)
@@ -1772,7 +1784,10 @@ enum DrawKind {
         index_count: i32,
         texture: glow::Texture,
     },
-    Text(Option<glow::Texture>),
+    Text {
+        texture: Option<glow::Texture>,
+        bg: Option<([f32; 3], f32)>,
+    },
     Solid,
     None,
 }
@@ -2001,9 +2016,12 @@ pub struct SceneRenderer {
     parallax_enabled: bool,
     parallax_amount: f32,
     parallax_mouse_influence: f32,
+    parallax_delay: f32,
     camera_shake: bool,
     camera_shake_amp: f32,
     camera_shake_speed: f32,
+    camera_shake_roughness: f32,
+    camera_zoom: f32,
     smooth_mouse: [f32; 2],
     speed_multiplier: f32,
     /// Horizontal offset applied when a portrait scene is widened to the
@@ -2331,9 +2349,12 @@ impl SceneRenderer {
             parallax_enabled: false,
             parallax_amount: 0.5,
             parallax_mouse_influence: 0.4,
+            parallax_delay: 0.1,
             camera_shake: false,
             camera_shake_amp: 0.01,
             camera_shake_speed: 1.5,
+            camera_shake_roughness: 0.0,
+            camera_zoom: 1.0,
             smooth_mouse: [0.0, 0.0],
             speed_multiplier: 1.0,
             view_shift: 0.0,
@@ -2457,6 +2478,48 @@ impl SceneRenderer {
         None
     }
 
+    fn apply_general_camera_settings(&mut self, general: &serde_json::Value) {
+        let resolve_f32 = |key: &str| {
+            general
+                .get(key)
+                .map(|v| resolve_prop(v, &self.properties))
+                .and_then(|v| value_f32(&v))
+        };
+        let resolve_bool = |key: &str| {
+            general
+                .get(key)
+                .map(|v| resolve_prop(v, &self.properties))
+                .and_then(|v| value_bool(&v))
+        };
+        if let Some(v) = resolve_bool("cameraparallax") {
+            self.parallax_enabled = v;
+        }
+        if let Some(v) = resolve_f32("cameraparallaxamount") {
+            self.parallax_amount = v;
+        }
+        if let Some(v) = resolve_f32("cameraparallaxmouseinfluence") {
+            self.parallax_mouse_influence = v;
+        }
+        if let Some(v) = resolve_f32("cameraparallaxdelay") {
+            self.parallax_delay = v.clamp(0.0, 10.0);
+        }
+        if let Some(v) = resolve_bool("camerashake") {
+            self.camera_shake = v;
+        }
+        if let Some(v) = resolve_f32("camerashakeamplitude") {
+            self.camera_shake_amp = v;
+        }
+        if let Some(v) = resolve_f32("camerashakespeed") {
+            self.camera_shake_speed = v;
+        }
+        if let Some(v) = resolve_f32("camerashakeroughness") {
+            self.camera_shake_roughness = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = resolve_f32("zoom") {
+            self.camera_zoom = v.clamp(0.1, 10.0);
+        }
+    }
+
     fn load_we_scene(&mut self, gl: &glow::Context, pkg: &PackageFs, json_text: &str) -> Result<()> {
         let root: serde_json::Value =
             serde_json::from_str(json_text).context("parsing Wallpaper Engine scene.json")?;
@@ -2464,6 +2527,15 @@ impl SceneRenderer {
         // Per-scene camera state: `view_shift` is only set by the portrait
         // widening branch below, so it must never leak in from a previous load.
         self.view_shift = 0.0;
+        self.parallax_enabled = false;
+        self.parallax_amount = 0.5;
+        self.parallax_mouse_influence = 0.4;
+        self.parallax_delay = 0.1;
+        self.camera_shake = false;
+        self.camera_shake_amp = 0.01;
+        self.camera_shake_speed = 1.5;
+        self.camera_shake_roughness = 0.0;
+        self.camera_zoom = 1.0;
         self.sounds.clear();
         self.sounds_started = false;
         self.scene_general = root.get("general").cloned();
@@ -2480,36 +2552,7 @@ impl SceneRenderer {
             if let Some(cc) = general.get("clearcolor") {
                 self.clear_color = eval_color_field(Some(cc), &self.properties, [0.04, 0.05, 0.08]);
             }
-            if let Some(v) = general
-                .get("cameraparallax")
-                .map(|v| resolve_prop(v, &self.properties))
-                .and_then(|v| value_bool(&v))
-            {
-                self.parallax_enabled = v;
-            }
-            if let Some(v) = general
-                .get("cameraparallaxamount")
-                .map(|v| resolve_prop(v, &self.properties))
-                .and_then(|v| value_f32(&v))
-            {
-                self.parallax_amount = v;
-            }
-            if let Some(v) = general
-                .get("cameraparallaxmouseinfluence")
-                .map(|v| resolve_prop(v, &self.properties))
-                .and_then(|v| value_f32(&v))
-            {
-                self.parallax_mouse_influence = v;
-            }
-            if let Some(v) = general.get("camerashake").and_then(value_bool) {
-                self.camera_shake = v;
-            }
-            if let Some(v) = general.get("camerashakeamplitude").and_then(value_f32) {
-                self.camera_shake_amp = v;
-            }
-            if let Some(v) = general.get("camerashakespeed").and_then(value_f32) {
-                self.camera_shake_speed = v;
-            }
+            self.apply_general_camera_settings(general);
         }
 
         let objects = root
@@ -4095,6 +4138,31 @@ impl SceneRenderer {
                 }),
                 _ => None,
             };
+            let authored_align = obj
+                .raw_obj
+                .get("alignment")
+                .and_then(|v| v.as_str())
+                .unwrap_or("center")
+                .to_string();
+            let (horizontal_align, vertical_align, point_size, font) = match &obj.kind {
+                ObjectKind::Text(layer) => (
+                    match layer.h_align {
+                        text::HAlign::Left => "left",
+                        text::HAlign::Right => "right",
+                        text::HAlign::Center => "center",
+                    }
+                    .to_string(),
+                    match layer.v_align {
+                        text::VAlign::Top => "top",
+                        text::VAlign::Bottom => "bottom",
+                        text::VAlign::Center => "center",
+                    }
+                    .to_string(),
+                    layer.point_size,
+                    layer.font_path.clone(),
+                ),
+                _ => ("center".to_string(), "center".to_string(), 32.0, String::new()),
+            };
             host.add_layer(&LayerSeed {
                 id,
                 name: obj.name.clone(),
@@ -4111,7 +4179,11 @@ impl SceneRenderer {
                 ],
                 color: [obj.color[0], obj.color[1], obj.color[2]],
                 size: obj.size,
-                align: obj.align,
+                align: authored_align,
+                horizontal_align,
+                vertical_align,
+                point_size,
+                font,
                 text,
                 parent,
                 tex_anim,
@@ -4484,6 +4556,7 @@ impl SceneRenderer {
                     let Some(&idx) = self.script_ids.get(&id) else {
                         continue;
                     };
+                    let pkg = &self.pkg;
                     let obj = &mut self.objects[idx];
                     match field {
                         ScriptField::Visible => {
@@ -4504,6 +4577,55 @@ impl SceneRenderer {
                         }
                         ScriptField::Text => {
                             obj.script_text_override = Some(value_to_string(&out.value));
+                        }
+                        ScriptField::Alignment => {
+                            obj.align = parse_alignment_str(&value_to_string(&out.value));
+                        }
+                        ScriptField::HorizontalAlign => {
+                            let ha = parse_h_align(&value_to_string(&out.value));
+                            if let ObjectKind::Text(layer) = &mut obj.kind {
+                                if layer.h_align != ha {
+                                    layer.h_align = ha;
+                                    layer.raster_ppw = -1.0;
+                                }
+                            }
+                        }
+                        ScriptField::VerticalAlign => {
+                            let va = parse_v_align(&value_to_string(&out.value));
+                            if let ObjectKind::Text(layer) = &mut obj.kind {
+                                if layer.v_align != va {
+                                    layer.v_align = va;
+                                    layer.raster_ppw = -1.0;
+                                }
+                            }
+                        }
+                        ScriptField::PointSize => {
+                            if let Some(ps) = out
+                                .value
+                                .as_f64()
+                                .map(|f| f as f32)
+                                .filter(|v| v.is_finite() && *v > 0.0)
+                                .map(|v| v.clamp(1.0, 2048.0))
+                            {
+                                if let ObjectKind::Text(layer) = &mut obj.kind {
+                                    if (ps - layer.point_size).abs() > 1e-3 {
+                                        layer.point_size = ps;
+                                        layer.raster_ppw = -1.0;
+                                    }
+                                }
+                            }
+                        }
+                        ScriptField::Font => {
+                            let new_path = value_to_string(&out.value);
+                            if !new_path.is_empty() {
+                                if let ObjectKind::Text(layer) = &mut obj.kind {
+                                    if new_path != layer.font_path {
+                                        layer.font_path = new_path;
+                                        layer.font = text::load_font(pkg, &layer.font_path);
+                                        layer.raster_ppw = -1.0;
+                                    }
+                                }
+                            }
                         }
                         ScriptField::Volume => {
                             let v = (out.value.as_f64().unwrap_or(1.0) as f32).clamp(0.0, 1.0);
@@ -5185,24 +5307,46 @@ impl SceneRenderer {
             })
             .unwrap_or([0.0, 0.0]);
         let max_width = obj.get("maxwidth").and_then(value_f32).unwrap_or(0.0);
-        let h_align = match obj
-            .get("horizontalalign")
-            .and_then(|v| v.as_str())
-            .unwrap_or("center")
-        {
-            "left" => text::HAlign::Left,
-            "right" => text::HAlign::Right,
-            _ => text::HAlign::Center,
-        };
-        let v_align = match obj
-            .get("verticalalign")
-            .and_then(|v| v.as_str())
-            .unwrap_or("center")
-        {
-            "top" => text::VAlign::Top,
-            "bottom" => text::VAlign::Bottom,
-            _ => text::VAlign::Center,
-        };
+        let limit_width = obj
+            .get("limitwidth")
+            .map(|v| resolve_prop(v, props_map))
+            .and_then(|v| value_bool(&v))
+            .unwrap_or(false);
+        let limit_rows = obj
+            .get("limitrows")
+            .map(|v| resolve_prop(v, props_map))
+            .and_then(|v| value_bool(&v))
+            .unwrap_or(false);
+        let max_rows = obj
+            .get("maxrows")
+            .map(|v| resolve_prop(v, props_map))
+            .and_then(|v| value_f32(&v))
+            .map(|f| f.round().max(1.0) as usize)
+            .unwrap_or(1);
+        let limit_use_ellipsis = obj
+            .get("limituseellipsis")
+            .map(|v| resolve_prop(v, props_map))
+            .and_then(|v| value_bool(&v))
+            .unwrap_or(false);
+        let opaque_background = obj
+            .get("opaquebackground")
+            .map(|v| resolve_prop(v, props_map))
+            .and_then(|v| value_bool(&v))
+            .unwrap_or(false);
+        let background_color =
+            eval_color_field(obj.get("backgroundcolor"), props_map, [0.0, 0.0, 0.0]);
+        let background_brightness =
+            eval_brightness_field(obj.get("backgroundbrightness"), props_map, 1.0);
+        let h_align = parse_h_align(
+            obj.get("horizontalalign")
+                .and_then(|v| v.as_str())
+                .unwrap_or("center"),
+        );
+        let v_align = parse_v_align(
+            obj.get("verticalalign")
+                .and_then(|v| v.as_str())
+                .unwrap_or("center"),
+        );
         let font_path = obj
             .get("font")
             .and_then(|v| v.as_str())
@@ -5215,11 +5359,18 @@ impl SceneRenderer {
             raw_text_def: text_def.clone(),
             props,
             font,
+            font_path,
             point_size,
             spacing: [0.0, 0.0],
             padding,
             max_width,
-            limit_width: obj.get("limitwidth").and_then(value_bool).unwrap_or(false),
+            limit_width,
+            limit_rows,
+            max_rows,
+            limit_use_ellipsis,
+            opaque_background,
+            background_color,
+            background_brightness,
             h_align,
             v_align,
             box_size,
@@ -5517,32 +5668,12 @@ impl SceneRenderer {
 
     fn reapply_scene_properties(&mut self) {
         let now = text::local_time();
-        if let Some(general) = &self.scene_general {
-            self.bloom = parse_bloom_config(general, &self.properties);
+        if let Some(general) = self.scene_general.clone() {
+            self.bloom = parse_bloom_config(&general, &self.properties);
             if let Some(cc) = general.get("clearcolor").filter(|v| v.get("user").is_some()) {
                 self.clear_color = eval_color_field(Some(cc), &self.properties, self.clear_color);
             }
-            if let Some(cp) = general.get("cameraparallax").filter(|v| v.get("user").is_some()) {
-                if let Some(b) = value_bool(&resolve_prop(cp, &self.properties)) {
-                    self.parallax_enabled = b;
-                }
-            }
-            if let Some(cpa) = general
-                .get("cameraparallaxamount")
-                .filter(|v| v.get("user").is_some())
-            {
-                if let Some(v) = value_f32(&resolve_prop(cpa, &self.properties)) {
-                    self.parallax_amount = v;
-                }
-            }
-            if let Some(cpmi) = general
-                .get("cameraparallaxmouseinfluence")
-                .filter(|v| v.get("user").is_some())
-            {
-                if let Some(v) = value_f32(&resolve_prop(cpmi, &self.properties)) {
-                    self.parallax_mouse_influence = v;
-                }
-            }
+            self.apply_general_camera_settings(&general);
         }
 
         let transforms = if self.raw_nodes.is_empty() {
@@ -5633,6 +5764,27 @@ impl SceneRenderer {
                     if (ps - layer.point_size).abs() > 1e-3 {
                         layer.point_size = ps;
                         layer.raster_ppw = -1.0;
+                    }
+                    if let Some(ob) = raw
+                        .get("opaquebackground")
+                        .map(|v| resolve_prop(v, &self.properties))
+                        .and_then(|v| value_bool(&v))
+                    {
+                        layer.opaque_background = ob;
+                    }
+                    if raw.get("backgroundcolor").is_some() {
+                        layer.background_color = eval_color_field(
+                            raw.get("backgroundcolor"),
+                            &self.properties,
+                            layer.background_color,
+                        );
+                    }
+                    if raw.get("backgroundbrightness").is_some() {
+                        layer.background_brightness = eval_brightness_field(
+                            raw.get("backgroundbrightness"),
+                            &self.properties,
+                            layer.background_brightness,
+                        );
                     }
                 }
                 ObjectKind::Image(_) | ObjectKind::Solid | ObjectKind::CompositeRef(_) => {
@@ -5766,19 +5918,7 @@ impl SceneRenderer {
     }
 
     fn cover_uv_transform(&self) -> ([f32; 2], [f32; 2]) {
-        let ortho_w = self.ortho_size[0].max(1.0);
-        let ortho_h = self.ortho_size[1].max(1.0);
-        let scene_aspect = ortho_w / ortho_h;
-        let win_aspect = (self.width.max(1) as f32) / (self.height.max(1) as f32);
-        if (win_aspect - scene_aspect).abs() < 1e-3 {
-            ([1.0, 1.0], [0.0, 0.0])
-        } else if win_aspect > scene_aspect {
-            let sy = (scene_aspect / win_aspect).clamp(0.05, 1.0);
-            ([1.0, sy], [0.0, (1.0 - sy) * 0.5])
-        } else {
-            let sx = (win_aspect / scene_aspect).clamp(0.05, 1.0);
-            ([sx, 1.0], [(1.0 - sx) * 0.5, 0.0])
-        }
+        cover_uv_with_zoom(self.ortho_size, [self.width, self.height], self.camera_zoom)
     }
 
     fn ensure_scene(&mut self, gl: &glow::Context) -> Result<()> {
@@ -6121,10 +6261,50 @@ impl SceneRenderer {
         }
         if self.camera_shake {
             let t = time * self.camera_shake_speed;
-            offset[0] += (t * 1.7).sin() * self.camera_shake_amp * self.ortho_size[0] * 0.01;
-            offset[1] += (t * 2.3).cos() * self.camera_shake_amp * self.ortho_size[1] * 0.01;
+            let r = self.camera_shake_roughness.clamp(0.0, 1.0);
+            let norm = 1.0 / (1.0 + 0.7 * r);
+            let sx = ((t * 1.7).sin() + r * (0.45 * (t * 4.3).sin() + 0.25 * (t * 7.9).cos())) * norm;
+            let sy = ((t * 2.3).cos() + r * (0.45 * (t * 5.1).cos() + 0.25 * (t * 8.7).sin())) * norm;
+            offset[0] += sx * self.camera_shake_amp * self.ortho_size[0] * 0.01;
+            offset[1] += sy * self.camera_shake_amp * self.ortho_size[1] * 0.01;
         }
         offset
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_textured_quad(
+        &mut self,
+        gl: &glow::Context,
+        transform: Affine,
+        size: [f32; 2],
+        canvas_min: [f32; 2],
+        canvas_size: [f32; 2],
+        color: [f32; 4],
+        brightness: f32,
+        uv_rect: [f32; 4],
+        premul: bool,
+        texture: glow::Texture,
+    ) {
+        let axis_x = transform.apply_vec([size[0] * 0.5, 0.0]);
+        let axis_y = transform.apply_vec([0.0, size[1] * 0.5]);
+        let p = &mut self.content_prog;
+        unsafe {
+            p.bind(gl);
+            p.set_vec2(gl, "u_min", canvas_min[0], canvas_min[1]);
+            p.set_vec2(gl, "u_canvas", canvas_size[0], canvas_size[1]);
+            p.set_vec2(gl, "u_origin", transform.tx, transform.ty);
+            p.set_vec2(gl, "u_axis_x", axis_x[0], axis_x[1]);
+            p.set_vec2(gl, "u_axis_y", axis_y[0], axis_y[1]);
+            p.set_vec4(gl, "u_color", color);
+            p.set_f32(gl, "u_brightness", brightness);
+            p.set_vec4(gl, "u_uv_rect", uv_rect);
+            p.set_i32(gl, "u_premul", i32::from(premul));
+            p.set_i32(gl, "u_tex", 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.bind_vertex_array(Some(self.quad_vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6139,27 +6319,66 @@ impl SceneRenderer {
         unsafe {
             gl.disable(glow::DEPTH_TEST);
             match info.kind {
-                DrawKind::Image(texture) | DrawKind::Text(Some(texture)) => {
-                    let axis_x = transform.apply_vec([info.size[0] * 0.5, 0.0]);
-                    let axis_y = transform.apply_vec([0.0, info.size[1] * 0.5]);
-                    let p = &mut self.content_prog;
-                    p.bind(gl);
-                    p.set_vec2(gl, "u_min", canvas_min[0], canvas_min[1]);
-                    p.set_vec2(gl, "u_canvas", canvas_size[0], canvas_size[1]);
-                    p.set_vec2(gl, "u_origin", transform.tx, transform.ty);
-                    p.set_vec2(gl, "u_axis_x", axis_x[0], axis_x[1]);
-                    p.set_vec2(gl, "u_axis_y", axis_y[0], axis_y[1]);
-                    p.set_vec4(gl, "u_color", info.color);
-                    p.set_f32(gl, "u_brightness", info.brightness);
-                    p.set_vec4(gl, "u_uv_rect", info.uv_rect);
-                    p.set_i32(gl, "u_premul", i32::from(info.premul));
-                    p.set_i32(gl, "u_tex", 0);
-                    gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                    gl.bind_vertex_array(Some(self.quad_vao));
-                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                DrawKind::Image(texture) => {
+                    self.draw_textured_quad(
+                        gl,
+                        transform,
+                        info.size,
+                        canvas_min,
+                        canvas_size,
+                        info.color,
+                        info.brightness,
+                        info.uv_rect,
+                        info.premul,
+                        texture,
+                    );
                 }
-                DrawKind::Text(None) | DrawKind::None => {}
+                DrawKind::Text { texture, bg } => {
+                    if let Some((bg_rgb, bg_br)) = bg {
+                        if let Some((white, _, _)) = self.textures.get(gl, &self.pkg, "util/white") {
+                            self.draw_textured_quad(
+                                gl,
+                                transform,
+                                info.size,
+                                canvas_min,
+                                canvas_size,
+                                [bg_rgb[0], bg_rgb[1], bg_rgb[2], info.color[3]],
+                                bg_br,
+                                [0.0, 0.0, 1.0, 1.0],
+                                info.premul,
+                                white,
+                            );
+                        }
+                    }
+                    if let Some(texture) = texture {
+                        let blend_was_on = bg.is_some() && gl.is_enabled(glow::BLEND);
+                        if bg.is_some() && !blend_was_on {
+                            gl.enable(glow::BLEND);
+                            gl.blend_func_separate(
+                                glow::SRC_ALPHA,
+                                glow::ONE_MINUS_SRC_ALPHA,
+                                glow::ONE,
+                                glow::ONE_MINUS_SRC_ALPHA,
+                            );
+                        }
+                        self.draw_textured_quad(
+                            gl,
+                            transform,
+                            info.size,
+                            canvas_min,
+                            canvas_size,
+                            info.color,
+                            info.brightness,
+                            info.uv_rect,
+                            info.premul,
+                            texture,
+                        );
+                        if bg.is_some() && !blend_was_on {
+                            gl.disable(glow::BLEND);
+                        }
+                    }
+                }
+                DrawKind::None => {}
                 DrawKind::Puppet {
                     vao,
                     index_count,
@@ -6187,24 +6406,18 @@ impl SceneRenderer {
                     else {
                         return;
                     };
-                    let axis_x = transform.apply_vec([info.size[0] * 0.5, 0.0]);
-                    let axis_y = transform.apply_vec([0.0, info.size[1] * 0.5]);
-                    let p = &mut self.content_prog;
-                    p.bind(gl);
-                    p.set_vec2(gl, "u_min", canvas_min[0], canvas_min[1]);
-                    p.set_vec2(gl, "u_canvas", canvas_size[0], canvas_size[1]);
-                    p.set_vec2(gl, "u_origin", transform.tx, transform.ty);
-                    p.set_vec2(gl, "u_axis_x", axis_x[0], axis_x[1]);
-                    p.set_vec2(gl, "u_axis_y", axis_y[0], axis_y[1]);
-                    p.set_vec4(gl, "u_color", info.color);
-                    p.set_f32(gl, "u_brightness", info.brightness);
-                    p.set_vec4(gl, "u_uv_rect", [0.0, 0.0, 1.0, 1.0]);
-                    p.set_i32(gl, "u_premul", i32::from(info.premul));
-                    p.set_i32(gl, "u_tex", 0);
-                    gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(white));
-                    gl.bind_vertex_array(Some(self.quad_vao));
-                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    self.draw_textured_quad(
+                        gl,
+                        transform,
+                        info.size,
+                        canvas_min,
+                        canvas_size,
+                        info.color,
+                        info.brightness,
+                        [0.0, 0.0, 1.0, 1.0],
+                        info.premul,
+                        white,
+                    );
                 }
             }
         }
@@ -6467,7 +6680,6 @@ impl TextLayer {
         };
         let font_px =
             (self.point_size.max(1.0) * text::UNITS_PER_POINT * ppw).clamp(1.0, 8192.0);
-        let pad_px = self.padding[0] * ppw;
         let spacing_px = [self.spacing[0] * ppw, self.spacing[1] * ppw];
         let (max_width_px, fixed) = if self.limit_width {
             let w = if self.max_width > 0.0 {
@@ -6485,17 +6697,24 @@ impl TextLayer {
         } else {
             (None, None)
         };
-        let out = text::rasterize(
+        let out = text::rasterize_with_options(
             font,
             &value,
             font_px,
-            pad_px,
-            spacing_px,
-            self.h_align,
-            self.v_align,
-            max_width_px,
-            0,
-            fixed,
+            text::RasterizeOptions {
+                padding_px: [self.padding[0] * ppw, self.padding[1] * ppw],
+                spacing: spacing_px,
+                h_align: self.h_align,
+                v_align: self.v_align,
+                max_width_px,
+                max_rows: if self.limit_rows {
+                    self.max_rows.max(1)
+                } else {
+                    0
+                },
+                use_ellipsis: self.limit_use_ellipsis,
+                fixed_size: fixed,
+            },
         );
         if let Some(old) = self.texture.take() {
             unsafe { gl.delete_texture(old) };
@@ -6769,7 +6988,14 @@ fn field_script_defaults(
         ScriptField::Alpha | ScriptField::Volume => {
             serde_json::Value::from(resolved.as_ref().and_then(value_f32).unwrap_or(1.0) as f64)
         }
-        ScriptField::Text => {
+        ScriptField::PointSize => {
+            serde_json::Value::from(resolved.as_ref().and_then(value_f32).unwrap_or(32.0) as f64)
+        }
+        ScriptField::Text
+        | ScriptField::Alignment
+        | ScriptField::HorizontalAlign
+        | ScriptField::VerticalAlign
+        | ScriptField::Font => {
             serde_json::Value::String(resolved.map(|v| value_to_string(&v)).unwrap_or_default())
         }
         ScriptField::Color => serde_json::Value::from(prop_vec3(rv, [1.0, 1.0, 1.0])),
@@ -6792,27 +7018,69 @@ fn field_script_defaults(
     (initial, script_props)
 }
 
-fn parse_alignment(obj: &serde_json::Value) -> [f32; 2] {
-    let s = obj
-        .get("alignment")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let x = if s.contains("left") {
+fn parse_h_align(s: &str) -> text::HAlign {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "left" => text::HAlign::Left,
+        "right" => text::HAlign::Right,
+        _ => text::HAlign::Center,
+    }
+}
+
+fn parse_v_align(s: &str) -> text::VAlign {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "top" => text::VAlign::Top,
+        "bottom" => text::VAlign::Bottom,
+        _ => text::VAlign::Center,
+    }
+}
+
+fn parse_alignment_str(s: &str) -> [f32; 2] {
+    let lower = s.trim().to_ascii_lowercase();
+    let x = if lower.contains("left") {
         0.5
-    } else if s.contains("right") {
+    } else if lower.contains("right") {
         -0.5
     } else {
         0.0
     };
-    let y = if s.contains("bottom") {
+    let y = if lower.contains("bottom") {
         0.5
-    } else if s.contains("top") {
+    } else if lower.contains("top") {
         -0.5
     } else {
         0.0
     };
     [x, y]
+}
+
+fn parse_alignment(obj: &serde_json::Value) -> [f32; 2] {
+    parse_alignment_str(obj.get("alignment").and_then(|v| v.as_str()).unwrap_or(""))
+}
+
+fn parallax_smoothing_factor(dt: f32, delay: f32) -> f32 {
+    (1.0 - (-dt.max(0.0) / delay.max(0.01)).exp()).clamp(0.0, 1.0)
+}
+
+fn cover_uv_with_zoom(
+    ortho_size: [f32; 2],
+    win_size: [i32; 2],
+    zoom: f32,
+) -> ([f32; 2], [f32; 2]) {
+    let ortho_w = ortho_size[0].max(1.0);
+    let ortho_h = ortho_size[1].max(1.0);
+    let scene_aspect = ortho_w / ortho_h;
+    let win_aspect = (win_size[0].max(1) as f32) / (win_size[1].max(1) as f32);
+    let (base_sx, base_sy) = if (win_aspect - scene_aspect).abs() < 1e-3 {
+        (1.0, 1.0)
+    } else if win_aspect > scene_aspect {
+        (1.0, (scene_aspect / win_aspect).clamp(0.05, 1.0))
+    } else {
+        ((win_aspect / scene_aspect).clamp(0.05, 1.0), 1.0)
+    };
+    let z = zoom.clamp(0.1, 10.0);
+    let sx = base_sx / z;
+    let sy = base_sy / z;
+    ([sx, sy], [(1.0 - sx) * 0.5, (1.0 - sy) * 0.5])
 }
 
 fn eval_visible_script(
@@ -7036,7 +7304,7 @@ impl Renderer for SceneRenderer {
             0.0
         };
         let (target_mx, target_my) = debug_mouse_ndc().unwrap_or((target_mx, target_my));
-        let lerp = (dt * 8.0).clamp(0.02, 1.0);
+        let lerp = parallax_smoothing_factor(dt, self.parallax_delay);
         self.smooth_mouse[0] += (target_mx - self.smooth_mouse[0]) * lerp;
         self.smooth_mouse[1] += (target_my - self.smooth_mouse[1]) * lerp;
         let (cover_scale, cover_offset) = self.cover_uv_transform();
@@ -8837,5 +9105,29 @@ mod tests {
         assert_eq!(p_local1.parent(), Some(base.as_path()));
         assert_eq!(p_local1, p_local1_again);
         assert_ne!(p_local1, p_local2);
+    }
+
+    #[test]
+    fn camera_zoom_parallax_delay_and_alignment_parsing() {
+        assert_eq!(parse_alignment_str("center"), [0.0, 0.0]);
+        assert_eq!(parse_alignment_str("left"), [0.5, 0.0]);
+        assert_eq!(parse_alignment_str("right"), [-0.5, 0.0]);
+        assert_eq!(parse_alignment_str("top"), [0.0, -0.5]);
+        assert_eq!(parse_alignment_str("bottom"), [0.0, 0.5]);
+        assert_eq!(parse_alignment_str("topleft"), [0.5, -0.5]);
+        assert_eq!(parse_alignment_str("bottomright"), [-0.5, 0.5]);
+
+        let fast = parallax_smoothing_factor(1.0 / 60.0, 0.1);
+        let slow = parallax_smoothing_factor(1.0 / 60.0, 2.0);
+        assert!(fast > slow && slow > 0.0);
+        assert_eq!(parallax_smoothing_factor(0.0, 0.1), 0.0);
+
+        let (s1, o1) = cover_uv_with_zoom([1920.0, 1080.0], [1920, 1080], 1.0);
+        assert!((s1[0] - 1.0).abs() < 1e-5 && (s1[1] - 1.0).abs() < 1e-5);
+        assert!(o1[0].abs() < 1e-5 && o1[1].abs() < 1e-5);
+
+        let (s2, o2) = cover_uv_with_zoom([1920.0, 1080.0], [1920, 1080], 2.0);
+        assert!((s2[0] - 0.5).abs() < 1e-5 && (s2[1] - 0.5).abs() < 1e-5);
+        assert!((o2[0] - 0.25).abs() < 1e-5 && (o2[1] - 0.25).abs() < 1e-5);
     }
 }

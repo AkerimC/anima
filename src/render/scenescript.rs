@@ -28,6 +28,11 @@ pub enum ScriptField {
     Color,
     Text,
     Volume,
+    Alignment,
+    HorizontalAlign,
+    VerticalAlign,
+    PointSize,
+    Font,
 }
 
 impl ScriptField {
@@ -41,6 +46,11 @@ impl ScriptField {
             ScriptField::Color => "color",
             ScriptField::Text => "text",
             ScriptField::Volume => "volume",
+            ScriptField::Alignment => "alignment",
+            ScriptField::HorizontalAlign => "horizontalalign",
+            ScriptField::VerticalAlign => "verticalalign",
+            ScriptField::PointSize => "pointsize",
+            ScriptField::Font => "font",
         }
     }
 
@@ -54,6 +64,11 @@ impl ScriptField {
             "color" => Some(Self::Color),
             "text" => Some(Self::Text),
             "volume" => Some(Self::Volume),
+            "alignment" => Some(Self::Alignment),
+            "horizontalalign" => Some(Self::HorizontalAlign),
+            "verticalalign" => Some(Self::VerticalAlign),
+            "pointsize" => Some(Self::PointSize),
+            "font" => Some(Self::Font),
             _ => None,
         }
     }
@@ -162,7 +177,11 @@ pub struct LayerSeed {
     pub angles: [f32; 3],
     pub color: [f32; 3],
     pub size: [f32; 2],
-    pub align: [f32; 2],
+    pub align: String,
+    pub horizontal_align: String,
+    pub vertical_align: String,
+    pub point_size: f32,
+    pub font: String,
     pub text: String,
     pub parent: Option<i64>,
     pub tex_anim: Option<TexAnimSeed>,
@@ -526,6 +545,10 @@ impl SceneScripts {
             "color": seed.color,
             "size": seed.size,
             "align": seed.align,
+            "horizontalalign": seed.horizontal_align,
+            "verticalalign": seed.vertical_align,
+            "pointsize": seed.point_size,
+            "font": seed.font,
             "text": seed.text,
             "parent": seed.parent,
         });
@@ -1275,9 +1298,17 @@ const PRELUDE: &str = r#"
       return parseVec(v);
     }
     if (field === 'visible') return v === undefined || v === null ? true : !!v;
-    if (field === 'alpha') return num(v, 1);
-    if (field === 'volume') return num(v, 1);
-    if (field === 'text') return v === undefined || v === null ? '' : String(v);
+    if (field === 'alpha' || field === 'volume') return num(v, 1);
+    if (field === 'pointsize') return num(v, 32);
+    if (
+      field === 'text' ||
+      field === 'alignment' ||
+      field === 'horizontalalign' ||
+      field === 'verticalalign' ||
+      field === 'font'
+    ) {
+      return v === undefined || v === null ? '' : String(v);
+    }
     return v;
   }
 
@@ -2238,13 +2269,63 @@ const PRELUDE: &str = r#"
     return null;
   }
 
+  function computeWorldTransform(layer) {
+    var chain = [];
+    var cur = layer;
+    for (var guard = 0; cur && guard < 32; guard++) {
+      chain.push(cur);
+      cur = cur.__parent;
+    }
+    var a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;
+    var sz = 1, tz = 0;
+    for (var i = chain.length - 1; i >= 0; i--) {
+      var node = chain[i];
+      var o = safe3(node.origin);
+      var sc = safe3(node.scale);
+      var ang = safe3(node.angles);
+      var ox = num(o.x, 0), oy = num(o.y, 0), oz = num(o.z, 0);
+      var sx = num(sc.x, 1), sy = num(sc.y, 1), nodeSz = num(sc.z, 1);
+      var rad = num(ang.z, 0) * Math.PI / 180;
+      var cs = Math.cos(rad), sn = Math.sin(rad);
+      var la = cs * sx;
+      var lb = sn * sx;
+      var lc = -sn * sy;
+      var ld = cs * sy;
+      var ntx = a * ox + c * oy + tx;
+      var nty = b * ox + d * oy + ty;
+      var na = a * la + c * lb;
+      var nb = b * la + d * lb;
+      var nc = a * lc + c * ld;
+      var nd = b * lc + d * ld;
+      a = na; b = nb; c = nc; d = nd; tx = ntx; ty = nty;
+      tz += sz * oz;
+      sz *= nodeSz;
+    }
+    return {
+      m: [
+        a, b, 0, 0,
+        c, d, 0, 0,
+        0, 0, sz, 0,
+        tx, ty, tz, 1
+      ]
+    };
+  }
+
   function makeLayer(id, name) {
     var _size = new Vec2(0, 0);
     var l = {
       id: id, name: name || '', visible: true, solid: true, alpha: 1, volume: 1,
       origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
-      color: new Vec3(1, 1, 1), alignment: new Vec2(0, 0),
-      text: '', pointsize: 0, cursorDetected: false, clicked: false, kind: '',
+      color: new Vec3(1, 1, 1),
+      alignment: 'center', horizontalalign: 'center', verticalalign: 'center',
+      pointsize: 32, font: '',
+      text: '', cursorDetected: false, clicked: false, kind: '',
+      _origOrigin: new Vec3(0, 0, 0),
+      _origScale: new Vec3(1, 1, 1),
+      _origAngles: new Vec3(0, 0, 0),
+      _origSize: new Vec2(0, 0),
+      _origColor: new Vec3(1, 1, 1),
+      _origAlpha: 1,
       __parent: null, __tex: null, __video: null, __layerFile: null,
       __effects: {}, __effectList: [],
       __animLayers: {}, __animLayerList: [],
@@ -2300,9 +2381,7 @@ const PRELUDE: &str = r#"
         return s;
       },
       getLayerFile: function () { return l.__layerFile; },
-      getTransformMatrix: function () {
-        return { m: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, l.origin.x, l.origin.y, 0, 1] };
-      },
+      getTransformMatrix: function () { return computeWorldTransform(l); },
       isPlaying: function () { return !!l.__playing; },
       play: function () {
         if (l.__isSound) { l.__playing = true; l.__soundAction = 'play'; }
@@ -2319,6 +2398,12 @@ const PRELUDE: &str = r#"
       set: function (v) { _size = new Vec2(v); },
       enumerable: true
     });
+    Object.defineProperty(l, 'originalOrigin', { get: function () { return l._origOrigin.copy(); }, enumerable: true });
+    Object.defineProperty(l, 'originalScale', { get: function () { return l._origScale.copy(); }, enumerable: true });
+    Object.defineProperty(l, 'originalAngles', { get: function () { return l._origAngles.copy(); }, enumerable: true });
+    Object.defineProperty(l, 'originalSize', { get: function () { return l._origSize.copy(); }, enumerable: true });
+    Object.defineProperty(l, 'originalColor', { get: function () { return l._origColor.copy(); }, enumerable: true });
+    Object.defineProperty(l, 'originalAlpha', { get: function () { return l._origAlpha; }, enumerable: true });
     return l;
   }
 
@@ -2343,7 +2428,11 @@ const PRELUDE: &str = r#"
         visible: l.visible,
         text: l.text,
         image: l.image || '',
-        alignment: l.alignment ? l.alignment.copy() : new Vec2(0, 0)
+        alignment: l.alignment || 'center',
+        horizontalalign: l.horizontalalign || 'center',
+        verticalalign: l.verticalalign || 'center',
+        pointsize: l.pointsize,
+        font: l.font || ''
       };
     },
     getAnimation: animStub,
@@ -2436,7 +2525,12 @@ const PRELUDE: &str = r#"
         scale: toArr3(l.scale),
         angles: toArr3(l.angles),
         color: toArr3(l.color),
-        text: l.text === undefined || l.text === null ? '' : String(l.text)
+        text: l.text === undefined || l.text === null ? '' : String(l.text),
+        alignment: l.alignment === undefined || l.alignment === null ? '' : String(l.alignment),
+        horizontalalign: l.horizontalalign === undefined || l.horizontalalign === null ? '' : String(l.horizontalalign),
+        verticalalign: l.verticalalign === undefined || l.verticalalign === null ? '' : String(l.verticalalign),
+        pointsize: num(l.pointsize, 32),
+        font: l.font === undefined || l.font === null ? '' : String(l.font)
       };
     }
     return snap;
@@ -2487,9 +2581,17 @@ const PRELUDE: &str = r#"
           outputs.push({ kind: 'layer', id: numId, field: f, value: curVec });
         }
       }
-      var curText = l.text === undefined || l.text === null ? '' : String(l.text);
-      if (curText !== prev.text || forcedLayers[idStr + ':text']) {
-        outputs.push({ kind: 'layer', id: numId, field: 'text', value: curText });
+      var strFields = ['text', 'alignment', 'horizontalalign', 'verticalalign', 'font'];
+      for (var si = 0; si < strFields.length; si++) {
+        var sf = strFields[si];
+        var curStr = l[sf] === undefined || l[sf] === null ? '' : String(l[sf]);
+        if (curStr !== prev[sf] || forcedLayers[idStr + ':' + sf]) {
+          outputs.push({ kind: 'layer', id: numId, field: sf, value: curStr });
+        }
+      }
+      var curPs = num(l.pointsize, 32);
+      if (curPs !== prev.pointsize || forcedLayers[idStr + ':pointsize']) {
+        outputs.push({ kind: 'layer', id: numId, field: 'pointsize', value: curPs });
       }
       var curSolid = !!l.solid;
       if (curSolid !== prev.solid) {
@@ -2712,8 +2814,18 @@ const PRELUDE: &str = r#"
       l.angles = parseVec(d.angles);
       l.color = parseVec(d.color);
       l.size = new Vec2(d.size && d.size[0], d.size && d.size[1]);
-      l.alignment = new Vec2(d.align && d.align[0], d.align && d.align[1]);
+      l.alignment = typeof d.align === 'string' && d.align ? d.align : 'center';
+      l.horizontalalign = typeof d.horizontalalign === 'string' && d.horizontalalign ? d.horizontalalign : 'center';
+      l.verticalalign = typeof d.verticalalign === 'string' && d.verticalalign ? d.verticalalign : 'center';
+      l.pointsize = num(d.pointsize, 32);
+      l.font = typeof d.font === 'string' ? d.font : '';
       l.text = d.text || '';
+      l._origOrigin = l.origin.copy();
+      l._origScale = l.scale.copy();
+      l._origAngles = l.angles.copy();
+      l._origSize = l.size.copy();
+      l._origColor = l.color.copy();
+      l._origAlpha = l.alpha;
       l.__parentId = d.parent;
       if (d.texAnim) l.__tex = makeTexAnim(d.id, d.texAnim);
       if (d.videoTex) l.__video = makeVideoTex(d.id, d.videoTex);
@@ -3362,7 +3474,11 @@ mod tests {
             angles: [0.0, 0.0, 0.0],
             color: [1.0, 1.0, 1.0],
             size: [100.0, 100.0],
-            align: [0.0, 0.0],
+            align: "center".into(),
+            horizontal_align: "center".into(),
+            vertical_align: "center".into(),
+            point_size: 32.0,
+            font: String::new(),
             text: String::new(),
             parent: None,
             tex_anim: None,
@@ -4804,6 +4920,71 @@ export function update(value) {
         assert_eq!(prop_vec3(&orig.value, [0.0; 3]), [12.0, 34.0, 56.0]);
     }
 
+    #[test]
+    fn transform_matrix_composes_parents_and_text_alignment_props_sync() {
+        let props = serde_json::Map::new();
+        let mut host = SceneScripts::new(&props).expect("host");
+        let mut parent = seed(501, "parent");
+        parent.origin = [100.0, 200.0, 0.0];
+        parent.angles = [0.0, 0.0, 90.0];
+        parent.scale = [2.0, 3.0, 1.0];
+
+        let mut child = seed(502, "child");
+        child.kind = "text".into();
+        child.parent = Some(501);
+        child.origin = [10.0, 5.0, 0.0];
+
+        host.add_layer(&parent);
+        host.add_layer(&child);
+        host.link_parents();
+        host.add_property_script(
+            502,
+            ScriptField::Alpha,
+            "'use strict';
+export function init(value) {
+  var mat = thisLayer.getTransformMatrix().m;
+  if (Math.abs(mat[12] - 85) > 1e-3 || Math.abs(mat[13] - 220) > 1e-3) {
+    throw new Error('bad world origin: ' + mat[12] + ',' + mat[13]);
+  }
+  if (Math.abs(mat[1] - 2) > 1e-3 || Math.abs(mat[4] + 3) > 1e-3) {
+    throw new Error('bad world basis: ' + mat[0] + ',' + mat[1] + ',' + mat[4] + ',' + mat[5]);
+  }
+  thisLayer.origin = new Vec3(999, 888, 0);
+  if (Math.abs(thisLayer.originalOrigin.x - 10) > 1e-3 || Math.abs(thisLayer.originalOrigin.y - 5) > 1e-3) {
+    throw new Error('originalOrigin mutated: ' + thisLayer.originalOrigin.x);
+  }
+  thisLayer.origin = new Vec3(10, 5, 0);
+  thisLayer.horizontalalign = 'right';
+  thisLayer.verticalalign = 'bottom';
+  thisLayer.pointsize = 48;
+  thisLayer.font = 'fonts/custom.ttf';
+  thisLayer.alignment = 'left';
+  return value;
+}
+export function update(value) { return value; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+        let init_out = host.finalize_init();
+        assert_eq!(host.failures(), 0, "failed: {:?}", host.errors());
+
+        let find_field = |field: ScriptField| {
+            init_out
+                .iter()
+                .find(|o| o.target == ScriptTarget::Layer { id: 502, field })
+                .map(|o| o.value.clone())
+        };
+        assert_eq!(find_field(ScriptField::HorizontalAlign), Some(json!("right")));
+        assert_eq!(find_field(ScriptField::VerticalAlign), Some(json!("bottom")));
+        assert_eq!(find_field(ScriptField::Font), Some(json!("fonts/custom.ttf")));
+        assert_eq!(find_field(ScriptField::Alignment), Some(json!("left")));
+        let ps = find_field(ScriptField::PointSize)
+            .and_then(|v| v.as_f64())
+            .expect("pointsize output");
+        assert!((ps - 48.0).abs() < 1e-3);
+    }
+
     /// Compile and tick every SceneScript (layer properties, effect visibility,
     /// effect constant shaders, puppet animation layers, and particle instance
     /// overrides) in the local Wallpaper Engine Workshop library.
@@ -4910,7 +5091,30 @@ export function update(value) {
                     angles: vec("angles", [0.0; 3]),
                     color: vec("color", [1.0; 3]),
                     size: [100.0, 100.0],
-                    align: [0.0, 0.0],
+                    align: obj
+                        .get("alignment")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("center")
+                        .to_string(),
+                    horizontal_align: obj
+                        .get("horizontalalign")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("center")
+                        .to_string(),
+                    vertical_align: obj
+                        .get("verticalalign")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("center")
+                        .to_string(),
+                    point_size: obj
+                        .get("pointsize")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(32.0) as f32,
+                    font: obj
+                        .get("font")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     text: String::new(),
                     parent,
                     tex_anim: None,
