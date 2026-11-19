@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use rquickjs::{Context, Function, Runtime};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// Property fields that Wallpaper Engine allows scripts to drive.
@@ -40,6 +41,19 @@ impl ScriptField {
             ScriptField::Text => "text",
         }
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "visible" => Some(Self::Visible),
+            "alpha" => Some(Self::Alpha),
+            "origin" => Some(Self::Origin),
+            "scale" => Some(Self::Scale),
+            "angles" => Some(Self::Angles),
+            "color" => Some(Self::Color),
+            "text" => Some(Self::Text),
+            _ => None,
+        }
+    }
 }
 
 /// A layer as the scripts see it (`thisLayer` / `thisScene.getLayer()`).
@@ -60,7 +74,17 @@ pub struct LayerSeed {
     pub parent: Option<i64>,
 }
 
-/// Per-frame state of a layer that has script bindings.
+/// An effect instance as scripts see it (`thisObject` / `thisLayer.getEffect()`).
+#[derive(Debug, Clone)]
+pub struct EffectSeed {
+    pub layer_id: i64,
+    pub effect_idx: usize,
+    pub id: Option<i64>,
+    pub name: String,
+    pub visible: bool,
+}
+
+/// Per-frame state of a layer handed to the SceneScript host.
 #[derive(Debug, Clone)]
 pub struct LayerFrame {
     pub id: i64,
@@ -73,11 +97,29 @@ pub struct LayerFrame {
     pub text: String,
 }
 
-/// Result of one scripted property for this frame.
+/// Destination property targeted by a [`ScriptOutput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptTarget {
+    Layer {
+        id: i64,
+        field: ScriptField,
+    },
+    EffectVisible {
+        layer_id: i64,
+        effect_idx: usize,
+    },
+    EffectConstant {
+        layer_id: i64,
+        effect_idx: usize,
+        pass_idx: usize,
+        key: String,
+    },
+}
+
+/// Result of one scripted property (or side-effect write) for this frame.
 #[derive(Debug, Clone)]
 pub struct ScriptOutput {
-    pub id: i64,
-    pub field: ScriptField,
+    pub target: ScriptTarget,
     pub value: Value,
 }
 
@@ -85,19 +127,71 @@ pub struct SceneScripts {
     #[allow(dead_code)]
     rt: Runtime,
     ctx: Context,
-    /// One entry per compiled property binding.
+    /// One entry per compiled property/effect binding (aligned 1:1 with JS `scripts`).
     bindings: Vec<Binding>,
     /// Script compile/runtime failures, logged once per binding.
     reported: HashMap<usize, u8>,
     /// First few distinct failure messages, for diagnostics and tests.
     errors: Vec<String>,
     timeouts: usize,
+    /// Whether any loaded script called `engine.registerAudioBuffers(...)`.
+    uses_audio: bool,
+    /// Whether `finalize_init()` has executed `init()` + startup `applyUserProperties()`.
+    initialized: bool,
 }
 
 struct Binding {
-    id: i64,
-    field: ScriptField,
+    target: ScriptTarget,
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct AddScriptAck {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default, rename = "usesAudio")]
+    uses_audio: bool,
+}
+
+#[derive(Deserialize)]
+struct HostResponse {
+    #[serde(default)]
+    errors: Vec<HostError>,
+    #[serde(default)]
+    outputs: Vec<HostOutput>,
+    #[serde(default, rename = "usesAudio")]
+    uses_audio: bool,
+}
+
+#[derive(Deserialize)]
+struct HostError {
+    idx: usize,
+    #[serde(default = "default_err_kind")]
+    kind: String,
+    message: String,
+}
+
+fn default_err_kind() -> String {
+    "runtime".to_string()
+}
+
+#[derive(Deserialize)]
+struct HostOutput {
+    kind: String,
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    field: String,
+    #[serde(default, rename = "layerId")]
+    layer_id: i64,
+    #[serde(default, rename = "effectIdx")]
+    effect_idx: usize,
+    #[serde(default, rename = "passIdx")]
+    pass_idx: usize,
+    #[serde(default)]
+    key: String,
+    value: Value,
 }
 
 impl SceneScripts {
@@ -127,6 +221,8 @@ impl SceneScripts {
             reported: HashMap::new(),
             errors: Vec::new(),
             timeouts: 0,
+            uses_audio: false,
+            initialized: false,
         })
     }
 
@@ -151,9 +247,23 @@ impl SceneScripts {
         }
     }
 
-    /// Compile and register one property script.  `script_props` is the
-    /// field's own `scriptproperties` block (with `{user: ...}` entries
-    /// already resolved), which overrides the script's declared defaults.
+    /// Register an effect instance on an already-added layer so scripts can
+    /// query `thisLayer.getEffect(...)` and target `thisObject` in effect scripts.
+    pub fn add_effect(&mut self, seed: &EffectSeed) {
+        let payload = json!({
+            "layerId": seed.layer_id,
+            "effectIdx": seed.effect_idx,
+            "id": seed.id,
+            "name": seed.name,
+            "visible": seed.visible,
+        });
+        if let Err(err) = self.call_unit("__WE_addEffect", &payload.to_string()) {
+            self.report_once(usize::MAX, "effect", &err);
+        }
+    }
+
+    /// Compile and register one layer property script without running `init()` yet.
+    /// Call [`Self::finalize_init`] after all layers, effects and scripts are added.
     pub fn add_property_script(
         &mut self,
         id: i64,
@@ -161,30 +271,114 @@ impl SceneScripts {
         script: &str,
         initial: Value,
         script_props: &serde_json::Map<String, Value>,
-    ) {
+    ) -> usize {
         let payload = json!({
+            "kind": "layer",
             "id": id,
             "field": field.as_str(),
             "source": script,
             "initial": initial,
             "scriptProperties": script_props,
         });
-        match self.call_unit("__WE_addScript", &payload.to_string()) {
-            Ok(()) => self.bindings.push(Binding {
-                id,
-                field,
-                enabled: true,
-            }),
+        self.register_binding(ScriptTarget::Layer { id, field }, &payload)
+    }
+
+    /// Compile and register a script driving `effects[effect_idx].visible`.
+    pub fn add_effect_visible_script(
+        &mut self,
+        layer_id: i64,
+        effect_idx: usize,
+        script: &str,
+        initial: bool,
+        script_props: &serde_json::Map<String, Value>,
+    ) -> usize {
+        let payload = json!({
+            "kind": "effect_visible",
+            "layerId": layer_id,
+            "effectIdx": effect_idx,
+            "source": script,
+            "initial": initial,
+            "scriptProperties": script_props,
+        });
+        self.register_binding(
+            ScriptTarget::EffectVisible {
+                layer_id,
+                effect_idx,
+            },
+            &payload,
+        )
+    }
+
+    /// Compile and register a script driving `effects[effect_idx].passes[pass_idx].constantshadervalues[key]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_effect_constant_script(
+        &mut self,
+        layer_id: i64,
+        effect_idx: usize,
+        pass_idx: usize,
+        key: &str,
+        script: &str,
+        initial: Value,
+        script_props: &serde_json::Map<String, Value>,
+    ) -> usize {
+        let key_lower = key.to_ascii_lowercase();
+        let payload = json!({
+            "kind": "effect_const",
+            "layerId": layer_id,
+            "effectIdx": effect_idx,
+            "passIdx": pass_idx,
+            "key": key_lower,
+            "source": script,
+            "initial": initial,
+            "scriptProperties": script_props,
+        });
+        self.register_binding(
+            ScriptTarget::EffectConstant {
+                layer_id,
+                effect_idx,
+                pass_idx,
+                key: key_lower,
+            },
+            &payload,
+        )
+    }
+
+    fn register_binding(&mut self, target: ScriptTarget, payload: &Value) -> usize {
+        let idx = self.bindings.len();
+        match self.call_string("__WE_addScript", &payload.to_string()) {
+            Ok(raw) => match serde_json::from_str::<AddScriptAck>(&raw) {
+                Ok(ack) => {
+                    self.uses_audio |= ack.uses_audio;
+                    if ack.ok {
+                        self.bindings.push(Binding {
+                            target,
+                            enabled: true,
+                        });
+                    } else {
+                        self.bindings.push(Binding {
+                            target,
+                            enabled: false,
+                        });
+                        let err = ack.error.unwrap_or_else(|| "compile failed".into());
+                        self.report_once(idx, "compile", &err);
+                    }
+                }
+                Err(_) => {
+                    self.bindings.push(Binding {
+                        target,
+                        enabled: true,
+                    });
+                }
+            },
             Err(err) => {
-                let idx = self.bindings.len();
                 self.bindings.push(Binding {
-                    id,
-                    field,
+                    target,
                     enabled: false,
                 });
                 self.report_once(idx, "compile", &err);
             }
         }
+        idx
     }
 
     pub fn is_empty(&self) -> bool {
@@ -199,6 +393,64 @@ impl SceneScripts {
         }
     }
 
+    /// Run `init(value)` and startup `applyUserProperties(userProperties)` on
+    /// every compiled binding, returning any initial or side-effect outputs.
+    pub fn finalize_init(&mut self) -> Vec<ScriptOutput> {
+        self.initialized = true;
+        if self.bindings.is_empty() {
+            return Vec::new();
+        }
+        match self.call_string("__WE_finalizeInit", "") {
+            Ok(raw) => self.parse_host_response(&raw),
+            Err(err) => {
+                self.report_once(usize::MAX, "init", &err);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Deliver live user-property updates to `scriptProperties` and every
+    /// script's `applyUserProperties(changed)` handler without resetting VM state.
+    pub fn apply_user_properties(
+        &mut self,
+        changed: &serde_json::Map<String, Value>,
+        binding_props: &[(usize, serde_json::Map<String, Value>)],
+    ) -> Vec<ScriptOutput> {
+        if self.bindings.is_empty() {
+            return Vec::new();
+        }
+        let mut out = if !self.initialized {
+            self.finalize_init()
+        } else {
+            Vec::new()
+        };
+        let mut overrides = serde_json::Map::with_capacity(binding_props.len());
+        for (idx, props) in binding_props {
+            overrides.insert(idx.to_string(), Value::Object(props.clone()));
+        }
+        let payload = json!({
+            "changed": changed,
+            "bindingProps": overrides,
+        });
+        match self.call_string("__WE_applyUserProperties", &payload.to_string()) {
+            Ok(raw) => out.extend(self.parse_host_response(&raw)),
+            Err(err) => self.report_once(usize::MAX, "applyUserProperties", &err),
+        }
+        out
+    }
+
+    /// Whether any loaded script registered an audio spectrum buffer.
+    pub fn uses_audio(&self) -> bool {
+        self.uses_audio
+    }
+
+    /// Whether `(id, field)` is currently driven by an enabled layer binding.
+    pub fn has_layer_binding(&self, id: i64, field: ScriptField) -> bool {
+        self.bindings.iter().any(|b| {
+            b.enabled && matches!(b.target, ScriptTarget::Layer { id: bid, field: bf } if bid == id && bf == field)
+        })
+    }
+
     /// Number of bindings disabled by a compile or runtime failure.
     pub fn failures(&self) -> usize {
         self.bindings.iter().filter(|b| !b.enabled).count()
@@ -209,14 +461,17 @@ impl SceneScripts {
         &self.errors
     }
 
-    /// Bound `(object id, field)` pairs, so the renderer knows which values it
-    /// has to feed back into the tick.
+    /// Bound `(object id, field)` layer pairs.
     pub fn bound_fields(&self) -> impl Iterator<Item = (i64, ScriptField)> + '_ {
-        self.bindings.iter().map(|b| (b.id, b.field))
+        self.bindings.iter().filter_map(|b| match b.target {
+            ScriptTarget::Layer { id, field } => Some((id, field)),
+            _ => None,
+        })
     }
 
     /// Run one frame of scripts.  `layers` carries the current authored /
-    /// animated state of every layer that has at least one binding.
+    /// animated state of observable layers, and `spectrum` feeds 64-bin audio
+    /// data whenever at least one script called `engine.registerAudioBuffers`.
     #[allow(clippy::too_many_arguments)]
     pub fn tick(
         &mut self,
@@ -226,11 +481,18 @@ impl SceneScripts {
         mouse: [f32; 2],
         canvas: [f32; 2],
         screen: [f32; 2],
+        spectrum: Option<&[f32; 64]>,
         layers: &[LayerFrame],
     ) -> Vec<ScriptOutput> {
         if self.bindings.is_empty() {
             return Vec::new();
         }
+        let mut pre_outputs = if !self.initialized {
+            self.finalize_init()
+        } else {
+            Vec::new()
+        };
+
         let mut layer_json = Vec::with_capacity(layers.len());
         for l in layers {
             layer_json.push(json!({
@@ -244,7 +506,7 @@ impl SceneScripts {
                 "text": l.text,
             }));
         }
-        let payload = json!({
+        let mut payload = json!({
             "runtime": runtime,
             "frametime": frametime,
             "timeOfDay": time_of_day,
@@ -253,50 +515,76 @@ impl SceneScripts {
             "screen": screen,
             "layers": layer_json,
         });
+        if self.uses_audio {
+            if let Some(spec) = spectrum {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("spectrum".to_string(), json!(spec.as_slice()));
+                }
+            }
+        }
 
         let raw = match self.call_string("__WE_tick", &payload.to_string()) {
             Ok(raw) => raw,
             Err(err) => {
                 self.report_once(usize::MAX, "tick", &err);
-                return Vec::new();
+                return pre_outputs;
             }
         };
-        let Ok(values) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        let mut out = self.parse_host_response(&raw);
+        if pre_outputs.is_empty() {
+            out
+        } else {
+            pre_outputs.append(&mut out);
+            pre_outputs
+        }
+    }
+
+    fn parse_host_response(&mut self, raw: &str) -> Vec<ScriptOutput> {
+        let Ok(resp) = serde_json::from_str::<HostResponse>(raw) else {
             self.report_once(usize::MAX, "tick-output", "invalid JSON from script host");
             return Vec::new();
         };
+        self.uses_audio |= resp.uses_audio;
 
-        let mut out = Vec::new();
-        for (idx, entry) in values.into_iter().enumerate() {
-            let Some(obj) = entry.as_object() else {
-                continue;
-            };
-            if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
-                let binding = self.bindings.get(idx);
-                if let Some(b) = binding {
-                    if !b.enabled {
+        for err in resp.errors {
+            if let Some(b) = self.bindings.get(err.idx) {
+                if !b.enabled {
+                    continue;
+                }
+            }
+            self.report_once(err.idx, &err.kind, &err.message);
+            if let Some(b) = self.bindings.get_mut(err.idx) {
+                b.enabled = false;
+            }
+        }
+
+        let mut out = Vec::with_capacity(resp.outputs.len());
+        for entry in resp.outputs {
+            let target = match entry.kind.as_str() {
+                "layer" => {
+                    let Some(field) = ScriptField::from_str(&entry.field) else {
                         continue;
+                    };
+                    ScriptTarget::Layer {
+                        id: entry.id,
+                        field,
                     }
                 }
-                self.report_once(idx, "runtime", err);
-                if let Some(b) = self.bindings.get_mut(idx) {
-                    b.enabled = false;
-                }
-                continue;
-            }
-            let Some(binding) = self.bindings.get(idx) else {
-                continue;
-            };
-            if !binding.enabled {
-                continue;
-            }
-            let Some(value) = obj.get("value") else {
-                continue;
+                "effect_visible" => ScriptTarget::EffectVisible {
+                    layer_id: entry.layer_id,
+                    effect_idx: entry.effect_idx,
+                },
+                "effect_const" => ScriptTarget::EffectConstant {
+                    layer_id: entry.layer_id,
+                    effect_idx: entry.effect_idx,
+                    pass_idx: entry.pass_idx,
+                    key: entry.key.to_ascii_lowercase(),
+                },
+                _ => continue,
             };
             out.push(ScriptOutput {
-                id: binding.id,
-                field: binding.field,
-                value: value.clone(),
+                target,
+                value: entry.value,
             });
         }
         self.timeouts += 1;
@@ -315,11 +603,29 @@ impl SceneScripts {
         if idx == usize::MAX {
             log::warn!("scenescript: {kind}: {err}");
         } else if let Some(b) = self.bindings.get(idx) {
-            log::warn!(
-                "scenescript: {} on object {}: {err}",
-                b.field.as_str(),
-                b.id
-            );
+            match &b.target {
+                ScriptTarget::Layer { id, field } => {
+                    log::warn!("scenescript: {} on object {id}: {err}", field.as_str());
+                }
+                ScriptTarget::EffectVisible {
+                    layer_id,
+                    effect_idx,
+                } => {
+                    log::warn!(
+                        "scenescript: effect[{effect_idx}].visible on object {layer_id}: {err}"
+                    );
+                }
+                ScriptTarget::EffectConstant {
+                    layer_id,
+                    effect_idx,
+                    pass_idx,
+                    key,
+                } => {
+                    log::warn!(
+                        "scenescript: effect[{effect_idx}].pass[{pass_idx}].{key} on object {layer_id}: {err}"
+                    );
+                }
+            }
         } else {
             log::warn!("scenescript: {kind}: {err}");
         }
@@ -383,14 +689,27 @@ const PRELUDE: &str = r#"
   function safe3(v) { return v && typeof v === 'object' ? v : ZERO3; }
   var ZERO2 = { x: 0, y: 0 };
   function safe2(v) { return v && typeof v === 'object' ? v : ZERO2; }
+  var ZERO4 = { x: 0, y: 0, z: 0, w: 0 };
+  function safe4(v) { return v && typeof v === 'object' ? v : ZERO4; }
 
   function Vec2(x, y) {
-    if (x && typeof x === 'object') {
-      this.x = num(x.x, 0);
-      this.y = num(x.y !== undefined ? x.y : y, 0);
+    if (typeof x === 'string') {
+      var p = x.trim().split(/\s+/).filter(Boolean);
+      if (p.length === 1) {
+        var s = num(parseFloat(p[0]), 0);
+        this.x = s; this.y = s;
+      } else {
+        this.x = num(parseFloat(p[0]), 0);
+        this.y = num(parseFloat(p[1]), 0);
+      }
       return;
     }
-    if (y === undefined && typeof x === 'number') { this.x = x; this.y = x; return; }
+    if (x && typeof x === 'object') {
+      this.x = num(x.x !== undefined ? x.x : x.r, 0);
+      this.y = num(x.y !== undefined ? x.y : (x.g !== undefined ? x.g : y), 0);
+      return;
+    }
+    if (y === undefined && typeof x === 'number') { this.x = num(x, 0); this.y = this.x; return; }
     this.x = num(x, 0); this.y = num(y, 0);
   }
   Vec2.prototype.add = function (o) { o = safe2(o); return new Vec2(this.x + num(o.x, 0), this.y + num(o.y, 0)); };
@@ -407,27 +726,63 @@ const PRELUDE: &str = r#"
     o = safe2(o); t = num(t, 0);
     return new Vec2(this.x + (num(o.x, 0) - this.x) * t, this.y + (num(o.y, 0) - this.y) * t);
   };
+  Vec2.prototype.dot = function (o) { o = safe2(o); return this.x * num(o.x, 0) + this.y * num(o.y, 0); };
   Vec2.prototype.length = function () { return Math.hypot(this.x, this.y); };
+  Vec2.prototype.lengthSqr = function () { return this.x * this.x + this.y * this.y; };
   Vec2.prototype.normalize = function () { var l = this.length() || 1; return new Vec2(this.x / l, this.y / l); };
+  Vec2.prototype.perpendicular = function () { return new Vec2(-this.y, this.x); };
+  Vec2.prototype.reflect = function (n) {
+    n = safe2(n);
+    var nx = num(n.x, 0), ny = num(n.y, 0), d = 2 * (this.x * nx + this.y * ny);
+    return new Vec2(this.x - d * nx, this.y - d * ny);
+  };
+  Vec2.prototype.min = function (o) { o = safe2(o); return new Vec2(Math.min(this.x, num(o.x, 0)), Math.min(this.y, num(o.y, 0))); };
+  Vec2.prototype.max = function (o) { o = safe2(o); return new Vec2(Math.max(this.x, num(o.x, 0)), Math.max(this.y, num(o.y, 0))); };
+  Vec2.prototype.abs = function () { return new Vec2(Math.abs(this.x), Math.abs(this.y)); };
+  Vec2.prototype.floor = function () { return new Vec2(Math.floor(this.x), Math.floor(this.y)); };
+  Vec2.prototype.ceil = function () { return new Vec2(Math.ceil(this.x), Math.ceil(this.y)); };
+  Vec2.prototype.round = function () { return new Vec2(Math.round(this.x), Math.round(this.y)); };
+  Vec2.prototype.smoothStep = function (e0, e1) {
+    var a = (e0 && typeof e0 === 'object') ? e0 : { x: num(e0, 0), y: num(e0, 0) };
+    var b = (e1 && typeof e1 === 'object') ? e1 : { x: num(e1, 1), y: num(e1, 1) };
+    return new Vec2(WEMath.smoothStep(num(a.x, 0), num(b.x, 1), this.x), WEMath.smoothStep(num(a.y, 0), num(b.y, 1), this.y));
+  };
   Vec2.prototype.copy = function () { return new Vec2(this.x, this.y); };
   Vec2.prototype.clone = Vec2.prototype.copy;
-  Vec2.prototype.toVec3 = function () { return new Vec3(this.x, this.y, 0); };
+  Vec2.prototype.toVec3 = function (z) { return new Vec3(this.x, this.y, num(z, 0)); };
   Vec2.prototype.equals = function (o) { return !!o && this.x === o.x && this.y === o.y; };
   Vec2.prototype.toString = function () { return this.x + ' ' + this.y; };
 
   function Vec3(x, y, z) {
+    if (typeof x === 'string') {
+      var p = x.trim().split(/\s+/).filter(Boolean);
+      if (p.length === 1) {
+        var s = num(parseFloat(p[0]), 0);
+        this.x = s; this.y = s; this.z = s;
+      } else {
+        this.x = num(parseFloat(p[0]), 0);
+        this.y = num(parseFloat(p[1]), 0);
+        this.z = num(parseFloat(p[2]), 0);
+      }
+      return;
+    }
     if (x && typeof x === 'object') {
-      this.x = num(x.x, 0);
-      this.y = num(x.y, 0);
-      this.z = num(x.z !== undefined ? x.z : z, 0);
+      this.x = num(x.x !== undefined ? x.x : x.r, 0);
+      this.y = num(x.y !== undefined ? x.y : (x.g !== undefined ? x.g : y), 0);
+      this.z = num(x.z !== undefined ? x.z : (x.b !== undefined ? x.b : z), 0);
       return;
     }
     if (y === undefined && z === undefined && typeof x === 'number') {
-      this.x = x; this.y = x; this.z = x;
+      this.x = num(x, 0); this.y = this.x; this.z = this.x;
       return;
     }
     this.x = num(x, 0); this.y = num(y, 0); this.z = num(z, 0);
   }
+  Object.defineProperties(Vec3.prototype, {
+    r: { get: function () { return this.x; }, set: function (v) { this.x = num(v, 0); } },
+    g: { get: function () { return this.y; }, set: function (v) { this.y = num(v, 0); } },
+    b: { get: function () { return this.z; }, set: function (v) { this.z = num(v, 0); } }
+  });
   Vec3.prototype.add = function (o) { o = safe3(o); return new Vec3(this.x + num(o.x, 0), this.y + num(o.y, 0), this.z + num(o.z, 0)); };
   Vec3.prototype.subtract = function (o) { o = safe3(o); return new Vec3(this.x - num(o.x, 0), this.y - num(o.y, 0), this.z - num(o.z, 0)); };
   Vec3.prototype.multiply = function (o) {
@@ -447,14 +802,35 @@ const PRELUDE: &str = r#"
       this.z + (num(o.z, 0) - this.z) * t
     );
   };
-  Vec3.prototype.dot = function (o) { o = safe3(o); return this.x * o.x + this.y * o.y + this.z * o.z; };
+  Vec3.prototype.dot = function (o) { o = safe3(o); return this.x * num(o.x, 0) + this.y * num(o.y, 0) + this.z * num(o.z, 0); };
   Vec3.prototype.cross = function (o) {
     o = safe3(o);
-    return new Vec3(this.y * o.z - this.z * o.y, this.z * o.x - this.x * o.z, this.x * o.y - this.y * o.x);
+    return new Vec3(this.y * num(o.z, 0) - this.z * num(o.y, 0), this.z * num(o.x, 0) - this.x * num(o.z, 0), this.x * num(o.y, 0) - this.y * num(o.x, 0));
   };
   Vec3.prototype.length = function () { return Math.sqrt(this.lengthSqr()); };
   Vec3.prototype.lengthSqr = function () { return this.x * this.x + this.y * this.y + this.z * this.z; };
   Vec3.prototype.normalize = function () { var l = this.length() || 1; return new Vec3(this.x / l, this.y / l, this.z / l); };
+  Vec3.prototype.reflect = function (n) {
+    n = safe3(n);
+    var nx = num(n.x, 0), ny = num(n.y, 0), nz = num(n.z, 0);
+    var d = 2 * (this.x * nx + this.y * ny + this.z * nz);
+    return new Vec3(this.x - d * nx, this.y - d * ny, this.z - d * nz);
+  };
+  Vec3.prototype.min = function (o) { o = safe3(o); return new Vec3(Math.min(this.x, num(o.x, 0)), Math.min(this.y, num(o.y, 0)), Math.min(this.z, num(o.z, 0))); };
+  Vec3.prototype.max = function (o) { o = safe3(o); return new Vec3(Math.max(this.x, num(o.x, 0)), Math.max(this.y, num(o.y, 0)), Math.max(this.z, num(o.z, 0))); };
+  Vec3.prototype.abs = function () { return new Vec3(Math.abs(this.x), Math.abs(this.y), Math.abs(this.z)); };
+  Vec3.prototype.floor = function () { return new Vec3(Math.floor(this.x), Math.floor(this.y), Math.floor(this.z)); };
+  Vec3.prototype.ceil = function () { return new Vec3(Math.ceil(this.x), Math.ceil(this.y), Math.ceil(this.z)); };
+  Vec3.prototype.round = function () { return new Vec3(Math.round(this.x), Math.round(this.y), Math.round(this.z)); };
+  Vec3.prototype.smoothStep = function (e0, e1) {
+    var a = (e0 && typeof e0 === 'object') ? e0 : { x: num(e0, 0), y: num(e0, 0), z: num(e0, 0) };
+    var b = (e1 && typeof e1 === 'object') ? e1 : { x: num(e1, 1), y: num(e1, 1), z: num(e1, 1) };
+    return new Vec3(
+      WEMath.smoothStep(num(a.x, 0), num(b.x, 1), this.x),
+      WEMath.smoothStep(num(a.y, 0), num(b.y, 1), this.y),
+      WEMath.smoothStep(num(a.z, 0), num(b.z, 1), this.z)
+    );
+  };
   Vec3.prototype.copy = function () { return new Vec3(this.x, this.y, this.z); };
   Vec3.prototype.clone = Vec3.prototype.copy;
   Vec3.prototype.toVec2 = function () { return new Vec2(this.x, this.y); };
@@ -462,13 +838,40 @@ const PRELUDE: &str = r#"
   Vec3.prototype.toString = function () { return this.x + ' ' + this.y + ' ' + this.z; };
 
   function Vec4(x, y, z, w) {
+    if (typeof x === 'string') {
+      var p = x.trim().split(/\s+/).filter(Boolean);
+      if (p.length === 1) {
+        var s = num(parseFloat(p[0]), 0);
+        this.x = s; this.y = s; this.z = s; this.w = s;
+      } else {
+        this.x = num(parseFloat(p[0]), 0);
+        this.y = num(parseFloat(p[1]), 0);
+        this.z = num(parseFloat(p[2]), 0);
+        this.w = num(parseFloat(p[3]), 0);
+      }
+      return;
+    }
     if (x && typeof x === 'object') {
-      this.x = num(x.x, 0); this.y = num(x.y, 0);
-      this.z = num(x.z, 0); this.w = num(x.w, 0);
+      this.x = num(x.x !== undefined ? x.x : x.r, 0);
+      this.y = num(x.y !== undefined ? x.y : x.g, 0);
+      this.z = num(x.z !== undefined ? x.z : x.b, 0);
+      this.w = num(x.w !== undefined ? x.w : x.a, 0);
+      return;
+    }
+    if (y === undefined && z === undefined && w === undefined && typeof x === 'number') {
+      this.x = num(x, 0); this.y = this.x; this.z = this.x; this.w = this.x;
       return;
     }
     this.x = num(x, 0); this.y = num(y, 0); this.z = num(z, 0); this.w = num(w, 0);
   }
+  Object.defineProperties(Vec4.prototype, {
+    r: { get: function () { return this.x; }, set: function (v) { this.x = num(v, 0); } },
+    g: { get: function () { return this.y; }, set: function (v) { this.y = num(v, 0); } },
+    b: { get: function () { return this.z; }, set: function (v) { this.z = num(v, 0); } },
+    a: { get: function () { return this.w; }, set: function (v) { this.w = num(v, 0); } }
+  });
+  Vec4.prototype.add = function (o) { o = safe4(o); return new Vec4(this.x + num(o.x, 0), this.y + num(o.y, 0), this.z + num(o.z, 0), this.w + num(o.w, 0)); };
+  Vec4.prototype.subtract = function (o) { o = safe4(o); return new Vec4(this.x - num(o.x, 0), this.y - num(o.y, 0), this.z - num(o.z, 0), this.w - num(o.w, 0)); };
   Vec4.prototype.copy = function () { return new Vec4(this.x, this.y, this.z, this.w); };
   Vec4.prototype.clone = Vec4.prototype.copy;
   Vec4.prototype.multiply = function (o) {
@@ -476,6 +879,27 @@ const PRELUDE: &str = r#"
     var d = num(o, 1);
     return new Vec4(this.x * d, this.y * d, this.z * d, this.w * d);
   };
+  Vec4.prototype.divide = function (o) {
+    if (o && typeof o === 'object') return new Vec4(this.x / (num(o.x, 1) || 1), this.y / (num(o.y, 1) || 1), this.z / (num(o.z, 1) || 1), this.w / (num(o.w, 1) || 1));
+    var d = num(o, 1) || 1;
+    return new Vec4(this.x / d, this.y / d, this.z / d, this.w / d);
+  };
+  Vec4.prototype.mix = function (o, t) {
+    o = safe4(o); t = num(t, 0);
+    return new Vec4(
+      this.x + (num(o.x, 0) - this.x) * t,
+      this.y + (num(o.y, 0) - this.y) * t,
+      this.z + (num(o.z, 0) - this.z) * t,
+      this.w + (num(o.w, 0) - this.w) * t
+    );
+  };
+  Vec4.prototype.dot = function (o) { o = safe4(o); return this.x * num(o.x, 0) + this.y * num(o.y, 0) + this.z * num(o.z, 0) + this.w * num(o.w, 0); };
+  Vec4.prototype.lengthSqr = function () { return this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w; };
+  Vec4.prototype.length = function () { return Math.sqrt(this.lengthSqr()); };
+  Vec4.prototype.normalize = function () { var l = this.length() || 1; return new Vec4(this.x / l, this.y / l, this.z / l, this.w / l); };
+  Vec4.prototype.equals = function (o) { return !!o && this.x === o.x && this.y === o.y && this.z === o.z && this.w === o.w; };
+  Vec4.prototype.toVec3 = function () { return new Vec3(this.x, this.y, this.z); };
+  Vec4.prototype.toVec2 = function () { return new Vec2(this.x, this.y); };
   Vec4.prototype.toString = function () { return this.x + ' ' + this.y + ' ' + this.z + ' ' + this.w; };
 
   globalThis.Vec2 = Vec2;
@@ -500,40 +924,156 @@ const PRELUDE: &str = r#"
   };
   var WEColor = {
     hsv2rgb: function (h, s, v) {
-      h = ((h % 1) + 1) % 1;
-      var i = Math.floor(h * 6), f = h * 6 - i;
-      var p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+      var hh, ss, vv;
+      if (h && typeof h === 'object') {
+        hh = num(h.x !== undefined ? h.x : h.r, 0);
+        ss = num(h.y !== undefined ? h.y : h.g, 0);
+        vv = num(h.z !== undefined ? h.z : h.b, 0);
+      } else {
+        hh = num(h, 0); ss = num(s, 0); vv = num(v, 0);
+      }
+      hh = ((hh % 1) + 1) % 1;
+      var i = Math.floor(hh * 6), f = hh * 6 - i;
+      var p = vv * (1 - ss), q = vv * (1 - f * ss), t = vv * (1 - (1 - f) * ss);
       var r, g, b;
       switch (i % 6) {
-        case 0: r = v; g = t; b = p; break;
-        case 1: r = q; g = v; b = p; break;
-        case 2: r = p; g = v; b = t; break;
-        case 3: r = p; g = q; b = v; break;
-        case 4: r = t; g = p; b = v; break;
-        default: r = v; g = p; b = q; break;
+        case 0: r = vv; g = t; b = p; break;
+        case 1: r = q; g = vv; b = p; break;
+        case 2: r = p; g = vv; b = t; break;
+        case 3: r = p; g = q; b = vv; break;
+        case 4: r = t; g = p; b = vv; break;
+        default: r = vv; g = p; b = q; break;
       }
       return new Vec3(r, g, b);
     },
-    rgb2hsv: function (c) {
-      var max = Math.max(c.x, c.y, c.z), min = Math.min(c.x, c.y, c.z);
+    rgb2hsv: function (c, g, b) {
+      var rx, gy, bz;
+      if (c && typeof c === 'object') {
+        rx = num(c.x !== undefined ? c.x : c.r, 0);
+        gy = num(c.y !== undefined ? c.y : c.g, 0);
+        bz = num(c.z !== undefined ? c.z : c.b, 0);
+      } else {
+        rx = num(c, 0); gy = num(g, 0); bz = num(b, 0);
+      }
+      var max = Math.max(rx, gy, bz), min = Math.min(rx, gy, bz);
       var d = max - min, h = 0;
       if (d > 0) {
-        if (max === c.x) h = ((c.y - c.z) / d) % 6;
-        else if (max === c.y) h = (c.z - c.x) / d + 2;
-        else h = (c.x - c.y) / d + 4;
+        if (max === rx) h = ((gy - bz) / d) % 6;
+        else if (max === gy) h = (bz - rx) / d + 2;
+        else h = (rx - gy) / d + 4;
         h /= 6;
       }
       return new Vec3(((h % 1) + 1) % 1, max > 0 ? d / max : 0, max);
     }
   };
   var WEVector = {
-    angleVector2: function (a) { return new Vec2(Math.cos(a), Math.sin(a)); }
+    angleVector2: function (a) {
+      var rad = num(a, 0) * Math.PI / 180;
+      return new Vec2(Math.cos(rad), Math.sin(rad));
+    },
+    angleVector3: function (a) {
+      var v = safe3(a);
+      var px = num(v.x, 0) * Math.PI / 180;
+      var py = num(v.y, 0) * Math.PI / 180;
+      var cp = Math.cos(px), sp = Math.sin(px);
+      var cy = Math.cos(py), sy = Math.sin(py);
+      return new Vec3(cp * cy, cp * sy, -sp);
+    },
+    vectorAngle2: function (v) {
+      v = safe2(v);
+      return Math.atan2(num(v.y, 0), num(v.x, 0)) * 180 / Math.PI;
+    }
   };
   globalThis.__WE_MODULES = { WEMath: WEMath, WEColor: WEColor, WEVector: WEVector };
 
   var userProperties = {};
   var timers = [];
   var nextTimer = 1;
+
+  function removeTimer(handle) {
+    if (handle == null) return;
+    var id = (typeof handle === 'function' && handle.__timerId !== undefined)
+      ? handle.__timerId
+      : handle;
+    for (var i = 0; i < timers.length; i++) {
+      if (timers[i].id === id) {
+        timers[i].cancelled = true;
+        timers.splice(i, 1);
+        return;
+      }
+    }
+  }
+
+  function scheduleTimer(fn, ms, repeating) {
+    if (typeof fn !== 'function') return function () {};
+    var id = nextTimer++;
+    var delay = Math.max(0, num(ms, 0)) / 1000;
+    var interval = repeating ? Math.max(0.001, delay) : 0;
+    timers.push({
+      id: id,
+      fn: fn,
+      at: globalThis.engine.runtime + (repeating ? interval : delay),
+      interval: interval,
+      cancelled: false,
+      layer: globalThis.thisLayer,
+      obj: globalThis.thisObject
+    });
+    function cancel() { removeTimer(id); }
+    cancel.__timerId = id;
+    return cancel;
+  }
+
+  var audioRegistered = false;
+  var audioCache = {};
+  function audioBuffers(res) {
+    audioRegistered = true;
+    var n = Math.max(1, Math.min(256, Math.round(num(res, 16))));
+    var buf = audioCache[n];
+    if (!buf) {
+      function zeros() { var a = []; for (var i = 0; i < n; i++) a.push(0); return a; }
+      buf = audioCache[n] = { length: n, left: zeros(), right: zeros(), average: zeros() };
+    }
+    return buf;
+  }
+
+  function updateAudioBuffers(spec64) {
+    if (!Array.isArray(spec64) || spec64.length === 0) return;
+    var srcLen = spec64.length;
+    var keys = Object.keys(audioCache);
+    for (var k = 0; k < keys.length; k++) {
+      var buf = audioCache[keys[k]];
+      var n = buf.length;
+      if (n === srcLen) {
+        for (var i = 0; i < n; i++) {
+          var v = num(spec64[i], 0);
+          buf.left[i] = v;
+          buf.right[i] = v;
+          buf.average[i] = v;
+        }
+      } else if (n === 32 && srcLen === 64) {
+        for (var i = 0; i < 32; i++) {
+          var b = i * 2;
+          var v = (num(spec64[b], 0) + num(spec64[b + 1], 0)) * 0.5;
+          buf.left[i] = v; buf.right[i] = v; buf.average[i] = v;
+        }
+      } else if (n === 16 && srcLen === 64) {
+        for (var i = 0; i < 16; i++) {
+          var b = i * 4;
+          var v = (num(spec64[b], 0) + num(spec64[b + 1], 0) + num(spec64[b + 2], 0) + num(spec64[b + 3], 0)) * 0.25;
+          buf.left[i] = v; buf.right[i] = v; buf.average[i] = v;
+        }
+      } else {
+        for (var i = 0; i < n; i++) {
+          var start = Math.floor(i * srcLen / n);
+          var end = Math.max(start + 1, Math.min(srcLen, Math.floor((i + 1) * srcLen / n)));
+          var sum = 0;
+          for (var j = start; j < end; j++) sum += num(spec64[j], 0);
+          var v = sum / (end - start);
+          buf.left[i] = v; buf.right[i] = v; buf.average[i] = v;
+        }
+      }
+    }
+  }
 
   globalThis.engine = {
     runtime: 0,
@@ -543,7 +1083,6 @@ const PRELUDE: &str = r#"
     screenResolution: new Vec2(1920, 1080),
     mousePosition: new Vec2(0, 0),
     userProperties: userProperties,
-    isScreensaver: false,
     AUDIO_RESOLUTION_16: 16,
     AUDIO_RESOLUTION_32: 32,
     AUDIO_RESOLUTION_64: 64,
@@ -553,26 +1092,17 @@ const PRELUDE: &str = r#"
     openUserShortcut: function () { return 0; },
     createAnimation: function () { return animStub(); },
     createEffect: function () { return {}; },
-    setTimeout: function (fn, ms) {
-      var id = nextTimer++;
-      timers.push({ id: id, fn: fn, at: globalThis.engine.runtime + (ms || 0) / 1000 });
-      return id;
-    },
-    clearTimeout: function (id) { timers = timers.filter(function (t) { return t.id !== id; }); }
+    setTimeout: function (fn, ms) { return scheduleTimer(fn, ms, false); },
+    clearTimeout: function (h) { removeTimer(h); },
+    setInterval: function (fn, ms) { return scheduleTimer(fn, ms, true); },
+    clearInterval: function (h) { removeTimer(h); }
   };
+  globalThis.setTimeout = globalThis.engine.setTimeout;
+  globalThis.clearTimeout = globalThis.engine.clearTimeout;
+  globalThis.setInterval = globalThis.engine.setInterval;
+  globalThis.clearInterval = globalThis.engine.clearInterval;
 
   globalThis.shared = {};
-
-  var audioCache = {};
-  function audioBuffers(res) {
-    var n = Math.max(1, Math.min(256, num(res, 16)));
-    var buf = audioCache[n];
-    if (!buf) {
-      function zeros() { var a = []; for (var i = 0; i < n; i++) a.push(0); return a; }
-      buf = audioCache[n] = { length: n, left: zeros(), right: zeros(), average: zeros() };
-    }
-    return buf;
-  }
 
   // Wallpaper Engine persists small values with get/set/remove.
   var storage = {};
@@ -606,7 +1136,7 @@ const PRELUDE: &str = r#"
 
   function parseVec(v) {
     if (Array.isArray(v)) return new Vec3(v[0], v[1], v[2]);
-    if (v && typeof v === 'object') return new Vec3(v.x, v.y, v.z);
+    if (v && typeof v === 'object') return new Vec3(v.x !== undefined ? v.x : v.r, v.y !== undefined ? v.y : v.g, v.z !== undefined ? v.z : v.b);
     if (typeof v === 'string') {
       var p = v.trim().split(/\s+/).map(parseFloat);
       return new Vec3(p[0], p[1], p[2]);
@@ -615,13 +1145,93 @@ const PRELUDE: &str = r#"
   }
   function toArr3(v) {
     if (Array.isArray(v)) return [num(v[0], 0), num(v[1], 0), num(v[2], 0)];
-    if (v && typeof v === 'object') return [num(v.x, 0), num(v.y, 0), num(v.z, 0)];
-    var n = typeof v === 'number' ? v : 0;
+    if (v && typeof v === 'object') return [num(v.x !== undefined ? v.x : v.r, 0), num(v.y !== undefined ? v.y : v.g, 0), num(v.z !== undefined ? v.z : v.b, 0)];
+    var n = typeof v === 'number' ? num(v, 0) : 0;
     return [n, n, n];
+  }
+  function vec3Eq(a, b) {
+    return a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+  }
+
+  function parseConstInitial(v) {
+    if (typeof v === 'boolean') return { value: v, kind: 'bool' };
+    if (typeof v === 'number') return { value: num(v, 0), kind: 'number' };
+    if (Array.isArray(v)) {
+      if (v.length >= 4) return { value: new Vec4(v[0], v[1], v[2], v[3]), kind: 'vec4' };
+      if (v.length === 3) return { value: new Vec3(v[0], v[1], v[2]), kind: 'vec3' };
+      if (v.length === 2) return { value: new Vec2(v[0], v[1]), kind: 'vec2' };
+      if (v.length === 1) return { value: num(v[0], 0), kind: 'number' };
+      return { value: 0, kind: 'number' };
+    }
+    if (typeof v === 'string') {
+      var parts = v.trim().split(/\s+/).filter(Boolean);
+      var nums = [];
+      var allNum = parts.length > 0;
+      for (var i = 0; i < parts.length; i++) {
+        var f = Number(parts[i]);
+        if (!isFinite(f)) { allNum = false; break; }
+        nums.push(f);
+      }
+      if (allNum) {
+        if (nums.length === 1) return { value: nums[0], kind: 'number' };
+        if (nums.length === 2) return { value: new Vec2(nums[0], nums[1]), kind: 'vec2' };
+        if (nums.length === 3) return { value: new Vec3(nums[0], nums[1], nums[2]), kind: 'vec3' };
+        if (nums.length >= 4) return { value: new Vec4(nums[0], nums[1], nums[2], nums[3]), kind: 'vec4' };
+      }
+      return { value: v, kind: 'string' };
+    }
+    if (v && typeof v === 'object') {
+      if (v.w !== undefined || v.a !== undefined) return { value: new Vec4(v), kind: 'vec4' };
+      if (v.z !== undefined || v.b !== undefined) return { value: new Vec3(v), kind: 'vec3' };
+      if (v.x !== undefined || v.r !== undefined) return { value: new Vec2(v), kind: 'vec2' };
+    }
+    return { value: 0, kind: 'number' };
+  }
+
+  function copyConstValue(v) {
+    if (v instanceof Vec2 || v instanceof Vec3 || v instanceof Vec4) return v.copy();
+    return v;
+  }
+
+  function normalizeConstValue(res, kind) {
+    if (res instanceof Vec2) return res.copy();
+    if (res instanceof Vec3) return res.copy();
+    if (res instanceof Vec4) return res.copy();
+    if (res && typeof res === 'object') {
+      if (Array.isArray(res)) {
+        if (res.length >= 4) return new Vec4(res[0], res[1], res[2], res[3]);
+        if (res.length === 3) return new Vec3(res[0], res[1], res[2]);
+        if (res.length === 2) return new Vec2(res[0], res[1]);
+        if (res.length === 1) return num(res[0], 0);
+        return 0;
+      }
+      if (res.w !== undefined || res.a !== undefined) return new Vec4(res);
+      if (res.z !== undefined || res.b !== undefined) return new Vec3(res);
+      if (res.x !== undefined || res.r !== undefined) return new Vec2(res);
+    }
+    if (kind === 'bool') return !!res;
+    if (typeof res === 'boolean') return res;
+    if (typeof res === 'number') return isFinite(res) ? res : 0;
+    if (typeof res === 'string') return parseConstInitial(res).value;
+    return 0;
+  }
+
+  function serializeConstValue(v) {
+    if (v instanceof Vec2) return [num(v.x, 0), num(v.y, 0)];
+    if (v instanceof Vec3) return [num(v.x, 0), num(v.y, 0), num(v.z, 0)];
+    if (v instanceof Vec4) return [num(v.x, 0), num(v.y, 0), num(v.z, 0), num(v.w, 0)];
+    if (v && typeof v === 'object') {
+      if (v.w !== undefined) return [num(v.x, 0), num(v.y, 0), num(v.z, 0), num(v.w, 0)];
+      if (v.z !== undefined) return [num(v.x, 0), num(v.y, 0), num(v.z, 0)];
+      if (v.x !== undefined) return [num(v.x, 0), num(v.y, 0)];
+    }
+    if (typeof v === 'number') return isFinite(v) ? v : 0;
+    return v;
   }
 
   var layers = {};
   var layerOrder = [];
+  var allEffects = [];
   var scripts = [];
 
   function layerByRef(ref) {
@@ -683,13 +1293,28 @@ const PRELUDE: &str = r#"
   }
 
   function makeLayer(id, name) {
+    var _size = new Vec2(0, 0);
     var l = {
-      id: id, name: name || '', visible: true, alpha: 1,
+      id: id, name: name || '', visible: true, solid: true, alpha: 1,
       origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
-      color: new Vec3(1, 1, 1), size: new Vec2(0, 0), alignment: new Vec2(0, 0),
+      color: new Vec3(1, 1, 1), alignment: new Vec2(0, 0),
       text: '', pointsize: 0, cursorDetected: false, clicked: false, kind: '',
       __parent: null, __tex: null, __video: null, __layerFile: null,
+      __effects: {}, __effectList: [],
       getParent: function () { return l.__parent || null; },
+      getEffect: function (ref) {
+        if (typeof ref === 'number') return l.__effects[String(ref)] || l.__effectList[ref] || null;
+        var s = String(ref || '');
+        for (var i = 0; i < l.__effectList.length; i++) {
+          if (l.__effectList[i].name === s) return l.__effectList[i];
+        }
+        var sl = s.toLowerCase();
+        for (var i = 0; i < l.__effectList.length; i++) {
+          if (l.__effectList[i].name.toLowerCase() === sl) return l.__effectList[i];
+        }
+        return null;
+      },
+      getEffectCount: function () { return l.__effectList.length; },
       getTextureAnimation: function () {
         if (!l.__tex) { l.__tex = animStub(); l.__tex.frameCount = 1; }
         return l.__tex;
@@ -707,6 +1332,11 @@ const PRELUDE: &str = r#"
       isPlaying: function () { return false; },
       play: function () {}, pause: function () {}, stop: function () {}
     };
+    Object.defineProperty(l, 'size', {
+      get: function () { return _size.copy(); },
+      set: function (v) { _size = new Vec2(v); },
+      enumerable: true
+    });
     return l;
   }
 
@@ -741,14 +1371,17 @@ const PRELUDE: &str = r#"
   globalThis.thisScene = scene;
   globalThis.thisLayer = null;
 
-  function userValue(name, fallback) {
-    var v = userProperties[name];
-    if (v === undefined || v === null) return fallback;
-    return v;
+  function coerceScriptProp(type, rawVal) {
+    if (type === 'slider') return num(rawVal, 0);
+    if (type === 'checkbox') return !!rawVal;
+    if (type === 'color' || type === 'direction') return parseVec(rawVal);
+    if (type === 'text' || type === 'file' || type === 'font') return String(rawVal == null ? '' : rawVal);
+    return rawVal;
   }
 
   globalThis.createScriptProperties = function () {
     var props = {};
+    var types = {};
     var override = globalThis.__WE_binding_props || {};
     function read(name, fallback) {
       var v = override[name];
@@ -756,15 +1389,21 @@ const PRELUDE: &str = r#"
       return (v === undefined || v === null) ? fallback : v;
     }
     var api = {
-      addSlider: function (o) { props[o.name] = num(read(o.name, o.value), 0); return api; },
-      addCheckbox: function (o) { props[o.name] = !!read(o.name, o.value); return api; },
-      addCombo: function (o) { props[o.name] = read(o.name, o.value); return api; },
-      addText: function (o) { var v = read(o.name, o.value || ''); props[o.name] = String(v); return api; },
-      addColor: function (o) { props[o.name] = parseVec(read(o.name, o.value)); return api; },
-      addDirection: function (o) { props[o.name] = parseVec(read(o.name, o.value)); return api; },
-      addFile: function (o) { var v = read(o.name, o.value || ''); props[o.name] = String(v); return api; },
-      addFont: function (o) { var v = read(o.name, o.value || ''); props[o.name] = String(v); return api; },
-      finish: function () { return props; }
+      addSlider: function (o) { types[o.name] = 'slider'; props[o.name] = num(read(o.name, o.value), 0); return api; },
+      addCheckbox: function (o) { types[o.name] = 'checkbox'; props[o.name] = !!read(o.name, o.value); return api; },
+      addCombo: function (o) { types[o.name] = 'combo'; props[o.name] = read(o.name, o.value); return api; },
+      addText: function (o) { types[o.name] = 'text'; var v = read(o.name, o.value || ''); props[o.name] = String(v); return api; },
+      addColor: function (o) { types[o.name] = 'color'; props[o.name] = parseVec(read(o.name, o.value)); return api; },
+      addDirection: function (o) { types[o.name] = 'direction'; props[o.name] = parseVec(read(o.name, o.value)); return api; },
+      addFile: function (o) { types[o.name] = 'file'; var v = read(o.name, o.value || ''); props[o.name] = String(v); return api; },
+      addFont: function (o) { types[o.name] = 'font'; var v = read(o.name, o.value || ''); props[o.name] = String(v); return api; },
+      finish: function () {
+        if (globalThis.__WE_current_sp_meta) {
+          globalThis.__WE_current_sp_meta.props = props;
+          globalThis.__WE_current_sp_meta.types = types;
+        }
+        return props;
+      }
     };
     return api;
   };
@@ -793,6 +1432,138 @@ const PRELUDE: &str = r#"
     return { body: body, names: names };
   }
 
+  function snapshotLayers() {
+    var snap = {};
+    for (var i = 0; i < layerOrder.length; i++) {
+      var id = layerOrder[i];
+      var l = layers[id];
+      snap[id] = {
+        visible: !!l.visible,
+        alpha: num(l.alpha, 1),
+        origin: toArr3(l.origin),
+        scale: toArr3(l.scale),
+        angles: toArr3(l.angles),
+        color: toArr3(l.color),
+        text: l.text === undefined || l.text === null ? '' : String(l.text)
+      };
+    }
+    return snap;
+  }
+
+  function snapshotEffects() {
+    var snap = [];
+    for (var i = 0; i < allEffects.length; i++) {
+      snap.push(!!allEffects[i].visible);
+    }
+    return snap;
+  }
+
+  function collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors) {
+    var outputs = [];
+    for (var i = 0; i < layerOrder.length; i++) {
+      var idStr = layerOrder[i];
+      var l = layers[idStr];
+      var prev = preLayers[idStr];
+      if (!prev) continue;
+      var numId = l.id;
+      var curVis = !!l.visible;
+      if (curVis !== prev.visible || forcedLayers[idStr + ':visible']) {
+        outputs.push({ kind: 'layer', id: numId, field: 'visible', value: curVis });
+      }
+      var curAlpha = num(l.alpha, 1);
+      if (curAlpha !== prev.alpha || forcedLayers[idStr + ':alpha']) {
+        outputs.push({ kind: 'layer', id: numId, field: 'alpha', value: curAlpha });
+      }
+      var vecFields = ['origin', 'scale', 'angles', 'color'];
+      for (var fi = 0; fi < vecFields.length; fi++) {
+        var f = vecFields[fi];
+        var curVec = toArr3(l[f]);
+        if (!vec3Eq(curVec, prev[f]) || forcedLayers[idStr + ':' + f]) {
+          outputs.push({ kind: 'layer', id: numId, field: f, value: curVec });
+        }
+      }
+      var curText = l.text === undefined || l.text === null ? '' : String(l.text);
+      if (curText !== prev.text || forcedLayers[idStr + ':text']) {
+        outputs.push({ kind: 'layer', id: numId, field: 'text', value: curText });
+      }
+    }
+
+    for (var e = 0; e < allEffects.length; e++) {
+      var eff = allEffects[e];
+      var curEffVis = !!eff.visible;
+      var eKey = eff.__layerId + ':' + eff.__effectIdx;
+      if (curEffVis !== preEffects[e] || forcedEffects[eKey]) {
+        outputs.push({
+          kind: 'effect_visible',
+          layerId: eff.__layerId,
+          effectIdx: eff.__effectIdx,
+          value: curEffVis
+        });
+      }
+    }
+
+    for (var s = 0; s < scripts.length; s++) {
+      var b = scripts[s];
+      if (!b.dead && b.kind === 'effect_const' && b.dirty) {
+        b.dirty = false;
+        outputs.push({
+          kind: 'effect_const',
+          layerId: b.layerId,
+          effectIdx: b.effectIdx,
+          passIdx: b.passIdx,
+          key: b.key,
+          value: serializeConstValue(b.current)
+        });
+      }
+    }
+
+    return JSON.stringify({
+      errors: errors,
+      outputs: outputs,
+      usesAudio: audioRegistered
+    });
+  }
+
+  function applyBindingValue(b, ret, forcedLayers, forcedEffects) {
+    if (ret === undefined) return;
+    if (b.kind === 'layer') {
+      var norm = normalizeField(b.field, ret);
+      b.layer[b.field] = norm;
+      forcedLayers[String(b.id) + ':' + b.field] = true;
+    } else if (b.kind === 'effect_visible') {
+      b.effect.visible = !!ret;
+      forcedEffects[b.layerId + ':' + b.effectIdx] = true;
+    } else if (b.kind === 'effect_const') {
+      b.current = normalizeConstValue(ret, b.valueKind);
+      b.dirty = true;
+    }
+  }
+
+  function runTimers() {
+    var limit = 64;
+    var rt = globalThis.engine.runtime;
+    while (timers.length && limit-- > 0) {
+      var due = null;
+      for (var t = 0; t < timers.length; t++) {
+        if (timers[t].at <= rt) {
+          due = timers[t];
+          if (due.interval > 0) {
+            due.at = rt + due.interval;
+          } else {
+            timers.splice(t, 1);
+          }
+          break;
+        }
+      }
+      if (!due) break;
+      if (due.cancelled) continue;
+      globalThis.thisScene = scene;
+      globalThis.thisLayer = due.layer;
+      globalThis.thisObject = due.obj;
+      try { due.fn(); } catch (_err) {}
+    }
+  }
+
   var init = {
     addLayer: function (jsonText) {
       var d = JSON.parse(jsonText);
@@ -812,6 +1583,26 @@ const PRELUDE: &str = r#"
       layerOrder.push(String(d.id));
       return true;
     },
+    addEffect: function (jsonText) {
+      var d = JSON.parse(jsonText);
+      var layer = layers[String(d.layerId)];
+      if (!layer) return false;
+      var eff = {
+        id: d.id != null ? d.id : d.effectIdx,
+        name: d.name || '',
+        visible: d.visible !== false,
+        color: new Vec3(1, 1, 1),
+        __layer: layer,
+        __layerId: d.layerId,
+        __effectIdx: d.effectIdx,
+        getLayer: function () { return layer; },
+        getAnimation: animStub
+      };
+      layer.__effects[String(d.effectIdx)] = eff;
+      layer.__effectList.push(eff);
+      allEffects.push(eff);
+      return true;
+    },
     linkParents: function () {
       for (var i = 0; i < layerOrder.length; i++) {
         var l = layers[layerOrder[i]];
@@ -821,38 +1612,179 @@ const PRELUDE: &str = r#"
     },
     addScript: function (jsonText) {
       var d = JSON.parse(jsonText);
-      d.initial = normalizeField(d.field, d.initial);
+      var kind = d.kind || 'layer';
+      var layer = layers[String(kind === 'layer' ? d.id : d.layerId)] || null;
+      var eff = (kind === 'effect_visible' || kind === 'effect_const') && layer
+        ? (layer.__effects[String(d.effectIdx)] || null)
+        : null;
       var prepared = prepare(d.source);
-      var factory = (0, eval)('(function(){\n' + prepared.body + '\nreturn {' +
-        prepared.names.map(function (n) {
-          return n + ':(typeof ' + n + '===\'undefined\'?undefined:' + n + ')';
-        }).join(',') + '};\n})');
-      var mod;
+      var mod = null;
+      var compileErr = null;
+      var spMeta = { props: null, types: {} };
       globalThis.__WE_binding_props = d.scriptProperties || {};
+      globalThis.__WE_current_sp_meta = spMeta;
+      globalThis.thisScene = scene;
+      globalThis.thisLayer = layer;
+      globalThis.thisObject = eff || layer;
       try {
+        var factory = (0, eval)('(function(){\n' + prepared.body + '\nreturn {' +
+          prepared.names.map(function (n) {
+            return n + ':(typeof ' + n + '===\'undefined\'?undefined:' + n + ')';
+          }).join(',') + '};\n})');
         mod = factory();
+      } catch (e) {
+        compileErr = errText(e);
       } finally {
         globalThis.__WE_binding_props = {};
+        globalThis.__WE_current_sp_meta = null;
       }
-      var layer = layers[String(d.id)];
+
       var entry = {
-        id: d.id, field: d.field, mod: mod, layer: layer || null,
-        source: d.source, initial: d.initial, dead: false, initDone: false
+        kind: kind,
+        id: d.id || 0,
+        field: d.field || '',
+        layerId: d.layerId || 0,
+        effectIdx: d.effectIdx || 0,
+        passIdx: d.passIdx || 0,
+        key: d.key || '',
+        mod: mod,
+        layer: layer,
+        effect: eff,
+        scriptPropsObj: spMeta.props,
+        scriptPropTypes: spMeta.types,
+        dead: !!compileErr,
+        error: compileErr,
+        dirty: false
       };
-      if (mod.init) {
-        try {
-          globalThis.thisLayer = layer;
-          globalThis.thisObject = layer;
-          var returned = mod.init(entry.initial);
-          if (returned !== undefined) entry.initial = returned;
-        } catch (e) {
-          entry.dead = true;
-          entry.error = errText(e);
-        }
-        entry.initDone = true;
+
+      if (kind === 'layer') {
+        entry.initial = normalizeField(d.field, d.initial);
+      } else if (kind === 'effect_visible') {
+        entry.initial = !!d.initial;
+      } else {
+        var ci = parseConstInitial(d.initial);
+        entry.initial = ci.value;
+        entry.current = copyConstValue(ci.value);
+        entry.valueKind = ci.kind;
       }
       scripts.push(entry);
-      return true;
+      return JSON.stringify({
+        ok: !compileErr,
+        error: compileErr,
+        usesAudio: audioRegistered
+      });
+    },
+    finalizeInit: function () {
+      var preLayers = snapshotLayers();
+      var preEffects = snapshotEffects();
+      var forcedLayers = {};
+      var forcedEffects = {};
+      var errors = [];
+
+      for (var k = 0; k < scripts.length; k++) {
+        var b = scripts[k];
+        if (b.dead) continue;
+        if (b.kind === 'layer' && !b.layer) {
+          b.dead = true;
+          errors.push({ idx: k, kind: 'init', message: 'layer missing' });
+          continue;
+        }
+        if ((b.kind === 'effect_visible' || b.kind === 'effect_const') && !b.effect) {
+          b.dead = true;
+          errors.push({ idx: k, kind: 'init', message: 'effect missing' });
+          continue;
+        }
+        if (b.mod && typeof b.mod.init === 'function') {
+          try {
+            globalThis.thisScene = scene;
+            globalThis.thisLayer = b.layer;
+            globalThis.thisObject = b.effect || b.layer;
+            var arg = copyConstValue(b.initial);
+            var ret = b.mod.init(arg);
+            if (b.kind === 'effect_const' && ret === undefined &&
+              (arg instanceof Vec2 || arg instanceof Vec3 || arg instanceof Vec4) &&
+              !arg.equals(b.initial)) {
+              ret = arg;
+            }
+            applyBindingValue(b, ret, forcedLayers, forcedEffects);
+          } catch (e) {
+            b.dead = true;
+            b.error = errText(e);
+            errors.push({ idx: k, kind: 'init', message: b.error });
+          }
+        }
+      }
+
+      for (var k = 0; k < scripts.length; k++) {
+        var b = scripts[k];
+        if (b.dead) continue;
+        if (b.mod && typeof b.mod.applyUserProperties === 'function') {
+          try {
+            globalThis.thisScene = scene;
+            globalThis.thisLayer = b.layer;
+            globalThis.thisObject = b.effect || b.layer;
+            b.mod.applyUserProperties(userProperties);
+          } catch (e) {
+            b.dead = true;
+            b.error = errText(e);
+            errors.push({ idx: k, kind: 'applyUserProperties', message: b.error });
+          }
+        }
+      }
+
+      return collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors);
+    },
+    applyUserProperties: function (jsonText) {
+      var d = JSON.parse(jsonText);
+      var changed = d.changed || {};
+      var bindingProps = d.bindingProps || {};
+      for (var key in changed) {
+        if (Object.prototype.hasOwnProperty.call(changed, key)) {
+          userProperties[key] = changed[key];
+        }
+      }
+
+      var preLayers = snapshotLayers();
+      var preEffects = snapshotEffects();
+      var forcedLayers = {};
+      var forcedEffects = {};
+      var errors = [];
+
+      for (var k = 0; k < scripts.length; k++) {
+        var b = scripts[k];
+        if (b.dead) continue;
+        var resolvedOverride = bindingProps[String(k)];
+        if (b.scriptPropsObj) {
+          var types = b.scriptPropTypes || {};
+          if (resolvedOverride) {
+            for (var pname in resolvedOverride) {
+              if (Object.prototype.hasOwnProperty.call(resolvedOverride, pname)) {
+                b.scriptPropsObj[pname] = coerceScriptProp(types[pname], resolvedOverride[pname]);
+              }
+            }
+          }
+          for (var pname in b.scriptPropsObj) {
+            if ((!resolvedOverride || !Object.prototype.hasOwnProperty.call(resolvedOverride, pname)) &&
+                Object.prototype.hasOwnProperty.call(changed, pname)) {
+              b.scriptPropsObj[pname] = coerceScriptProp(types[pname], changed[pname]);
+            }
+          }
+        }
+        if (b.mod && typeof b.mod.applyUserProperties === 'function') {
+          try {
+            globalThis.thisScene = scene;
+            globalThis.thisLayer = b.layer;
+            globalThis.thisObject = b.effect || b.layer;
+            b.mod.applyUserProperties(changed);
+          } catch (e) {
+            b.dead = true;
+            b.error = errText(e);
+            errors.push({ idx: k, kind: 'applyUserProperties', message: b.error });
+          }
+        }
+      }
+
+      return collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors);
     },
     tick: function (jsonText) {
       var s = JSON.parse(jsonText);
@@ -864,6 +1796,11 @@ const PRELUDE: &str = r#"
       e.canvasSize = new Vec2(s.canvas && s.canvas[0], s.canvas && s.canvas[1]);
       e.screenResolution = new Vec2(s.screen && s.screen[0], s.screen && s.screen[1]);
       globalThis.input.cursorWorldPosition = new Vec3(e.mousePosition.x, e.mousePosition.y, 0);
+      globalThis.input.cursorScreenPosition = new Vec2(e.mousePosition.x, e.mousePosition.y);
+
+      if (s.spectrum) {
+        updateAudioBuffers(s.spectrum);
+      }
 
       for (var i = 0; i < s.layers.length; i++) {
         var d = s.layers[i];
@@ -878,53 +1815,78 @@ const PRELUDE: &str = r#"
         l.text = d.text || '';
       }
 
-      while (timers.length) {
-        var due = null;
-        for (var t = 0; t < timers.length; t++) {
-          if (timers[t].at <= e.runtime) { due = timers[t]; timers.splice(t, 1); break; }
-        }
-        if (!due) break;
-        try { due.fn(); } catch (err) { /* keep other timers alive */ }
-      }
+      var preLayers = snapshotLayers();
+      var preEffects = snapshotEffects();
+      var forcedLayers = {};
+      var forcedEffects = {};
+      var errors = [];
 
-      var out = [];
+      runTimers();
+
       for (var k = 0; k < scripts.length; k++) {
         var b = scripts[k];
-        var layer = b.layer;
-        if (!layer) { out.push({ error: 'layer missing' }); continue; }
-        if (b.dead) { out.push({ error: b.error || 'dead' }); continue; }
-        var value;
-        if (b.field === 'text') value = layer.text;
-        else if (b.field === 'visible') value = layer.visible;
-        else if (b.field === 'alpha') value = layer.alpha;
-        else value = layer[b.field] ? layer[b.field].copy() : null;
+        if (b.dead) continue;
+        if (b.kind === 'layer' && !b.layer) {
+          b.dead = true;
+          errors.push({ idx: k, kind: 'runtime', message: 'layer missing' });
+          continue;
+        }
+        if ((b.kind === 'effect_visible' || b.kind === 'effect_const') && !b.effect) {
+          b.dead = true;
+          errors.push({ idx: k, kind: 'runtime', message: 'effect missing' });
+          continue;
+        }
+        if (!b.mod || typeof b.mod.update !== 'function') continue;
 
         try {
-          globalThis.thisLayer = layer;
           globalThis.thisScene = scene;
-          globalThis.thisObject = layer;
-          var res = b.mod.update ? b.mod.update(value) : undefined;
-          if (b.field === 'text') {
-            if (res !== undefined && res !== null) layer.text = String(res);
-            value = layer.text;
-          } else if (b.field === 'visible') {
-            if (res !== undefined) layer.visible = !!res;
-            value = layer.visible;
-          } else if (b.field === 'alpha') {
-            if (res !== undefined) layer.alpha = num(res, layer.alpha);
-            value = layer.alpha;
-          } else {
-            var v = (res !== undefined && res !== null) ? res : layer[b.field];
-            value = toArr3(v);
-            if (b.field === 'color') layer.color = parseVec(v);
-            else layer[b.field] = parseVec(v);
+          globalThis.thisLayer = b.layer;
+          globalThis.thisObject = b.effect || b.layer;
+
+          if (b.kind === 'layer') {
+            var layer = b.layer;
+            var value;
+            if (b.field === 'text') value = layer.text;
+            else if (b.field === 'visible') value = layer.visible;
+            else if (b.field === 'alpha') value = layer.alpha;
+            else value = layer[b.field] ? layer[b.field].copy() : null;
+
+            var res = b.mod.update(value);
+            if (b.field === 'text') {
+              if (res !== undefined && res !== null) layer.text = String(res);
+            } else if (b.field === 'visible') {
+              if (res !== undefined) layer.visible = !!res;
+            } else if (b.field === 'alpha') {
+              if (res !== undefined) layer.alpha = num(res, layer.alpha);
+            } else if (res !== undefined && res !== null) {
+              layer[b.field] = parseVec(res);
+            } else if (value instanceof Vec3 && preLayers[String(b.id)] &&
+              !vec3Eq(toArr3(value), preLayers[String(b.id)][b.field])) {
+              layer[b.field] = value;
+            }
+            forcedLayers[String(b.id) + ':' + b.field] = true;
+          } else if (b.kind === 'effect_visible') {
+            var res = b.mod.update(!!b.effect.visible);
+            if (res !== undefined) b.effect.visible = !!res;
+            forcedEffects[b.layerId + ':' + b.effectIdx] = true;
+          } else if (b.kind === 'effect_const') {
+            var arg = copyConstValue(b.current);
+            var res = b.mod.update(arg);
+            if (res !== undefined && res !== null) {
+              b.current = normalizeConstValue(res, b.valueKind);
+            } else if ((arg instanceof Vec2 || arg instanceof Vec3 || arg instanceof Vec4) &&
+              !arg.equals(b.current)) {
+              b.current = arg;
+            }
+            b.dirty = true;
           }
-          out.push({ id: b.id, field: b.field, value: value });
         } catch (err) {
-          out.push({ error: errText(err) });
+          b.dead = true;
+          b.error = errText(err);
+          errors.push({ idx: k, kind: 'runtime', message: b.error });
         }
       }
-      return JSON.stringify(out);
+      return collectOutputs(preLayers, preEffects, forcedLayers, forcedEffects, errors);
     }
   };
 
@@ -935,7 +1897,10 @@ const PRELUDE: &str = r#"
     return true;
   };
   globalThis.__WE_addLayer = init.addLayer;
+  globalThis.__WE_addEffect = init.addEffect;
   globalThis.__WE_addScript = init.addScript;
+  globalThis.__WE_finalizeInit = init.finalizeInit;
+  globalThis.__WE_applyUserProperties = init.applyUserProperties;
   globalThis.__WE_tick = init.tick;
   globalThis.__WE_linkParents = init.linkParents;
 })();
@@ -1017,9 +1982,24 @@ mod tests {
             json!(null),
             &serde_json::Map::new(),
         );
-        let out = host.tick(0.0, 0.016, 0.5, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &[frame(1)]);
+        let out = host.tick(
+            0.0,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(1)],
+        );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].field, ScriptField::Scale);
+        assert_eq!(
+            out[0].target,
+            ScriptTarget::Layer {
+                id: 1,
+                field: ScriptField::Scale
+            }
+        );
         let v = out[0].value.as_array().unwrap();
         assert!(v[0].as_f64().unwrap() <= 1.0);
     }
@@ -1035,7 +2015,16 @@ mod tests {
             json!("authored"),
             &serde_json::Map::new(),
         );
-        let out = host.tick(0.0, 0.016, 0.0, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &[frame(7)]);
+        let out = host.tick(
+            0.0,
+            0.016,
+            0.0,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(7)],
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].value, json!("hello 1920"));
     }
@@ -1051,7 +2040,16 @@ mod tests {
             json!(true),
             &serde_json::Map::new(),
         );
-        let out = host.tick(0.0, 0.016, 0.0, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &[frame(3)]);
+        let out = host.tick(
+            0.0,
+            0.016,
+            0.0,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(3)],
+        );
         assert_eq!(out.len(), 1);
         assert!(out[0].value.is_boolean());
     }
@@ -1069,7 +2067,16 @@ mod tests {
             json!(0.0),
             &serde_json::Map::new(),
         );
-        let out = host.tick(0.0, 0.016, 0.0, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &[frame(4)]);
+        let out = host.tick(
+            0.0,
+            0.016,
+            0.0,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(4)],
+        );
         assert_eq!(out.len(), 1);
         assert!((out[0].value.as_f64().unwrap() - 1.0).abs() < 1e-6);
     }
@@ -1086,7 +2093,16 @@ mod tests {
             json!(""),
             &serde_json::Map::new(),
         );
-        let out = host.tick(0.0, 0.016, 0.0, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &[frame(5), frame(6)]);
+        let out = host.tick(
+            0.0,
+            0.016,
+            0.0,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(5), frame(6)],
+        );
         assert_eq!(out[0].value, json!("right-hand"));
     }
 
@@ -1103,7 +2119,16 @@ mod tests {
             json!(1.0),
             &props,
         );
-        let out = host.tick(0.0, 0.016, 0.0, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &[frame(11)]);
+        let out = host.tick(
+            0.0,
+            0.016,
+            0.0,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(11)],
+        );
         assert_eq!(out.len(), 1);
         assert!((out[0].value.as_f64().unwrap() - 0.25).abs() < 1e-6);
     }
@@ -1120,13 +2145,438 @@ mod tests {
             &serde_json::Map::new(),
         );
         let layers = [frame(9)];
-        let _ = host.tick(0.0, 0.016, 0.0, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &layers);
-        let out = host.tick(0.0, 0.016, 0.0, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &layers);
+        let _ = host.tick(
+            0.0,
+            0.016,
+            0.0,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &layers,
+        );
+        let out = host.tick(
+            0.0,
+            0.016,
+            0.0,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &layers,
+        );
         assert!(out.is_empty());
     }
 
-    /// Compile and tick every SceneScript in the local Wallpaper Engine
-    /// Workshop library.  Ignored by default: needs the workshop files.
+    #[test]
+    fn effect_constant_script_scalar_vec3_shared_and_wecolor() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(10, "bars"));
+        host.add_effect(&EffectSeed {
+            layer_id: 10,
+            effect_idx: 0,
+            id: Some(100),
+            name: "gradient".into(),
+            visible: true,
+        });
+        host.add_property_script(
+            10,
+            ScriptField::Alpha,
+            "import * as WEColor from 'WEColor';\nexport function update() {\n  shared.primaryColor = WEColor.hsv2rgb({ x: 0.0, y: 1.0, z: 1.0 });\n  return 1.0;\n}",
+            json!(1.0),
+            &serde_json::Map::new(),
+        );
+        host.add_effect_constant_script(
+            10,
+            0,
+            0,
+            "Color 1",
+            "export function update() { return shared.primaryColor; }",
+            json!("0 0 1"),
+            &serde_json::Map::new(),
+        );
+        host.add_effect_constant_script(
+            10,
+            0,
+            0,
+            "Opacity",
+            "export function update(v) { return v * 0.5; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+        );
+        let _ = host.finalize_init();
+        let out = host.tick(
+            0.1,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(10)],
+        );
+        let col = out
+            .iter()
+            .find(|o| {
+                o.target
+                    == ScriptTarget::EffectConstant {
+                        layer_id: 10,
+                        effect_idx: 0,
+                        pass_idx: 0,
+                        key: "color 1".into(),
+                    }
+            })
+            .expect("color 1 output");
+        let arr = col.value.as_array().expect("vec3");
+        assert!((arr[0].as_f64().unwrap() - 1.0).abs() < 1e-5);
+        assert!(arr[1].as_f64().unwrap().abs() < 1e-5);
+        assert!(arr[2].as_f64().unwrap().abs() < 1e-5);
+
+        let op = out
+            .iter()
+            .find(|o| {
+                o.target
+                    == ScriptTarget::EffectConstant {
+                        layer_id: 10,
+                        effect_idx: 0,
+                        pass_idx: 0,
+                        key: "opacity".into(),
+                    }
+            })
+            .expect("opacity output");
+        assert!((op.value.as_f64().unwrap() - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn effect_visible_script_and_set_timeout_cancel_and_interval() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(20, "cover"));
+        host.add_effect(&EffectSeed {
+            layer_id: 20,
+            effect_idx: 0,
+            id: Some(200),
+            name: "Tint".into(),
+            visible: true,
+        });
+        host.add_effect_visible_script(
+            20,
+            0,
+            "let ticks = 0;\nlet iv;\nexport function init() {\n  const cancel = engine.setTimeout(() => { thisObject.visible = false; }, 100);\n  cancel();\n  engine.setTimeout(() => { thisLayer.getEffect('Tint').visible = false; }, 500);\n  iv = engine.setInterval(() => {\n    ticks++;\n    thisLayer.alpha = ticks / 10;\n    if (ticks >= 2) engine.clearInterval(iv);\n  }, 150);\n}",
+            true,
+            &serde_json::Map::new(),
+        );
+        let _ = host.finalize_init();
+
+        let frames = [frame(20)];
+        let out1 = host.tick(
+            0.2,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &frames,
+        );
+        // Cancelled timeout did NOT fire; interval fired once (alpha = 0.1)
+        assert!(out1.iter().all(|o| !matches!(
+            o.target,
+            ScriptTarget::EffectVisible { .. }
+        )));
+        let a1 = out1
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 20, field: ScriptField::Alpha })
+            .expect("alpha from interval 1");
+        assert!((a1.value.as_f64().unwrap() - 0.1).abs() < 1e-5);
+
+        // At 0.4s: interval fires a 2nd time and clears itself; timeout not yet due.
+        let mut f20 = frame(20);
+        f20.alpha = 0.1;
+        let out2 = host.tick(
+            0.4,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[f20],
+        );
+        let a2 = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 20, field: ScriptField::Alpha })
+            .expect("alpha from interval 2");
+        assert!((a2.value.as_f64().unwrap() - 0.2).abs() < 1e-5);
+
+        // At 0.6s: 500ms timeout fires and hides effect; interval stays cleared.
+        let mut f20_3 = frame(20);
+        f20_3.alpha = 0.2;
+        let out3 = host.tick(
+            0.6,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[f20_3],
+        );
+        let ev = out3
+            .iter()
+            .find(|o| {
+                o.target
+                    == ScriptTarget::EffectVisible {
+                        layer_id: 20,
+                        effect_idx: 0,
+                    }
+            })
+            .expect("effect_visible from timeout");
+        assert_eq!(ev.value, json!(false));
+        assert!(out3.iter().all(|o| o.target != ScriptTarget::Layer { id: 20, field: ScriptField::Alpha }));
+    }
+
+    #[test]
+    fn audio_buffers_populated_from_spectrum() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(30, "vu"));
+        host.add_property_script(
+            30,
+            ScriptField::Scale,
+            "const b16 = engine.registerAudioBuffers(engine.AUDIO_RESOLUTION_16);\nconst b32 = engine.registerAudioBuffers(engine.AUDIO_RESOLUTION_32);\nconst b64 = engine.registerAudioBuffers(engine.AUDIO_RESOLUTION_64);\nexport function update() { return new Vec3(b16.average[0], b32.left[0], b64.right[63]); }",
+            json!("1 1 1"),
+            &serde_json::Map::new(),
+        );
+        let _ = host.finalize_init();
+        assert!(host.uses_audio());
+
+        let mut spec = [0.0f32; 64];
+        spec[0] = 0.2;
+        spec[1] = 0.6;
+        spec[2] = 0.8;
+        spec[3] = 0.4;
+        spec[63] = 0.9;
+        let out = host.tick(
+            0.1,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            Some(&spec),
+            &[frame(30)],
+        );
+        assert_eq!(out.len(), 1);
+        let arr = out[0].value.as_array().unwrap();
+        assert!((arr[0].as_f64().unwrap() - 0.5).abs() < 1e-5);
+        assert!((arr[1].as_f64().unwrap() - 0.4).abs() < 1e-5);
+        assert!((arr[2].as_f64().unwrap() - 0.9).abs() < 1e-5);
+    }
+
+    #[test]
+    fn side_effect_layer_mutation_and_init_return() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(40, "controller"));
+        host.add_layer(&seed(41, "target"));
+        host.add_property_script(
+            40,
+            ScriptField::Alpha,
+            "export function init(v) { return 0.4; }\nexport function update(v) { thisScene.getLayer('target').visible = false; return v; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+        );
+        let init_out = host.finalize_init();
+        assert!(init_out.iter().any(|o| {
+            o.target
+                == ScriptTarget::Layer {
+                    id: 40,
+                    field: ScriptField::Alpha,
+                }
+                && (o.value.as_f64().unwrap() - 0.4).abs() < 1e-5
+        }));
+
+        let out = host.tick(
+            0.1,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(40), frame(41)],
+        );
+        assert!(out.iter().any(|o| {
+            o.target
+                == ScriptTarget::Layer {
+                    id: 41,
+                    field: ScriptField::Visible,
+                }
+                && o.value == json!(false)
+        }));
+    }
+
+    #[test]
+    fn apply_user_properties_updates_in_place_preserving_shared() {
+        let mut init_props = serde_json::Map::new();
+        init_props.insert("speed".into(), json!(1.0));
+        let mut host = SceneScripts::new(&init_props).expect("host");
+        host.add_layer(&seed(50, "rain"));
+        let mut sp = serde_json::Map::new();
+        sp.insert("speed".into(), json!(1.0));
+        let bidx = host.add_property_script(
+            50,
+            ScriptField::Alpha,
+            "let calls = 0;\nexport var scriptProperties = createScriptProperties().addSlider({ name: 'speed', value: 1 }).finish();\nexport function applyUserProperties(changed) { calls++; shared.calls = calls; }\nexport function update() { return scriptProperties.speed * 0.1 + shared.calls; }",
+            json!(1.0),
+            &sp,
+        );
+        let _ = host.finalize_init();
+
+        let mut changed = serde_json::Map::new();
+        changed.insert("speed".into(), json!(3.0));
+        let mut updated_sp = serde_json::Map::new();
+        updated_sp.insert("speed".into(), json!(3.0));
+        let _ = host.apply_user_properties(&changed, &[(bidx, updated_sp)]);
+
+        let out = host.tick(
+            0.1,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(50)],
+        );
+        // calls = 2 (1 at finalizeInit, 1 at applyUserProperties), speed = 3.0 -> 2.3
+        assert!((out[0].value.as_f64().unwrap() - 2.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn event_only_effect_constant_script_does_not_emit() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        host.add_layer(&seed(60, "album"));
+        host.add_effect(&EffectSeed {
+            layer_id: 60,
+            effect_idx: 0,
+            id: Some(600),
+            name: "blend".into(),
+            visible: true,
+        });
+        host.add_effect_constant_script(
+            60,
+            0,
+            0,
+            "multiply",
+            "export function mediaThumbnailChanged(e) { thisObject.getAnimation().play(); }",
+            json!(1.0),
+            &serde_json::Map::new(),
+        );
+        let init_out = host.finalize_init();
+        assert!(init_out.is_empty());
+        let tick_out = host.tick(
+            0.1,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(60)],
+        );
+        assert!(tick_out.is_empty());
+    }
+
+    #[test]
+    fn timer_restores_context_top_level_this_layer_and_size_is_value_copied() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        let mut s70 = seed(70, "layerA");
+        s70.size = [200.0, 100.0];
+        host.add_layer(&s70);
+        host.add_layer(&seed(71, "layerB"));
+        host.add_effect(&EffectSeed {
+            layer_id: 70,
+            effect_idx: 0,
+            id: Some(700),
+            name: "GlowA".into(),
+            visible: true,
+        });
+        host.add_effect_visible_script(
+            70,
+            0,
+            "const topNames = thisLayer.name + ':' + thisObject.name;\nexport function init() {\n  engine.setTimeout(() => {\n    shared.timerOk = (thisLayer && thisLayer.id === 70 && thisObject && thisObject.name === 'GlowA');\n    thisObject.visible = false;\n  }, 100);\n}\nexport function update(v) {\n  shared.topOk = (topNames === 'layerA:GlowA');\n  return v;\n}",
+            true,
+            &serde_json::Map::new(),
+        );
+        host.add_property_script(
+            70,
+            ScriptField::Origin,
+            "const topLayerSelf = (thisLayer === thisObject && thisLayer.name === 'layerA');\nexport function update() {\n  let s = thisLayer.size;\n  s.x *= 0.5;\n  return new Vec3(s.x, thisLayer.size.x, (topLayerSelf && shared.topOk && shared.timerOk) ? 1 : 0);\n}",
+            json!("0 0 0"),
+            &serde_json::Map::new(),
+        );
+        host.add_property_script(
+            71,
+            ScriptField::Alpha,
+            "export function update() { return 0.75; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+        );
+
+        let _ = host.finalize_init();
+        let frames = [frame(70), frame(71)];
+        let out1 = host.tick(
+            0.05,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &frames,
+        );
+        let o1 = out1
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 70, field: ScriptField::Origin })
+            .expect("origin on frame 1");
+        let arr1 = o1.value.as_array().expect("origin vec3");
+        assert!((arr1[0].as_f64().unwrap() - 100.0).abs() < 1e-5);
+        assert!((arr1[1].as_f64().unwrap() - 200.0).abs() < 1e-5);
+
+        let out2 = host.tick(
+            0.20,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &frames,
+        );
+        let ev = out2
+            .iter()
+            .find(|o| {
+                o.target
+                    == ScriptTarget::EffectVisible {
+                        layer_id: 70,
+                        effect_idx: 0,
+                    }
+            })
+            .expect("effect_visible on frame 2");
+        assert_eq!(ev.value, json!(false));
+
+        let o2 = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 70, field: ScriptField::Origin })
+            .expect("origin on frame 2");
+        let arr2 = o2.value.as_array().expect("origin vec3 on frame 2");
+        assert!((arr2[0].as_f64().unwrap() - 100.0).abs() < 1e-5);
+        assert!((arr2[1].as_f64().unwrap() - 200.0).abs() < 1e-5);
+        assert!((arr2[2].as_f64().unwrap() - 1.0).abs() < 1e-5);
+    }
+
+    /// Compile and tick every SceneScript (layer properties, effect visibility
+    /// and effect constant shaders) in the local Wallpaper Engine Workshop
+    /// library.  Ignored by default: needs the workshop files.
     #[test]
     #[ignore = "requires the Wallpaper Engine workshop library"]
     fn workshop_scripts_compile_and_tick() {
@@ -1137,13 +2587,20 @@ mod tests {
             )
         });
         let mut scenes = 0usize;
-        let mut bindings = 0usize;
+        let mut layer_bindings = 0usize;
+        let mut effect_vis_bindings = 0usize;
+        let mut effect_const_bindings = 0usize;
+        let mut audio_scenes = 0usize;
         let mut failures = 0usize;
         let mut reports: Vec<String> = Vec::new();
         let Ok(dirs) = std::fs::read_dir(&root) else {
             eprintln!("no workshop library at {root}");
             return;
         };
+        let mut spectrum = [0.0f32; 64];
+        for (i, s) in spectrum.iter_mut().enumerate() {
+            *s = ((i as f32) / 64.0) * 0.5;
+        }
         for dir in dirs.flatten() {
             let pkg = dir.path().join("scene.pkg");
             if !pkg.is_file() {
@@ -1167,8 +2624,6 @@ mod tests {
             if scene.get("objects").and_then(|o| o.as_array()).is_none() {
                 continue;
             }
-            // Every object in the scene tree, including layer files that are
-            // inlined as nested `objects` arrays.
             let mut objs: Vec<Value> = Vec::new();
             fn collect(v: &Value, out: &mut Vec<Value>) {
                 match v {
@@ -1190,19 +2645,6 @@ mod tests {
             }
             collect(&scene, &mut objs);
             let id_of = |v: &Value| v.get("id").and_then(|i| i.as_i64());
-            let mut ids: Vec<i64> = Vec::new();
-            for obj in &objs {
-                if let Some(id) = id_of(obj) {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                }
-            }
-            let mut index: std::collections::HashMap<i64, usize> =
-                std::collections::HashMap::new();
-            for (i, id) in ids.iter().enumerate() {
-                index.insert(*id, i);
-            }
             let props = serde_json::Map::new();
             let mut host = match SceneScripts::new(&props) {
                 Some(h) => h,
@@ -1219,7 +2661,6 @@ mod tests {
                     p.as_i64()
                         .or_else(|| p.as_str().and_then(|s| s.trim().parse().ok()))
                 });
-                let _ = &index;
                 host.add_layer(&LayerSeed {
                     id,
                     name: obj
@@ -1239,6 +2680,21 @@ mod tests {
                     text: String::new(),
                     parent,
                 });
+                if let Some(effects) = obj.get("effects").and_then(|e| e.as_array()) {
+                    for (eidx, ef) in effects.iter().enumerate() {
+                        host.add_effect(&EffectSeed {
+                            layer_id: id,
+                            effect_idx: eidx,
+                            id: ef.get("id").and_then(|v| v.as_i64()),
+                            name: ef
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            visible: ef.get("visible").and_then(|v| v.as_bool()).unwrap_or(true),
+                        });
+                    }
+                }
                 frames.push(LayerFrame {
                     id,
                     visible: true,
@@ -1266,9 +2722,6 @@ mod tests {
                     let Some(script) = def.get("script").and_then(|s| s.as_str()) else {
                         continue;
                     };
-                    // Particle objects carry scripts on their own tuning
-                    // fields (rate, lifetime, ...), which are not layer
-                    // properties, so only bind the scene renderer's set.
                     let sp = def
                         .get("scriptproperties")
                         .and_then(|v| v.as_object())
@@ -1276,12 +2729,68 @@ mod tests {
                         .unwrap_or_default();
                     let initial = def.get("value").cloned().unwrap_or(Value::Null);
                     host.add_property_script(id, field, script, initial, &sp);
-                    bindings += 1;
+                    layer_bindings += 1;
+                }
+                if let Some(effects) = obj.get("effects").and_then(|e| e.as_array()) {
+                    for (eidx, ef) in effects.iter().enumerate() {
+                        if let Some(vis) = ef.get("visible") {
+                            if let Some(script) = vis.get("script").and_then(|s| s.as_str()) {
+                                let sp = vis
+                                    .get("scriptproperties")
+                                    .and_then(|v| v.as_object())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let initial =
+                                    vis.get("value").and_then(|v| v.as_bool()).unwrap_or(true);
+                                host.add_effect_visible_script(id, eidx, script, initial, &sp);
+                                effect_vis_bindings += 1;
+                            }
+                        }
+                        if let Some(passes) = ef.get("passes").and_then(|p| p.as_array()) {
+                            for (pidx, pass) in passes.iter().enumerate() {
+                                let Some(csv) = pass
+                                    .get("constantshadervalues")
+                                    .and_then(|c| c.as_object())
+                                else {
+                                    continue;
+                                };
+                                for (ck, cv) in csv {
+                                    let Some(script) = cv.get("script").and_then(|s| s.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    let sp = cv
+                                        .get("scriptproperties")
+                                        .and_then(|v| v.as_object())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let initial = cv.get("value").cloned().unwrap_or(json!(0.0));
+                                    host.add_effect_constant_script(
+                                        id, eidx, pidx, ck, script, initial, &sp,
+                                    );
+                                    effect_const_bindings += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             scenes += 1;
-            for _ in 0..3 {
-                let _ = host.tick(1.0, 0.016, 0.5, [0.0, 0.0], [1920.0, 1080.0], [1920.0, 1080.0], &frames);
+            let _ = host.finalize_init();
+            if host.uses_audio() {
+                audio_scenes += 1;
+            }
+            for step in 0..3 {
+                let _ = host.tick(
+                    1.0 + step as f32 * 0.016,
+                    0.016,
+                    0.5,
+                    [0.0, 0.0],
+                    [1920.0, 1080.0],
+                    [1920.0, 1080.0],
+                    Some(&spectrum),
+                    &frames,
+                );
             }
             let f = host.failures();
             if f > 0 {
@@ -1293,8 +2802,9 @@ mod tests {
                 ));
             }
         }
+        let bindings = layer_bindings + effect_vis_bindings + effect_const_bindings;
         eprintln!(
-            "workshop: {scenes} scenes, {bindings} bindings, {failures} failures\n{}",
+            "workshop: {scenes} scenes ({audio_scenes} audio), {bindings} bindings (layer={layer_bindings}, eff_vis={effect_vis_bindings}, eff_const={effect_const_bindings}), {failures} failures\n{}",
             reports.join("\n")
         );
         assert!(bindings > 100, "expected the workshop library to be present");

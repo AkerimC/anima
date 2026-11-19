@@ -4566,6 +4566,8 @@ struct EffectPass {
     textures: Vec<Option<String>>,
     /// constant key -> value.
     constants: HashMap<String, Value>,
+    /// Per-frame constant overrides produced by SceneScript (`key` lowercased).
+    script_constants: HashMap<String, Value>,
     /// combo definitions for this pass.
     combos: Vec<(String, i32)>,
 }
@@ -4575,6 +4577,14 @@ pub struct EffectInstance {
     fbos: Vec<(String, i32)>,
     named: HashMap<String, Canvas>,
     dims: (i32, i32),
+    /// Index of this effect in the scene object's raw `effects` array.
+    pub scene_idx: usize,
+    /// Authored effect name (`scene.json` `effects[i].name`).
+    pub name: String,
+    /// Authored effect id (`scene.json` `effects[i].id`).
+    pub id: Option<i64>,
+    /// Per-frame visibility produced by SceneScript (`None` falls back to `visible_raw`).
+    pub script_visible: Option<bool>,
     /// Raw `visible` field from the effect definition (`scene.json`) so user toggles re-evaluate live.
     pub visible_raw: Option<Value>,
 }
@@ -4856,6 +4866,7 @@ impl EffectInstance {
                     .map(str::to_string),
                 textures,
                 constants,
+                script_constants: HashMap::new(),
                 combos,
             });
         }
@@ -4879,17 +4890,91 @@ impl EffectInstance {
             })
             .unwrap_or_default();
 
+        let name = scene_effect
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = scene_effect
+            .get("id")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
         Some(Self {
             passes,
             fbos,
             named: HashMap::new(),
             dims: (0, 0),
+            scene_idx: 0,
+            name,
+            id,
+            script_visible: None,
             visible_raw: scene_effect.get("visible").cloned(),
         })
     }
 
     pub fn is_empty(&self) -> bool {
         self.passes.is_empty()
+    }
+
+    /// Store a SceneScript-computed uniform value for `pass_idx` and lowercased `key`.
+    pub fn set_script_constant(&mut self, pass_idx: usize, key: &str, value: Value) {
+        if let Some(pass) = self.passes.get_mut(pass_idx) {
+            pass.script_constants
+                .insert(key.to_ascii_lowercase(), value);
+        }
+    }
+
+    /// Clear all SceneScript-driven state (e.g. before rebuilding scripts).
+    pub fn clear_script_state(&mut self) {
+        self.script_visible = None;
+        for pass in &mut self.passes {
+            pass.script_constants.clear();
+        }
+    }
+
+    /// Best fallback initial value for a pass constant (authored constant or shader default).
+    pub fn constant_initial_value(&self, pass_idx: usize, key: &str) -> Option<Value> {
+        let pass = self.passes.get(pass_idx)?;
+        let kl = key.to_ascii_lowercase();
+        if let Some(v) = pass.constants.get(&kl) {
+            match v {
+                Value::Object(obj) => {
+                    if obj.contains_key("value") || obj.contains_key("user") {
+                        return Some(v.clone());
+                    }
+                }
+                _ => return Some(v.clone()),
+            }
+        }
+        if let Some(prog) = &pass.program {
+            for spec in &prog.uniforms {
+                let matches_mat = |m: &str| {
+                    let ml = m.to_ascii_lowercase();
+                    ml == kl || format!("ui_editor_properties_{ml}") == kl
+                };
+                let matched = spec.material.as_deref().is_some_and(matches_mat)
+                    || spec
+                        .alt_materials
+                        .iter()
+                        .any(|m| matches_mat(m.as_str()))
+                    || spec
+                        .label
+                        .as_deref()
+                        .is_some_and(|l| l.eq_ignore_ascii_case(&kl))
+                    || spec
+                        .name
+                        .strip_prefix("g_")
+                        .or_else(|| spec.name.strip_prefix("u_"))
+                        .unwrap_or(&spec.name)
+                        .eq_ignore_ascii_case(&kl);
+                if matched {
+                    if let Some(def) = &spec.default {
+                        return Some(def.clone());
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn ensure_targets(&mut self, gl: &glow::Context, w: i32, h: i32) -> Result<()> {
@@ -5232,42 +5317,16 @@ impl EffectInstance {
                     continue;
                 }
 
-                let lookup_mat = |m: &str| -> Option<Value> {
-                    let ml = m.to_ascii_lowercase();
-                    pass.constants
-                        .get(&ml)
-                        .or_else(|| pass.constants.get(&format!("ui_editor_properties_{ml}")))
-                        .cloned()
+                let resolved = if let Some(script_val) = lookup_uniform_constant(spec, &pass.script_constants) {
+                    script_val
+                } else if let Some(raw_value) =
+                    lookup_uniform_constant(spec, &pass.constants).or_else(|| spec.default.clone())
+                {
+                    eval_dynamic_constant(&raw_value, ctx)
+                } else {
+                    continue;
                 };
-                let value = spec
-                    .material
-                    .as_deref()
-                    .and_then(lookup_mat)
-                    .or_else(|| {
-                        spec.alt_materials
-                            .iter()
-                            .find_map(|m| lookup_mat(m.as_str()))
-                    })
-                    .or_else(|| {
-                        spec.label
-                            .as_ref()
-                            .and_then(|l| pass.constants.get(&l.to_ascii_lowercase()))
-                            .cloned()
-                    })
-                    .or_else(|| {
-                        let short = spec
-                            .name
-                            .strip_prefix("g_")
-                            .or_else(|| spec.name.strip_prefix("u_"))
-                            .unwrap_or(&spec.name)
-                            .to_ascii_lowercase();
-                        pass.constants.get(&short).cloned()
-                    })
-                    .or_else(|| spec.default.clone());
-                if let Some(raw_value) = value {
-                    let resolved = eval_dynamic_constant(&raw_value, ctx);
-                    set_uniform_value(gl, &mut program.prog, spec, &resolved);
-                }
+                set_uniform_value(gl, &mut program.prog, spec, &resolved);
             }
 
             unsafe {
@@ -5288,6 +5347,37 @@ impl EffectInstance {
         }
         Ok(())
     }
+}
+
+fn lookup_uniform_constant(spec: &UniformSpec, map: &HashMap<String, Value>) -> Option<Value> {
+    if map.is_empty() {
+        return None;
+    }
+    let lookup_mat = |m: &str| -> Option<Value> {
+        let ml = m.to_ascii_lowercase();
+        map.get(&ml)
+            .or_else(|| map.get(&format!("ui_editor_properties_{ml}")))
+            .cloned()
+    };
+    spec.material
+        .as_deref()
+        .and_then(lookup_mat)
+        .or_else(|| spec.alt_materials.iter().find_map(|m| lookup_mat(m.as_str())))
+        .or_else(|| {
+            spec.label
+                .as_ref()
+                .and_then(|l| map.get(&l.to_ascii_lowercase()))
+                .cloned()
+        })
+        .or_else(|| {
+            let short = spec
+                .name
+                .strip_prefix("g_")
+                .or_else(|| spec.name.strip_prefix("u_"))
+                .unwrap_or(&spec.name)
+                .to_ascii_lowercase();
+            map.get(&short).cloned()
+        })
 }
 
 fn resolve_effect_user_prop(val: &Value, props: &HashMap<String, Value>) -> Value {
@@ -5627,14 +5717,15 @@ pub fn load_object_effects(
     effects: &[Value],
 ) -> Vec<EffectInstance> {
     let mut out = Vec::new();
-    for effect in effects {
+    for (effect_idx, effect) in effects.iter().enumerate() {
         if effect.get("visible").and_then(|v| v.as_bool()) == Some(false) {
             continue;
         }
         let Some(file) = effect.get("file").and_then(|v| v.as_str()) else {
             continue;
         };
-        if let Some(instance) = EffectInstance::load(gl, pkg, file, effect) {
+        if let Some(mut instance) = EffectInstance::load(gl, pkg, file, effect) {
+            instance.scene_idx = effect_idx;
             out.push(instance);
         }
     }
@@ -5932,6 +6023,59 @@ void main() {
         assert!(
             out.contains("step(0.5, float(nodeNum))"),
             "integer argument was not cast: {out}"
+        );
+    }
+
+    #[test]
+    fn script_constants_take_precedence_and_fall_back() {
+        let spec_mat = UniformSpec {
+            name: "g_Tint".into(),
+            kind: UniformKind::Vec3,
+            material: Some("Color".into()),
+            alt_materials: vec!["TintColor".into()],
+            label: Some("Color 1".into()),
+            default: Some(Value::String("0.5 0.5 0.5".into())),
+            default_tex: None,
+            slot: None,
+        };
+        let mut constants = HashMap::new();
+        constants.insert("color".into(), Value::String("0.1 0.2 0.3".into()));
+        constants.insert("ui_editor_properties_power".into(), Value::from(2.0));
+
+        let mut script_constants = HashMap::new();
+        script_constants.insert("color".into(), serde_json::json!([1.0, 0.0, 0.0]));
+
+        // Script constant wins over authored constant on material key.
+        let picked = lookup_uniform_constant(&spec_mat, &script_constants)
+            .or_else(|| lookup_uniform_constant(&spec_mat, &constants));
+        assert_eq!(picked, Some(serde_json::json!([1.0, 0.0, 0.0])));
+
+        // Removing script override falls back to authored constant.
+        script_constants.clear();
+        let fallback = lookup_uniform_constant(&spec_mat, &script_constants)
+            .or_else(|| lookup_uniform_constant(&spec_mat, &constants));
+        assert_eq!(fallback, Some(Value::String("0.1 0.2 0.3".into())));
+
+        // Label and ui_editor_properties_* keys also resolve.
+        script_constants.insert("color 1".into(), serde_json::json!([0.0, 1.0, 0.0]));
+        assert_eq!(
+            lookup_uniform_constant(&spec_mat, &script_constants),
+            Some(serde_json::json!([0.0, 1.0, 0.0]))
+        );
+
+        let spec_ui = UniformSpec {
+            name: "g_Power".into(),
+            kind: UniformKind::Float,
+            material: Some("power".into()),
+            alt_materials: Vec::new(),
+            label: None,
+            default: Some(Value::from(1.0)),
+            default_tex: None,
+            slot: None,
+        };
+        assert_eq!(
+            lookup_uniform_constant(&spec_ui, &constants),
+            Some(Value::from(2.0))
         );
     }
 }

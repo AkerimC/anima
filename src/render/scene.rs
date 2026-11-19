@@ -30,7 +30,9 @@ use serde::Deserialize;
 use crate::pkg::PackageFs;
 
 use super::gl::{bytemuck_cast, create_texture, Filter, Program};
-use super::scenescript::{LayerFrame, LayerSeed, SceneScripts, ScriptField};
+use super::scenescript::{
+    EffectSeed, LayerFrame, LayerSeed, SceneScripts, ScriptField, ScriptOutput, ScriptTarget,
+};
 use super::text;
 use super::we_effect::{Canvas, EffectContext, EffectInstance, TextureCache};
 use super::we_model::{parse_mdl, Mesh, MeshVertex, ParsedMdl, PuppetAnimLayer};
@@ -507,8 +509,6 @@ enum VisibleRule {
         value: bool,
     },
     Script(bool),
-    /// Own rule plus every ancestor's rule: all must hold.
-    All(Vec<VisibleRule>),
 }
 
 fn matches_condition(actual: &serde_json::Value, condition: &str) -> bool {
@@ -541,7 +541,6 @@ impl VisibleRule {
         match self {
             VisibleRule::Always => true,
             VisibleRule::Script(v) => *v,
-            VisibleRule::All(rules) => rules.iter().all(|r| r.eval(props)),
             VisibleRule::User { name, condition, value } => {
                 let Some(actual) = prop_get(props, name) else {
                     return *value;
@@ -2035,27 +2034,18 @@ struct SceneObject {
     sprite: Option<crate::pkg::SpritesheetMeta>,
     /// Set when this layer is parented to a puppet bone (`attachment`).
     attach: Option<AttachPoint>,
+    /// Index of the parent object in `SceneRenderer::objects`, when parented.
+    parent_obj: Option<usize>,
+    /// Authoritative local transform components `(origin, scale, angles_rad)`.
+    local_parts: ([f32; 3], [f32; 3], [f32; 3]),
     /// Index into `SceneRenderer::raw_nodes` and raw `scene.json` object definition
     /// so user property changes can re-evaluate transforms, colors, and text live.
     raw_idx: Option<usize>,
     raw_obj: serde_json::Value,
-    /// SceneScript state for layers with at least one scripted property.
-    script: Option<Box<ScriptLayer>>,
-    /// Visibility produced by a `visible` SceneScript this frame.
+    /// Persistent visibility produced by a `visible` SceneScript (or side-effect write).
     script_visible: Option<bool>,
-}
-
-/// Bookkeeping for a layer that SceneScripts can drive.
-struct ScriptLayer {
-    /// World transform of the parent, used to rebuild the layer transform when
-    /// a script writes `origin` / `scale` / `angles`.
-    parent: Affine,
-    /// Local components after keyframe animation for the current frame.
-    parts: ([f32; 3], [f32; 3], [f32; 3]),
-    /// Current text, fed to text scripts as `value`.
-    text: String,
-    /// Text produced by a text script this frame (applied when refreshing).
-    text_out: Option<String>,
+    /// Persistent text produced by a `text` SceneScript (or side-effect write).
+    script_text_override: Option<String>,
 }
 
 /// A layer that follows a bone of its parent puppet, possibly animated.
@@ -2299,7 +2289,6 @@ impl PropScript {
 }
 
 struct ObjAnim {
-    parent: Affine,
     origin: [f32; 3],
     scale: [f32; 3],
     angles: [f32; 3],
@@ -2316,7 +2305,6 @@ struct ObjAnim {
 impl ObjAnim {
     fn parse(
         obj: &serde_json::Value,
-        parent: Affine,
         origin: [f32; 3],
         scale: [f32; 3],
         angles: [f32; 3],
@@ -2326,7 +2314,6 @@ impl ObjAnim {
         let track = |k: &str| obj.get(k).and_then(KeyTrack::parse);
         let script = |k: &str| obj.get(k).and_then(|v| PropScript::parse(v, props));
         let a = ObjAnim {
-            parent,
             origin,
             scale,
             angles,
@@ -2349,58 +2336,56 @@ impl ObjAnim {
         any.then(|| Box::new(a))
     }
 
-    /// Authored local transform components after keyframes, script patterns
-    /// and property overrides: `(origin, scale, angles)`.
-    fn components(
+    fn apply_to_parts(
         &self,
+        parts: &mut ([f32; 3], [f32; 3], [f32; 3]),
         time: f32,
         daytime: f32,
         now: text::LocalTime,
-    ) -> ([f32; 3], [f32; 3], [f32; 3]) {
-        let mut origin = self.origin;
-        let mut scale = self.scale;
-        let mut angles = self.angles;
+        skip_origin_script: bool,
+        skip_scale_script: bool,
+        skip_angles_script: bool,
+    ) -> (bool, Option<f32>) {
+        let mut changed = false;
         if let Some(t) = &self.origin_track {
-            origin = t.apply(origin, time);
+            parts.0 = t.apply(self.origin, time);
+            changed = true;
+        } else if !skip_origin_script {
+            if let Some(s) = &self.origin_script {
+                parts.0 = s.apply(self.origin, time, daytime, now);
+                changed = true;
+            }
         }
         if let Some(t) = &self.scale_track {
-            scale = t.apply(scale, time);
+            parts.1 = t.apply(self.scale, time);
+            changed = true;
+        } else if !skip_scale_script {
+            if let Some(s) = &self.scale_script {
+                parts.1 = s.apply(self.scale, time, daytime, now);
+                changed = true;
+            }
         }
         if let Some(t) = &self.angles_track {
-            angles = t.apply(angles, time);
+            parts.2 = t.apply(self.angles, time);
+            changed = true;
+        } else if !skip_angles_script {
+            if let Some(s) = &self.angles_script {
+                // Scripts use degrees; scene.json stores radians.
+                let deg = s.apply([0.0; 3], time, daytime, now);
+                parts.2[2] = deg[2].to_radians();
+                changed = true;
+            }
         }
-        if let Some(s) = &self.origin_script {
-            origin = s.apply(origin, time, daytime, now);
-        }
-        if let Some(s) = &self.scale_script {
-            scale = s.apply(scale, time, daytime, now);
-        }
-        if let Some(s) = &self.angles_script {
-            // Scripts use degrees; scene.json stores radians.
-            let deg = s.apply([0.0; 3], time, daytime, now);
-            angles[2] = deg[2].to_radians();
-        }
-        (origin, scale, angles)
-    }
-
-    fn eval_local(&self, time: f32, daytime: f32, now: text::LocalTime) -> (Affine, Option<f32>) {
-        let (origin, scale, angles) = self.components(time, daytime, now);
-        let local = compose_local(origin, scale, angles);
         let alpha = self
             .alpha_track
             .as_ref()
             .map(|t| t.apply([self.base_alpha; 3], time)[0].clamp(0.0, 1.0));
-        (local, alpha)
-    }
-
-    fn eval(&self, time: f32, daytime: f32, now: text::LocalTime) -> (Affine, Option<f32>) {
-        let (local, alpha) = self.eval_local(time, daytime, now);
-        (self.parent.mul(local), alpha)
+        (changed, alpha)
     }
 }
 
 impl SceneObject {
-    fn is_visible(&self, props: &HashMap<String, serde_json::Value>) -> bool {
+    fn is_own_visible(&self, props: &HashMap<String, serde_json::Value>) -> bool {
         self.script_visible
             .unwrap_or_else(|| self.visible.eval(props))
     }
@@ -2658,19 +2643,20 @@ pub struct SceneRenderer {
     authored_prop_keys: std::collections::HashSet<String>,
     raw_nodes: Vec<(Option<usize>, serde_json::Value)>,
     properties: HashMap<String, serde_json::Value>,
-    /// SceneScript host (QuickJS) for layers with scripted properties.
+    /// SceneScript host (QuickJS) for layers and effects with scripted properties.
     scripts: Option<SceneScripts>,
-    /// Object id -> index in `objects`, for applying script output.
+    /// Object id -> index in `objects`, for applying script output and side effects.
     script_ids: HashMap<i64, usize>,
-    /// Indices of objects that carry a `ScriptLayer` (fed to the scripts).
+    /// Indices of objects fed into the script host each frame.
     script_objs: Vec<usize>,
-    /// Subset of `script_objs` whose own properties are scripted.
-    script_binding_objs: Vec<usize>,
+    /// Unresolved `scriptproperties` blocks keyed by binding index, so user
+    /// property changes update `scriptProperties` in-place without resetting VM.
+    script_binding_props: Vec<(usize, serde_json::Map<String, serde_json::Value>)>,
+    /// Coalesced user property updates queued for `applyUserProperties`.
+    pending_user_props: serde_json::Map<String, serde_json::Value>,
     /// Reused per-frame layer snapshot handed to the script host.
     script_frames: Vec<LayerFrame>,
-    /// Set when user properties changed; scripts read their overrides at
-    /// compile time, so bindings are rebuilt once at the next frame instead of
-    /// once per property assignment.
+    /// Set when scripts need a full rebuild (only used before scripts exist).
     scripts_dirty: bool,
     pkg: PackageFs,
 
@@ -2755,7 +2741,8 @@ impl SceneRenderer {
             scripts: None,
             script_ids: HashMap::new(),
             script_objs: Vec::new(),
-            script_binding_objs: Vec::new(),
+            script_binding_props: Vec::new(),
+            pending_user_props: serde_json::Map::new(),
             script_frames: Vec::new(),
             scripts_dirty: false,
             pkg: PackageFs::default(),
@@ -3052,8 +3039,6 @@ impl SceneRenderer {
             self.ortho_size = [view_w, authored_ortho[1]];
             self.clear_color = [0.0, 0.0, 0.0];
         }
-        let root_transform = Affine::translate(self.view_shift, 0.0);
-
         let now = text::local_time();
         let parent_index = |i: usize| -> Option<usize> {
             raws[i].parent.as_ref().and_then(|p| id_index.get(p).copied())
@@ -3069,37 +3054,13 @@ impl SceneRenderer {
             .iter()
             .map(|r| parse_visible(r.obj.get("visible"), &self.properties, now))
             .collect();
-        let inherited_visible = |i: usize| -> VisibleRule {
-            let mut rules: Vec<VisibleRule> = Vec::new();
-            let mut cur = Some(i);
-            let mut depth = 0;
-            while let Some(c) = cur {
-                if depth > 32 {
-                    break;
-                }
-                if !matches!(own_visible[c], VisibleRule::Always) {
-                    rules.push(own_visible[c].clone());
-                }
-                cur = parent_index(c);
-                depth += 1;
-            }
-            match rules.len() {
-                0 => VisibleRule::Always,
-                1 => rules.pop().unwrap(),
-                _ => VisibleRule::All(rules),
-            }
-        };
         let mut anims: HashMap<i64, Box<ObjAnim>> = HashMap::new();
         let mut sprites: HashMap<i64, crate::pkg::SpritesheetMeta> = HashMap::new();
-        for (i, raw) in raws.iter().enumerate() {
-            let parent = parent_index(i)
-                .and_then(|p| resolved[p])
-                .unwrap_or(root_transform);
+        for raw in &raws {
             if let (Some(id), Some(a)) = (
                 raw.obj.get("id").and_then(|v| v.as_i64()),
                 ObjAnim::parse(
                     &raw.obj,
-                    parent,
                     raw.origin,
                     raw.scale,
                     raw.angles,
@@ -3131,7 +3092,7 @@ impl SceneRenderer {
                 .unwrap_or("object")
                 .to_string();
 
-            let visible = inherited_visible(i);
+            let visible = own_visible[i].clone();
             let align = parse_alignment(obj);
 
             if let Some(particle_path) = obj
@@ -3194,8 +3155,10 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
-                    script: None,
+                    parent_obj: None,
+                    local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
+                    script_text_override: None,
                 });
                 continue;
             }
@@ -3234,8 +3197,10 @@ impl SceneRenderer {
                         attach: None,
                         raw_idx: Some(i),
                         raw_obj: obj.clone(),
-                        script: None,
+                        parent_obj: None,
+                        local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                         script_visible: None,
+                        script_text_override: None,
                     });
                 }
                 continue;
@@ -3274,8 +3239,10 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
-                    script: None,
+                    parent_obj: None,
+                    local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
+                    script_text_override: None,
                 });
                 continue;
             }
@@ -3320,8 +3287,10 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
-                    script: None,
+                    parent_obj: None,
+                    local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
+                    script_text_override: None,
                 });
                 continue;
             }
@@ -3357,8 +3326,10 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
-                    script: None,
+                    parent_obj: None,
+                    local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
+                    script_text_override: None,
                 });
                 continue;
             }
@@ -3485,8 +3456,10 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
-                    script: None,
+                    parent_obj: None,
+                    local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                     script_visible: None,
+                    script_text_override: None,
                 });
                 continue;
             }
@@ -3633,8 +3606,10 @@ impl SceneRenderer {
                 attach: None,
                 raw_idx: Some(i),
                 raw_obj: obj.clone(),
-                script: None,
+                parent_obj: None,
+                local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                 script_visible: None,
+                script_text_override: None,
             });
         }
 
@@ -3673,9 +3648,9 @@ impl SceneRenderer {
                 ],
                 brightness: 1.0,
                 blend: LayerBlend::Normal,
-                color_blend: object_color_blend(obj),
+                color_blend: 0,
                 parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
-                visible: inherited_visible(i),
+                visible: own_visible[i].clone(),
                 dependencies: Vec::new(),
                 capture_composite: false,
                 effects: Vec::new(),
@@ -3685,9 +3660,47 @@ impl SceneRenderer {
                 attach: None,
                 raw_idx: Some(i),
                 raw_obj: obj.clone(),
-                script: None,
+                parent_obj: None,
+                local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                 script_visible: None,
+                script_text_override: None,
             });
+        }
+
+        // Wire object parent indices and authoritative local transform parts
+        // across all objects (including zero-sized anchors).
+        let mut id_to_obj: HashMap<i64, usize> = HashMap::with_capacity(self.objects.len());
+        for (j, o) in self.objects.iter().enumerate() {
+            if let Some(id) = o.id {
+                id_to_obj.insert(id, j);
+            }
+        }
+        for j in 0..self.objects.len() {
+            if let Some(pid) = self.objects[j].raw_obj.get("parent").and_then(parent_id) {
+                if let Some(&p_idx) = id_to_obj.get(&pid) {
+                    if p_idx != j {
+                        self.objects[j].parent_obj = Some(p_idx);
+                    }
+                }
+            }
+            if let Some(ri) = self.objects[j].raw_idx {
+                if let Some(raw) = raws.get(ri) {
+                    let has_scale_dyn = raw.obj.get("scale").is_some_and(|v| {
+                        v.get("script").and_then(|s| s.as_str()).is_some()
+                            || v.get("animation").is_some()
+                    });
+                    let eff_scale = if has_scale_dyn {
+                        raw.scale
+                    } else {
+                        [
+                            if raw.scale[0] == 0.0 { 1.0 } else { raw.scale[0] },
+                            if raw.scale[1] == 0.0 { 1.0 } else { raw.scale[1] },
+                            raw.scale[2],
+                        ]
+                    };
+                    self.objects[j].local_parts = (raw.origin, eff_scale, raw.angles);
+                }
+            }
         }
 
         // Wallpaper Engine attachments: a layer parented to a puppet is placed
@@ -3793,28 +3806,94 @@ impl SceneRenderer {
                     o.color[3],
                     o.transform.tx,
                     o.transform.ty,
-                    o.is_visible(&self.properties)
+                    self.is_obj_visible(i)
                 );
             }
         }
         Ok(())
     }
 
-    /// Compile every SceneScript bound to a layer property and register the
-    /// layer table the scripts see through `thisLayer` / `thisScene`.
-    ///
-    /// Called after the scene is parsed and again whenever user properties
-    /// change, because script properties read their overrides at compile time.
+    /// Whether object `idx` and every ancestor in its parent chain are visible.
+    fn is_obj_visible(&self, idx: usize) -> bool {
+        let mut cur = Some(idx);
+        for _ in 0..32 {
+            let Some(i) = cur else { break };
+            let obj = &self.objects[i];
+            if !obj.is_own_visible(&self.properties) {
+                return false;
+            }
+            cur = obj.parent_obj;
+        }
+        true
+    }
+
+    /// Recompute world transforms across the object hierarchy from `local_parts`.
+    fn propagate_transforms(&mut self) {
+        let n = self.objects.len();
+        if n == 0 {
+            return;
+        }
+        let root = Affine::translate(self.view_shift, 0.0);
+        let mut world: Vec<Option<Affine>> = vec![None; n];
+        for i in 0..n {
+            let mut chain = [0usize; 32];
+            let mut depth = 0usize;
+            let mut cur = Some(i);
+            let mut base = root;
+            while let Some(idx) = cur {
+                if let Some(w) = world[idx] {
+                    base = w;
+                    break;
+                }
+                if depth >= chain.len() {
+                    break;
+                }
+                chain[depth] = idx;
+                depth += 1;
+                cur = self.objects[idx].parent_obj;
+            }
+            let mut acc = base;
+            for &idx in chain[..depth].iter().rev() {
+                let obj = &self.objects[idx];
+                if matches!(obj.kind, ObjectKind::Post | ObjectKind::Particle(_))
+                    || obj.attach.is_some()
+                {
+                    acc = obj.transform;
+                } else {
+                    let (origin, scale, angles) = obj.local_parts;
+                    acc = acc.mul(compose_local(origin, scale, angles));
+                }
+                world[idx] = Some(acc);
+            }
+        }
+        for (i, obj) in self.objects.iter_mut().enumerate() {
+            if matches!(obj.kind, ObjectKind::Post | ObjectKind::Particle(_))
+                || obj.attach.is_some()
+            {
+                continue;
+            }
+            if let Some(w) = world[i] {
+                obj.transform = w;
+            }
+        }
+    }
+
+    /// Compile every SceneScript bound to a layer or effect property and register
+    /// the layer/effect tables the scripts see through `thisLayer`/`thisObject`/`thisScene`.
     fn load_scene_scripts(&mut self) {
         self.scripts_dirty = false;
         self.scripts = None;
         self.script_ids.clear();
         self.script_objs.clear();
-        self.script_binding_objs.clear();
+        self.script_binding_props.clear();
+        self.pending_user_props.clear();
         self.script_frames.clear();
         for obj in self.objects.iter_mut() {
-            obj.script = None;
             obj.script_visible = None;
+            obj.script_text_override = None;
+            for eff in &mut obj.effects {
+                eff.clear_script_state();
+            }
         }
 
         if self.raw_nodes.is_empty()
@@ -3826,12 +3905,6 @@ impl SceneRenderer {
             return;
         }
 
-        let transforms = recompute_raw_transforms(
-            &self.raw_nodes,
-            self.authored_ortho,
-            self.view_shift,
-            &self.properties,
-        );
         let user_props: serde_json::Map<String, serde_json::Value> = self
             .properties
             .iter()
@@ -3843,36 +3916,41 @@ impl SceneRenderer {
         };
 
         // Layers whose live values have to reach the scripts: the scripted
-        // layers themselves, their parents (scripts walk up with
-        // `getParent()`), and layers a script addresses by name.
-        let obj_by_id: HashMap<i64, usize> = self
-            .objects
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| o.id.map(|id| (id, i)))
-            .collect();
+        // layers themselves, their parents (`getParent()`), and layers a
+        // script addresses by name (or all layers when `enumerateLayers` is used).
         let mut feed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut named: Vec<String> = Vec::new();
+        let mut enumerates_all = false;
         for (idx, obj) in self.objects.iter().enumerate() {
             if obj.raw_obj.is_null() || !object_has_script(&obj.raw_obj) {
                 continue;
             }
             feed.insert(idx);
             named.extend(layer_script_refs(&obj.raw_obj));
-            let mut parent = obj.raw_obj.get("parent").and_then(parent_id);
+            if object_enumerates_layers(&obj.raw_obj) {
+                enumerates_all = true;
+            }
+            let mut cur = obj.parent_obj;
             for _ in 0..64 {
-                let Some(pid) = parent else { break };
-                let Some(&p) = obj_by_id.get(&pid) else { break };
+                let Some(p) = cur else { break };
                 if !feed.insert(p) {
                     break;
                 }
-                parent = self.objects[p].raw_obj.get("parent").and_then(parent_id);
+                cur = self.objects[p].parent_obj;
             }
         }
-        for name in named {
+        if enumerates_all {
             for (i, obj) in self.objects.iter().enumerate() {
-                if obj.name == name {
+                if obj.id.is_some() {
                     feed.insert(i);
+                }
+            }
+        } else {
+            for name in named {
+                for (i, obj) in self.objects.iter().enumerate() {
+                    if obj.name == name {
+                        feed.insert(i);
+                    }
                 }
             }
         }
@@ -3880,14 +3958,12 @@ impl SceneRenderer {
         let now = text::local_time();
         let mut registered_ids: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
-        for (idx, obj) in self.objects.iter_mut().enumerate() {
-            let (Some(id), Some(ri)) = (obj.id, obj.raw_idx) else {
+        for (idx, obj) in self.objects.iter().enumerate() {
+            let Some(id) = obj.id else {
                 continue;
             };
             registered_ids.insert(id);
-            let Some(&(_, parent_world, origin, scale, angles)) = transforms.get(ri) else {
-                continue;
-            };
+            let (origin, scale, angles) = obj.local_parts;
             let kind = match &obj.kind {
                 ObjectKind::Image(_) => "image",
                 ObjectKind::Puppet { .. } => "puppet",
@@ -3907,40 +3983,62 @@ impl SceneRenderer {
                 id,
                 name: obj.name.clone(),
                 kind: kind.to_string(),
-                visible: obj.is_visible(&self.properties),
+                visible: obj.is_own_visible(&self.properties),
                 alpha: obj.color[3],
                 origin,
                 scale,
-                angles,
+                angles: [
+                    angles[0].to_degrees(),
+                    angles[1].to_degrees(),
+                    angles[2].to_degrees(),
+                ],
                 color: [obj.color[0], obj.color[1], obj.color[2]],
                 size: obj.size,
                 align: obj.align,
-                text: text.clone(),
+                text,
                 parent,
             });
-            // Only layers a script can observe get a per-frame state entry.
+            for eff in &obj.effects {
+                let raw_eff = obj
+                    .raw_obj
+                    .get("effects")
+                    .and_then(|e| e.as_array())
+                    .and_then(|a| a.get(eff.scene_idx));
+                let vis_has_script = raw_eff
+                    .and_then(|re| re.get("visible"))
+                    .and_then(|v| v.get("script"))
+                    .and_then(|s| s.as_str())
+                    .is_some();
+                let eff_vis = if vis_has_script {
+                    raw_bool_field(raw_eff.and_then(|re| re.get("visible")), &self.properties)
+                } else {
+                    parse_visible(eff.visible_raw.as_ref(), &self.properties, now)
+                        .eval(&self.properties)
+                };
+                host.add_effect(&EffectSeed {
+                    layer_id: id,
+                    effect_idx: eff.scene_idx,
+                    id: eff.id,
+                    name: eff.name.clone(),
+                    visible: eff_vis,
+                });
+            }
+            // Any registered object can be mutated via side effects (`getLayer`, `enumerateLayers`).
+            self.script_ids.insert(id, idx);
             if feed.contains(&idx) {
-                obj.script = Some(Box::new(ScriptLayer {
-                    parent: parent_world,
-                    parts: (origin, scale, angles),
-                    text,
-                    text_out: None,
-                }));
-                self.script_ids.insert(id, idx);
                 self.script_objs.push(idx);
             }
         }
 
         host.link_parents();
         if log::log_enabled!(log::Level::Debug) {
-            let registered = registered_ids;
             let missing: Vec<String> = self
-                .objects
+                .script_objs
                 .iter()
-                .filter(|o| o.script.is_some())
-                .filter_map(|o| {
+                .filter_map(|&idx| {
+                    let o = &self.objects[idx];
                     let p = o.raw_obj.get("parent").and_then(parent_id)?;
-                    (!registered.contains(&p)).then(|| format!("{}->{p}", o.id.unwrap_or(-1)))
+                    (!registered_ids.contains(&p)).then(|| format!("{}->{p}", o.id.unwrap_or(-1)))
                 })
                 .take(8)
                 .collect();
@@ -3950,9 +4048,10 @@ impl SceneRenderer {
         }
 
         let mut bindings = 0usize;
-        for (idx, obj) in self.objects.iter().enumerate() {
+        let mut binding_layers = 0usize;
+        for obj in &self.objects {
             let Some(id) = obj.id else { continue };
-            if obj.script.is_none() {
+            if obj.raw_obj.is_null() {
                 continue;
             }
             let raw = &obj.raw_obj;
@@ -3971,140 +4070,262 @@ impl SceneRenderer {
                     continue;
                 };
                 let (initial, script_props) = field_script_defaults(field, v, &self.properties);
-                host.add_property_script(id, field, script, initial, &script_props);
+                let bidx = host.add_property_script(id, field, script, initial, &script_props);
+                if let Some(raw_sp) = v.get("scriptproperties").and_then(|p| p.as_object()) {
+                    if !raw_sp.is_empty() {
+                        self.script_binding_props.push((bidx, raw_sp.clone()));
+                    }
+                }
                 bindings += 1;
                 has = true;
             }
+
+            if let Some(raw_effects) = raw.get("effects").and_then(|e| e.as_array()) {
+                for eff in &obj.effects {
+                    let Some(raw_eff) = raw_effects.get(eff.scene_idx) else {
+                        continue;
+                    };
+                    if let Some(vis) = raw_eff.get("visible") {
+                        if let Some(script) = vis.get("script").and_then(|s| s.as_str()) {
+                            let initial = raw_bool_field(Some(vis), &self.properties);
+                            let raw_sp = vis.get("scriptproperties").and_then(|p| p.as_object());
+                            let script_props = resolve_script_props(raw_sp, &self.properties);
+                            let bidx = host.add_effect_visible_script(
+                                id,
+                                eff.scene_idx,
+                                script,
+                                initial,
+                                &script_props,
+                            );
+                            if let Some(sp) = raw_sp {
+                                if !sp.is_empty() {
+                                    self.script_binding_props.push((bidx, sp.clone()));
+                                }
+                            }
+                            bindings += 1;
+                            has = true;
+                        }
+                    }
+                    if let Some(passes) = raw_eff.get("passes").and_then(|p| p.as_array()) {
+                        for (pass_idx, raw_pass) in passes.iter().enumerate() {
+                            let Some(csv) = raw_pass
+                                .get("constantshadervalues")
+                                .and_then(|c| c.as_object())
+                            else {
+                                continue;
+                            };
+                            for (ck, cv) in csv {
+                                let Some(script) = cv.get("script").and_then(|s| s.as_str()) else {
+                                    continue;
+                                };
+                                let initial = if cv.get("user").is_some() {
+                                    let r = resolve_prop(cv, &self.properties);
+                                    r.get("value").cloned().unwrap_or(r)
+                                } else if let Some(v) = cv.get("value") {
+                                    let r = resolve_prop(v, &self.properties);
+                                    r.get("value").cloned().unwrap_or(r)
+                                } else if let Some(def) = eff.constant_initial_value(pass_idx, ck) {
+                                    let r = resolve_prop(&def, &self.properties);
+                                    r.get("value").cloned().unwrap_or(r)
+                                } else {
+                                    serde_json::json!(0.0)
+                                };
+                                let raw_sp = cv.get("scriptproperties").and_then(|p| p.as_object());
+                                let script_props = resolve_script_props(raw_sp, &self.properties);
+                                let bidx = host.add_effect_constant_script(
+                                    id,
+                                    eff.scene_idx,
+                                    pass_idx,
+                                    ck,
+                                    script,
+                                    initial,
+                                    &script_props,
+                                );
+                                if let Some(sp) = raw_sp {
+                                    if !sp.is_empty() {
+                                        self.script_binding_props.push((bidx, sp.clone()));
+                                    }
+                                }
+                                bindings += 1;
+                                has = true;
+                            }
+                        }
+                    }
+                }
+            }
             if has {
-                self.script_binding_objs.push(idx);
+                binding_layers += 1;
             }
         }
 
-        let failing = host.failures();
-        if failing > 0 {
-            for err in host.errors().iter().take(4) {
-                log::warn!("scene: SceneScript: {err}");
+        if bindings > 0 {
+            let init_outputs = host.finalize_init();
+            let failing = host.failures();
+            if failing > 0 {
+                for err in host.errors().iter().take(4) {
+                    log::warn!("scene: SceneScript: {err}");
+                }
+            }
+            log::debug!(
+                "scene: SceneScript {bindings} binding(s) on {binding_layers} layer(s), audio={}, {failing} failing",
+                host.uses_audio()
+            );
+            self.scripts = Some(host);
+            self.apply_script_outputs(init_outputs);
+        }
+    }
+
+    /// Apply SceneScript outputs (layer fields, effect visibility, shader constants)
+    /// and propagate any transform updates down the parent chain.
+    fn apply_script_outputs(&mut self, outputs: Vec<ScriptOutput>) {
+        if outputs.is_empty() {
+            return;
+        }
+        let mut transforms_dirty = false;
+        for out in outputs {
+            match out.target {
+                ScriptTarget::Layer { id, field } => {
+                    let Some(&idx) = self.script_ids.get(&id) else {
+                        continue;
+                    };
+                    let obj = &mut self.objects[idx];
+                    match field {
+                        ScriptField::Visible => {
+                            obj.script_visible = Some(out.value.as_bool().unwrap_or(true));
+                        }
+                        ScriptField::Alpha => {
+                            let a = out.value.as_f64().unwrap_or(1.0) as f32;
+                            obj.color[3] = a.clamp(0.0, 1.0);
+                        }
+                        ScriptField::Color => {
+                            let c = crate::render::scenescript::prop_vec3(&out.value, [1.0; 3]);
+                            obj.color[0] = c[0];
+                            obj.color[1] = c[1];
+                            obj.color[2] = c[2];
+                        }
+                        ScriptField::Text => {
+                            obj.script_text_override = Some(value_to_string(&out.value));
+                        }
+                        ScriptField::Origin | ScriptField::Scale | ScriptField::Angles => {
+                            let v3 = crate::render::scenescript::prop_vec3(&out.value, [0.0; 3]);
+                            match field {
+                                ScriptField::Origin => obj.local_parts.0 = v3,
+                                ScriptField::Scale => obj.local_parts.1 = v3,
+                                _ => {
+                                    obj.local_parts.2 = [
+                                        v3[0].to_radians(),
+                                        v3[1].to_radians(),
+                                        v3[2].to_radians(),
+                                    ];
+                                }
+                            }
+                            transforms_dirty = true;
+                        }
+                    }
+                }
+                ScriptTarget::EffectVisible {
+                    layer_id,
+                    effect_idx,
+                } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let Some(eff) = self.objects[idx]
+                        .effects
+                        .iter_mut()
+                        .find(|e| e.scene_idx == effect_idx)
+                    {
+                        eff.script_visible = Some(out.value.as_bool().unwrap_or(true));
+                    }
+                }
+                ScriptTarget::EffectConstant {
+                    layer_id,
+                    effect_idx,
+                    pass_idx,
+                    key,
+                } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let Some(eff) = self.objects[idx]
+                        .effects
+                        .iter_mut()
+                        .find(|e| e.scene_idx == effect_idx)
+                    {
+                        eff.set_script_constant(pass_idx, &key, out.value);
+                    }
+                }
             }
         }
-        log::debug!(
-            "scene: SceneScript {bindings} binding(s) on {} layer(s), {failing} failing",
-            self.script_binding_objs.len()
-        );
-        if bindings > 0 {
-            self.scripts = Some(host);
+        if transforms_dirty {
+            self.propagate_transforms();
         }
     }
 
     /// Run one frame of SceneScripts and apply the produced property values.
+    #[allow(clippy::too_many_arguments)]
     fn tick_scripts(
         &mut self,
         time: f32,
         dt: f32,
         daytime: f32,
+        now: text::LocalTime,
         pointer_world: [f32; 2],
         ortho: [f32; 2],
+        spectrum: &[f32; 64],
     ) {
-        let Some(host) = self.scripts.as_mut() else {
+        if self.scripts.as_ref().is_none_or(|h| h.is_empty()) {
             return;
-        };
-        if host.is_empty() {
-            return;
-        }
-
-        // Property scripts own their layer's visible/text state, so clear the
-        // previous frame's results before the scripts run again.
-        for &idx in &self.script_binding_objs {
-            let obj = &mut self.objects[idx];
-            obj.script_visible = None;
-            if let Some(s) = obj.script.as_mut() {
-                s.text_out = None;
-            }
         }
 
         self.script_frames.clear();
         for &idx in &self.script_objs {
             let props = &self.properties;
-            let obj = &mut self.objects[idx];
-            let prev_visible = obj.script_visible;
+            let obj = &self.objects[idx];
+            let Some(id) = obj.id else { continue };
+            let visible = obj.is_own_visible(props);
             let alpha = obj.color[3];
             let color = [obj.color[0], obj.color[1], obj.color[2]];
-            let visible = prev_visible.unwrap_or_else(|| obj.visible.eval(props));
-            let Some(id) = obj.id else { continue };
-            let Some(s) = obj.script.as_mut() else {
-                continue;
+            let text = match &obj.kind {
+                ObjectKind::Text(layer) => obj
+                    .script_text_override
+                    .clone()
+                    .unwrap_or_else(|| layer.evaluate(props, now)),
+                _ => obj.script_text_override.clone().unwrap_or_default(),
             };
             self.script_frames.push(LayerFrame {
                 id,
                 visible,
                 alpha,
-                origin: s.parts.0,
-                scale: s.parts.1,
+                origin: obj.local_parts.0,
+                scale: obj.local_parts.1,
                 angles: [
-                    s.parts.2[0].to_degrees(),
-                    s.parts.2[1].to_degrees(),
-                    s.parts.2[2].to_degrees(),
+                    obj.local_parts.2[0].to_degrees(),
+                    obj.local_parts.2[1].to_degrees(),
+                    obj.local_parts.2[2].to_degrees(),
                 ],
                 color,
-                text: s.text.clone(),
+                text,
             });
         }
 
         let screen = [self.width as f32, self.height as f32];
-        let outputs = host.tick(
-            time,
-            dt,
-            daytime,
-            pointer_world,
-            ortho,
-            screen,
-            &self.script_frames,
-        );
-        for out in outputs {
-            let Some(&idx) = self.script_ids.get(&out.id) else {
-                continue;
+        let outputs = {
+            let Some(host) = self.scripts.as_mut() else {
+                return;
             };
-            let obj = &mut self.objects[idx];
-            match out.field {
-                ScriptField::Visible => {
-                    obj.script_visible = Some(out.value.as_bool().unwrap_or(true));
-                }
-                ScriptField::Alpha => {
-                    let a = out.value.as_f64().unwrap_or(1.0) as f32;
-                    obj.color[3] = a.clamp(0.0, 1.0);
-                }
-                ScriptField::Color => {
-                    let c = crate::render::scenescript::prop_vec3(&out.value, [1.0; 3]);
-                    obj.color[0] = c[0];
-                    obj.color[1] = c[1];
-                    obj.color[2] = c[2];
-                }
-                ScriptField::Text => {
-                    if let Some(s) = obj.script.as_mut() {
-                        s.text_out = Some(value_to_string(&out.value));
-                    }
-                }
-                ScriptField::Origin | ScriptField::Scale | ScriptField::Angles => {
-                    let v3 = crate::render::scenescript::prop_vec3(&out.value, [0.0; 3]);
-                    let Some(s) = obj.script.as_mut() else { continue };
-                    match out.field {
-                        ScriptField::Origin => s.parts.0 = v3,
-                        ScriptField::Scale => s.parts.1 = v3,
-                        _ => {
-                            s.parts.2 = [
-                                v3[0].to_radians(),
-                                v3[1].to_radians(),
-                                v3[2].to_radians(),
-                            ]
-                        }
-                    }
-                    if obj.attach.is_none() {
-                        obj.transform = s
-                            .parent
-                            .mul(compose_local(s.parts.0, s.parts.1, s.parts.2));
-                    }
-                }
-            }
-        }
+            host.tick(
+                time,
+                dt,
+                daytime,
+                pointer_world,
+                ortho,
+                screen,
+                Some(spectrum),
+                &self.script_frames,
+            )
+        };
+        self.apply_script_outputs(outputs);
     }
 
     /// Collect Wallpaper Engine `sound` layer objects.  They are not started
@@ -4404,8 +4625,14 @@ impl SceneRenderer {
                 attach: None,
                 raw_idx: None,
                 raw_obj: serde_json::Value::Null,
-                script: None,
+                parent_obj: None,
+                local_parts: (
+                    origin,
+                    [scale[0], scale[1], 1.0],
+                    [0.0, 0.0, l.rotation.unwrap_or(0.0)],
+                ),
                 script_visible: None,
+                script_text_override: None,
             });
         }
         for p in doc.particles {
@@ -4441,8 +4668,10 @@ impl SceneRenderer {
                 attach: None,
                 raw_idx: None,
                 raw_obj: serde_json::Value::Null,
-                script: None,
+                parent_obj: None,
+                local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
                 script_visible: None,
+                script_text_override: None,
             });
         }
         Ok(())
@@ -4545,7 +4774,8 @@ impl SceneRenderer {
             .find(|k| k.eq_ignore_ascii_case(key))
             .cloned()
             .unwrap_or_else(|| key.to_string());
-        self.properties.insert(existing_key, parsed);
+        self.properties.insert(existing_key.clone(), parsed.clone());
+        self.pending_user_props.insert(existing_key, parsed);
 
         let kl = key.to_ascii_lowercase();
         let is_authored = self.authored_prop_keys.contains(&kl);
@@ -4652,12 +4882,23 @@ impl SceneRenderer {
             )
         };
 
+        let has_binding = |id: Option<i64>, field: ScriptField| -> bool {
+            self.scripts
+                .as_ref()
+                .is_some_and(|s| id.is_some_and(|id| s.has_layer_binding(id, field)))
+        };
+        let mut transforms_dirty = false;
         for obj in &mut self.objects {
             if obj.raw_obj.is_null() {
                 continue;
             }
             let raw = &obj.raw_obj;
-            let alpha = eval_alpha_field(raw.get("alpha"), &self.properties, now);
+            let obj_id = obj.id;
+            let alpha = if has_binding(obj_id, ScriptField::Alpha) {
+                obj.color[3]
+            } else {
+                eval_alpha_field(raw.get("alpha"), &self.properties, now)
+            };
             match &mut obj.kind {
                 ObjectKind::Post => {}
                 ObjectKind::Compose { .. } => {
@@ -4680,8 +4921,13 @@ impl SceneRenderer {
                     }
                 }
                 ObjectKind::Text(layer) => {
-                    let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
-                    obj.color = [c[0], c[1], c[2], alpha];
+                    if !has_binding(obj_id, ScriptField::Color) {
+                        let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
+                        obj.color[0] = c[0];
+                        obj.color[1] = c[1];
+                        obj.color[2] = c[2];
+                    }
+                    obj.color[3] = alpha;
                     obj.brightness =
                         eval_brightness_field(raw.get("brightness"), &self.properties, 1.0);
                     obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
@@ -4700,8 +4946,13 @@ impl SceneRenderer {
                 | ObjectKind::Puppet { .. }
                 | ObjectKind::Solid
                 | ObjectKind::CompositeRef(_) => {
-                    let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
-                    obj.color = [c[0], c[1], c[2], alpha];
+                    if !has_binding(obj_id, ScriptField::Color) {
+                        let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
+                        obj.color[0] = c[0];
+                        obj.color[1] = c[1];
+                        obj.color[2] = c[2];
+                    }
+                    obj.color[3] = alpha;
                     obj.brightness =
                         eval_brightness_field(raw.get("brightness"), &self.properties, 1.0);
                     obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
@@ -4709,7 +4960,34 @@ impl SceneRenderer {
             }
 
             if let Some(ridx) = obj.raw_idx {
-                if let Some(&(world, parent_world, origin, scale, angles)) = transforms.get(ridx) {
+                if let Some(&(_, _, origin, scale, angles)) = transforms.get(ridx) {
+                    let s_origin = has_binding(obj_id, ScriptField::Origin);
+                    let s_scale = has_binding(obj_id, ScriptField::Scale);
+                    let s_angles = has_binding(obj_id, ScriptField::Angles);
+                    if !s_origin {
+                        obj.local_parts.0 = origin;
+                    }
+                    if !s_scale {
+                        let has_scale_dyn = raw.get("scale").is_some_and(|v| {
+                            v.get("script").and_then(|s| s.as_str()).is_some()
+                                || v.get("animation").is_some()
+                        });
+                        obj.local_parts.1 = if has_scale_dyn {
+                            scale
+                        } else {
+                            [
+                                if scale[0] == 0.0 { 1.0 } else { scale[0] },
+                                if scale[1] == 0.0 { 1.0 } else { scale[1] },
+                                scale[2],
+                            ]
+                        };
+                    }
+                    if !s_angles {
+                        obj.local_parts.2 = angles;
+                    }
+                    if !s_origin || !s_scale || !s_angles {
+                        transforms_dirty = true;
+                    }
                     if let Some(att) = &mut obj.attach {
                         att.local = Affine::translate(origin[0], origin[1])
                             .mul(Affine::rotate(angles[2]))
@@ -4720,26 +4998,27 @@ impl SceneRenderer {
                     } else if !matches!(obj.kind, ObjectKind::Post | ObjectKind::Particle(_)) {
                         obj.anim = ObjAnim::parse(
                             raw,
-                            parent_world,
                             origin,
                             scale,
                             angles,
                             &self.properties,
                             now,
                         );
-                        if obj.anim.is_none() {
-                            obj.transform = world;
-                        }
                     }
                 }
             }
         }
-
-        // Script properties resolve their overrides when they are compiled, so
-        // a user property change has to rebuild every SceneScript binding.
-        // Rebuilding on the next frame collapses a batch of property
-        // assignments into a single compile pass.
-        self.scripts_dirty = true;
+        if transforms_dirty {
+            self.propagate_transforms();
+        }
+        if self.scripts.is_none()
+            && self
+                .objects
+                .iter()
+                .any(|o| !o.raw_obj.is_null() && object_has_script(&o.raw_obj))
+        {
+            self.scripts_dirty = true;
+        }
     }
 
     fn cover_uv_transform(&self) -> ([f32; 2], [f32; 2]) {
@@ -5104,7 +5383,7 @@ impl SceneRenderer {
                 props: &self.properties,
             };
             for effect in effects.iter_mut() {
-                if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                if !effect_is_visible(effect, ctx.props, now) {
                     continue;
                 }
                 let (src, dst) = if flip { (tmp, canvas) } else { (canvas, tmp) };
@@ -5249,26 +5528,56 @@ fn parent_id(v: &serde_json::Value) -> Option<i64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// Invoke `f` for every SceneScript source string attached to `raw`
+/// (layer fields, effect visibility, and effect pass constants).
+fn visit_object_scripts(raw: &serde_json::Value, mut f: impl FnMut(&str)) {
+    const KEYS: [&str; 7] = [
+        "visible", "alpha", "origin", "scale", "angles", "color", "text",
+    ];
+    for key in KEYS {
+        if let Some(script) = raw
+            .get(key)
+            .and_then(|v| v.get("script"))
+            .and_then(|s| s.as_str())
+        {
+            f(script);
+        }
+    }
+    if let Some(effects) = raw.get("effects").and_then(|e| e.as_array()) {
+        for ef in effects {
+            if let Some(script) = ef
+                .get("visible")
+                .and_then(|v| v.get("script"))
+                .and_then(|s| s.as_str())
+            {
+                f(script);
+            }
+            if let Some(passes) = ef.get("passes").and_then(|p| p.as_array()) {
+                for pass in passes {
+                    if let Some(csv) = pass
+                        .get("constantshadervalues")
+                        .and_then(|c| c.as_object())
+                    {
+                        for cv in csv.values() {
+                            if let Some(script) = cv.get("script").and_then(|s| s.as_str()) {
+                                f(script);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Layer names a SceneScript reaches for through `thisScene.getLayer('name')`.
 ///
 /// The scene table handed to QuickJS covers every layer, but per-frame values
 /// are only fed for layers a script can actually observe, so the named
 /// lookups have to be discovered from the script source.
 fn layer_script_refs(raw: &serde_json::Value) -> Vec<String> {
-    const KEYS: [&str; 7] = [
-        "visible", "alpha", "origin", "scale", "angles", "color", "text",
-    ];
     let mut out = Vec::new();
-    for key in KEYS {
-        let Some(script) = raw
-            .get(key)
-            .and_then(|v| v.get("script"))
-            .and_then(|s| s.as_str())
-        else {
-            continue;
-        };
-        collect_get_layer_names(script, &mut out);
-    }
+    visit_object_scripts(raw, |script| collect_get_layer_names(script, &mut out));
     out.sort();
     out.dedup();
     out
@@ -5310,17 +5619,64 @@ fn collect_get_layer_names(src: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Layers whose properties are driven by a Wallpaper Engine SceneScript.
+/// Objects that carry at least one SceneScript on layer or effect fields.
 fn object_has_script(raw: &serde_json::Value) -> bool {
-    const KEYS: [&str; 7] = [
-        "visible", "alpha", "origin", "scale", "angles", "color", "text",
-    ];
-    KEYS.iter().any(|key| {
-        raw.get(*key)
-            .and_then(|v| v.get("script"))
-            .and_then(|s| s.as_str())
-            .is_some()
-    })
+    let mut found = false;
+    visit_object_scripts(raw, |_| found = true);
+    found
+}
+
+/// Whether any script on `raw` calls `enumerateLayers`.
+fn object_enumerates_layers(raw: &serde_json::Value) -> bool {
+    let mut found = false;
+    visit_object_scripts(raw, |s| {
+        if s.contains("enumerateLayers") {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Resolve any `{ "user": ... }` entries inside a `scriptproperties` map.
+fn resolve_script_props(
+    block: Option<&serde_json::Map<String, serde_json::Value>>,
+    props: &HashMap<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let Some(block) = block else { return out };
+    for (name, value) in block {
+        let resolved = if value.get("user").is_some() {
+            resolve_prop(value, props)
+        } else {
+            value.clone()
+        };
+        out.insert(name.clone(), resolved);
+    }
+    out
+}
+
+fn raw_bool_field(
+    v: Option<&serde_json::Value>,
+    props: &HashMap<String, serde_json::Value>,
+) -> bool {
+    let Some(v) = v else { return true };
+    if v.get("user").is_some() {
+        value_bool(&resolve_prop(v, props)).unwrap_or(true)
+    } else if let Some(b) = v.as_bool() {
+        b
+    } else {
+        v.get("value").and_then(value_bool).unwrap_or(true)
+    }
+}
+
+fn effect_is_visible(
+    effect: &EffectInstance,
+    props: &HashMap<String, serde_json::Value>,
+    now: text::LocalTime,
+) -> bool {
+    effect
+        .script_visible
+        .unwrap_or_else(|| parse_visible(effect.visible_raw.as_ref(), props, now).eval(props))
 }
 
 /// Resolve a scripted property definition into the value handed to
@@ -5333,20 +5689,16 @@ fn field_script_defaults(
 ) -> (serde_json::Value, serde_json::Map<String, serde_json::Value>) {
     use crate::render::scenescript::{prop_vec3, ScriptField};
 
-    let mut script_props = serde_json::Map::new();
-    if let Some(block) = def.get("scriptproperties").and_then(|p| p.as_object()) {
-        for (name, value) in block {
-            let resolved = if value.get("user").is_some() {
-                resolve_prop(value, props)
-            } else {
-                value.clone()
-            };
-            script_props.insert(name.clone(), resolved);
-        }
-    }
+    let script_props = resolve_script_props(
+        def.get("scriptproperties").and_then(|p| p.as_object()),
+        props,
+    );
 
-    let authored = def.get("value");
-    let resolved = authored.map(|v| resolve_prop(v, props));
+    let resolved = if def.get("user").is_some() {
+        Some(resolve_prop(def, props))
+    } else {
+        def.get("value").map(|v| resolve_prop(v, props))
+    };
     let rv = resolved.as_ref().unwrap_or(&serde_json::Value::Null);
     let initial = match field {
         ScriptField::Visible => {
@@ -5564,7 +5916,7 @@ fn load_effects(
         return Vec::new();
     };
     let mut out = Vec::new();
-    for effect in effects {
+    for (effect_idx, effect) in effects.iter().enumerate() {
         // Keep effects whose visibility is script- or user-property-driven so toggling
         // properties live in the inspector enables/disables them without reloading.
         if effect.get("visible").and_then(|v| v.as_bool()) == Some(false) {
@@ -5573,7 +5925,8 @@ fn load_effects(
         let Some(file) = effect.get("file").and_then(|v| v.as_str()) else {
             continue;
         };
-        if let Some(instance) = EffectInstance::load(gl, pkg, file, effect) {
+        if let Some(mut instance) = EffectInstance::load(gl, pkg, file, effect) {
+            instance.scene_idx = effect_idx;
             out.push(instance);
         }
     }
@@ -5585,6 +5938,21 @@ impl Renderer for SceneRenderer {
         self.ensure_scene(gl)?;
         if self.scripts_dirty {
             self.load_scene_scripts();
+        } else if !self.pending_user_props.is_empty() {
+            let changed = std::mem::take(&mut self.pending_user_props);
+            if self.scripts.is_some() {
+                let binding_props: Vec<(usize, serde_json::Map<String, serde_json::Value>)> = self
+                    .script_binding_props
+                    .iter()
+                    .map(|(idx, raw_sp)| (*idx, resolve_script_props(Some(raw_sp), &self.properties)))
+                    .collect();
+                let outputs = self
+                    .scripts
+                    .as_mut()
+                    .map(|host| host.apply_user_properties(&changed, &binding_props))
+                    .unwrap_or_default();
+                self.apply_script_outputs(outputs);
+            }
         }
         self.start_sounds();
         // Video-texture layers play their own stream; hand them the frame
@@ -5638,75 +6006,97 @@ impl Renderer for SceneRenderer {
 
         // Evaluate keyframe / property animation and hand every layer to the
         // SceneScript host.  Script results are applied before text and puppet
-        // refresh so a script can drive `text`, `visible` and `alpha`.
+        // refresh so a script can drive `text`, `visible`, `alpha` and `local_parts`.
         {
-            let props = &self.properties;
-            for obj in self.objects.iter_mut() {
-                if !obj.is_visible(props) && !obj.capture_composite {
+            let mut transforms_dirty = false;
+            for i in 0..self.objects.len() {
+                if !self.is_obj_visible(i) && !self.objects[i].capture_composite {
                     continue;
                 }
+                let obj_id = self.objects[i].id;
+                let has_script = |field: ScriptField| -> bool {
+                    self.scripts
+                        .as_ref()
+                        .is_some_and(|s| obj_id.is_some_and(|id| s.has_layer_binding(id, field)))
+                };
+                let skip_origin = has_script(ScriptField::Origin);
+                let skip_scale = has_script(ScriptField::Scale);
+                let skip_angles = has_script(ScriptField::Angles);
+                let obj = &mut self.objects[i];
                 if let Some(anim) = &obj.anim {
-                    let (t, alpha) = anim.eval(time, daytime, now);
-                    if obj.attach.is_none() {
-                        obj.transform = t;
+                    let mut parts = obj.local_parts;
+                    let (changed, alpha) = anim.apply_to_parts(
+                        &mut parts,
+                        time,
+                        daytime,
+                        now,
+                        skip_origin,
+                        skip_scale,
+                        skip_angles,
+                    );
+                    if changed {
+                        obj.local_parts = parts;
+                        transforms_dirty = true;
                     }
                     if let Some(a) = alpha {
                         obj.color[3] = a;
                     }
-                    let parts = anim.components(time, daytime, now);
-                    if let Some(s) = obj.script.as_mut() {
-                        s.parts = parts;
-                    }
                 }
+            }
+            if transforms_dirty {
+                self.propagate_transforms();
             }
         }
 
-        self.tick_scripts(time, dt, daytime, pointer_world, ortho);
+        self.tick_scripts(
+            time,
+            dt,
+            daytime,
+            now,
+            pointer_world,
+            ortho,
+            &info.spectrum,
+        );
 
         // Refresh text and skeletal puppet meshes before computing layer bounds.
-        {
+        for i in 0..self.objects.len() {
+            if !self.is_obj_visible(i) && !self.objects[i].capture_composite {
+                continue;
+            }
             let props = &self.properties;
-            for obj in self.objects.iter_mut() {
-                if !obj.is_visible(props) && !obj.capture_composite {
-                    continue;
+            let obj = &mut self.objects[i];
+            match &mut obj.kind {
+                ObjectKind::Text(layer) => {
+                    let value = match obj.script_text_override.as_ref() {
+                        Some(t) => t.clone(),
+                        None => layer.evaluate(props, now),
+                    };
+                    // Wallpaper Engine rasterises text at the layer's
+                    // authored scale, so a group that is scaled up (e.g. a
+                    // 20pt headline stretched 1.5x) keeps full glyph
+                    // density.  Our output density therefore has to
+                    // include the object's world scale as well, otherwise
+                    // large text is rasterised at half resolution and gets
+                    // upscaled (soft, blurry edges).
+                    let t = &obj.transform;
+                    let world_scale = t.a.hypot(t.b).max(t.c.hypot(t.d)).clamp(0.01, 64.0);
+                    layer.update(gl, value, (px_per_world * world_scale).max(1.0));
+                    obj.size = layer.world_size;
                 }
-                match &mut obj.kind {
-                    ObjectKind::Text(layer) => {
-                        let scripted = obj.script.as_mut().and_then(|s| s.text_out.take());
-                        let value = match scripted {
-                            Some(t) => t,
-                            None => layer.evaluate(props, now),
-                        };
-                        if let Some(s) = obj.script.as_mut() {
-                            s.text = value.clone();
-                        }
-                        // Wallpaper Engine rasterises text at the layer's
-                        // authored scale, so a group that is scaled up (e.g. a
-                        // 20pt headline stretched 1.5x) keeps full glyph
-                        // density.  Our output density therefore has to
-                        // include the object's world scale as well, otherwise
-                        // large text is rasterised at half resolution and gets
-                        // upscaled (soft, blurry edges).
-                        let t = &obj.transform;
-                        let world_scale = t.a.hypot(t.b).max(t.c.hypot(t.d)).clamp(0.01, 64.0);
-                        layer.update(gl, value, (px_per_world * world_scale).max(1.0));
-                        obj.size = layer.world_size;
+                ObjectKind::Puppet {
+                    mesh,
+                    mdl,
+                    anim_layers,
+                    bounds,
+                    ..
+                } => {
+                    if mdl.has_animations() {
+                        let verts = mdl.evaluate_vertices(time, anim_layers);
+                        *bounds = mdl_bounds(&verts);
+                        mesh.update_vertices(gl, &verts);
                     }
-                    ObjectKind::Puppet {
-                        mesh,
-                        mdl,
-                        anim_layers,
-                        bounds,
-                        ..
-                    } => {
-                        if mdl.has_animations() {
-                            let verts = mdl.evaluate_vertices(time, anim_layers);
-                            *bounds = mdl_bounds(&verts);
-                            mesh.update_vertices(gl, &verts);
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
 
@@ -5733,9 +6123,18 @@ impl Renderer for SceneRenderer {
                 tx: bone[4],
                 ty: bone[5],
             };
-            let local = match &self.objects[i].anim {
-                Some(anim) => anim.eval_local(time, daytime, now).0,
-                None => att.local,
+            let has_local_script = self.scripts.as_ref().is_some_and(|s| {
+                self.objects[i].id.is_some_and(|id| {
+                    s.has_layer_binding(id, ScriptField::Origin)
+                        || s.has_layer_binding(id, ScriptField::Scale)
+                        || s.has_layer_binding(id, ScriptField::Angles)
+                })
+            });
+            let local = if self.objects[i].anim.is_some() || has_local_script {
+                let (o, sc, a) = self.objects[i].local_parts;
+                compose_local(o, sc, a)
+            } else {
+                att.local
             };
             self.objects[i].transform = parent_world.mul(bone_aff).mul(local);
         }
@@ -5760,7 +6159,7 @@ impl Renderer for SceneRenderer {
         }
 
         for i in 0..self.objects.len() {
-            let is_vis = self.objects[i].is_visible(&self.properties);
+            let is_vis = self.is_obj_visible(i);
             let capture_comp = self.objects[i].capture_composite;
             if !is_vis && !capture_comp {
                 continue;
@@ -5882,7 +6281,7 @@ impl Renderer for SceneRenderer {
                         props: &self.properties,
                     };
                     for effect in effects.iter_mut() {
-                        if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                        if !effect_is_visible(effect, ctx.props, now) {
                             continue;
                         }
                         let (src, dst) = if flip { (&tmp, &canvas) } else { (&canvas, &tmp) };
@@ -5953,7 +6352,7 @@ impl Renderer for SceneRenderer {
                         props: &self.properties,
                     };
                     for effect in effects.iter_mut() {
-                        if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                        if !effect_is_visible(effect, ctx.props, now) {
                             continue;
                         }
                         let (src, dst) = if flip { (&tmp, &canvas) } else { (&canvas, &tmp) };
@@ -6060,7 +6459,7 @@ impl Renderer for SceneRenderer {
                         props: &self.properties,
                     };
                     for effect in effects.iter_mut() {
-                        if !parse_visible(effect.visible_raw.as_ref(), ctx.props, now).eval(ctx.props) {
+                        if !effect_is_visible(effect, ctx.props, now) {
                             continue;
                         }
                         let (src, dst) = if flip { (&tmp, &canvas) } else { (&canvas, &tmp) };
@@ -6411,6 +6810,7 @@ impl Renderer for SceneRenderer {
                 .objects
                 .iter()
                 .any(|o| o.effects.iter().any(|e| e.uses_audio()))
+            || self.scripts.as_ref().is_some_and(|s| s.uses_audio())
     }
 
     fn describe(&self) -> String {
@@ -6934,5 +7334,77 @@ mod tests {
 
         props.insert("greeting".into(), json!("Updated Label"));
         assert_eq!(layer.evaluate(&props, now), "Updated Label");
+    }
+
+    #[test]
+    fn object_has_script_and_refs_include_effects() {
+        let eff_const = json!({
+            "id": 99,
+            "effects": [{
+                "visible": { "script": "export function update() { return thisScene.getLayer('MaskLayer').visible; }" },
+                "passes": [{
+                    "constantshadervalues": {
+                        "Color 1": { "script": "export function update() { return thisScene.getLayer('Palette').color; }" }
+                    }
+                }]
+            }]
+        });
+        assert!(object_has_script(&eff_const));
+        assert!(!object_enumerates_layers(&eff_const));
+        assert_eq!(
+            layer_script_refs(&eff_const),
+            vec!["MaskLayer".to_string(), "Palette".to_string()]
+        );
+
+        let enum_obj = json!({
+            "alpha": { "script": "export function update() { return thisScene.enumerateLayers().length; }" }
+        });
+        assert!(object_enumerates_layers(&enum_obj));
+    }
+
+    #[test]
+    fn obj_anim_skips_legacy_prop_script_when_quickjs_owns_field() {
+        let props = HashMap::new();
+        let now = sample_time(12, 0);
+        let raw = json!({
+            "angles": {
+                "script": "export function update(value) { value.z = engine.runtime * 20; return value; }"
+            }
+        });
+        let anim = ObjAnim::parse(
+            &raw,
+            [0.0; 3],
+            [1.0; 3],
+            [0.0; 3],
+            &props,
+            now,
+        )
+        .expect("spin anim parsed");
+
+        // When QuickJS owns `angles`, `apply_to_parts` leaves scripted parts untouched.
+        let mut parts_owned = ([0.0; 3], [1.0; 3], [0.0, 0.0, 0.25]);
+        let (changed, _) = anim.apply_to_parts(&mut parts_owned, 2.0, 0.5, now, false, false, true);
+        assert!(!changed);
+        assert!((parts_owned.2[2] - 0.25).abs() < 1e-6);
+
+        // When QuickJS does NOT own `angles`, legacy PropScript still drives it.
+        let mut parts_legacy = ([0.0; 3], [1.0; 3], [0.0; 3]);
+        let (changed_legacy, _) =
+            anim.apply_to_parts(&mut parts_legacy, 2.0, 0.5, now, false, false, false);
+        assert!(changed_legacy);
+        assert!((parts_legacy.2[2] - 40.0f32.to_radians()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn raw_bool_field_respects_user_and_value() {
+        let mut props = HashMap::new();
+        props.insert("show_fx".to_string(), json!(false));
+        let v = json!({ "user": "show_fx", "value": true, "script": "export function update() {}" });
+        assert!(!raw_bool_field(Some(&v), &props));
+        props.insert("show_fx".to_string(), json!(true));
+        assert!(raw_bool_field(Some(&v), &props));
+
+        let plain = json!({ "value": false, "script": "export function update() {}" });
+        assert!(!raw_bool_field(Some(&plain), &props));
     }
 }
