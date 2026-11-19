@@ -14,6 +14,7 @@ pub mod blue_archive;
 pub mod config;
 pub mod ipc;
 pub mod lyrics;
+pub mod media;
 pub mod pkg;
 pub mod render;
 pub mod tempo;

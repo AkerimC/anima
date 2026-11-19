@@ -4617,6 +4617,28 @@ impl BlendMode {
     }
 }
 
+/// Dynamic system texture bound via `usertextures` in a material, layer, or effect pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemTexture {
+    MediaThumbnail,
+    MediaPreviousThumbnail,
+}
+
+/// Parses one entry of a WE `usertextures` array into a known [`SystemTexture`].
+pub fn parse_usertexture_slot(val: &Value) -> Option<SystemTexture> {
+    let raw = match val {
+        Value::String(s) => s.as_str(),
+        Value::Object(map) => map.get("name").and_then(|v| v.as_str())?,
+        _ => return None,
+    };
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "$mediathumbnail" => Some(SystemTexture::MediaThumbnail),
+        "$mediapreviousthumbnail" => Some(SystemTexture::MediaPreviousThumbnail),
+        _ => None,
+    }
+}
+
 struct EffectPass {
     program: Option<CompiledProgram>,
     /// texture index -> either "previous"/"input" or a named FBO.
@@ -4624,6 +4646,8 @@ struct EffectPass {
     target: Option<String>,
     /// Declared textures for this pass (index -> material texture path).
     textures: Vec<Option<String>>,
+    /// System `usertextures` bindings for this pass (e.g. `$mediaThumbnail`).
+    user_textures: Vec<Option<SystemTexture>>,
     /// constant key -> value.
     constants: HashMap<String, Value>,
     /// Keyframe animation tracks parsed from `constants` (`key` lowercased).
@@ -4683,6 +4707,24 @@ impl EffectInstance {
                 })
         })
     }
+
+    /// Whether any pass binds a media system texture or a `media*Changed` script.
+    pub fn uses_media(&self) -> bool {
+        self.passes.iter().any(|p| {
+            p.user_textures.iter().any(|u| u.is_some())
+                || p.constants.values().any(|v| {
+                    v.get("script")
+                        .and_then(|s| s.as_str())
+                        .is_some_and(|s| {
+                            s.contains("mediaThumbnailChanged")
+                                || s.contains("mediaPlaybackChanged")
+                                || s.contains("mediaPropertiesChanged")
+                                || s.contains("mediaTimelineChanged")
+                                || s.contains("mediaStatusChanged")
+                        })
+                })
+        })
+    }
 }
 
 pub struct EffectContext<'a> {
@@ -4697,6 +4739,8 @@ pub struct EffectContext<'a> {
     pub self_id: Option<i64>,
     pub dependencies: &'a [i64],
     pub props: &'a HashMap<String, Value>,
+    pub media_thumbnail: Option<(glow::Texture, u32, u32)>,
+    pub media_prev_thumbnail: Option<(glow::Texture, u32, u32)>,
 }
 
 fn read_text(pkg: &PackageFs, path: &str) -> Option<String> {
@@ -4844,12 +4888,32 @@ impl EffectInstance {
                     }
                 }
             }
+            let mut user_textures: Vec<Option<SystemTexture>> = mat_pass
+                .get("usertextures")
+                .and_then(|t| t.as_array())
+                .map(|a| a.iter().map(parse_usertexture_slot).collect())
+                .unwrap_or_default();
+            if let Some(ut) = scene_pass
+                .and_then(|p| p.get("usertextures"))
+                .and_then(|t| t.as_array())
+            {
+                for (idx, v) in ut.iter().enumerate() {
+                    if idx >= user_textures.len() {
+                        user_textures.resize(idx + 1, None);
+                    }
+                    if let Some(sys) = parse_usertexture_slot(v) {
+                        user_textures[idx] = Some(sys);
+                    }
+                }
+            }
 
             // Texture combo inference from uniform metadata across both stages.
             let combined_src = format!("{vert_src}\n{frag_src}");
             for spec in parse_uniforms(&combined_src) {
                 if let Some(slot) = spec.slot {
-                    if textures.get(slot).and_then(|t| t.as_deref()).is_some() {
+                    let has_slot_tex = textures.get(slot).and_then(|t| t.as_deref()).is_some()
+                        || user_textures.get(slot).and_then(|u| *u).is_some();
+                    if has_slot_tex {
                         for line in combined_src.lines() {
                             if line.contains(&format!("uniform sampler2D {}", spec.name)) {
                                 if let Some((_, c)) = line.split_once("//") {
@@ -4933,6 +4997,7 @@ impl EffectInstance {
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
                 textures,
+                user_textures,
                 constants,
                 anim_constants,
                 script_constants: HashMap::new(),
@@ -5215,7 +5280,16 @@ impl EffectInstance {
                         .get(name)
                         .map(|c| (c.tex, c.w as u32, c.h as u32)),
                     None => {
-                        if let Some(path) = pass.textures.get(slot).and_then(|t| t.as_deref()) {
+                        let sys_tex = match pass.user_textures.get(slot).and_then(|u| *u) {
+                            Some(SystemTexture::MediaThumbnail) => ctx.media_thumbnail,
+                            Some(SystemTexture::MediaPreviousThumbnail) => {
+                                ctx.media_prev_thumbnail.or(ctx.media_thumbnail)
+                            }
+                            None => None,
+                        };
+                        if let Some(t) = sys_tex {
+                            Some(t)
+                        } else if let Some(path) = pass.textures.get(slot).and_then(|t| t.as_deref()) {
                             if let Some(rest) = path.strip_prefix("_rt_imageLayerComposite_") {
                                 let id_str = rest.split('_').next().unwrap_or("");
                                 let parsed_id = id_str.parse::<i64>().ok();
@@ -6235,5 +6309,30 @@ void main() {
             .or_else(|| lookup_uniform_map(&spec, &anim_constants).map(|t| t.eval_value()))
             .or_else(|| lookup_uniform_map(&spec, &constants).cloned());
         assert!((val_script.unwrap().as_f64().unwrap() - 0.9).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parse_usertexture_slot_handles_media_variants() {
+        assert_eq!(
+            parse_usertexture_slot(&serde_json::json!({ "name": "$mediaThumbnail", "type": "system" })),
+            Some(SystemTexture::MediaThumbnail)
+        );
+        assert_eq!(
+            parse_usertexture_slot(&serde_json::json!({ "name": "$mediaPreviousThumbnail", "type": "system" })),
+            Some(SystemTexture::MediaPreviousThumbnail)
+        );
+        assert_eq!(
+            parse_usertexture_slot(&serde_json::json!("$mediaThumbnail")),
+            Some(SystemTexture::MediaThumbnail)
+        );
+        assert_eq!(
+            parse_usertexture_slot(&serde_json::json!("$mediaPreviousThumbnail")),
+            Some(SystemTexture::MediaPreviousThumbnail)
+        );
+        assert_eq!(parse_usertexture_slot(&Value::Null), None);
+        assert_eq!(
+            parse_usertexture_slot(&serde_json::json!({ "name": "$otherTexture", "type": "system" })),
+            None
+        );
     }
 }

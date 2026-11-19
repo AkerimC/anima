@@ -29,15 +29,17 @@ use serde::Deserialize;
 
 use crate::pkg::PackageFs;
 
-use super::gl::{bytemuck_cast, create_texture, Filter, Program};
+use super::gl::{bytemuck_cast, create_texture, create_texture_ex, Filter, Program};
 use super::keytrack::KeyTrack;
 use super::scenescript::{
     AnimLayerField, AnimLayerSeed, CursorEventInput, CursorEventKind, EffectSeed, LayerFrame,
-    LayerSeed, PropAnimSeed, SceneScripts, ScriptField, ScriptOutput, ScriptTarget, TexAnimSeed,
-    VideoTexSeed,
+    LayerSeed, MediaEventInput, PropAnimSeed, SceneScripts, ScriptField, ScriptOutput,
+    ScriptTarget, TexAnimSeed, VideoTexSeed,
 };
 use super::text;
-use super::we_effect::{Canvas, EffectContext, EffectInstance, TextureCache};
+use super::we_effect::{
+    parse_usertexture_slot, Canvas, EffectContext, EffectInstance, SystemTexture, TextureCache,
+};
 use super::we_model::{parse_mdl, Mesh, MeshVertex, ParsedMdl, PuppetAnimLayer};
 use super::{FrameInfo, Renderer};
 
@@ -2337,6 +2339,57 @@ struct SceneObject {
     script_text_override: Option<String>,
     /// Explicit spritesheet frame set by `thisLayer.getTextureAnimation()`.
     script_sprite_frame: Option<u32>,
+    /// Dynamic system media texture bound via slot 0 `usertextures` (`$mediaThumbnail`, etc.).
+    media_tex: Option<SystemTexture>,
+}
+
+fn detect_layer_media_tex(
+    obj: &serde_json::Value,
+    mat_pass: Option<&serde_json::Value>,
+) -> Option<SystemTexture> {
+    let slot0 = |v: &serde_json::Value| {
+        v.get("usertextures")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(parse_usertexture_slot)
+    };
+    obj.get("instanceoverride")
+        .and_then(slot0)
+        .or_else(|| obj.get("instance").and_then(slot0))
+        .or_else(|| mat_pass.and_then(slot0))
+}
+
+fn sync_media_tex_slot(
+    gl: &glow::Context,
+    slot: &mut Option<(u64, glow::Texture, u32, u32)>,
+    art: Option<&crate::media::MediaArt>,
+) {
+    match art {
+        None => {
+            if let Some((_, tex, _, _)) = slot.take() {
+                unsafe { gl.delete_texture(tex) };
+            }
+        }
+        Some(a) => {
+            if slot.is_some_and(|(rev, _, _, _)| rev == a.rev) {
+                return;
+            }
+            if let Some((_, old_tex, _, _)) = slot.take() {
+                unsafe { gl.delete_texture(old_tex) };
+            }
+            if let Ok(tex) = create_texture_ex(
+                gl,
+                a.width,
+                a.height,
+                &a.rgba,
+                Filter::Linear,
+                true,
+                true,
+            ) {
+                *slot = Some((a.rev, tex, a.width, a.height));
+            }
+        }
+    }
 }
 
 /// A layer that follows a bone of its parent puppet, possibly animated.
@@ -2981,6 +3034,15 @@ pub struct SceneRenderer {
     prev_mouse_down: bool,
     prev_cursor_world: Option<[f32; 2]>,
     cursor_events: Vec<CursorEventInput>,
+    media_thumb_tex: Option<(u64, glow::Texture, u32, u32)>,
+    media_prev_thumb_tex: Option<(u64, glow::Texture, u32, u32)>,
+    media_status_sent: bool,
+    last_media_state: crate::media::MediaPlaybackState,
+    last_media_props_rev: u64,
+    last_media_thumb_rev: u64,
+    last_media_pos: f32,
+    last_media_dur: f32,
+    media_events: Vec<MediaEventInput>,
     pkg: PackageFs,
 
     width: i32,
@@ -3080,6 +3142,15 @@ impl SceneRenderer {
             prev_mouse_down: false,
             prev_cursor_world: None,
             cursor_events: Vec::new(),
+            media_thumb_tex: None,
+            media_prev_thumb_tex: None,
+            media_status_sent: false,
+            last_media_state: crate::media::MediaPlaybackState::Stopped,
+            last_media_props_rev: 0,
+            last_media_thumb_rev: 0,
+            last_media_pos: 0.0,
+            last_media_dur: 0.0,
+            media_events: Vec::new(),
             pkg: PackageFs::default(),
             width,
             height,
@@ -3499,6 +3570,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
+                    media_tex: None,
                 });
                 continue;
             }
@@ -3543,6 +3615,7 @@ impl SceneRenderer {
                         script_visible: None,
                         script_text_override: None,
                         script_sprite_frame: None,
+                        media_tex: None,
                     });
                 }
                 continue;
@@ -3587,6 +3660,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
+                    media_tex: None,
                 });
                 continue;
             }
@@ -3637,6 +3711,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
+                    media_tex: None,
                 });
                 continue;
             }
@@ -3678,6 +3753,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
+                    media_tex: None,
                 });
                 continue;
             }
@@ -3688,6 +3764,7 @@ impl SceneRenderer {
             let mut texture_path: Option<String> = None;
             let mut puppet_path: Option<String> = None;
             let mut solid_model = false;
+            let mut mat_media_pass: Option<serde_json::Value> = None;
             if lower.ends_with(".json") {
                 if let Some(text) = read_scene_text(pkg, image_ref) {
                     if let Ok(model) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -3713,6 +3790,9 @@ impl SceneRenderer {
                                         .and_then(|p| p.as_array())
                                         .and_then(|a| a.first())
                                     {
+                                        if pass.get("usertextures").is_some() {
+                                            mat_media_pass = Some(pass.clone());
+                                        }
                                         material_blend = pass
                                             .get("blending")
                                             .and_then(|v| v.as_str())
@@ -3733,6 +3813,7 @@ impl SceneRenderer {
             } else {
                 texture_path = Some(image_ref.to_string());
             }
+            let media_tex = detect_layer_media_tex(obj, mat_media_pass.as_ref());
 
             if solid_model {
                 let inst_tex_ref = obj
@@ -3810,142 +3891,149 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
+                    media_tex,
                 });
                 continue;
             }
 
-            let Some(texture_path) = texture_path else {
-                log::debug!("scene object {name}: no usable texture in {image_ref}");
-                continue;
-            };
-            let Some((texture, tex_w, tex_h)) =
-                Self::load_texture(gl, pkg, &mut self.textures, &texture_path)
-                    .map(|(t, w, h, ss)| {
-                        if let (Some(ss), Some(id)) = (ss, obj_id) {
-                            sprites.insert(id, ss);
-                        }
-                        let (w, h) = match ss {
-                            Some(ss) => (w / ss.cols.max(1), h / ss.rows.max(1)),
-                            None => (w, h),
-                        };
-                        (t, w, h)
-                    })
-            else {
-                log::debug!("scene object {name}: missing texture {texture_path}");
-                continue;
-            };
-
-            let mut default_size = model_size.unwrap_or([tex_w as f32, tex_h as f32]);
-            let kind = if let Some(puppet_path) = puppet_path {
-                match pkg.read(&puppet_path).ok().and_then(|b| parse_mdl(&b)) {
-                    Some(mut parsed) => {
-                        let sym_bounds = [
-                            (parsed.bounds_min[0].abs().max(parsed.bounds_max[0].abs()) * 2.0).max(1.0),
-                            (parsed.bounds_min[1].abs().max(parsed.bounds_max[1].abs()) * 2.0).max(1.0),
-                        ];
-                        if model_size.is_none() {
-                            default_size = [
-                                default_size[0].max(sym_bounds[0]),
-                                default_size[1].max(sym_bounds[1]),
-                            ];
-                        }
-                        let mut anim_layers = Vec::new();
-                        let mut anim_meta = Vec::new();
-                        if let Some(arr) = obj.get("animationlayers").and_then(|v| v.as_array()) {
-                            for (layer_idx, layer) in arr.iter().enumerate() {
-                                let vis = parse_visible(
-                                    layer.get("visible"),
-                                    &self.properties,
-                                    now,
-                                )
-                                .eval(&self.properties);
-                                let anim_id = layer
-                                    .get("animation")
-                                    .and_then(|v| v.as_i64())
-                                    .map(|v| v as u32);
-                                let blend_track = layer.get("blend").and_then(KeyTrack::parse);
-                                let rate_track = layer.get("rate").and_then(KeyTrack::parse);
-                                let blend = blend_track
-                                    .as_ref()
-                                    .map(|t| t.eval()[0])
-                                    .unwrap_or_else(|| {
-                                        layer
-                                            .get("blend")
-                                            .map(|v| resolve_prop(v, &self.properties))
-                                            .as_ref()
-                                            .and_then(value_f32)
-                                            .unwrap_or(1.0)
-                                    })
-                                    .clamp(0.0, 1.0);
-                                let rate = rate_track
-                                    .as_ref()
-                                    .map(|t| t.eval()[0])
-                                    .unwrap_or_else(|| {
-                                        layer
-                                            .get("rate")
-                                            .map(|v| resolve_prop(v, &self.properties))
-                                            .as_ref()
-                                            .and_then(value_f32)
-                                            .unwrap_or(1.0)
-                                    });
-                                let additive = layer
-                                    .get("additive")
-                                    .and_then(value_bool)
-                                    .unwrap_or(false);
-                                anim_layers.push(PuppetAnimLayer {
-                                    scene_idx: layer_idx,
-                                    id: layer.get("id").and_then(|v| v.as_i64()),
-                                    name: layer
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    anim_id,
-                                    visible: vis,
-                                    rate,
-                                    blend,
-                                    additive,
-                                    playing: true,
-                                    frame: 0.0,
-                                    mirror_reverse: false,
-                                });
-                                anim_meta.push(PuppetLayerMeta {
-                                    visible_raw: layer.get("visible").cloned(),
-                                    script_visible: None,
-                                    blend_track,
-                                    script_blend: None,
-                                    rate_track,
-                                    script_rate: None,
-                                });
-                            }
-                        }
-                        if parsed.has_animations() {
-                            parsed.vertices = parsed.evaluate_vertices(0.0, &anim_layers);
-                        }
-                        match Mesh::new(gl, &parsed) {
-                            Ok(mesh) => ObjectKind::Puppet {
-                                mesh,
-                                bounds: mdl_bounds(&parsed.vertices),
-                                mdl: parsed,
-                                anim_layers,
-                                anim_meta,
-                                texture,
-                                tex_size: [tex_w, tex_h],
-                            },
-                            Err(err) => {
-                                log::warn!("puppet {puppet_path}: {err}");
-                                continue;
-                            }
-                        }
+            let loaded = texture_path.as_deref().and_then(|tp| {
+                Self::load_texture(gl, pkg, &mut self.textures, tp).map(|(t, w, h, ss)| {
+                    if let (Some(ss), Some(id)) = (ss, obj_id) {
+                        sprites.insert(id, ss);
                     }
-                    None => {
-                        log::warn!("puppet {puppet_path}: unreadable model");
-                        continue;
-                    }
+                    let (w, h) = match ss {
+                        Some(ss) => (w / ss.cols.max(1), h / ss.rows.max(1)),
+                        None => (w, h),
+                    };
+                    (t, w, h)
+                })
+            });
+            if loaded.is_none() && (media_tex.is_none() || puppet_path.is_some()) {
+                if let Some(tp) = texture_path.as_deref() {
+                    log::debug!("scene object {name}: missing texture {tp}");
+                } else {
+                    log::debug!("scene object {name}: no usable texture in {image_ref}");
                 }
+                continue;
+            }
+
+            let (mut default_size, kind) = if let Some((texture, tex_w, tex_h)) = loaded {
+                let mut ds = model_size.unwrap_or([tex_w as f32, tex_h as f32]);
+                let kind = if let Some(puppet_path) = puppet_path {
+                    match pkg.read(&puppet_path).ok().and_then(|b| parse_mdl(&b)) {
+                        Some(mut parsed) => {
+                            let sym_bounds = [
+                                (parsed.bounds_min[0].abs().max(parsed.bounds_max[0].abs()) * 2.0).max(1.0),
+                                (parsed.bounds_min[1].abs().max(parsed.bounds_max[1].abs()) * 2.0).max(1.0),
+                            ];
+                            if model_size.is_none() {
+                                ds = [
+                                    ds[0].max(sym_bounds[0]),
+                                    ds[1].max(sym_bounds[1]),
+                                ];
+                            }
+                            let mut anim_layers = Vec::new();
+                            let mut anim_meta = Vec::new();
+                            if let Some(arr) = obj.get("animationlayers").and_then(|v| v.as_array()) {
+                                for (layer_idx, layer) in arr.iter().enumerate() {
+                                    let vis = parse_visible(
+                                        layer.get("visible"),
+                                        &self.properties,
+                                        now,
+                                    )
+                                    .eval(&self.properties);
+                                    let anim_id = layer
+                                        .get("animation")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as u32);
+                                    let blend_track = layer.get("blend").and_then(KeyTrack::parse);
+                                    let rate_track = layer.get("rate").and_then(KeyTrack::parse);
+                                    let blend = blend_track
+                                        .as_ref()
+                                        .map(|t| t.eval()[0])
+                                        .unwrap_or_else(|| {
+                                            layer
+                                                .get("blend")
+                                                .map(|v| resolve_prop(v, &self.properties))
+                                                .as_ref()
+                                                .and_then(value_f32)
+                                                .unwrap_or(1.0)
+                                        })
+                                        .clamp(0.0, 1.0);
+                                    let rate = rate_track
+                                        .as_ref()
+                                        .map(|t| t.eval()[0])
+                                        .unwrap_or_else(|| {
+                                            layer
+                                                .get("rate")
+                                                .map(|v| resolve_prop(v, &self.properties))
+                                                .as_ref()
+                                                .and_then(value_f32)
+                                                .unwrap_or(1.0)
+                                        });
+                                    let additive = layer
+                                        .get("additive")
+                                        .and_then(value_bool)
+                                        .unwrap_or(false);
+                                    anim_layers.push(PuppetAnimLayer {
+                                        scene_idx: layer_idx,
+                                        id: layer.get("id").and_then(|v| v.as_i64()),
+                                        name: layer
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        anim_id,
+                                        visible: vis,
+                                        rate,
+                                        blend,
+                                        additive,
+                                        playing: true,
+                                        frame: 0.0,
+                                        mirror_reverse: false,
+                                    });
+                                    anim_meta.push(PuppetLayerMeta {
+                                        visible_raw: layer.get("visible").cloned(),
+                                        script_visible: None,
+                                        blend_track,
+                                        script_blend: None,
+                                        rate_track,
+                                        script_rate: None,
+                                    });
+                                }
+                            }
+                            if parsed.has_animations() {
+                                parsed.vertices = parsed.evaluate_vertices(0.0, &anim_layers);
+                            }
+                            match Mesh::new(gl, &parsed) {
+                                Ok(mesh) => ObjectKind::Puppet {
+                                    mesh,
+                                    bounds: mdl_bounds(&parsed.vertices),
+                                    mdl: parsed,
+                                    anim_layers,
+                                    anim_meta,
+                                    texture,
+                                    tex_size: [tex_w, tex_h],
+                                },
+                                Err(err) => {
+                                    log::warn!("puppet {puppet_path}: {err}");
+                                    continue;
+                                }
+                            }
+                        }
+                        None => {
+                            log::warn!("puppet {puppet_path}: unreadable model");
+                            continue;
+                        }
+                    }
+                } else {
+                    ObjectKind::Image(texture)
+                };
+                (ds, kind)
             } else {
-                ObjectKind::Image(texture)
+                (model_size.unwrap_or([256.0, 256.0]), ObjectKind::Solid)
             };
+            let _ = &mut default_size;
 
             let size = obj
                 .get("size")
@@ -3954,16 +4042,18 @@ impl SceneRenderer {
                 .unwrap_or(default_size);
 
             if std::env::var_os("ANIMA_TRACE_SCENE").is_some() {
-                log::info!(
-                    "load obj {:?} '{}' image='{}' tex='{}' {}x{} sprite={:?}",
-                    obj_id,
-                    name,
-                    image_ref,
-                    texture_path,
-                    tex_w,
-                    tex_h,
-                    obj_id.and_then(|id| sprites.get(&id).copied())
-                );
+                if let (Some(tp), Some((_, tex_w, tex_h))) = (texture_path.as_deref(), loaded.as_ref()) {
+                    log::info!(
+                        "load obj {:?} '{}' image='{}' tex='{}' {}x{} sprite={:?}",
+                        obj_id,
+                        name,
+                        image_ref,
+                        tp,
+                        tex_w,
+                        tex_h,
+                        obj_id.and_then(|id| sprites.get(&id).copied())
+                    );
+                }
             }
             let c = eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]);
             self.objects.push(SceneObject {
@@ -3998,6 +4088,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
+                media_tex,
             });
         }
 
@@ -4054,6 +4145,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
+                media_tex: None,
             });
         }
 
@@ -4283,6 +4375,7 @@ impl SceneRenderer {
         self.prev_mouse_down = false;
         self.prev_cursor_world = None;
         self.cursor_events.clear();
+        self.media_status_sent = false;
         for obj in self.objects.iter_mut() {
             obj.script_visible = None;
             obj.script_text_override = None;
@@ -5116,6 +5209,104 @@ impl SceneRenderer {
         self.prev_cursor_world = Some(cursor_world);
     }
 
+    fn sync_media_textures(&mut self, gl: &glow::Context, media: &crate::media::MediaSnapshot) {
+        let cur_art_rev = media.art.as_ref().map(|a| a.rev);
+        let prev_art_rev = media.prev_art.as_ref().map(|a| a.rev);
+        if let Some((old_rev, _, _, _)) = self.media_thumb_tex {
+            if cur_art_rev != Some(old_rev) && prev_art_rev == Some(old_rev) {
+                if let Some((_, stale_prev, _, _)) = self.media_prev_thumb_tex.take() {
+                    unsafe { gl.delete_texture(stale_prev) };
+                }
+                self.media_prev_thumb_tex = self.media_thumb_tex.take();
+            }
+        }
+        sync_media_tex_slot(gl, &mut self.media_thumb_tex, media.art.as_deref());
+        sync_media_tex_slot(gl, &mut self.media_prev_thumb_tex, media.prev_art.as_deref());
+    }
+
+    fn collect_media_events(&mut self, media: Option<&crate::media::MediaSnapshot>) {
+        self.media_events.clear();
+        let Some(media) = media else {
+            self.media_status_sent = false;
+            return;
+        };
+
+        let make_props = || MediaEventInput::Properties {
+            title: media.title.clone(),
+            artist: media.artist.clone(),
+            album_title: media.album_title.clone(),
+            album_artist: media.album_artist.clone(),
+            sub_title: media.sub_title.clone(),
+            genres: media.genres.clone(),
+            content_type: media.content_type.clone(),
+        };
+        let make_thumb = || MediaEventInput::Thumbnail {
+            has_thumbnail: media.has_thumbnail,
+            primary_color: media.palette.primary,
+            secondary_color: media.palette.secondary,
+            tertiary_color: media.palette.tertiary,
+            text_color: media.palette.text,
+            high_contrast_color: media.palette.high_contrast,
+        };
+
+        if !self.media_status_sent {
+            self.media_events.push(MediaEventInput::Status {
+                enabled: media.enabled,
+            });
+            self.media_events.push(MediaEventInput::Playback {
+                state: media.state.as_we_code(),
+            });
+            self.media_events.push(make_props());
+            self.media_events.push(make_thumb());
+            self.media_events.push(MediaEventInput::Timeline {
+                position: media.position,
+                duration: media.duration,
+            });
+            self.media_status_sent = true;
+            self.last_media_state = media.state;
+            self.last_media_props_rev = media.props_rev;
+            self.last_media_thumb_rev = media.thumb_rev;
+            self.last_media_pos = media.position;
+            self.last_media_dur = media.duration;
+            return;
+        }
+
+        let state_changed = media.state != self.last_media_state;
+        let props_changed = media.props_rev != self.last_media_props_rev;
+        let thumb_changed = media.thumb_rev != self.last_media_thumb_rev;
+
+        if state_changed {
+            self.media_events.push(MediaEventInput::Playback {
+                state: media.state.as_we_code(),
+            });
+            self.last_media_state = media.state;
+        }
+        if props_changed {
+            self.media_events.push(make_props());
+            self.last_media_props_rev = media.props_rev;
+        }
+        if thumb_changed {
+            self.media_events.push(make_thumb());
+            self.last_media_thumb_rev = media.thumb_rev;
+        }
+
+        let dur_changed = (media.duration - self.last_media_dur).abs() > 0.01;
+        let pos_changed = (media.position - self.last_media_pos).abs() >= 0.25;
+        if dur_changed
+            || state_changed
+            || props_changed
+            || (pos_changed
+                && (media.duration > 0.0 || media.state == crate::media::MediaPlaybackState::Playing))
+        {
+            self.media_events.push(MediaEventInput::Timeline {
+                position: media.position,
+                duration: media.duration,
+            });
+            self.last_media_pos = media.position;
+            self.last_media_dur = media.duration;
+        }
+    }
+
     /// Run one frame of SceneScripts and apply the produced property values.
     #[allow(clippy::too_many_arguments)]
     fn tick_scripts(
@@ -5190,6 +5381,7 @@ impl SceneRenderer {
                 cursor_screen,
                 mouse_down,
                 &self.cursor_events,
+                &self.media_events,
             )
         };
         self.apply_script_outputs(outputs);
@@ -5502,6 +5694,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
+                media_tex: None,
             });
         }
         for p in doc.particles {
@@ -5543,6 +5736,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
+                media_tex: None,
             });
         }
         Ok(())
@@ -6569,6 +6763,8 @@ impl SceneRenderer {
                 self_id,
                 dependencies: &deps,
                 props: &self.properties,
+                media_thumbnail: self.media_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
+                media_prev_thumbnail: self.media_prev_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
             };
             for effect in effects.iter_mut() {
                 if !effect_is_visible(effect, ctx.props, now) {
@@ -7326,6 +7522,10 @@ impl Renderer for SceneRenderer {
             }
         }
 
+        if let Some(media) = info.media.as_ref() {
+            self.sync_media_textures(gl, media);
+        }
+        self.collect_media_events(info.media.as_ref());
         self.collect_cursor_events(cursor_world, raw_win_uv, info.mouse_down, time);
         self.tick_scripts(
             time,
@@ -7560,6 +7760,8 @@ impl Renderer for SceneRenderer {
                         self_id: obj_id,
                         dependencies: &deps,
                         props: &self.properties,
+                        media_thumbnail: self.media_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
+                        media_prev_thumbnail: self.media_prev_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
                     };
                     for effect in effects.iter_mut() {
                         if !effect_is_visible(effect, ctx.props, now) {
@@ -7631,6 +7833,8 @@ impl Renderer for SceneRenderer {
                         self_id: obj_id,
                         dependencies: &deps,
                         props: &self.properties,
+                        media_thumbnail: self.media_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
+                        media_prev_thumbnail: self.media_prev_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
                     };
                     for effect in effects.iter_mut() {
                         if !effect_is_visible(effect, ctx.props, now) {
@@ -7738,6 +7942,8 @@ impl Renderer for SceneRenderer {
                         self_id: obj_id,
                         dependencies: &deps,
                         props: &self.properties,
+                        media_thumbnail: self.media_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
+                        media_prev_thumbnail: self.media_prev_thumb_tex.map(|(_, t, w, h)| (t, w, h)),
                     };
                     for effect in effects.iter_mut() {
                         if !effect_is_visible(effect, ctx.props, now) {
@@ -7776,6 +7982,21 @@ impl Renderer for SceneRenderer {
             let has_effects = !self.objects[i].effects.is_empty();
             let mut draw = self.objects[i].draw_info();
             draw.uv_rect = self.objects[i].sprite_rect(time);
+            if let Some(slot) = self.objects[i].media_tex {
+                let media_tex = match slot {
+                    SystemTexture::MediaThumbnail => self.media_thumb_tex.map(|(_, t, _, _)| t),
+                    SystemTexture::MediaPreviousThumbnail => self
+                        .media_prev_thumb_tex
+                        .or(self.media_thumb_tex)
+                        .map(|(_, t, _, _)| t),
+                };
+                if let Some(tex) = media_tex {
+                    if matches!(draw.kind, DrawKind::Image(_) | DrawKind::Solid) {
+                        draw.kind = DrawKind::Image(tex);
+                        draw.uv_rect = [0.0, 0.0, 1.0, 1.0];
+                    }
+                }
+            }
             if std::env::var_os("ANIMA_TRACE_SPRITE").is_some()
                 && self.objects[i].sprite.is_some()
             {
@@ -8106,6 +8327,13 @@ impl Renderer for SceneRenderer {
             || self.scripts.as_ref().is_some_and(|s| s.uses_audio())
     }
 
+    fn uses_media(&self) -> bool {
+        self.objects
+            .iter()
+            .any(|o| o.media_tex.is_some() || o.effects.iter().any(|e| e.uses_media()))
+            || self.scripts.as_ref().is_some_and(|s| s.uses_media())
+    }
+
     fn describe(&self) -> String {
         format!(
             "scene '{}' ({} objects, {} emitters)",
@@ -8119,6 +8347,12 @@ impl Renderer for SceneRenderer {
         // Stop scene audio before releasing GL resources.
         self.sounds.clear();
         self.sound_specs.clear();
+        if let Some((_, tex, _, _)) = self.media_thumb_tex.take() {
+            unsafe { gl.delete_texture(tex) };
+        }
+        if let Some((_, tex, _, _)) = self.media_prev_thumb_tex.take() {
+            unsafe { gl.delete_texture(tex) };
+        }
         if let Some(canvas) = self.scene.take() {
             canvas.destroy(gl);
         }
@@ -8846,6 +9080,7 @@ mod tests {
             script_visible: None,
             script_text_override: None,
             script_sprite_frame: None,
+            media_tex: None,
         };
         // With align=[0.5, 0], local_center=(50, 0); scaled by (2,1) -> (100,0);
         // rotated +90 deg -> (0, +100), so quad center is at (200, 400), covering
@@ -8861,5 +9096,52 @@ mod tests {
         // solid=false disables hit-testing even inside bounds.
         obj.solid = false;
         assert!(obj.hit_test([205.0, 460.0], [0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn detect_layer_media_tex_checks_instance_and_material() {
+        let thumb_entry = serde_json::json!({ "name": "$mediaThumbnail", "type": "system" });
+        let prev_entry =
+            serde_json::json!({ "name": "$mediaPreviousThumbnail", "type": "system" });
+
+        let obj_override = serde_json::json!({
+            "instanceoverride": { "usertextures": [thumb_entry] }
+        });
+        assert_eq!(
+            detect_layer_media_tex(&obj_override, None),
+            Some(SystemTexture::MediaThumbnail)
+        );
+
+        let obj_instance = serde_json::json!({
+            "instance": { "usertextures": [prev_entry] }
+        });
+        assert_eq!(
+            detect_layer_media_tex(&obj_instance, None),
+            Some(SystemTexture::MediaPreviousThumbnail)
+        );
+
+        let obj_plain = serde_json::json!({
+            "instanceoverride": { "color": "1 1 1" }
+        });
+        let mat_pass = serde_json::json!({
+            "shader": "genericimage4",
+            "usertextures": [thumb_entry]
+        });
+        assert_eq!(
+            detect_layer_media_tex(&obj_plain, Some(&mat_pass)),
+            Some(SystemTexture::MediaThumbnail)
+        );
+
+        let obj_both = serde_json::json!({
+            "instanceoverride": { "usertextures": [prev_entry] },
+            "instance": { "usertextures": [thumb_entry] }
+        });
+        assert_eq!(
+            detect_layer_media_tex(&obj_both, Some(&mat_pass)),
+            Some(SystemTexture::MediaPreviousThumbnail)
+        );
+
+        let obj_none = serde_json::json!({ "name": "bg" });
+        assert_eq!(detect_layer_media_tex(&obj_none, None), None);
     }
 }

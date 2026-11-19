@@ -46,6 +46,7 @@ use crate::audio::AudioAnalyzer;
 use crate::config::Config;
 use crate::ipc::{self, Command, Request, Response};
 use crate::lyrics::{LyricsEngine, fuse_mouth_visemes};
+use crate::media::MediaTracker;
 use crate::render::character::{CharacterOverlay, Corner, Placement, SharedSurface, WindowRect};
 use crate::render::image::ImageRenderer;
 use crate::render::scene::SceneRenderer;
@@ -119,6 +120,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
     let egl_alpha_config = pick_config(&egl_display, true).unwrap_or_else(|_| egl_config.clone());
     let audio = AudioAnalyzer::spawn(false);
     let lyrics = LyricsEngine::spawn(false);
+    let media = MediaTracker::spawn(false);
 
     let socket = util::socket_path();
     let mut app = App {
@@ -139,6 +141,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         outputs: Vec::new(),
         audio,
         lyrics,
+        media,
         cursor_pos: None,
         pointer_down: false,
         active_window: None,
@@ -218,6 +221,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
     }
     app.audio.stop();
     app.lyrics.stop();
+    app.media.stop();
     // Tear outputs down while the EGL display and Wayland connection are still
     // alive. `App`'s fields drop in declaration order, which would destroy the
     // EGL display before the per-output surfaces and contexts, crashing in the
@@ -303,6 +307,8 @@ struct OutputCtx {
     /// analyzer.  Scenes load lazily on the first frame, so this has to be
     /// re-checked after rendering instead of only when the renderer is built.
     audio_users: bool,
+    /// Whether this output's renderer currently wants MPRIS media state / artwork.
+    media_users: bool,
 }
 
 impl OutputCtx {
@@ -336,6 +342,7 @@ impl OutputCtx {
             frames: 0,
             fps_since: Instant::now(),
             audio_users: false,
+            media_users: false,
         }
     }
 }
@@ -360,6 +367,7 @@ pub struct App {
     outputs: Vec<OutputCtx>,
     audio: AudioAnalyzer,
     lyrics: LyricsEngine,
+    media: MediaTracker,
     cursor_pos: Option<(f32, f32)>,
     pointer_down: bool,
     active_window: Option<WindowRect>,
@@ -471,6 +479,13 @@ impl App {
         }
         self.audio.set_enabled(any_needs_audio);
         self.lyrics.set_enabled(any_char_audio);
+    }
+
+    fn update_media_state(&self) {
+        let any_needs_media = self.outputs.iter().any(|oc| {
+            !oc.paused && oc.renderer.as_ref().is_some_and(|r| r.uses_media())
+        });
+        self.media.set_enabled(any_needs_media);
     }
 
     /// Synchronize the front overlay `Layer::Overlay` surface for output `idx`
@@ -831,6 +846,7 @@ impl App {
         oc.last_render = Instant::now() - Duration::from_secs(1);
         self.sync_character_surfaces(idx, false);
         self.update_audio_state();
+        self.update_media_state();
 
         if self.outputs[idx].configured {
             self.outputs[idx].animating = true;
@@ -949,6 +965,7 @@ impl App {
             mouse: [-10000.0, -10000.0],
             mouse_down: false,
             scale: scale as f32,
+            media: None,
         };
         let _ = ch.render(gl, &info, None, &mut SharedSurface);
         // the characters live along the bottom
@@ -1020,6 +1037,7 @@ impl App {
 
         let audio_snap = self.audio.snapshot();
         let lyric_snap = self.lyrics.sample();
+        let media_snap = self.media.snapshot();
         let fused_mouth = fuse_mouth_visemes(audio_snap.mouth, &lyric_snap);
         let cursor = self.cursor_pos;
         let active_win = self.active_window;
@@ -1061,6 +1079,7 @@ impl App {
             mouse_down: self.pointer_down
                 || crate::backend::pointer::BUTTON_DOWN.load(std::sync::atomic::Ordering::Relaxed),
             scale: oc.scale as f32,
+            media: media_snap,
         };
 
         let Some(renderer) = oc.renderer.as_mut() else {
@@ -1103,13 +1122,20 @@ impl App {
         };
 
         // The renderer may have loaded its scene (and therefore discovered
-        // audio-reactive effects) on this very frame; enable the analyzer now.
+        // audio-reactive or media-reactive effects) on this very frame.
         let wants_audio = renderer.uses_audio();
         let mut audio_changed = false;
         if wants_audio != oc.audio_users {
             log::info!("monitor {name}: renderer uses audio = {wants_audio}");
             oc.audio_users = wants_audio;
             audio_changed = true;
+        }
+        let wants_media = renderer.uses_media();
+        let mut media_changed = false;
+        if wants_media != oc.media_users {
+            log::info!("monitor {name}: renderer uses media = {wants_media}");
+            oc.media_users = wants_media;
+            media_changed = true;
         }
 
         // Also render the transparent front overlay surface if active!
@@ -1220,6 +1246,9 @@ impl App {
         if audio_changed {
             self.update_audio_state();
         }
+        if media_changed {
+            self.update_media_state();
+        }
         keep_going
     }
 
@@ -1280,6 +1309,7 @@ impl App {
             }
         }
         self.update_audio_state();
+        self.update_media_state();
     }
 
     /// Draw one fully transparent frame over the character overlay.
@@ -1629,6 +1659,7 @@ impl App {
                             "wallpaper": oc.wallpaper.as_ref().map(|w| w.entry.display().to_string()),
                             "renderer": oc.renderer.as_ref().map(|r| r.describe()),
                             "uses_audio": oc.renderer.as_ref().map(|r| r.uses_audio()).unwrap_or(false),
+                            "uses_media": oc.renderer.as_ref().map(|r| r.uses_media()).unwrap_or(false),
                             "properties": props,
                             "error": oc.error,
                         })
@@ -1808,6 +1839,7 @@ impl App {
                     }
                 }
                 self.update_audio_state();
+                self.update_media_state();
                 self.config_changed();
                 Response::ok(format!("property {key} = {value}"))
             }
@@ -1909,6 +1941,7 @@ impl App {
                     }
                 }
                 self.update_audio_state();
+                self.update_media_state();
                 self.config_changed();
                 let msg = match &key {
                     Some(k) => format!("reset property {k} to default"),
@@ -2005,6 +2038,7 @@ impl App {
                     self.schedule_render(idx);
                 }
                 self.update_audio_state();
+                self.update_media_state();
                 self.config_changed();
                 Response::with_data(
                     format!(

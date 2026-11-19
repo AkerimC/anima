@@ -217,6 +217,92 @@ pub struct CursorEventInput {
     pub local_pos: [f32; 2],
 }
 
+/// MPRIS2 media session event delivered to SceneScript `media*Changed` callbacks.
+#[derive(Debug, Clone)]
+pub enum MediaEventInput {
+    Status {
+        enabled: bool,
+    },
+    Playback {
+        state: u8,
+    },
+    Properties {
+        title: String,
+        artist: String,
+        album_title: String,
+        album_artist: String,
+        sub_title: String,
+        genres: String,
+        content_type: String,
+    },
+    Timeline {
+        position: f32,
+        duration: f32,
+    },
+    Thumbnail {
+        has_thumbnail: bool,
+        primary_color: [f32; 3],
+        secondary_color: [f32; 3],
+        tertiary_color: [f32; 3],
+        text_color: [f32; 3],
+        high_contrast_color: [f32; 3],
+    },
+}
+
+impl MediaEventInput {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Status { enabled } => json!({
+                "kind": "mediaStatusChanged",
+                "enabled": enabled,
+            }),
+            Self::Playback { state } => json!({
+                "kind": "mediaPlaybackChanged",
+                "state": state,
+            }),
+            Self::Properties {
+                title,
+                artist,
+                album_title,
+                album_artist,
+                sub_title,
+                genres,
+                content_type,
+            } => json!({
+                "kind": "mediaPropertiesChanged",
+                "title": title,
+                "artist": artist,
+                "albumTitle": album_title,
+                "albumArtist": album_artist,
+                "subTitle": sub_title,
+                "genres": genres,
+                "contentType": content_type,
+            }),
+            Self::Timeline { position, duration } => json!({
+                "kind": "mediaTimelineChanged",
+                "position": position,
+                "duration": duration,
+            }),
+            Self::Thumbnail {
+                has_thumbnail,
+                primary_color,
+                secondary_color,
+                tertiary_color,
+                text_color,
+                high_contrast_color,
+            } => json!({
+                "kind": "mediaThumbnailChanged",
+                "hasThumbnail": has_thumbnail,
+                "primaryColor": primary_color,
+                "secondaryColor": secondary_color,
+                "tertiaryColor": tertiary_color,
+                "textColor": text_color,
+                "highContrastColor": high_contrast_color,
+            }),
+        }
+    }
+}
+
 /// Destination property targeted by a [`ScriptOutput`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptTarget {
@@ -288,6 +374,8 @@ pub struct SceneScripts {
     timeouts: usize,
     /// Whether any loaded script called `engine.registerAudioBuffers(...)`.
     uses_audio: bool,
+    /// Whether any compiled script defines a `media*Changed` callback.
+    uses_media: bool,
     /// Layers that declare at least one `cursor*` event callback.
     cursor_layers: HashSet<i64>,
     /// Whether `finalize_init()` has executed `init()` + startup `applyUserProperties()`.
@@ -308,6 +396,8 @@ struct AddScriptAck {
     uses_audio: bool,
     #[serde(default, rename = "hasCursor")]
     has_cursor: bool,
+    #[serde(default, rename = "hasMedia")]
+    has_media: bool,
 }
 
 #[derive(Deserialize)]
@@ -380,6 +470,7 @@ impl SceneScripts {
             errors: Vec::new(),
             timeouts: 0,
             uses_audio: false,
+            uses_media: false,
             cursor_layers: HashSet::new(),
             initialized: false,
         })
@@ -626,6 +717,7 @@ impl SceneScripts {
                 Ok(ack) => {
                     self.uses_audio |= ack.uses_audio;
                     if ack.ok {
+                        self.uses_media |= ack.has_media;
                         if ack.has_cursor {
                             let lid = match &target {
                                 ScriptTarget::Layer { id, .. }
@@ -736,6 +828,11 @@ impl SceneScripts {
         self.uses_audio
     }
 
+    /// Whether any compiled script registered a `media*Changed` callback.
+    pub fn uses_media(&self) -> bool {
+        self.uses_media
+    }
+
     /// Whether any loaded script registered a `cursor*` callback.
     pub fn has_cursor_layers(&self) -> bool {
         !self.cursor_layers.is_empty()
@@ -798,10 +895,11 @@ impl SceneScripts {
             [0.0, 0.0],
             false,
             &[],
+            &[],
         )
     }
 
-    /// Run one frame of scripts with live pointer state and hit-tested cursor events.
+    /// Run one frame of scripts with live pointer state, hit-tested cursor events, and media events.
     #[allow(clippy::too_many_arguments)]
     pub fn tick_with_input(
         &mut self,
@@ -816,6 +914,7 @@ impl SceneScripts {
         mouse_screen: [f32; 2],
         mouse_down: bool,
         cursor_events: &[CursorEventInput],
+        media_events: &[MediaEventInput],
     ) -> Vec<ScriptOutput> {
         if self.bindings.is_empty() {
             return Vec::new();
@@ -871,6 +970,12 @@ impl SceneScripts {
                 .collect();
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("cursorEvents".to_string(), Value::Array(ev_json));
+            }
+        }
+        if !media_events.is_empty() {
+            let ev_json: Vec<Value> = media_events.iter().map(MediaEventInput::to_json).collect();
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("mediaEvents".to_string(), Value::Array(ev_json));
             }
         }
         if self.uses_audio {
@@ -2597,6 +2702,14 @@ const PRELUDE: &str = r#"
         typeof mod.cursorMove === 'function'
       ));
       entry.hasCursor = hasCursor;
+      var hasMedia = !!(mod && (
+        typeof mod.mediaStatusChanged === 'function' ||
+        typeof mod.mediaPlaybackChanged === 'function' ||
+        typeof mod.mediaPropertiesChanged === 'function' ||
+        typeof mod.mediaTimelineChanged === 'function' ||
+        typeof mod.mediaThumbnailChanged === 'function'
+      ));
+      entry.hasMedia = hasMedia;
 
       if (kind === 'layer') {
         entry.initial = normalizeField(d.field, d.initial);
@@ -2615,7 +2728,8 @@ const PRELUDE: &str = r#"
         ok: !compileErr,
         error: compileErr,
         usesAudio: audioRegistered,
-        hasCursor: hasCursor
+        hasCursor: hasCursor,
+        hasMedia: hasMedia
       });
     },
     finalizeInit: function () {
@@ -2813,6 +2927,64 @@ const PRELUDE: &str = r#"
           for (var k = 0; k < scripts.length; k++) {
             var b = scripts[k];
             if (b.dead || !b.hasCursor || b.layer !== targetLayer || !b.mod) continue;
+            var fn = b.mod[ev.kind];
+            if (typeof fn !== 'function') continue;
+            try {
+              globalThis.thisScene = scene;
+              globalThis.thisLayer = b.layer;
+              globalThis.thisObject = b.animLayer || b.effect || b.layer;
+              currentBinding = b;
+              var ret = fn(eventObj);
+              applyBindingValue(b, ret, forcedLayers, forcedEffects, forcedAnimLayers);
+            } catch (err) {
+              b.dead = true;
+              b.error = errText(err);
+              errors.push({ idx: k, kind: ev.kind, message: b.error });
+            } finally {
+              currentBinding = null;
+            }
+          }
+        }
+      }
+
+      if (Array.isArray(s.mediaEvents) && s.mediaEvents.length) {
+        for (var mi = 0; mi < s.mediaEvents.length; mi++) {
+          var ev = s.mediaEvents[mi];
+          var eventObj;
+          if (ev.kind === 'mediaStatusChanged') {
+            eventObj = { enabled: !!ev.enabled };
+          } else if (ev.kind === 'mediaPlaybackChanged') {
+            eventObj = { state: num(ev.state, 0) };
+          } else if (ev.kind === 'mediaPropertiesChanged') {
+            eventObj = {
+              title: ev.title || '',
+              artist: ev.artist || '',
+              albumTitle: ev.albumTitle || '',
+              albumArtist: ev.albumArtist || '',
+              subTitle: ev.subTitle || '',
+              genres: ev.genres || '',
+              contentType: ev.contentType || 'music'
+            };
+          } else if (ev.kind === 'mediaTimelineChanged') {
+            eventObj = {
+              position: num(ev.position, 0),
+              duration: num(ev.duration, 0)
+            };
+          } else if (ev.kind === 'mediaThumbnailChanged') {
+            eventObj = {
+              hasThumbnail: !!ev.hasThumbnail,
+              primaryColor: parseVec(ev.primaryColor),
+              secondaryColor: parseVec(ev.secondaryColor),
+              tertiaryColor: parseVec(ev.tertiaryColor),
+              textColor: parseVec(ev.textColor),
+              highContrastColor: parseVec(ev.highContrastColor)
+            };
+          } else {
+            continue;
+          }
+          for (var k = 0; k < scripts.length; k++) {
+            var b = scripts[k];
+            if (b.dead || !b.hasMedia || !b.mod) continue;
             var fn = b.mod[ev.kind];
             if (typeof fn !== 'function') continue;
             try {
@@ -4026,6 +4198,7 @@ mod tests {
             [0.5, 0.5],
             true,
             &ev1,
+            &[],
         );
         assert!(out1.iter().any(|o| {
             o.target == ScriptTarget::Layer { id: 101, field: ScriptField::Visible }
@@ -4053,6 +4226,7 @@ mod tests {
             [0.52, 0.52],
             true,
             &ev2,
+            &[],
         );
         let moved = out2
             .iter()
@@ -4092,6 +4266,7 @@ mod tests {
             [0.0, 0.0],
             false,
             &ev3,
+            &[],
         );
         assert!(out3.iter().any(|o| {
             o.target == ScriptTarget::Layer { id: 101, field: ScriptField::Visible }
@@ -4100,6 +4275,154 @@ mod tests {
         assert!(out3.iter().any(|o| {
             o.target == ScriptTarget::LayerSolid { id: 101 } && o.value == json!(false)
         }));
+    }
+
+    #[test]
+    fn media_events_dispatch_all_callbacks_and_colors() {
+        let mut host = SceneScripts::new(&serde_json::Map::new()).expect("host");
+        for (id, name) in [(201, "title_lbl"), (202, "panel"), (203, "tint"), (204, "bar"), (205, "cover")] {
+            host.add_layer(&seed(id, name));
+        }
+        host.add_effect(&EffectSeed {
+            layer_id: 205,
+            effect_idx: 0,
+            id: Some(901),
+            name: "blend".into(),
+            visible: true,
+        });
+
+        host.add_property_script(
+            201,
+            ScriptField::Text,
+            "let cur = ''; export function mediaPropertiesChanged(e) { cur = e.artist + ' - ' + e.title; } export function update() { return cur; }",
+            json!(""),
+            &serde_json::Map::new(),
+            None,
+        );
+        host.add_property_script(
+            202,
+            ScriptField::Visible,
+            "let en = false, pl = false;\nexport function mediaStatusChanged(e) { en = e.enabled; return en && pl; }\nexport function mediaPlaybackChanged(e) { pl = e.state === MediaPlaybackEvent.PLAYBACK_PLAYING; return en && pl; }",
+            json!(false),
+            &serde_json::Map::new(),
+            None,
+        );
+        host.add_property_script(
+            203,
+            ScriptField::Color,
+            "export function mediaThumbnailChanged(e) { if (!e.hasThumbnail) return new Vec3(0, 0, 0); return e.primaryColor.mix(e.textColor, 0.5); }",
+            json!("1 1 1"),
+            &serde_json::Map::new(),
+            None,
+        );
+        host.add_property_script(
+            204,
+            ScriptField::Scale,
+            "let ratio = 0;\nexport function mediaTimelineChanged(e) { ratio = e.duration > 0 ? e.position / e.duration : 0; }\nexport function update() { return new Vec3(ratio, 1, 1); }",
+            json!("0 1 1"),
+            &serde_json::Map::new(),
+            None,
+        );
+        host.add_effect_constant_script(
+            205,
+            0,
+            0,
+            "blend",
+            "export function mediaThumbnailChanged(e) { if (e.hasThumbnail) thisObject.getAnimation().play(); }",
+            json!(0.0),
+            &serde_json::Map::new(),
+            Some(&PropAnimSeed {
+                name: "reveal".into(),
+                fps: 30.0,
+                length: 30.0,
+                mode: "single",
+                start_paused: true,
+            }),
+        );
+
+        let _ = host.finalize_init();
+        assert!(host.uses_media());
+
+        let events = [
+            MediaEventInput::Status { enabled: true },
+            MediaEventInput::Playback { state: 1 },
+            MediaEventInput::Properties {
+                title: "Dawn".into(),
+                artist: "Miku".into(),
+                album_title: "Sky".into(),
+                album_artist: "Miku".into(),
+                sub_title: String::new(),
+                genres: "Electronic".into(),
+                content_type: "music".into(),
+            },
+            MediaEventInput::Thumbnail {
+                has_thumbnail: true,
+                primary_color: [0.2, 0.4, 0.8],
+                secondary_color: [0.1, 0.2, 0.5],
+                tertiary_color: [0.7, 0.5, 0.2],
+                text_color: [1.0, 1.0, 1.0],
+                high_contrast_color: [1.0, 1.0, 1.0],
+            },
+            MediaEventInput::Timeline {
+                position: 30.0,
+                duration: 120.0,
+            },
+        ];
+        let mut f202 = frame(202);
+        f202.visible = false;
+        let frames = [frame(201), f202, frame(203), frame(204), frame(205)];
+
+        let out = host.tick_with_input(
+            0.1,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &frames,
+            [0.0, 0.0],
+            false,
+            &[],
+            &events,
+        );
+
+        assert!(out.iter().any(|o| {
+            o.target == ScriptTarget::Layer { id: 201, field: ScriptField::Text }
+                && o.value == json!("Miku - Dawn")
+        }));
+        assert!(out.iter().any(|o| {
+            o.target == ScriptTarget::Layer { id: 202, field: ScriptField::Visible }
+                && o.value == json!(true)
+        }));
+        let color_out = out
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 203, field: ScriptField::Color })
+            .expect("mediaThumbnailChanged color output");
+        let c_arr = color_out.value.as_array().unwrap();
+        assert!((c_arr[0].as_f64().unwrap() - 0.6).abs() < 1e-4);
+        assert!((c_arr[1].as_f64().unwrap() - 0.7).abs() < 1e-4);
+        assert!((c_arr[2].as_f64().unwrap() - 0.9).abs() < 1e-4);
+
+        let scale_out = out
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 204, field: ScriptField::Scale })
+            .expect("mediaTimelineChanged scale output");
+        assert!((scale_out.value[0].as_f64().unwrap() - 0.25).abs() < 1e-4);
+
+        let anim_ctrl = out
+            .iter()
+            .find(|o| {
+                o.target
+                    == ScriptTarget::EffectConstAnimControl {
+                        layer_id: 205,
+                        effect_idx: 0,
+                        pass_idx: 0,
+                        key: "blend".to_string(),
+                    }
+            })
+            .expect("mediaThumbnailChanged triggers effect animation play()");
+        assert_eq!(anim_ctrl.value.get("playing"), Some(&json!(true)));
     }
 
     /// Compile and tick every SceneScript (layer properties, effect visibility,

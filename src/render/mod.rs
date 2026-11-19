@@ -44,6 +44,8 @@ pub struct FrameInfo {
     pub mouse_down: bool,
     /// Content scale (HiDPI factor).
     pub scale: f32,
+    /// Live MPRIS2 session & album artwork snapshot when any output uses media.
+    pub media: Option<crate::media::MediaSnapshot>,
 }
 
 /// A renderer owns its GL objects and draws one frame into the current
@@ -67,6 +69,12 @@ pub trait Renderer {
     /// Whether this renderer reacts to desktop audio (so the audio analyzer can
     /// sleep at 0% CPU when no output needs it).
     fn uses_audio(&self) -> bool {
+        false
+    }
+
+    /// Whether this renderer reacts to MPRIS media events or `$mediaThumbnail`
+    /// (so the media tracker can sleep at 0% CPU when no output needs it).
+    fn uses_media(&self) -> bool {
         false
     }
 
