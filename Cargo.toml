@@ -43,6 +43,7 @@ gltf = { version = "1.4.1", default-features = false, features = ["import", "uti
 glam = "0.34.2"
 lewton = "0.10"
 ab_glyph = "0.2.32"
+rquickjs = "0.9"
 
 [profile.release]
 opt-level = 3

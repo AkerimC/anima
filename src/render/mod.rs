@@ -6,6 +6,7 @@ pub mod gl;
 pub mod image;
 pub mod model3d;
 pub mod scene;
+pub mod scenescript;
 pub mod shader;
 pub mod tuning;
 pub mod text;

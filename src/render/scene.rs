@@ -30,6 +30,7 @@ use serde::Deserialize;
 use crate::pkg::PackageFs;
 
 use super::gl::{bytemuck_cast, create_texture, Filter, Program};
+use super::scenescript::{LayerFrame, LayerSeed, SceneScripts, ScriptField};
 use super::text;
 use super::we_effect::{Canvas, EffectContext, EffectInstance, TextureCache};
 use super::we_model::{parse_mdl, Mesh, MeshVertex, ParsedMdl, PuppetAnimLayer};
@@ -483,6 +484,14 @@ impl Affine {
     fn apply_vec(self, v: [f32; 2]) -> [f32; 2] {
         [self.a * v[0] + self.c * v[1], self.b * v[0] + self.d * v[1]]
     }
+}
+
+/// Build the local (parent-relative) transform from Wallpaper Engine's
+/// translation / rotation / scale triple.
+fn compose_local(origin: [f32; 3], scale: [f32; 3], angles: [f32; 3]) -> Affine {
+    Affine::translate(origin[0], origin[1])
+        .mul(Affine::rotate(angles[2]))
+        .mul(Affine::scale(scale[0], scale[1]))
 }
 
 // ---------------------------------------------------------------------------
@@ -2030,6 +2039,23 @@ struct SceneObject {
     /// so user property changes can re-evaluate transforms, colors, and text live.
     raw_idx: Option<usize>,
     raw_obj: serde_json::Value,
+    /// SceneScript state for layers with at least one scripted property.
+    script: Option<Box<ScriptLayer>>,
+    /// Visibility produced by a `visible` SceneScript this frame.
+    script_visible: Option<bool>,
+}
+
+/// Bookkeeping for a layer that SceneScripts can drive.
+struct ScriptLayer {
+    /// World transform of the parent, used to rebuild the layer transform when
+    /// a script writes `origin` / `scale` / `angles`.
+    parent: Affine,
+    /// Local components after keyframe animation for the current frame.
+    parts: ([f32; 3], [f32; 3], [f32; 3]),
+    /// Current text, fed to text scripts as `value`.
+    text: String,
+    /// Text produced by a text script this frame (applied when refreshing).
+    text_out: Option<String>,
 }
 
 /// A layer that follows a bone of its parent puppet, possibly animated.
@@ -2323,7 +2349,14 @@ impl ObjAnim {
         any.then(|| Box::new(a))
     }
 
-    fn eval_local(&self, time: f32, daytime: f32, now: text::LocalTime) -> (Affine, Option<f32>) {
+    /// Authored local transform components after keyframes, script patterns
+    /// and property overrides: `(origin, scale, angles)`.
+    fn components(
+        &self,
+        time: f32,
+        daytime: f32,
+        now: text::LocalTime,
+    ) -> ([f32; 3], [f32; 3], [f32; 3]) {
         let mut origin = self.origin;
         let mut scale = self.scale;
         let mut angles = self.angles;
@@ -2347,9 +2380,12 @@ impl ObjAnim {
             let deg = s.apply([0.0; 3], time, daytime, now);
             angles[2] = deg[2].to_radians();
         }
-        let local = Affine::translate(origin[0], origin[1])
-            .mul(Affine::rotate(angles[2]))
-            .mul(Affine::scale(scale[0], scale[1]));
+        (origin, scale, angles)
+    }
+
+    fn eval_local(&self, time: f32, daytime: f32, now: text::LocalTime) -> (Affine, Option<f32>) {
+        let (origin, scale, angles) = self.components(time, daytime, now);
+        let local = compose_local(origin, scale, angles);
         let alpha = self
             .alpha_track
             .as_ref()
@@ -2365,7 +2401,8 @@ impl ObjAnim {
 
 impl SceneObject {
     fn is_visible(&self, props: &HashMap<String, serde_json::Value>) -> bool {
-        self.visible.eval(props)
+        self.script_visible
+            .unwrap_or_else(|| self.visible.eval(props))
     }
 
     fn local_center(&self) -> [f32; 2] {
@@ -2621,6 +2658,20 @@ pub struct SceneRenderer {
     authored_prop_keys: std::collections::HashSet<String>,
     raw_nodes: Vec<(Option<usize>, serde_json::Value)>,
     properties: HashMap<String, serde_json::Value>,
+    /// SceneScript host (QuickJS) for layers with scripted properties.
+    scripts: Option<SceneScripts>,
+    /// Object id -> index in `objects`, for applying script output.
+    script_ids: HashMap<i64, usize>,
+    /// Indices of objects that carry a `ScriptLayer` (fed to the scripts).
+    script_objs: Vec<usize>,
+    /// Subset of `script_objs` whose own properties are scripted.
+    script_binding_objs: Vec<usize>,
+    /// Reused per-frame layer snapshot handed to the script host.
+    script_frames: Vec<LayerFrame>,
+    /// Set when user properties changed; scripts read their overrides at
+    /// compile time, so bindings are rebuilt once at the next frame instead of
+    /// once per property assignment.
+    scripts_dirty: bool,
     pkg: PackageFs,
 
     width: i32,
@@ -2701,6 +2752,12 @@ impl SceneRenderer {
             authored_prop_keys: std::collections::HashSet::new(),
             raw_nodes: Vec::new(),
             properties: HashMap::new(),
+            scripts: None,
+            script_ids: HashMap::new(),
+            script_objs: Vec::new(),
+            script_binding_objs: Vec::new(),
+            script_frames: Vec::new(),
+            scripts_dirty: false,
             pkg: PackageFs::default(),
             width,
             height,
@@ -3137,6 +3194,8 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
+                    script: None,
+                    script_visible: None,
                 });
                 continue;
             }
@@ -3175,6 +3234,8 @@ impl SceneRenderer {
                         attach: None,
                         raw_idx: Some(i),
                         raw_obj: obj.clone(),
+                        script: None,
+                        script_visible: None,
                     });
                 }
                 continue;
@@ -3213,6 +3274,8 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
+                    script: None,
+                    script_visible: None,
                 });
                 continue;
             }
@@ -3257,6 +3320,8 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
+                    script: None,
+                    script_visible: None,
                 });
                 continue;
             }
@@ -3292,6 +3357,8 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
+                    script: None,
+                    script_visible: None,
                 });
                 continue;
             }
@@ -3418,6 +3485,8 @@ impl SceneRenderer {
                     attach: None,
                     raw_idx: Some(i),
                     raw_obj: obj.clone(),
+                    script: None,
+                    script_visible: None,
                 });
                 continue;
             }
@@ -3564,6 +3633,60 @@ impl SceneRenderer {
                 attach: None,
                 raw_idx: Some(i),
                 raw_obj: obj.clone(),
+                script: None,
+                script_visible: None,
+            });
+        }
+
+        // Layers that draw nothing (empty groups, effect hosts without
+        // effects) are skipped above, but SceneScripts still address them
+        // through `getParent()` / `thisScene.getLayer()`.  Register them as
+        // zero-sized anchors so the script layer table matches the scene.
+        let mut known: std::collections::HashSet<i64> =
+            self.objects.iter().filter_map(|o| o.id).collect();
+        for (i, raw) in raws.iter().enumerate() {
+            let obj = &raw.obj;
+            let Some(id) = obj
+                .get("id")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            else {
+                continue;
+            };
+            if !known.insert(id) {
+                continue;
+            }
+            self.objects.push(SceneObject {
+                id: Some(id),
+                name: obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("object")
+                    .to_string(),
+                transform: resolved[i].unwrap_or_else(Affine::identity),
+                size: [0.0, 0.0],
+                align: parse_alignment(obj),
+                color: [
+                    1.0,
+                    1.0,
+                    1.0,
+                    eval_alpha_field(obj.get("alpha"), &self.properties, now),
+                ],
+                brightness: 1.0,
+                blend: LayerBlend::Normal,
+                color_blend: object_color_blend(obj),
+                parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
+                visible: inherited_visible(i),
+                dependencies: Vec::new(),
+                capture_composite: false,
+                effects: Vec::new(),
+                kind: ObjectKind::Solid,
+                anim: None,
+                sprite: None,
+                attach: None,
+                raw_idx: Some(i),
+                raw_obj: obj.clone(),
+                script: None,
+                script_visible: None,
             });
         }
 
@@ -3642,6 +3765,7 @@ impl SceneRenderer {
                 o.anim = Some(a);
             }
         }
+        self.load_scene_scripts();
         log::debug!(
             "scene: ortho={:?} objects={} emitters={}",
             self.ortho_size,
@@ -3674,6 +3798,313 @@ impl SceneRenderer {
             }
         }
         Ok(())
+    }
+
+    /// Compile every SceneScript bound to a layer property and register the
+    /// layer table the scripts see through `thisLayer` / `thisScene`.
+    ///
+    /// Called after the scene is parsed and again whenever user properties
+    /// change, because script properties read their overrides at compile time.
+    fn load_scene_scripts(&mut self) {
+        self.scripts_dirty = false;
+        self.scripts = None;
+        self.script_ids.clear();
+        self.script_objs.clear();
+        self.script_binding_objs.clear();
+        self.script_frames.clear();
+        for obj in self.objects.iter_mut() {
+            obj.script = None;
+            obj.script_visible = None;
+        }
+
+        if self.raw_nodes.is_empty()
+            || !self
+                .objects
+                .iter()
+                .any(|o| !o.raw_obj.is_null() && object_has_script(&o.raw_obj))
+        {
+            return;
+        }
+
+        let transforms = recompute_raw_transforms(
+            &self.raw_nodes,
+            self.authored_ortho,
+            self.view_shift,
+            &self.properties,
+        );
+        let user_props: serde_json::Map<String, serde_json::Value> = self
+            .properties
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let Some(mut host) = SceneScripts::new(&user_props) else {
+            log::warn!("scene: SceneScript runtime unavailable");
+            return;
+        };
+
+        // Layers whose live values have to reach the scripts: the scripted
+        // layers themselves, their parents (scripts walk up with
+        // `getParent()`), and layers a script addresses by name.
+        let obj_by_id: HashMap<i64, usize> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.id.map(|id| (id, i)))
+            .collect();
+        let mut feed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut named: Vec<String> = Vec::new();
+        for (idx, obj) in self.objects.iter().enumerate() {
+            if obj.raw_obj.is_null() || !object_has_script(&obj.raw_obj) {
+                continue;
+            }
+            feed.insert(idx);
+            named.extend(layer_script_refs(&obj.raw_obj));
+            let mut parent = obj.raw_obj.get("parent").and_then(parent_id);
+            for _ in 0..64 {
+                let Some(pid) = parent else { break };
+                let Some(&p) = obj_by_id.get(&pid) else { break };
+                if !feed.insert(p) {
+                    break;
+                }
+                parent = self.objects[p].raw_obj.get("parent").and_then(parent_id);
+            }
+        }
+        for name in named {
+            for (i, obj) in self.objects.iter().enumerate() {
+                if obj.name == name {
+                    feed.insert(i);
+                }
+            }
+        }
+
+        let now = text::local_time();
+        let mut registered_ids: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
+        for (idx, obj) in self.objects.iter_mut().enumerate() {
+            let (Some(id), Some(ri)) = (obj.id, obj.raw_idx) else {
+                continue;
+            };
+            registered_ids.insert(id);
+            let Some(&(_, parent_world, origin, scale, angles)) = transforms.get(ri) else {
+                continue;
+            };
+            let kind = match &obj.kind {
+                ObjectKind::Image(_) => "image",
+                ObjectKind::Puppet { .. } => "puppet",
+                ObjectKind::Text(_) => "text",
+                ObjectKind::Solid => "solid",
+                ObjectKind::Particle(_) => "particle",
+                ObjectKind::Compose { .. } | ObjectKind::CompositeRef(_) | ObjectKind::Post => {
+                    "group"
+                }
+            };
+            let text = match &obj.kind {
+                ObjectKind::Text(layer) => layer.evaluate(&self.properties, now),
+                _ => String::new(),
+            };
+            let parent = obj.raw_obj.get("parent").and_then(parent_id);
+            host.add_layer(&LayerSeed {
+                id,
+                name: obj.name.clone(),
+                kind: kind.to_string(),
+                visible: obj.is_visible(&self.properties),
+                alpha: obj.color[3],
+                origin,
+                scale,
+                angles,
+                color: [obj.color[0], obj.color[1], obj.color[2]],
+                size: obj.size,
+                align: obj.align,
+                text: text.clone(),
+                parent,
+            });
+            // Only layers a script can observe get a per-frame state entry.
+            if feed.contains(&idx) {
+                obj.script = Some(Box::new(ScriptLayer {
+                    parent: parent_world,
+                    parts: (origin, scale, angles),
+                    text,
+                    text_out: None,
+                }));
+                self.script_ids.insert(id, idx);
+                self.script_objs.push(idx);
+            }
+        }
+
+        host.link_parents();
+        if log::log_enabled!(log::Level::Debug) {
+            let registered = registered_ids;
+            let missing: Vec<String> = self
+                .objects
+                .iter()
+                .filter(|o| o.script.is_some())
+                .filter_map(|o| {
+                    let p = o.raw_obj.get("parent").and_then(parent_id)?;
+                    (!registered.contains(&p)).then(|| format!("{}->{p}", o.id.unwrap_or(-1)))
+                })
+                .take(8)
+                .collect();
+            if !missing.is_empty() {
+                log::debug!("scene: SceneScript parents not registered: {missing:?}");
+            }
+        }
+
+        let mut bindings = 0usize;
+        for (idx, obj) in self.objects.iter().enumerate() {
+            let Some(id) = obj.id else { continue };
+            if obj.script.is_none() {
+                continue;
+            }
+            let raw = &obj.raw_obj;
+            let mut has = false;
+            for (field, key) in [
+                (ScriptField::Visible, "visible"),
+                (ScriptField::Alpha, "alpha"),
+                (ScriptField::Origin, "origin"),
+                (ScriptField::Scale, "scale"),
+                (ScriptField::Angles, "angles"),
+                (ScriptField::Color, "color"),
+                (ScriptField::Text, "text"),
+            ] {
+                let Some(v) = raw.get(key) else { continue };
+                let Some(script) = v.get("script").and_then(|s| s.as_str()) else {
+                    continue;
+                };
+                let (initial, script_props) = field_script_defaults(field, v, &self.properties);
+                host.add_property_script(id, field, script, initial, &script_props);
+                bindings += 1;
+                has = true;
+            }
+            if has {
+                self.script_binding_objs.push(idx);
+            }
+        }
+
+        let failing = host.failures();
+        if failing > 0 {
+            for err in host.errors().iter().take(4) {
+                log::warn!("scene: SceneScript: {err}");
+            }
+        }
+        log::debug!(
+            "scene: SceneScript {bindings} binding(s) on {} layer(s), {failing} failing",
+            self.script_binding_objs.len()
+        );
+        if bindings > 0 {
+            self.scripts = Some(host);
+        }
+    }
+
+    /// Run one frame of SceneScripts and apply the produced property values.
+    fn tick_scripts(
+        &mut self,
+        time: f32,
+        dt: f32,
+        daytime: f32,
+        pointer_world: [f32; 2],
+        ortho: [f32; 2],
+    ) {
+        let Some(host) = self.scripts.as_mut() else {
+            return;
+        };
+        if host.is_empty() {
+            return;
+        }
+
+        // Property scripts own their layer's visible/text state, so clear the
+        // previous frame's results before the scripts run again.
+        for &idx in &self.script_binding_objs {
+            let obj = &mut self.objects[idx];
+            obj.script_visible = None;
+            if let Some(s) = obj.script.as_mut() {
+                s.text_out = None;
+            }
+        }
+
+        self.script_frames.clear();
+        for &idx in &self.script_objs {
+            let props = &self.properties;
+            let obj = &mut self.objects[idx];
+            let prev_visible = obj.script_visible;
+            let alpha = obj.color[3];
+            let color = [obj.color[0], obj.color[1], obj.color[2]];
+            let visible = prev_visible.unwrap_or_else(|| obj.visible.eval(props));
+            let Some(id) = obj.id else { continue };
+            let Some(s) = obj.script.as_mut() else {
+                continue;
+            };
+            self.script_frames.push(LayerFrame {
+                id,
+                visible,
+                alpha,
+                origin: s.parts.0,
+                scale: s.parts.1,
+                angles: [
+                    s.parts.2[0].to_degrees(),
+                    s.parts.2[1].to_degrees(),
+                    s.parts.2[2].to_degrees(),
+                ],
+                color,
+                text: s.text.clone(),
+            });
+        }
+
+        let screen = [self.width as f32, self.height as f32];
+        let outputs = host.tick(
+            time,
+            dt,
+            daytime,
+            pointer_world,
+            ortho,
+            screen,
+            &self.script_frames,
+        );
+        for out in outputs {
+            let Some(&idx) = self.script_ids.get(&out.id) else {
+                continue;
+            };
+            let obj = &mut self.objects[idx];
+            match out.field {
+                ScriptField::Visible => {
+                    obj.script_visible = Some(out.value.as_bool().unwrap_or(true));
+                }
+                ScriptField::Alpha => {
+                    let a = out.value.as_f64().unwrap_or(1.0) as f32;
+                    obj.color[3] = a.clamp(0.0, 1.0);
+                }
+                ScriptField::Color => {
+                    let c = crate::render::scenescript::prop_vec3(&out.value, [1.0; 3]);
+                    obj.color[0] = c[0];
+                    obj.color[1] = c[1];
+                    obj.color[2] = c[2];
+                }
+                ScriptField::Text => {
+                    if let Some(s) = obj.script.as_mut() {
+                        s.text_out = Some(value_to_string(&out.value));
+                    }
+                }
+                ScriptField::Origin | ScriptField::Scale | ScriptField::Angles => {
+                    let v3 = crate::render::scenescript::prop_vec3(&out.value, [0.0; 3]);
+                    let Some(s) = obj.script.as_mut() else { continue };
+                    match out.field {
+                        ScriptField::Origin => s.parts.0 = v3,
+                        ScriptField::Scale => s.parts.1 = v3,
+                        _ => {
+                            s.parts.2 = [
+                                v3[0].to_radians(),
+                                v3[1].to_radians(),
+                                v3[2].to_radians(),
+                            ]
+                        }
+                    }
+                    if obj.attach.is_none() {
+                        obj.transform = s
+                            .parent
+                            .mul(compose_local(s.parts.0, s.parts.1, s.parts.2));
+                    }
+                }
+            }
+        }
     }
 
     /// Collect Wallpaper Engine `sound` layer objects.  They are not started
@@ -3973,6 +4404,8 @@ impl SceneRenderer {
                 attach: None,
                 raw_idx: None,
                 raw_obj: serde_json::Value::Null,
+                script: None,
+                script_visible: None,
             });
         }
         for p in doc.particles {
@@ -4008,6 +4441,8 @@ impl SceneRenderer {
                 attach: None,
                 raw_idx: None,
                 raw_obj: serde_json::Value::Null,
+                script: None,
+                script_visible: None,
             });
         }
         Ok(())
@@ -4299,6 +4734,12 @@ impl SceneRenderer {
                 }
             }
         }
+
+        // Script properties resolve their overrides when they are compiled, so
+        // a user property change has to rebuild every SceneScript binding.
+        // Rebuilding on the next frame collapses a batch of property
+        // assignments into a single compile pass.
+        self.scripts_dirty = true;
     }
 
     fn cover_uv_transform(&self) -> ([f32; 2], [f32; 2]) {
@@ -4802,6 +5243,141 @@ impl TextLayer {
 // Loading helpers
 // ---------------------------------------------------------------------------
 
+/// Normalise a Wallpaper Engine `parent` field to an object id.
+fn parent_id(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// Layer names a SceneScript reaches for through `thisScene.getLayer('name')`.
+///
+/// The scene table handed to QuickJS covers every layer, but per-frame values
+/// are only fed for layers a script can actually observe, so the named
+/// lookups have to be discovered from the script source.
+fn layer_script_refs(raw: &serde_json::Value) -> Vec<String> {
+    const KEYS: [&str; 7] = [
+        "visible", "alpha", "origin", "scale", "angles", "color", "text",
+    ];
+    let mut out = Vec::new();
+    for key in KEYS {
+        let Some(script) = raw
+            .get(key)
+            .and_then(|v| v.get("script"))
+            .and_then(|s| s.as_str())
+        else {
+            continue;
+        };
+        collect_get_layer_names(script, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Extract the string literal argument of every `getLayer(...)` call.
+fn collect_get_layer_names(src: &str, out: &mut Vec<String>) {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while let Some(pos) = src[i..].find("getLayer") {
+        let mut p = i + pos + "getLayer".len();
+        i = p;
+        while matches!(bytes.get(p), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            p += 1;
+        }
+        if bytes.get(p) != Some(&b'(') {
+            continue;
+        }
+        p += 1;
+        while matches!(bytes.get(p), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            p += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(p) else {
+            continue;
+        };
+        p += 1;
+        let start = p;
+        while let Some(&c) = bytes.get(p) {
+            if c == quote || c == b'\n' {
+                break;
+            }
+            p += 1;
+        }
+        if bytes.get(p) == Some(&quote) && p > start {
+            if let Ok(name) = std::str::from_utf8(&bytes[start..p]) {
+                out.push(name.to_string());
+            }
+        }
+    }
+}
+
+/// Layers whose properties are driven by a Wallpaper Engine SceneScript.
+fn object_has_script(raw: &serde_json::Value) -> bool {
+    const KEYS: [&str; 7] = [
+        "visible", "alpha", "origin", "scale", "angles", "color", "text",
+    ];
+    KEYS.iter().any(|key| {
+        raw.get(*key)
+            .and_then(|v| v.get("script"))
+            .and_then(|s| s.as_str())
+            .is_some()
+    })
+}
+
+/// Resolve a scripted property definition into the value handed to
+/// `update(value)` / `init(value)` and the property block that overrides the
+/// script's declared `createScriptProperties()` defaults.
+fn field_script_defaults(
+    field: crate::render::scenescript::ScriptField,
+    def: &serde_json::Value,
+    props: &HashMap<String, serde_json::Value>,
+) -> (serde_json::Value, serde_json::Map<String, serde_json::Value>) {
+    use crate::render::scenescript::{prop_vec3, ScriptField};
+
+    let mut script_props = serde_json::Map::new();
+    if let Some(block) = def.get("scriptproperties").and_then(|p| p.as_object()) {
+        for (name, value) in block {
+            let resolved = if value.get("user").is_some() {
+                resolve_prop(value, props)
+            } else {
+                value.clone()
+            };
+            script_props.insert(name.clone(), resolved);
+        }
+    }
+
+    let authored = def.get("value");
+    let resolved = authored.map(|v| resolve_prop(v, props));
+    let rv = resolved.as_ref().unwrap_or(&serde_json::Value::Null);
+    let initial = match field {
+        ScriptField::Visible => {
+            serde_json::Value::Bool(resolved.as_ref().and_then(value_bool).unwrap_or(true))
+        }
+        ScriptField::Alpha => {
+            serde_json::Value::from(resolved.as_ref().and_then(value_f32).unwrap_or(1.0) as f64)
+        }
+        ScriptField::Text => {
+            serde_json::Value::String(resolved.map(|v| value_to_string(&v)).unwrap_or_default())
+        }
+        ScriptField::Color => serde_json::Value::from(prop_vec3(rv, [1.0, 1.0, 1.0])),
+        ScriptField::Angles => {
+            let mut a = prop_vec3(rv, [0.0, 0.0, 0.0]);
+            for c in a.iter_mut() {
+                *c = c.to_degrees();
+            }
+            serde_json::Value::from(a)
+        }
+        ScriptField::Origin | ScriptField::Scale => {
+            let default = if field == ScriptField::Scale {
+                [1.0, 1.0, 1.0]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            serde_json::Value::from(prop_vec3(rv, default))
+        }
+    };
+    (initial, script_props)
+}
+
 fn parse_alignment(obj: &serde_json::Value) -> [f32; 2] {
     let s = obj
         .get("alignment")
@@ -5007,6 +5583,9 @@ fn load_effects(
 impl Renderer for SceneRenderer {
     fn render(&mut self, gl: &glow::Context, info: &FrameInfo) -> Result<bool> {
         self.ensure_scene(gl)?;
+        if self.scripts_dirty {
+            self.load_scene_scripts();
+        }
         self.start_sounds();
         // Video-texture layers play their own stream; hand them the frame
         // before anything samples the texture.
@@ -5057,11 +5636,13 @@ impl Renderer for SceneRenderer {
             / 86400.0)
             .clamp(0.0, 1.0);
 
-        // Refresh text and skeletal puppet meshes before computing layer bounds.
+        // Evaluate keyframe / property animation and hand every layer to the
+        // SceneScript host.  Script results are applied before text and puppet
+        // refresh so a script can drive `text`, `visible` and `alpha`.
         {
             let props = &self.properties;
             for obj in self.objects.iter_mut() {
-                if !obj.visible.eval(props) && !obj.capture_composite {
+                if !obj.is_visible(props) && !obj.capture_composite {
                     continue;
                 }
                 if let Some(anim) = &obj.anim {
@@ -5072,10 +5653,33 @@ impl Renderer for SceneRenderer {
                     if let Some(a) = alpha {
                         obj.color[3] = a;
                     }
+                    let parts = anim.components(time, daytime, now);
+                    if let Some(s) = obj.script.as_mut() {
+                        s.parts = parts;
+                    }
+                }
+            }
+        }
+
+        self.tick_scripts(time, dt, daytime, pointer_world, ortho);
+
+        // Refresh text and skeletal puppet meshes before computing layer bounds.
+        {
+            let props = &self.properties;
+            for obj in self.objects.iter_mut() {
+                if !obj.is_visible(props) && !obj.capture_composite {
+                    continue;
                 }
                 match &mut obj.kind {
                     ObjectKind::Text(layer) => {
-                        let value = layer.evaluate(props, now);
+                        let scripted = obj.script.as_mut().and_then(|s| s.text_out.take());
+                        let value = match scripted {
+                            Some(t) => t,
+                            None => layer.evaluate(props, now),
+                        };
+                        if let Some(s) = obj.script.as_mut() {
+                            s.text = value.clone();
+                        }
                         // Wallpaper Engine rasterises text at the layer's
                         // authored scale, so a group that is scaled up (e.g. a
                         // 20pt headline stretched 1.5x) keeps full glyph
@@ -6076,6 +6680,51 @@ struct NativeParticleDef {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn get_layer_names_are_extracted_from_script_sources() {
+        let raw = json!({
+            "id": 7,
+            "scale": {
+                "script": "let a = thisScene.getLayer('grid_v_1');\nlet b = thisScene.getLayer(\"SharedNoise\");\nlet c = thisScene.getLayer(name);"
+            },
+            "alpha": { "value": 1.0 }
+        });
+        let mut refs = layer_script_refs(&raw);
+        refs.sort();
+        assert_eq!(refs, vec!["SharedNoise".to_string(), "grid_v_1".to_string()]);
+        assert!(object_has_script(&raw));
+        assert!(!object_has_script(&json!({"id": 1, "alpha": {"value": 1.0}})));
+        assert_eq!(parent_id(&json!("42")), Some(42));
+        assert_eq!(parent_id(&json!(42)), Some(42));
+        assert_eq!(parent_id(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn scripted_field_defaults_convert_units_and_user_overrides() {
+        let mut props = HashMap::new();
+        props.insert("spin".to_string(), json!(0.5));
+
+        let (initial, sp) = field_script_defaults(
+            ScriptField::Angles,
+            &json!({
+                "value": "0.00000 0.00000 1.57080",
+                "scriptproperties": { "speed": { "user": "spin" }, "enabled": true }
+            }),
+            &props,
+        );
+        let v = initial.as_array().expect("vec3");
+        assert!((v[2].as_f64().unwrap() - 90.0).abs() < 1e-3);
+        assert_eq!(sp.get("speed"), Some(&json!(0.5)));
+        assert_eq!(sp.get("enabled"), Some(&json!(true)));
+
+        let (alpha, _) =
+            field_script_defaults(ScriptField::Alpha, &json!({ "value": 0.25 }), &props);
+        assert!((alpha.as_f64().unwrap() - 0.25).abs() < 1e-6);
+
+        let (visible, _) = field_script_defaults(ScriptField::Visible, &json!({}), &props);
+        assert_eq!(visible, json!(true));
+    }
 
     fn sample_time(hour: u32, minute: u32) -> text::LocalTime {
         text::LocalTime {
