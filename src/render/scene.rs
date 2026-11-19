@@ -34,7 +34,7 @@ use super::keytrack::KeyTrack;
 use super::scenescript::{
     AnimLayerField, AnimLayerSeed, CursorEventInput, CursorEventKind, EffectSeed, LayerFrame,
     LayerSeed, MediaEventInput, PropAnimSeed, SceneScripts, ScriptField, ScriptOutput,
-    ScriptTarget, TexAnimSeed, VideoTexSeed,
+    ScriptTarget, SoundSeed, TexAnimSeed, VideoTexSeed,
 };
 use super::text;
 use super::we_effect::{
@@ -3442,6 +3442,7 @@ enum ObjectKind {
     Text(Box<TextLayer>),
     Solid,
     Particle(usize),
+    Sound(usize),
     Compose {
         copy_background: bool,
     },
@@ -3904,7 +3905,12 @@ impl SceneObject {
 
     /// Hit-test a scene world coordinate against the layer's oriented bounds.
     fn hit_test(&self, world_pos: [f32; 2], parallax_offset: [f32; 2]) -> Option<[f32; 2]> {
-        if !self.solid || matches!(self.kind, ObjectKind::Post | ObjectKind::Particle(_)) {
+        if !self.solid
+            || matches!(
+                self.kind,
+                ObjectKind::Post | ObjectKind::Particle(_) | ObjectKind::Sound(_)
+            )
+        {
             return None;
         }
         let local = self
@@ -3977,6 +3983,7 @@ impl SceneObject {
             ObjectKind::Text(layer) => DrawKind::Text(layer.texture),
             ObjectKind::Solid => DrawKind::Solid,
             ObjectKind::Particle(_)
+            | ObjectKind::Sound(_)
             | ObjectKind::Compose { .. }
             | ObjectKind::CompositeRef(_)
             | ObjectKind::Post => DrawKind::None,
@@ -4090,17 +4097,125 @@ impl CanvasPool {
 // Renderer
 // ---------------------------------------------------------------------------
 
-/// A Wallpaper Engine scene `sound` layer waiting to be started.
-struct SoundSpec {
+/// Scriptable Wallpaper Engine scene `sound` layer (lazily backed by libmpv).
+struct SceneSound {
     files: Vec<std::path::PathBuf>,
+    mode: super::video::AudioPlayMode,
+    min_time: f32,
+    max_time: f32,
+    min_volume: f32,
+    max_volume: f32,
     base_volume: f32,
-    shuffle: bool,
+    script_volume: Option<f32>,
+    playing: bool,
+    script_paused: bool,
+    player: Option<super::video::AudioPlayer>,
+    init_failed: bool,
 }
 
-/// A running scene sound (one libmpv instance per sound layer).
-struct SceneSound {
-    player: super::video::AudioPlayer,
-    base_volume: f32,
+impl SceneSound {
+    fn effective_layer_volume(&self) -> f32 {
+        self.script_volume
+            .unwrap_or(self.base_volume)
+            .clamp(0.0, 1.0)
+    }
+
+    fn is_playing(&self) -> bool {
+        self.player
+            .as_ref()
+            .map(|p| p.is_playing())
+            .unwrap_or(self.playing && !self.script_paused)
+    }
+
+    fn poll(&mut self) {
+        if let Some(p) = &mut self.player {
+            if p.poll() {
+                self.playing = false;
+            }
+        }
+    }
+
+    fn sync_player(
+        &mut self,
+        master_volume: f32,
+        muted: bool,
+        global_paused: bool,
+        layer_visible: bool,
+        sounds_started: bool,
+    ) {
+        let eff_vol = (master_volume * self.effective_layer_volume()).clamp(0.0, 1.0);
+        if sounds_started
+            && self.player.is_none()
+            && !self.init_failed
+            && self.playing
+            && !self.script_paused
+            && eff_vol > 0.0
+            && !muted
+            && layer_visible
+        {
+            let cfg = super::video::AudioPlayerConfig {
+                mode: self.mode,
+                start_silent: false,
+                volume: eff_vol,
+                muted,
+                min_time: self.min_time,
+                max_time: self.max_time,
+                min_volume: self.min_volume,
+                max_volume: self.max_volume,
+            };
+            match super::video::AudioPlayer::new(&self.files, cfg) {
+                Ok(p) => self.player = Some(p),
+                Err(err) => {
+                    log::warn!("scene sound playback disabled: {err}");
+                    self.init_failed = true;
+                }
+            }
+        }
+        if let Some(p) = &mut self.player {
+            p.set_volume(eff_vol);
+            p.set_muted(muted || !layer_visible);
+            p.set_global_paused(global_paused);
+        }
+    }
+
+    fn cmd_play(
+        &mut self,
+        master_volume: f32,
+        muted: bool,
+        global_paused: bool,
+        layer_visible: bool,
+        sounds_started: bool,
+    ) {
+        self.playing = true;
+        self.script_paused = false;
+        if let Some(p) = &mut self.player {
+            p.play();
+        }
+        self.sync_player(
+            master_volume,
+            muted,
+            global_paused,
+            layer_visible,
+            sounds_started,
+        );
+    }
+
+    fn cmd_pause(&mut self) {
+        if self.playing {
+            self.script_paused = true;
+            if let Some(p) = &mut self.player {
+                p.pause();
+            }
+        }
+    }
+
+    fn cmd_stop(&mut self) {
+        self.playing = false;
+        self.script_paused = false;
+        if let Some(p) = &mut self.player {
+            p.stop();
+        }
+    }
 }
 
 pub struct SceneRenderer {
@@ -4151,9 +4266,8 @@ pub struct SceneRenderer {
 
     objects: Vec<SceneObject>,
     emitters: Vec<Emitter>,
-    /// Wallpaper Engine scene `sound` layers, started on the first frame so the
-    /// backend's mute/volume settings are applied before playback begins.
-    sound_specs: Vec<SoundSpec>,
+    /// Wallpaper Engine scene `sound` layers, lazily backed by libmpv after the
+    /// first frame so mute/volume settings apply before playback starts.
     sounds: Vec<SceneSound>,
     sound_temp_dir: Option<std::path::PathBuf>,
     sounds_started: bool,
@@ -4271,7 +4385,6 @@ impl SceneRenderer {
             view_shift: 0.0,
             objects: Vec::new(),
             emitters: Vec::new(),
-            sound_specs: Vec::new(),
             sounds: Vec::new(),
             sound_temp_dir: None,
             sounds_started: false,
@@ -4421,7 +4534,6 @@ impl SceneRenderer {
         // widening branch below, so it must never leak in from a previous load.
         self.view_shift = 0.0;
         self.sounds.clear();
-        self.sound_specs.clear();
         self.sounds_started = false;
         self.scene_general = root.get("general").cloned();
         self.raw_nodes.clear();
@@ -4632,7 +4744,6 @@ impl SceneRenderer {
                 anims.insert(id, a);
             }
         }
-        self.collect_sounds(pkg, &raws.iter().map(|r| &r.obj).collect::<Vec<_>>(), now);
         for (i, raw) in raws.iter().enumerate() {
             let obj = &raw.obj;
             let transform = resolved[i].unwrap_or_else(Affine::identity);
@@ -4764,6 +4875,94 @@ impl SceneRenderer {
                         capture_composite,
                         effects: load_effects(gl, pkg, obj, &self.properties, now),
                         kind: ObjectKind::Text(Box::new(layer)),
+                        anim: None,
+                        sprite: None,
+                        attach: None,
+                        raw_idx: Some(i),
+                        raw_obj: obj.clone(),
+                        parent_obj: None,
+                        local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
+                        script_visible: None,
+                        script_text_override: None,
+                        script_sprite_frame: None,
+                        media_tex: None,
+                    });
+                }
+                continue;
+            }
+
+            if let Some(list) = obj.get("sound").and_then(|v| v.as_array()) {
+                let mut files = Vec::new();
+                for sound in list {
+                    let Some(rel) = sound.as_str() else {
+                        continue;
+                    };
+                    match self.resolve_sound_file(pkg, rel) {
+                        Some(path) => files.push(path),
+                        None => log::warn!("scene sound '{rel}' not found in package"),
+                    }
+                }
+                if !files.is_empty() {
+                    let base_volume = eval_sound_volume(obj.get("volume"), &self.properties);
+                    let start_silent = obj
+                        .get("startsilent")
+                        .and_then(value_bool)
+                        .unwrap_or(false);
+                    let mode = super::video::AudioPlayMode::parse(
+                        obj.get("playbackmode").and_then(|v| v.as_str()),
+                    );
+                    let min_time = obj
+                        .get("mintime")
+                        .and_then(value_f32)
+                        .unwrap_or(1.0)
+                        .max(0.0);
+                    let max_time = obj
+                        .get("maxtime")
+                        .and_then(value_f32)
+                        .unwrap_or(5.0)
+                        .max(min_time);
+                    let min_volume = obj
+                        .get("minvolume")
+                        .and_then(value_f32)
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0);
+                    let max_volume = obj
+                        .get("maxvolume")
+                        .and_then(value_f32)
+                        .unwrap_or(1.0)
+                        .clamp(min_volume, 1.0);
+                    let sidx = self.sounds.len();
+                    self.sounds.push(SceneSound {
+                        files,
+                        mode,
+                        min_time,
+                        max_time,
+                        min_volume,
+                        max_volume,
+                        base_volume,
+                        script_volume: None,
+                        playing: !start_silent,
+                        script_paused: false,
+                        player: None,
+                        init_failed: false,
+                    });
+                    self.objects.push(SceneObject {
+                        id: obj_id,
+                        name,
+                        transform,
+                        size: [0.0, 0.0],
+                        align: [0.0, 0.0],
+                        color: [1.0, 1.0, 1.0, 0.0],
+                        brightness: 1.0,
+                        blend: LayerBlend::Normal,
+                        color_blend: 0,
+                        parallax: [0.0, 0.0],
+                        visible,
+                        solid: false,
+                        dependencies,
+                        capture_composite: false,
+                        effects: Vec::new(),
+                        kind: ObjectKind::Sound(sidx),
                         anim: None,
                         sprite: None,
                         attach: None,
@@ -5409,7 +5608,10 @@ impl SceneRenderer {
         // the whole view, so they are skipped.
         for o in self.objects.iter_mut() {
             let Some(id) = o.id else { continue };
-            if matches!(o.kind, ObjectKind::Particle(_) | ObjectKind::Post) {
+            if matches!(
+                o.kind,
+                ObjectKind::Particle(_) | ObjectKind::Post | ObjectKind::Sound(_)
+            ) {
                 continue;
             }
             if matches!(o.kind, ObjectKind::Image(_)) {
@@ -5434,6 +5636,7 @@ impl SceneRenderer {
                     ObjectKind::Text(_) => "text",
                     ObjectKind::Solid => "solid",
                     ObjectKind::Particle(_) => "particle",
+                    ObjectKind::Sound(_) => "sound",
                     ObjectKind::Compose { .. } => "compose",
                     ObjectKind::CompositeRef(_) => "composite_ref",
                     ObjectKind::Post => "post",
@@ -5855,6 +6058,9 @@ impl SceneRenderer {
         self.prev_cursor_world = None;
         self.cursor_events.clear();
         self.media_status_sent = false;
+        for snd in &mut self.sounds {
+            snd.script_volume = None;
+        }
         for obj in self.objects.iter_mut() {
             obj.script_visible = None;
             obj.script_text_override = None;
@@ -5951,6 +6157,7 @@ impl SceneRenderer {
                 ObjectKind::Text(_) => "text",
                 ObjectKind::Solid => "solid",
                 ObjectKind::Particle(_) => "particle",
+                ObjectKind::Sound(_) => "sound",
                 ObjectKind::Compose { .. } | ObjectKind::CompositeRef(_) | ObjectKind::Post => {
                     "group"
                 }
@@ -5970,6 +6177,13 @@ impl SceneRenderer {
                     current_time: vt.current_time() as f32,
                     playing: !vt.is_script_paused(),
                     rate: vt.playback_rate(),
+                }),
+                _ => None,
+            };
+            let sound = match &obj.kind {
+                ObjectKind::Sound(sidx) => self.sounds.get(*sidx).map(|s| SoundSeed {
+                    volume: s.effective_layer_volume(),
+                    playing: s.is_playing(),
                 }),
                 _ => None,
             };
@@ -5994,6 +6208,7 @@ impl SceneRenderer {
                 parent,
                 tex_anim,
                 video_tex,
+                sound,
             });
             for eff in &obj.effects {
                 let raw_eff = obj
@@ -6105,6 +6320,7 @@ impl SceneRenderer {
                 (ScriptField::Angles, "angles"),
                 (ScriptField::Color, "color"),
                 (ScriptField::Text, "text"),
+                (ScriptField::Volume, "volume"),
             ] {
                 let Some(v) = raw.get(key) else { continue };
                 let Some(script) = v.get("script").and_then(|s| s.as_str()) else {
@@ -6320,6 +6536,7 @@ impl SceneRenderer {
             return;
         }
         let mut transforms_dirty = false;
+        let mut sounds_dirty = false;
         for out in outputs {
             match out.target {
                 ScriptTarget::Layer { id, field } => {
@@ -6330,6 +6547,9 @@ impl SceneRenderer {
                     match field {
                         ScriptField::Visible => {
                             obj.script_visible = Some(out.value.as_bool().unwrap_or(true));
+                            if matches!(obj.kind, ObjectKind::Sound(_)) {
+                                sounds_dirty = true;
+                            }
                         }
                         ScriptField::Alpha => {
                             let a = out.value.as_f64().unwrap_or(1.0) as f32;
@@ -6343,6 +6563,15 @@ impl SceneRenderer {
                         }
                         ScriptField::Text => {
                             obj.script_text_override = Some(value_to_string(&out.value));
+                        }
+                        ScriptField::Volume => {
+                            let v = (out.value.as_f64().unwrap_or(1.0) as f32).clamp(0.0, 1.0);
+                            if let ObjectKind::Sound(sidx) = obj.kind {
+                                if let Some(snd) = self.sounds.get_mut(sidx) {
+                                    snd.script_volume = Some(v);
+                                    sounds_dirty = true;
+                                }
+                            }
                         }
                         ScriptField::Origin | ScriptField::Scale | ScriptField::Angles => {
                             let v3 = crate::render::scenescript::prop_vec3(&out.value, [0.0; 3]);
@@ -6576,10 +6805,34 @@ impl SceneRenderer {
                     };
                     self.objects[idx].solid = out.value.as_bool().unwrap_or(true);
                 }
+                ScriptTarget::SoundControl { layer_id } => {
+                    let Some(&idx) = self.script_ids.get(&layer_id) else {
+                        continue;
+                    };
+                    if let ObjectKind::Sound(sidx) = self.objects[idx].kind {
+                        let vis = self.is_obj_visible(idx);
+                        let (master_vol, muted, paused, started) =
+                            (self.volume, self.muted, self.paused, self.sounds_started);
+                        if let Some(snd) = self.sounds.get_mut(sidx) {
+                            match out.value.get("action").and_then(|v| v.as_str()) {
+                                Some("play") => {
+                                    snd.cmd_play(master_vol, muted, paused, vis, started)
+                                }
+                                Some("pause") => snd.cmd_pause(),
+                                Some("stop") => snd.cmd_stop(),
+                                _ => {}
+                            }
+                            sounds_dirty = true;
+                        }
+                    }
+                }
             }
         }
         if transforms_dirty {
             self.propagate_transforms();
+        }
+        if sounds_dirty {
+            self.sync_sounds();
         }
     }
 
@@ -6822,6 +7075,13 @@ impl SceneRenderer {
                     .map(|vt| (vt.current_time() as f32, vt.duration() as f32)),
                 _ => None,
             };
+            let sound = match &obj.kind {
+                ObjectKind::Sound(sidx) => self
+                    .sounds
+                    .get(*sidx)
+                    .map(|s| (s.effective_layer_volume(), s.is_playing())),
+                _ => None,
+            };
             self.script_frames.push(LayerFrame {
                 id,
                 visible,
@@ -6836,6 +7096,7 @@ impl SceneRenderer {
                 color,
                 text,
                 video_time,
+                sound,
             });
         }
 
@@ -6862,69 +7123,6 @@ impl SceneRenderer {
         self.apply_script_outputs(outputs);
     }
 
-    /// Collect Wallpaper Engine `sound` layer objects.  They are not started
-    /// here: the backend applies the configured mute/volume right after the
-    /// renderer is constructed, so playback is deferred to the first frame
-    /// (`start_sounds`).
-    fn collect_sounds(
-        &mut self,
-        pkg: &PackageFs,
-        objects: &[&serde_json::Value],
-        _now: text::LocalTime,
-    ) {
-        for obj in objects {
-            let Some(list) = obj.get("sound").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            // `startsilent` sounds wait for a SceneScript trigger we cannot run
-            // yet; starting them eagerly would play unrelated audio.
-            if obj
-                .get("startsilent")
-                .and_then(value_bool)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let base_volume = obj
-                .get("volume")
-                .and_then(value_f32)
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
-            if base_volume <= 0.0 {
-                continue;
-            }
-            let shuffle = obj
-                .get("playbackmode")
-                .and_then(|v| v.as_str())
-                .map(|m| m.eq_ignore_ascii_case("random"))
-                .unwrap_or(false);
-            let mut files = Vec::new();
-            for sound in list {
-                let Some(rel) = sound.as_str() else {
-                    continue;
-                };
-                match self.resolve_sound_file(pkg, rel) {
-                    Some(path) => files.push(path),
-                    None => log::warn!("scene sound '{rel}' not found in package"),
-                }
-            }
-            if files.is_empty() {
-                continue;
-            }
-            self.sound_specs.push(SoundSpec {
-                files,
-                base_volume,
-                shuffle,
-            });
-        }
-        if !self.sound_specs.is_empty() {
-            log::debug!("scene sounds: {} layer(s)", self.sound_specs.len());
-        }
-    }
-
-    /// Resolve a `sound` entry to a real file path.  Directory wallpapers are
-    /// used in place; archive-backed wallpapers extract the audio next to the
-    /// other temporary files, since libmpv cannot read from a `.pkg`.
     fn resolve_sound_file(
         &mut self,
         pkg: &PackageFs,
@@ -6965,32 +7163,24 @@ impl SceneRenderer {
         dir
     }
 
-    /// Start deferred scene sounds with the current volume/mute state.
-    fn start_sounds(&mut self) {
-        if self.sounds_started {
-            return;
+    fn poll_sounds(&mut self) {
+        for sound in &mut self.sounds {
+            sound.poll();
         }
-        self.sounds_started = true;
-        let specs = std::mem::take(&mut self.sound_specs);
-        for spec in specs {
-            let volume = (self.volume * spec.base_volume).clamp(0.0, 1.0);
-            match super::video::AudioPlayer::new(
-                &spec.files,
-                spec.shuffle,
-                volume,
-                self.muted,
-            ) {
-                Ok(mut player) => {
-                    if self.paused {
-                        player.set_paused(true);
-                    }
-                    self.sounds.push(SceneSound {
-                        player,
-                        base_volume: spec.base_volume,
-                    });
+    }
+
+    fn sync_sounds(&mut self) {
+        let mut vis_by_sound = vec![true; self.sounds.len()];
+        for i in 0..self.objects.len() {
+            if let ObjectKind::Sound(sidx) = self.objects[i].kind {
+                if sidx < vis_by_sound.len() {
+                    vis_by_sound[sidx] = self.is_obj_visible(i);
                 }
-                Err(err) => log::warn!("scene sound playback disabled: {err}"),
             }
+        }
+        for (sidx, sound) in self.sounds.iter_mut().enumerate() {
+            let vis = vis_by_sound.get(sidx).copied().unwrap_or(true);
+            sound.sync_player(self.volume, self.muted, self.paused, vis, self.sounds_started);
         }
     }
 
@@ -7471,6 +7661,15 @@ impl SceneRenderer {
                         }
                     }
                 }
+                ObjectKind::Sound(sidx) => {
+                    let new_base = eval_sound_volume(raw.get("volume"), &self.properties);
+                    if let Some(snd) = self.sounds.get_mut(*sidx) {
+                        if (new_base - snd.base_volume).abs() > 1e-4 {
+                            snd.base_volume = new_base;
+                            snd.script_volume = None;
+                        }
+                    }
+                }
                 ObjectKind::Text(layer) => {
                     if !has_binding(obj_id, ScriptField::Color) {
                         let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
@@ -7588,7 +7787,10 @@ impl SceneRenderer {
                                 if scale[0] == 0.0 { 1.0 } else { scale[0] },
                                 if scale[1] == 0.0 { 1.0 } else { scale[1] },
                             ));
-                    } else if !matches!(obj.kind, ObjectKind::Post | ObjectKind::Particle(_)) {
+                    } else if !matches!(
+                        obj.kind,
+                        ObjectKind::Post | ObjectKind::Particle(_) | ObjectKind::Sound(_)
+                    ) {
                         let prev_anim = obj.anim.take();
                         let mut next_anim = ObjAnim::parse(
                             raw,
@@ -7609,6 +7811,7 @@ impl SceneRenderer {
         if transforms_dirty {
             self.propagate_transforms();
         }
+        self.sync_sounds();
         if self.scripts.is_none()
             && self
                 .objects
@@ -8409,9 +8612,26 @@ fn parent_id(v: &serde_json::Value) -> Option<i64> {
 
 /// Invoke `f` for every SceneScript source string attached to `raw`
 /// (layer fields, effect visibility, and effect pass constants).
+fn eval_sound_volume(
+    def: Option<&serde_json::Value>,
+    props: &HashMap<String, serde_json::Value>,
+) -> f32 {
+    let Some(def) = def else {
+        return 1.0;
+    };
+    let resolved = if def.get("user").is_some() {
+        resolve_prop(def, props)
+    } else if let Some(val) = def.get("value") {
+        resolve_prop(val, props)
+    } else {
+        resolve_prop(def, props)
+    };
+    value_f32(&resolved).unwrap_or(1.0).clamp(0.0, 1.0)
+}
+
 fn visit_object_scripts(raw: &serde_json::Value, mut f: impl FnMut(&str)) {
-    const KEYS: [&str; 7] = [
-        "visible", "alpha", "origin", "scale", "angles", "color", "text",
+    const KEYS: [&str; 8] = [
+        "visible", "alpha", "origin", "scale", "angles", "color", "text", "volume",
     ];
     for key in KEYS {
         if let Some(script) = raw
@@ -8603,7 +8823,7 @@ fn field_script_defaults(
         ScriptField::Visible => {
             serde_json::Value::Bool(resolved.as_ref().and_then(value_bool).unwrap_or(true))
         }
-        ScriptField::Alpha => {
+        ScriptField::Alpha | ScriptField::Volume => {
             serde_json::Value::from(resolved.as_ref().and_then(value_f32).unwrap_or(1.0) as f64)
         }
         ScriptField::Text => {
@@ -8853,7 +9073,8 @@ impl Renderer for SceneRenderer {
                 self.apply_script_outputs(outputs);
             }
         }
-        self.start_sounds();
+        self.sounds_started = true;
+        self.poll_sounds();
         // Video-texture layers play their own stream; hand them the frame
         // before anything samples the texture.
         self.textures.update_videos(gl, self.paused);
@@ -9011,6 +9232,7 @@ impl Renderer for SceneRenderer {
             ortho,
             &info.spectrum,
         );
+        self.sync_sounds();
 
         // Refresh text and skeletal puppet meshes before computing layer bounds.
         for i in 0..self.objects.len() {
@@ -9140,6 +9362,10 @@ impl Renderer for SceneRenderer {
                     pointer_world,
                     None,
                 )?;
+                continue;
+            }
+
+            if matches!(self.objects[i].kind, ObjectKind::Sound(_)) {
                 continue;
             }
 
@@ -9698,18 +9924,12 @@ impl Renderer for SceneRenderer {
 
     fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
-        for sound in &mut self.sounds {
-            sound.player.set_paused(paused);
-        }
+        self.sync_sounds();
     }
 
     fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
-        for sound in &mut self.sounds {
-            sound
-                .player
-                .set_volume((self.volume * sound.base_volume).clamp(0.0, 1.0));
-        }
+        self.sync_sounds();
     }
 
     fn set_property(&mut self, key: &str, value: &str) -> Result<()> {
@@ -9719,9 +9939,7 @@ impl Renderer for SceneRenderer {
                     value.trim().to_ascii_lowercase().as_str(),
                     "1" | "true" | "yes" | "on"
                 );
-                for sound in &mut self.sounds {
-                    sound.player.set_muted(self.muted);
-                }
+                self.sync_sounds();
             }
             "volume" => {
                 if let Ok(v) = value.parse::<f32>() {
@@ -9762,7 +9980,7 @@ impl Renderer for SceneRenderer {
     fn destroy(&mut self, gl: &glow::Context) {
         // Stop scene audio before releasing GL resources.
         self.sounds.clear();
-        self.sound_specs.clear();
+        self.sounds_started = false;
         if let Some((_, tex, _, _)) = self.media_thumb_tex.take() {
             unsafe { gl.delete_texture(tex) };
         }
@@ -10786,5 +11004,75 @@ mod tests {
         assert!((em_line.particles[1].x - 100.0).abs() < 1e-3);
         assert!((em_line.particles[1].y - 50.0).abs() < 1e-3);
         assert!((em_line.particles[2].x - 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn sound_layer_volume_mode_and_state_transitions() {
+        let mut props = HashMap::new();
+        assert!((eval_sound_volume(Some(&serde_json::json!(0.69)), &props) - 0.69).abs() < 1e-4);
+        let user_vol = serde_json::json!({ "user": "sound", "value": 0.0 });
+        assert!((eval_sound_volume(Some(&user_vol), &props) - 0.0).abs() < 1e-4);
+        props.insert("sound".into(), serde_json::json!(0.65));
+        assert!((eval_sound_volume(Some(&user_vol), &props) - 0.65).abs() < 1e-4);
+
+        let script_user_vol = serde_json::json!({
+            "script": "export function update(v) { return v; }",
+            "user": "pbrvolume",
+            "value": 1.0
+        });
+        assert!((eval_sound_volume(Some(&script_user_vol), &props) - 1.0).abs() < 1e-4);
+        props.insert("pbrvolume".into(), serde_json::json!(0.42));
+        assert!((eval_sound_volume(Some(&script_user_vol), &props) - 0.42).abs() < 1e-4);
+        assert!((eval_sound_volume(Some(&serde_json::json!(1.5)), &props) - 1.0).abs() < 1e-4);
+        assert!((eval_sound_volume(Some(&serde_json::json!(-0.2)), &props) - 0.0).abs() < 1e-4);
+
+        assert_eq!(
+            super::super::video::AudioPlayMode::parse(Some("loop")),
+            super::super::video::AudioPlayMode::Loop
+        );
+        assert_eq!(
+            super::super::video::AudioPlayMode::parse(Some("RANDOM")),
+            super::super::video::AudioPlayMode::Random
+        );
+        assert_eq!(
+            super::super::video::AudioPlayMode::parse(Some("single")),
+            super::super::video::AudioPlayMode::Single
+        );
+        assert_eq!(
+            super::super::video::AudioPlayMode::parse(None),
+            super::super::video::AudioPlayMode::Loop
+        );
+
+        let mut snd = SceneSound {
+            files: Vec::new(),
+            mode: super::super::video::AudioPlayMode::Single,
+            min_time: 1.0,
+            max_time: 5.0,
+            min_volume: 1.0,
+            max_volume: 1.0,
+            base_volume: 0.8,
+            script_volume: None,
+            playing: false, // e.g. startsilent: true
+            script_paused: false,
+            player: None,
+            init_failed: false,
+        };
+        assert!(!snd.is_playing());
+        assert!((snd.effective_layer_volume() - 0.8).abs() < 1e-4);
+
+        snd.cmd_play(1.0, false, false, true, false);
+        assert!(snd.is_playing());
+
+        snd.cmd_pause();
+        assert!(!snd.is_playing());
+
+        snd.cmd_play(1.0, false, false, true, false);
+        assert!(snd.is_playing());
+
+        snd.cmd_stop();
+        assert!(!snd.is_playing());
+
+        snd.script_volume = Some(0.35);
+        assert!((snd.effective_layer_volume() - 0.35).abs() < 1e-4);
     }
 }

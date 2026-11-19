@@ -27,6 +27,7 @@ pub enum ScriptField {
     Angles,
     Color,
     Text,
+    Volume,
 }
 
 impl ScriptField {
@@ -39,6 +40,7 @@ impl ScriptField {
             ScriptField::Angles => "angles",
             ScriptField::Color => "color",
             ScriptField::Text => "text",
+            ScriptField::Volume => "volume",
         }
     }
 
@@ -51,6 +53,7 @@ impl ScriptField {
             "angles" => Some(Self::Angles),
             "color" => Some(Self::Color),
             "text" => Some(Self::Text),
+            "volume" => Some(Self::Volume),
             _ => None,
         }
     }
@@ -97,6 +100,13 @@ pub struct VideoTexSeed {
     pub current_time: f32,
     pub playing: bool,
     pub rate: f32,
+}
+
+/// Audio playback metadata exposed to sound layers and `thisLayer.getSound()`.
+#[derive(Debug, Clone, Copy)]
+pub struct SoundSeed {
+    pub volume: f32,
+    pub playing: bool,
 }
 
 /// Property keyframe track metadata exposed to `thisObject.getAnimation()`.
@@ -157,6 +167,7 @@ pub struct LayerSeed {
     pub parent: Option<i64>,
     pub tex_anim: Option<TexAnimSeed>,
     pub video_tex: Option<VideoTexSeed>,
+    pub sound: Option<SoundSeed>,
 }
 
 /// An effect instance as scripts see it (`thisObject` / `thisLayer.getEffect()`).
@@ -181,6 +192,7 @@ pub struct LayerFrame {
     pub color: [f32; 3],
     pub text: String,
     pub video_time: Option<(f32, f32)>,
+    pub sound: Option<(f32, bool)>,
 }
 
 /// Pointer interaction event types delivered to layer scripts (`cursorEnter`, `cursorClick`, ...).
@@ -352,6 +364,9 @@ pub enum ScriptTarget {
         layer_id: i64,
         key: String,
     },
+    SoundControl {
+        layer_id: i64,
+    },
 }
 
 /// Result of one scripted property (or side-effect write) for this frame.
@@ -508,6 +523,15 @@ impl SceneScripts {
                         "currentTime": vt.current_time,
                         "playing": vt.playing,
                         "rate": vt.rate,
+                    }),
+                );
+            }
+            if let Some(snd) = seed.sound {
+                obj.insert(
+                    "sound".into(),
+                    json!({
+                        "volume": snd.volume,
+                        "playing": snd.playing,
                     }),
                 );
             }
@@ -730,7 +754,8 @@ impl SceneScripts {
                                 | ScriptTarget::VideoTexture { layer_id }
                                 | ScriptTarget::PuppetAnimLayerField { layer_id, .. }
                                 | ScriptTarget::PuppetAnimLayerControl { layer_id, .. }
-                                | ScriptTarget::InstanceOverride { layer_id, .. } => *layer_id,
+                                | ScriptTarget::InstanceOverride { layer_id, .. }
+                                | ScriptTarget::SoundControl { layer_id } => *layer_id,
                             };
                             self.cursor_layers.insert(lid);
                         }
@@ -942,6 +967,11 @@ impl SceneScripts {
                     obj.insert("videoTime".into(), json!([ct, dur]));
                 }
             }
+            if let Some((vol, playing)) = l.sound {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("sound".into(), json!([vol, playing]));
+                }
+            }
             layer_json.push(item);
         }
         let mut payload = json!({
@@ -1083,6 +1113,9 @@ impl SceneScripts {
                     layer_id: entry.layer_id,
                     key: entry.key.to_ascii_lowercase(),
                 },
+                "sound_ctrl" => ScriptTarget::SoundControl {
+                    layer_id: entry.layer_id,
+                },
                 _ => continue,
             };
             out.push(ScriptOutput {
@@ -1165,6 +1198,9 @@ impl SceneScripts {
                 ScriptTarget::InstanceOverride { layer_id, key } => {
                     log::warn!("scenescript: instanceoverride.{key} on object {layer_id}: {err}");
                 }
+                ScriptTarget::SoundControl { layer_id } => {
+                    log::warn!("scenescript: sound_ctrl on object {layer_id}: {err}");
+                }
             }
         } else {
             log::warn!("scenescript: {kind}: {err}");
@@ -1211,6 +1247,7 @@ const PRELUDE: &str = r#"
     }
     if (field === 'visible') return v === undefined || v === null ? true : !!v;
     if (field === 'alpha') return num(v, 1);
+    if (field === 'volume') return num(v, 1);
     if (field === 'text') return v === undefined || v === null ? '' : String(v);
     return v;
   }
@@ -2109,7 +2146,7 @@ const PRELUDE: &str = r#"
   function makeLayer(id, name) {
     var _size = new Vec2(0, 0);
     var l = {
-      id: id, name: name || '', visible: true, solid: true, alpha: 1,
+      id: id, name: name || '', visible: true, solid: true, alpha: 1, volume: 1,
       origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
       color: new Vec3(1, 1, 1), alignment: new Vec2(0, 0),
       text: '', pointsize: 0, cursorDetected: false, clicked: false, kind: '',
@@ -2117,6 +2154,7 @@ const PRELUDE: &str = r#"
       __effects: {}, __effectList: [],
       __animLayers: {}, __animLayerList: [],
       __propAnims: [],
+      __isSound: false, __playing: false, __soundAction: null,
       getParent: function () { return l.__parent || null; },
       getEffect: function (ref) {
         if (typeof ref === 'number') return l.__effects[String(ref)] || l.__effectList[ref] || null;
@@ -2145,13 +2183,41 @@ const PRELUDE: &str = r#"
         }
         return l.__propAnims[0] || l.__animLayerList[0] || l.getTextureAnimation();
       },
-      getSound: function () { return soundStub(); },
+      getSound: function () {
+        if (!l.__isSound) return soundStub();
+        var s = {
+          play: function () { l.play(); },
+          pause: function () { l.pause(); },
+          stop: function () { l.stop(); },
+          isPlaying: function () { return l.isPlaying(); },
+          setVolume: function (v) { l.volume = num(v, 1); },
+          getVolume: function () { return l.volume; },
+          setMuted: function () {},
+          isMuted: function () { return false; },
+          getCurrentTime: function () { return 0; },
+          setCurrentTime: function () {}
+        };
+        Object.defineProperty(s, 'volume', {
+          get: function () { return l.volume; },
+          set: function (v) { l.volume = num(v, 1); },
+          enumerable: true
+        });
+        return s;
+      },
       getLayerFile: function () { return l.__layerFile; },
       getTransformMatrix: function () {
         return { m: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, l.origin.x, l.origin.y, 0, 1] };
       },
-      isPlaying: function () { return false; },
-      play: function () {}, pause: function () {}, stop: function () {}
+      isPlaying: function () { return !!l.__playing; },
+      play: function () {
+        if (l.__isSound) { l.__playing = true; l.__soundAction = 'play'; }
+      },
+      pause: function () {
+        if (l.__isSound) { l.__playing = false; l.__soundAction = 'pause'; }
+      },
+      stop: function () {
+        if (l.__isSound) { l.__playing = false; l.__soundAction = 'stop'; }
+      }
     };
     Object.defineProperty(l, 'size', {
       get: function () { return _size.copy(); },
@@ -2250,7 +2316,15 @@ const PRELUDE: &str = r#"
       return '';
     });
     body = body.replace(/export[ \t]+default[ \t]+/g, '');
-    return { body: body, names: names };
+    var seen = {};
+    var uniq = [];
+    for (var ni = 0; ni < names.length; ni++) {
+      if (!Object.prototype.hasOwnProperty.call(seen, names[ni])) {
+        seen[names[ni]] = true;
+        uniq.push(names[ni]);
+      }
+    }
+    return { body: body, names: uniq };
   }
 
   function snapshotLayers() {
@@ -2262,6 +2336,7 @@ const PRELUDE: &str = r#"
         visible: !!l.visible,
         solid: !!l.solid,
         alpha: num(l.alpha, 1),
+        volume: num(l.volume, 1),
         origin: toArr3(l.origin),
         scale: toArr3(l.scale),
         angles: toArr3(l.angles),
@@ -2324,6 +2399,20 @@ const PRELUDE: &str = r#"
       var curSolid = !!l.solid;
       if (curSolid !== prev.solid) {
         outputs.push({ kind: 'layer_solid', id: numId, value: curSolid });
+      }
+      if (l.__isSound) {
+        var curVol = num(l.volume, 1);
+        if (curVol !== prev.volume || forcedLayers[idStr + ':volume']) {
+          outputs.push({ kind: 'layer', id: numId, field: 'volume', value: curVol });
+        }
+        if (l.__soundAction !== null) {
+          outputs.push({
+            kind: 'sound_ctrl',
+            layerId: numId,
+            value: { action: l.__soundAction }
+          });
+          l.__soundAction = null;
+        }
       }
     }
 
@@ -2528,6 +2617,11 @@ const PRELUDE: &str = r#"
       l.__parentId = d.parent;
       if (d.texAnim) l.__tex = makeTexAnim(d.id, d.texAnim);
       if (d.videoTex) l.__video = makeVideoTex(d.id, d.videoTex);
+      if (d.sound) {
+        l.__isSound = true;
+        l.volume = num(d.sound.volume, 1);
+        l.__playing = !!d.sound.playing;
+      }
       layers[String(d.id)] = l;
       layerOrder.push(String(d.id));
       return true;
@@ -2896,6 +2990,10 @@ const PRELUDE: &str = r#"
           l.__video.currentTime = num(d.videoTime[0], l.__video.currentTime);
           if (num(d.videoTime[1], 0) > 0) l.__video.duration = num(d.videoTime[1], l.__video.duration);
         }
+        if (d.sound && l.__isSound) {
+          l.volume = num(d.sound[0], l.volume);
+          l.__playing = !!d.sound[1];
+        }
       }
 
       var preLayers = snapshotLayers();
@@ -3037,6 +3135,7 @@ const PRELUDE: &str = r#"
             if (b.field === 'text') value = layer.text;
             else if (b.field === 'visible') value = layer.visible;
             else if (b.field === 'alpha') value = layer.alpha;
+            else if (b.field === 'volume') value = layer.volume;
             else value = layer[b.field] ? layer[b.field].copy() : null;
 
             var res = b.mod.update(value);
@@ -3046,6 +3145,8 @@ const PRELUDE: &str = r#"
               if (res !== undefined) layer.visible = !!res;
             } else if (b.field === 'alpha') {
               if (res !== undefined) layer.alpha = num(res, layer.alpha);
+            } else if (b.field === 'volume') {
+              if (res !== undefined) layer.volume = num(res, layer.volume);
             } else if (res !== undefined && res !== null) {
               layer[b.field] = parseVec(res);
             } else if (value instanceof Vec3 && preLayers[String(b.id)] &&
@@ -3158,6 +3259,7 @@ mod tests {
             parent: None,
             tex_anim: None,
             video_tex: None,
+            sound: None,
         }
     }
 
@@ -3172,6 +3274,7 @@ mod tests {
             color: [1.0, 1.0, 1.0],
             text: String::new(),
             video_time: None,
+            sound: None,
         }
     }
 
@@ -4425,6 +4528,109 @@ mod tests {
         assert_eq!(anim_ctrl.value.get("playing"), Some(&json!(true)));
     }
 
+    #[test]
+    fn sound_layer_play_pause_stop_is_playing_and_volume() {
+        let mut props = serde_json::Map::new();
+        props.insert("play".into(), json!(true));
+        let mut host = SceneScripts::new(&props).expect("host");
+
+        let mut snd_seed = seed(301, "theme.mp3");
+        snd_seed.kind = "sound".into();
+        snd_seed.sound = Some(SoundSeed {
+            volume: 0.75,
+            playing: false,
+        });
+        host.add_layer(&snd_seed);
+        host.add_layer(&seed(302, "controller"));
+        host.link_parents();
+
+        // Direct `volume.script` with duplicate `export function update` (like Workshop 3432999904).
+        let mut sp = serde_json::Map::new();
+        sp.insert("play".into(), json!(true));
+        host.add_property_script(
+            301,
+            ScriptField::Volume,
+            "'use strict';
+export function update(value) { return value; }
+export var scriptProperties = createScriptProperties().addCheckbox({ name: 'play', value: false }).finish();
+export function update(value) {
+  if (scriptProperties.play && !thisLayer.isPlaying()) { thisLayer.play(); }
+  else if (!scriptProperties.play && thisLayer.isPlaying()) { thisLayer.pause(); }
+  return value * 0.8;
+}",
+            json!(1.0),
+            &sp,
+            None,
+        );
+
+        // Controller enumerating sound layers and calling getSound()/pause()/stop()/volume = v (like 3346831410).
+        host.add_property_script(
+            302,
+            ScriptField::Alpha,
+            "'use strict';
+var phase = 0;
+export function update(value) {
+  phase++;
+  thisScene.enumerateLayers().forEach(function (l) {
+    if (l.name.indexOf('.mp3') >= 0) {
+      if (phase === 2) {
+        l.getSound().volume = 0.25;
+        l.pause();
+      } else if (phase === 3) {
+        l.stop();
+      }
+    }
+  });
+  return value;
+}",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+
+        let mut f_snd = frame(301);
+        f_snd.sound = Some((0.75, false));
+        let f_ctrl = frame(302);
+
+        // Tick 1: sound script triggers play() and scales volume 0.75 -> 0.6.
+        let out1 = host.tick(0.0, 0.016, 0.5, [0.0; 2], [1920.0, 1080.0], [1920.0, 1080.0], None, &[f_snd.clone(), f_ctrl.clone()]);
+        assert_eq!(host.failures(), 0, "sound script failed: {:?}", host.errors());
+        let sc1 = out1
+            .iter()
+            .find(|o| o.target == ScriptTarget::SoundControl { layer_id: 301 })
+            .expect("play sound_ctrl emitted");
+        assert_eq!(sc1.value.get("action"), Some(&json!("play")));
+        let vol1 = out1
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 301, field: ScriptField::Volume })
+            .expect("volume output emitted");
+        assert!((vol1.value.as_f64().unwrap() - 0.6).abs() < 1e-4);
+
+        // Tick 2: controller calls pause() and sets volume = 0.25 via getSound().
+        f_snd.sound = Some((0.6, true));
+        let out2 = host.tick(0.016, 0.016, 0.5, [0.0; 2], [1920.0, 1080.0], [1920.0, 1080.0], None, &[f_snd.clone(), f_ctrl.clone()]);
+        let sc2 = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::SoundControl { layer_id: 301 })
+            .expect("pause sound_ctrl emitted");
+        assert_eq!(sc2.value.get("action"), Some(&json!("pause")));
+        let vol2 = out2
+            .iter()
+            .find(|o| o.target == ScriptTarget::Layer { id: 301, field: ScriptField::Volume })
+            .expect("controller volume output emitted");
+        assert!((vol2.value.as_f64().unwrap() - 0.25).abs() < 1e-4);
+
+        // Tick 3: Rust syncs Single EOF (`playing: false`) -> controller calls stop().
+        f_snd.sound = Some((0.25, false));
+        let out3 = host.tick(0.032, 0.016, 0.5, [0.0; 2], [1920.0, 1080.0], [1920.0, 1080.0], None, &[f_snd, f_ctrl]);
+        // Note: on Tick 3 scriptProperties.play is true and LayerFrame said playing=false, so 301 calls play() first, then 302 calls stop()!
+        let sc3 = out3
+            .iter()
+            .find(|o| o.target == ScriptTarget::SoundControl { layer_id: 301 })
+            .expect("stop sound_ctrl emitted");
+        assert_eq!(sc3.value.get("action"), Some(&json!("stop")));
+    }
+
     /// Compile and tick every SceneScript (layer properties, effect visibility,
     /// effect constant shaders, puppet animation layers, and particle instance
     /// overrides) in the local Wallpaper Engine Workshop library.
@@ -4536,6 +4742,13 @@ mod tests {
                     parent,
                     tex_anim: None,
                     video_tex: None,
+                    sound: obj.get("sound").map(|_| SoundSeed {
+                        volume: 1.0,
+                        playing: !obj
+                            .get("startsilent")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    }),
                 });
                 if let Some(effects) = obj.get("effects").and_then(|e| e.as_array()) {
                     for (eidx, ef) in effects.iter().enumerate() {
@@ -4583,6 +4796,7 @@ mod tests {
                     color: vec("color", [1.0; 3]),
                     text: String::new(),
                     video_time: None,
+                    sound: obj.get("sound").map(|_| (1.0, true)),
                 });
             }
             host.link_parents();
@@ -4596,6 +4810,7 @@ mod tests {
                     (ScriptField::Angles, "angles"),
                     (ScriptField::Color, "color"),
                     (ScriptField::Text, "text"),
+                    (ScriptField::Volume, "volume"),
                 ] {
                     let Some(def) = obj.get(key) else { continue };
                     let Some(script) = def.get("script").and_then(|s| s.as_str()) else {

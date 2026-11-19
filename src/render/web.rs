@@ -297,11 +297,41 @@ shim_js = r"""
   window.wallpaperRegisterAudioListener = function(cb) {
     if (typeof cb === 'function') window.__animaAudioCbs.push(cb);
   };
-  window.wallpaperRegisterMediaStatusListener = function() {};
-  window.wallpaperRegisterMediaPropertiesListener = function() {};
-  window.wallpaperRegisterMediaPlaybackListener = function() {};
-  window.wallpaperRegisterMediaThumbnailListener = function() {};
-  window.wallpaperRegisterMediaTimelineListener = function() {};
+  window.wallpaperMediaIntegration = {
+    PLAYBACK_STOPPED: 0,
+    PLAYBACK_PLAYING: 1,
+    PLAYBACK_PAUSED: 2,
+  };
+  window.__animaMediaCbs = {
+    status: [],
+    properties: [],
+    playback: [],
+    thumbnail: [],
+    timeline: [],
+  };
+  window.__animaLastMedia = {};
+  function _regMedia(kind, cb) {
+    if (typeof cb !== 'function') return;
+    const list = window.__animaMediaCbs[kind];
+    if (!list) return;
+    if (list.indexOf(cb) === -1) list.push(cb);
+    if (Object.prototype.hasOwnProperty.call(window.__animaLastMedia, kind)) {
+      try { cb(window.__animaLastMedia[kind]); } catch (_e) {}
+    }
+  }
+  window.wallpaperRegisterMediaStatusListener = function(cb) { _regMedia('status', cb); };
+  window.wallpaperRegisterMediaPropertiesListener = function(cb) { _regMedia('properties', cb); };
+  window.wallpaperRegisterMediaPlaybackListener = function(cb) { _regMedia('playback', cb); };
+  window.wallpaperRegisterMediaThumbnailListener = function(cb) { _regMedia('thumbnail', cb); };
+  window.wallpaperRegisterMediaTimelineListener = function(cb) { _regMedia('timeline', cb); };
+  window.__animaPushMedia = function(kind, ev) {
+    window.__animaLastMedia[kind] = ev;
+    const list = window.__animaMediaCbs[kind];
+    if (!list) return;
+    for (let i = 0; i < list.length; i++) {
+      try { list[i](ev); } catch (_e) {}
+    }
+  };
   window.__animaApplyProps = function(props) {
     if (!props || typeof props !== 'object') return;
     Object.assign(window.__animaProps, props);
@@ -463,6 +493,7 @@ state = {
     "stall_warned": False,
     "needs_snap": False,
     "closed": False,
+    "media_cache": {},
 }
 
 def on_snap(view, res, _data=None):
@@ -534,9 +565,14 @@ def periodic_tick():
 def on_load_changed(_view, event):
     if event == WebKit2.LoadEvent.FINISHED:
         state["loaded"] = True
+        replay_media = "".join(
+            f"window.__animaPushMedia && window.__animaPushMedia({json.dumps(k)}, {json.dumps(v)});"
+            for k, v in state["media_cache"].items()
+        )
         props_js = (
             f"window.__animaApplyGeneral && window.__animaApplyGeneral();"
             f"window.__animaApplyProps && window.__animaApplyProps({json.dumps(init_props)});"
+            f"{replay_media}"
             f"requestAnimationFrame(() => requestAnimationFrame(() => {{}}));"
         )
         webview.run_javascript(props_js, None, None, None)
@@ -581,6 +617,19 @@ def handle_cmd(msg):
                 None,
                 None,
             )
+    elif cmd == "media":
+        kind = msg.get("kind")
+        ev = msg.get("event")
+        if isinstance(kind, str) and ev is not None:
+            state["media_cache"][kind] = ev
+            if state["loaded"]:
+                webview.run_javascript(
+                    f"window.__animaPushMedia && window.__animaPushMedia({json.dumps(kind)}, {json.dumps(ev)});",
+                    None,
+                    None,
+                    None,
+                )
+                state["needs_snap"] = True
     elif cmd == "mouse":
         if state["loaded"]:
             x = float(msg.get("x", 0.0))
@@ -838,6 +887,15 @@ pub struct WebRenderer {
     show_clock: bool,
     show_bars: bool,
     has_audio_listener: bool,
+    has_media_listener: bool,
+    media_status_sent: bool,
+    last_media_state: crate::media::MediaPlaybackState,
+    last_media_props_rev: u64,
+    last_media_thumb_rev: u64,
+    last_media_art_rev: Option<u64>,
+    cached_thumb_data_url: String,
+    last_media_pos_sec: i64,
+    last_media_dur_sec: i64,
     properties: HashMap<String, String>,
     property_types: HashMap<String, String>,
     worker: Option<WebWorker>,
@@ -872,7 +930,7 @@ impl WebRenderer {
         let mut we_props = serde_json::Map::new();
 
         let html = std::fs::read_to_string(entry).unwrap_or_default();
-        let has_audio_listener = detect_audio_listener(root, &html);
+        let (has_audio_listener, has_media_listener) = detect_web_listeners(root, &html);
 
         if let Some(proj) = project {
             if let Some(props) = proj
@@ -952,6 +1010,15 @@ impl WebRenderer {
             show_clock,
             show_bars,
             has_audio_listener,
+            has_media_listener,
+            media_status_sent: false,
+            last_media_state: crate::media::MediaPlaybackState::Stopped,
+            last_media_props_rev: 0,
+            last_media_thumb_rev: 0,
+            last_media_art_rev: None,
+            cached_thumb_data_url: String::new(),
+            last_media_pos_sec: -1,
+            last_media_dur_sec: -1,
             properties,
             property_types,
             worker,
@@ -1003,6 +1070,113 @@ impl WebRenderer {
                     serde_json::Value::String(value.to_string())
                 }
             }
+        }
+    }
+
+    fn push_media_events(&mut self, media: Option<&crate::media::MediaSnapshot>) {
+        if !self.has_media_listener || self.worker.is_none() {
+            return;
+        }
+        let Some(m) = media else {
+            if self.media_status_sent {
+                if let Some(worker) = self.worker.as_mut() {
+                    worker.send_json(&serde_json::json!({
+                        "cmd": "media",
+                        "kind": "status",
+                        "event": { "enabled": false },
+                    }));
+                }
+                self.media_status_sent = false;
+            }
+            return;
+        };
+
+        let pos_sec = m.position.max(0.0).floor() as i64;
+        let dur_sec = m.duration.max(0.0).floor() as i64;
+        let art_rev = m.art.as_ref().map(|a| a.rev);
+        if !m.has_thumbnail || m.art.is_none() {
+            self.cached_thumb_data_url.clear();
+            self.last_media_art_rev = art_rev;
+        } else if art_rev != self.last_media_art_rev {
+            self.cached_thumb_data_url = m
+                .art
+                .as_deref()
+                .and_then(encode_art_data_url)
+                .unwrap_or_default();
+            self.last_media_art_rev = art_rev;
+        }
+
+        let first = !self.media_status_sent;
+        let state_changed = m.state != self.last_media_state;
+        let props_changed = m.props_rev != self.last_media_props_rev;
+        let thumb_changed = m.thumb_rev != self.last_media_thumb_rev;
+        let timeline_changed = pos_sec != self.last_media_pos_sec
+            || dur_sec != self.last_media_dur_sec
+            || state_changed
+            || props_changed;
+
+        let Some(worker) = self.worker.as_mut() else {
+            return;
+        };
+
+        if first {
+            worker.send_json(&serde_json::json!({
+                "cmd": "media",
+                "kind": "status",
+                "event": { "enabled": m.enabled },
+            }));
+            self.media_status_sent = true;
+        }
+        if first || state_changed {
+            worker.send_json(&serde_json::json!({
+                "cmd": "media",
+                "kind": "playback",
+                "event": { "state": m.state.as_we_code() },
+            }));
+            self.last_media_state = m.state;
+        }
+        if first || props_changed {
+            worker.send_json(&serde_json::json!({
+                "cmd": "media",
+                "kind": "properties",
+                "event": {
+                    "title": m.title,
+                    "artist": m.artist,
+                    "subTitle": m.sub_title,
+                    "albumTitle": m.album_title,
+                    "albumArtist": m.album_artist,
+                    "genres": m.genres,
+                    "contentType": m.content_type,
+                },
+            }));
+            self.last_media_props_rev = m.props_rev;
+        }
+        if first || thumb_changed {
+            worker.send_json(&serde_json::json!({
+                "cmd": "media",
+                "kind": "thumbnail",
+                "event": {
+                    "thumbnail": self.cached_thumb_data_url,
+                    "primaryColor": rgb_to_hex(m.palette.primary),
+                    "secondaryColor": rgb_to_hex(m.palette.secondary),
+                    "tertiaryColor": rgb_to_hex(m.palette.tertiary),
+                    "textColor": rgb_to_hex(m.palette.text),
+                    "highContrastColor": rgb_to_hex(m.palette.high_contrast),
+                },
+            }));
+            self.last_media_thumb_rev = m.thumb_rev;
+        }
+        if first || timeline_changed {
+            worker.send_json(&serde_json::json!({
+                "cmd": "media",
+                "kind": "timeline",
+                "event": {
+                    "position": pos_sec,
+                    "duration": dur_sec,
+                },
+            }));
+            self.last_media_pos_sec = pos_sec;
+            self.last_media_dur_sec = dur_sec;
         }
     }
 }
@@ -1082,6 +1256,7 @@ impl Renderer for WebRenderer {
                     self.last_mouse_down = down;
                     self.last_mouse_push = Instant::now();
                 }
+                self.push_media_events(info.media.as_ref());
             }
         }
 
@@ -1250,6 +1425,10 @@ impl Renderer for WebRenderer {
         self.has_audio_listener || self.show_bars || !self.has_live_frame
     }
 
+    fn uses_media(&self) -> bool {
+        self.has_media_listener
+    }
+
     fn describe(&self) -> String {
         format!("web {}", self.entry.display())
     }
@@ -1267,12 +1446,12 @@ impl Renderer for WebRenderer {
     }
 }
 
-fn detect_audio_listener(root: &Path, html: &str) -> bool {
-    if html
-        .to_ascii_lowercase()
-        .contains("wallpaperregisteraudiolistener")
-    {
-        return true;
+fn detect_web_listeners(root: &Path, html: &str) -> (bool, bool) {
+    let html_low = html.to_ascii_lowercase();
+    let mut has_audio = html_low.contains("wallpaperregisteraudiolistener");
+    let mut has_media = html_low.contains("wallpaperregistermedia");
+    if has_audio && has_media {
+        return (true, true);
     }
     let mut stack = vec![root.to_path_buf()];
     let mut checked = 0usize;
@@ -1283,7 +1462,11 @@ fn detect_audio_listener(root: &Path, html: &str) -> bool {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                if stack.len() < 16 {
+                let skip = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.') || n == "node_modules");
+                if !skip && stack.len() < 16 {
                     stack.push(p);
                 }
                 continue;
@@ -1291,29 +1474,75 @@ fn detect_audio_listener(root: &Path, html: &str) -> bool {
             let is_js = p
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("js"));
+                .is_some_and(|e| e.eq_ignore_ascii_case("js") || e.eq_ignore_ascii_case("mjs"));
             if !is_js {
                 continue;
             }
             let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            if len > 512 * 1024 {
+            if len > 1024 * 1024 {
                 continue;
             }
             if let Ok(src) = std::fs::read_to_string(&p) {
-                if src
-                    .to_ascii_lowercase()
-                    .contains("wallpaperregisteraudiolistener")
-                {
-                    return true;
+                let low = src.to_ascii_lowercase();
+                has_audio |= low.contains("wallpaperregisteraudiolistener");
+                has_media |= low.contains("wallpaperregistermedia");
+                if has_audio && has_media {
+                    return (true, true);
                 }
             }
             checked += 1;
-            if checked >= 32 {
-                return false;
+            if checked >= 48 {
+                return (has_audio, has_media);
             }
         }
     }
-    false
+    (has_audio, has_media)
+}
+
+fn rgb_to_hex(rgb: [f32; 3]) -> String {
+    let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", ch(rgb[0]), ch(rgb[1]), ch(rgb[2]))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn encode_art_data_url(art: &crate::media::MediaArt) -> Option<String> {
+    use image::ImageEncoder;
+    if art.width == 0 || art.height == 0 || art.rgba.is_empty() {
+        return None;
+    }
+    let mut png = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new_with_quality(
+        &mut png,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    );
+    enc.write_image(&art.rgba, art.width, art.height, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(format!("data:image/png;base64,{}", encode_base64(&png)))
 }
 
 fn find_web_background(root: &Path, _html: &str) -> Option<PathBuf> {
@@ -1397,5 +1626,72 @@ mod web_tests {
         assert!(WEBKIT_WORKER_SCRIPT.contains("target_fps"));
         assert!(WEBKIT_WORKER_SCRIPT
             .contains("GLib.timeout_add(max(1, int(round(1000.0 / target_fps))), periodic_tick)"));
+    }
+
+    #[test]
+    fn web_media_listener_detection_and_shim_wiring() {
+        for sym in [
+            "wallpaperMediaIntegration",
+            "_regMedia",
+            "__animaPushMedia",
+            "wallpaperRegisterMediaStatusListener",
+            "wallpaperRegisterMediaPropertiesListener",
+            "wallpaperRegisterMediaPlaybackListener",
+            "wallpaperRegisterMediaThumbnailListener",
+            "wallpaperRegisterMediaTimelineListener",
+            "\"media_cache\": {}",
+            "elif cmd == \"media\":",
+        ] {
+            assert!(
+                WEBKIT_WORKER_SCRIPT.contains(sym),
+                "missing shim symbol: {sym}"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("anima-web-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".history")).unwrap();
+        std::fs::create_dir_all(dir.join("js")).unwrap();
+        std::fs::write(dir.join(".history/old.js"), "wallpaperRegisterAudioListener(() => {});")
+            .unwrap();
+        std::fs::write(
+            dir.join("js/media.js"),
+            "window.wallpaperRegisterMediaPropertiesListener(fn);",
+        )
+        .unwrap();
+
+        let (has_audio, has_media) = detect_web_listeners(&dir, "<html><body></body></html>");
+        assert!(!has_audio, ".history dir must be skipped");
+        assert!(has_media, "js/media.js must trigger has_media");
+
+        let (has_audio2, has_media2) =
+            detect_web_listeners(&dir, "<script>wallpaperRegisterAudioListener(x);</script>");
+        assert!(has_audio2 && has_media2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_media_hex_color_and_png_data_url_encoding() {
+        assert_eq!(rgb_to_hex([0.0, 0.5, 1.0]), "#0080ff");
+        assert_eq!(rgb_to_hex([1.2, -0.1, 0.25]), "#ff0040");
+        assert_eq!(encode_base64(b"Man"), "TWFu");
+        assert_eq!(encode_base64(b"Ma"), "TWE=");
+        assert_eq!(encode_base64(b"M"), "TQ==");
+
+        let art = crate::media::MediaArt {
+            rev: 1,
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+        let url = encode_art_data_url(&art).expect("PNG data URL");
+        assert!(
+            url.starts_with("data:image/png;base64,iVBORw0KGgo"),
+            "unexpected data url prefix: {}",
+            &url[..url.len().min(40)]
+        );
     }
 }

@@ -7,6 +7,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use glow::HasContext;
@@ -519,18 +520,62 @@ fn cstr(ptr: *const c_char) -> String {
     unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
 }
 
+/// Playback mode for a Wallpaper Engine `sound` layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioPlayMode {
+    #[default]
+    Loop,
+    Single,
+    Random,
+}
+
+impl AudioPlayMode {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("random") => Self::Random,
+            Some("single") => Self::Single,
+            _ => Self::Loop,
+        }
+    }
+}
+
+/// Configuration for creating an [`AudioPlayer`] matching a WE `sound` layer.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioPlayerConfig {
+    pub mode: AudioPlayMode,
+    pub start_silent: bool,
+    pub volume: f32,
+    pub muted: bool,
+    pub min_time: f32,
+    pub max_time: f32,
+    pub min_volume: f32,
+    pub max_volume: f32,
+}
+
 /// Headless libmpv audio player used for Wallpaper Engine scene `sound`
-/// layers (background music bundled with a scene).  Wallpaper Engine plays
-/// these and its own audio visualiser reacts to them, so audio-reactive
-/// effects (pulses, glitch transitions) depend on the music actually playing.
+/// layers (background music and ambient SFX bundled with a scene).
 pub struct AudioPlayer {
     handle: *mut mpv_handle,
+    files: Vec<PathBuf>,
+    mode: AudioPlayMode,
     volume: f32,
     muted: bool,
+    global_paused: bool,
+    layer_paused: bool,
+    stopped: bool,
+    min_time: f32,
+    max_time: f32,
+    min_volume: f32,
+    max_volume: f32,
+    clip_volume_mult: f32,
+    next_random_at: Option<Instant>,
+    last_load: Option<Instant>,
+    rng_state: u32,
+    last_index: usize,
 }
 
 impl AudioPlayer {
-    pub fn new(files: &[PathBuf], shuffle: bool, volume: f32, muted: bool) -> Result<Self> {
+    pub fn new(files: &[PathBuf], cfg: AudioPlayerConfig) -> Result<Self> {
         if files.is_empty() {
             bail!("no audio files");
         }
@@ -539,18 +584,23 @@ impl AudioPlayer {
             if handle.is_null() {
                 bail!("mpv_create() failed");
             }
+            let loop_opt = if cfg.mode == AudioPlayMode::Loop {
+                "inf"
+            } else {
+                "no"
+            };
             let opts: &[(&str, &str)] = &[
                 ("vid", "no"),
                 ("video", "no"),
                 ("vo", "null"),
-                ("loop-playlist", "inf"),
+                ("loop-playlist", loop_opt),
+                ("keep-open", "no"),
                 ("idle", "yes"),
                 ("terminal", "no"),
                 ("msg-level", "all=warn"),
                 ("ytdl", "no"),
                 ("audio-display", "no"),
                 ("input-default-bindings", "no"),
-                ("shuffle", if shuffle { "yes" } else { "no" }),
                 ("audio-client-name", "anima"),
             ];
             for (name, value) in opts {
@@ -564,31 +614,136 @@ impl AudioPlayer {
                 mpv_terminate_destroy(handle);
                 bail!("mpv_initialize failed: {msg}");
             }
-            let this = Self { handle, volume, muted };
-            this.apply();
-            for (i, f) in files.iter().enumerate() {
-                let path = CString::new(f.to_string_lossy().as_bytes())?;
-                let cmd = c"loadfile";
-                let mode = if i == 0 { c"replace" } else { c"append" };
-                let args = [cmd.as_ptr(), path.as_ptr(), mode.as_ptr(), ptr::null()];
-                mpv_command(handle, args.as_ptr());
+            let min_time = cfg.min_time.max(0.0);
+            let max_time = cfg.max_time.max(min_time);
+            let min_volume = cfg.min_volume.clamp(0.0, 1.0);
+            let max_volume = cfg.max_volume.clamp(min_volume, 1.0);
+            let seed = ((handle as usize as u32) ^ ((files.len() as u32).wrapping_mul(0x85EB_CA6B)))
+                | 1;
+            let mut this = Self {
+                handle,
+                files: files.to_vec(),
+                mode: cfg.mode,
+                volume: cfg.volume.clamp(0.0, 1.0),
+                muted: cfg.muted,
+                global_paused: false,
+                layer_paused: false,
+                stopped: cfg.start_silent,
+                min_time,
+                max_time,
+                min_volume,
+                max_volume,
+                clip_volume_mult: 1.0,
+                next_random_at: None,
+                last_load: None,
+                rng_state: seed,
+                last_index: 0,
+            };
+            if cfg.start_silent {
+                this.apply();
+            } else if cfg.mode == AudioPlayMode::Random && min_time >= 10.0 {
+                let lo = min_time * 0.2;
+                let hi = (max_time * 0.5).max(lo);
+                let delay = lo + this.next_f32() * (hi - lo);
+                this.next_random_at = Some(Instant::now() + Duration::from_secs_f32(delay));
+                this.apply();
+            } else {
+                this.load_current_tracks();
+                this.apply();
             }
             Ok(this)
         }
     }
 
-    fn apply(&self) {
-        let volume = (self.volume.clamp(0.0, 1.0) * 100.0).round();
+    fn next_f32(&mut self) -> f32 {
+        if self.rng_state == 0 {
+            self.rng_state = 0x9E37_79B9;
+        }
+        self.rng_state ^= self.rng_state << 13;
+        self.rng_state ^= self.rng_state >> 17;
+        self.rng_state ^= self.rng_state << 5;
+        (self.rng_state as f32) / (u32::MAX as f32)
+    }
+
+    fn pick_random_index(&mut self) -> usize {
+        if self.files.len() <= 1 {
+            self.last_index = 0;
+            return 0;
+        }
+        let mut idx = (self.next_f32() * self.files.len() as f32) as usize % self.files.len();
+        if idx == self.last_index {
+            idx = (idx + 1) % self.files.len();
+        }
+        self.last_index = idx;
+        idx
+    }
+
+    fn load_current_tracks(&mut self) {
+        if self.handle.is_null() || self.files.is_empty() {
+            return;
+        }
+        if self.mode == AudioPlayMode::Random {
+            let idx = self.pick_random_index();
+            self.clip_volume_mult =
+                self.min_volume + self.next_f32() * (self.max_volume - self.min_volume);
+            if let Some(f) = self.files.get(idx) {
+                if let Ok(path) = CString::new(f.to_string_lossy().as_bytes()) {
+                    let cmd = c"loadfile";
+                    let mode = c"replace";
+                    let args = [cmd.as_ptr(), path.as_ptr(), mode.as_ptr(), ptr::null()];
+                    unsafe { mpv_command(self.handle, args.as_ptr()) };
+                }
+            }
+        } else {
+            self.clip_volume_mult = 1.0;
+            for (i, f) in self.files.iter().enumerate() {
+                if let Ok(path) = CString::new(f.to_string_lossy().as_bytes()) {
+                    let cmd = c"loadfile";
+                    let mode = if i == 0 { c"replace" } else { c"append" };
+                    let args = [cmd.as_ptr(), path.as_ptr(), mode.as_ptr(), ptr::null()];
+                    unsafe { mpv_command(self.handle, args.as_ptr()) };
+                }
+            }
+        }
+        self.last_load = Some(Instant::now());
+    }
+
+    fn mpv_is_idle(&self) -> bool {
+        if self.handle.is_null() {
+            return true;
+        }
+        if let Some(t) = self.last_load {
+            if t.elapsed() < Duration::from_millis(250) {
+                return false;
+            }
+        }
         unsafe {
+            let val = mpv_get_property_string(self.handle, c"idle-active".as_ptr());
+            if val.is_null() {
+                return false;
+            }
+            let idle = cstr(val) == "yes";
+            mpv_free(val as *mut c_void);
+            idle
+        }
+    }
+
+    fn apply(&self) {
+        if self.handle.is_null() {
+            return;
+        }
+        let eff_paused = self.global_paused || self.layer_paused || self.stopped;
+        let volume = ((self.volume.clamp(0.0, 1.0) * self.clip_volume_mult) * 100.0).round();
+        unsafe {
+            let _ = set_prop(self.handle, "pause", if eff_paused { "yes" } else { "no" });
             let _ = set_prop(self.handle, "mute", if self.muted { "yes" } else { "no" });
             let _ = set_prop(self.handle, "volume", &volume.to_string());
         }
     }
 
-    pub fn set_paused(&mut self, paused: bool) {
-        unsafe {
-            let _ = set_prop(self.handle, "pause", if paused { "yes" } else { "no" });
-        }
+    pub fn set_global_paused(&mut self, paused: bool) {
+        self.global_paused = paused;
+        self.apply();
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -599,6 +754,86 @@ impl AudioPlayer {
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
         self.apply();
+    }
+
+    pub fn play(&mut self) {
+        self.next_random_at = None;
+        if self.stopped || self.mpv_is_idle() {
+            self.stopped = false;
+            self.layer_paused = false;
+            self.load_current_tracks();
+        } else {
+            self.layer_paused = false;
+        }
+        self.apply();
+    }
+
+    pub fn pause(&mut self) {
+        if !self.stopped {
+            self.layer_paused = true;
+            self.apply();
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.stopped = true;
+        self.layer_paused = false;
+        self.next_random_at = None;
+        if !self.handle.is_null() {
+            let args = [c"stop".as_ptr(), ptr::null()];
+            unsafe { mpv_command(self.handle, args.as_ptr()) };
+        }
+        self.apply();
+    }
+
+    /// Drain libmpv events and drive `single`/`random` layer scheduling.
+    /// Returns `true` when a `single` track finishes naturally.
+    pub fn poll(&mut self) -> bool {
+        if self.handle.is_null() {
+            return false;
+        }
+        for _ in 0..32 {
+            let ev = unsafe { mpv_wait_event(self.handle, 0.0) };
+            if ev.is_null() {
+                break;
+            }
+            let id = unsafe { (*ev).event_id };
+            if id == 0 {
+                break;
+            }
+        }
+        if self.stopped || self.layer_paused || self.global_paused {
+            return false;
+        }
+        match self.mode {
+            AudioPlayMode::Loop => false,
+            AudioPlayMode::Single => {
+                if self.mpv_is_idle() {
+                    self.stopped = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            AudioPlayMode::Random => {
+                if let Some(when) = self.next_random_at {
+                    if Instant::now() >= when {
+                        self.next_random_at = None;
+                        self.load_current_tracks();
+                        self.apply();
+                    }
+                } else if self.mpv_is_idle() {
+                    let delay = self.min_time
+                        + self.next_f32() * (self.max_time - self.min_time).max(0.0);
+                    self.next_random_at = Some(Instant::now() + Duration::from_secs_f32(delay));
+                }
+                false
+            }
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        !self.stopped && !self.layer_paused
     }
 }
 
