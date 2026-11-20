@@ -14,6 +14,9 @@ jobs:
   test:
     name: build, tests, headless render
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
       - uses: actions/checkout@v4
 
@@ -21,8 +24,9 @@ jobs:
       # EGL/GL (glutin, the engine's GLES context), libmpv (video wallpapers).
       # Mesa's llvmpipe driver is what makes the GPU-less runner render.
       - name: Install system dependencies
+        timeout-minutes: 12
         run: |
-          sudo apt-get update
+          sudo apt-get update -o Acquire::Retries=3
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config \
             libwayland-dev libxkbcommon-dev \
