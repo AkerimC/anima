@@ -1,146 +1,117 @@
-# Real web wallpapers — design plan
+# Web wallpapers — WebKit renderer
 
-Status: **planned, not implemented.** The current `src/render/web.rs` is a
-metadata-driven GPU HUD, not a browser. This document describes how a real
-HTML/CSS/JS renderer would be added without compromising the daemon's
-low-overhead event loop.
+Status: **implemented** in `src/render/web.rs`. This document describes the
+renderer as it ships; the earlier design draft (a GTK4 layer-shell helper with
+`gtk4-layer-shell`) was replaced by the offscreen process described below
+because it needs no compositor-specific protocol work and shares the engine's
+existing texture path.
 
 ## Goal
 
-Render Wallpaper Engine style `web` projects (an `index.html` plus
-`project.json`, optionally referenced assets) as an actual browser page on the
-background layer, while keeping:
+Render Wallpaper Engine `web` projects (an `index.html` plus `project.json`,
+assets resolved relative to it) as a real browser page while keeping:
 
 - static image / video / shader / scene wallpapers unchanged and lightweight;
 - the daemon event loop free of GTK main-loop coupling;
-- isolation from crashes and memory leaks in WebKit;
-- a graceful fallback to the current HUD renderer when WebKit or
-  `gtk4-layer-shell` is unavailable.
+- isolation from crashes and leaks in WebKit;
+- a graceful fallback when WebKit or PyGObject is unavailable.
 
-## Why not embed WebKit in the daemon process
-
-WebKitGTK requires a running `GMainContext`, owns its own Wayland/EGL surfaces
-and utilizes several helper processes. Embedding it in `animad` would:
-
-- force GTK initialization into the Wayland event loop thread;
-- make WebKit crashes fatal for every wallpaper;
-- pin 200–400 MB of RSS to the daemon even after switching to an image;
-- complicate the existing EGL context / frame-callback pacing model.
-
-**Decision: a separate helper process**, `anima-webhelper`, spawned per web
-output and terminated when it is no longer needed.
+## Architecture
 
 ```
-animad (Wayland + EGL)                     anima-webhelper (GTK4 + WebKitGTK)
-├─ layer-shell background surface   ←──┐   ├─ GTK4 layer-shell window
-├─ IPC: anima.sock                     │   │   (Layer::Background, anchors all)
-└─ spawn/kill + JSON control socket ──┴──►  ├─ WebKitWebView (index.html)
-                                             └─ JS bridges (audio/properties)
+animad (Wayland + EGL)                     python3 worker (GTK3 + WebKit2GTK 4.1)
+├─ layer-shell background surface           ├─ Gtk.OffscreenWindow + WebKit2.WebView
+├─ frames: BGRA over stdout ────────┐       ├─ get_snapshot() loop at web_fps
+├─ control: JSON lines over stdin ──┴─────► ├─ JS bridges (properties/audio/pointer)
+└─ fallback: procedural shader backdrop      └─ internal scale = web_scale
 ```
 
-The helper owns the layer surface for that output; `animad` does not create its
-own background surface while a web wallpaper is active on that monitor.
+One worker process per web output. The worker keeps WebKit off the daemon's
+event loop and confines its RSS; killing the child reclaims everything.
 
-## Dependencies (optional feature)
+Frame protocol: each frame is an 8-byte little-endian `(width, height)` header
+followed by `width * height * 4` bytes of BGRA, streamed over stdout. The
+worker duplicates the original stdout to a private file descriptor and points
+fd 1 at stderr so GTK/WebKit/Mesa log lines can never corrupt the binary
+stream. The daemon keeps one spare frame buffer so a steady 1080p stream does
+not allocate (and zero) 8 MB per frame.
 
-Add a Cargo feature `web` (off by default) pulling:
+The worker serves the wallpaper directory from a loopback HTTP server
+(`http://127.0.0.1:<port>/index.html`) instead of `file://`, which keeps
+relative asset loads and WebGL textures same-origin. User properties that
+point at local files are rewritten to loopback URLs so pages can fetch them.
 
-| Crate | Purpose |
-| --- | --- |
-| `gtk4` | GTK4 bindings |
-| `webkit6` | WebKitGTK 6.0 bindings (`webkitgtk-6.0.pc`) |
-| `gtk4-layer-shell` | layer-shell integration for GTK4 windows |
+Control protocol: JSON lines on stdin (`props`, `audio`, `pointer`, `pause`,
+`reload`, …). Property updates go through
+`wallpaperPropertyListener.applyUserProperties`; general settings (the fps the
+daemon snapshots at) go through `applyGeneralProperties`.
 
-System packages: `gtk4`, `webkitgtk-6.0`, `gtk4-layer-shell` (available in the
-Arch `extra` repository). The helper binary is only built with
-`--features web`; a default build remains dependency-light.
+## JavaScript bridges
 
-Runtime detection: `animad` checks for the helper next to its own executable
-and for `libwebkitgtk-6.0.so`; if either is missing, it keeps using the HUD
-renderer and logs a single warning.
+Injected before page scripts run (user content manager, `START`):
 
-## Helper responsibilities
+- `window.wallpaperPropertyListener` — property updates and
+  `applyGeneralProperties` (`fps`).
+- `window.wallpaperRegisterAudioListener` — 64-band spectrum + beat pumped at
+  the engine's audio rate; audio capture stays idle when the page never
+  registers a listener.
+- Media integration: `wallpaperMediaIntegration`,
+  `wallpaperRegisterMediaStatusListener`, `…PropertiesListener`,
+  `…PlaybackListener`, `…ThumbnailListener`, `…TimelineListener`, and
+  `wallpaperRequestRandomFileForProperty`.
+- Pointer/mouse events are replayed as `pointermove`, `pointerdown`,
+  `pointerup` and `mousemove`/`mousedown`/`mouseup` with page-relative
+  coordinates, so hover- and click-driven wallpapers work.
 
-1. Parse `project.json` (`type`, `file`, `general.properties`) — reuse
-   `crate::wallpaper` metadata where possible.
-2. Create a GTK4 window and turn it into a background layer surface:
-   - `Layer::Background`, anchors on all edges, `exclusive_zone(-1)`,
-     keyboard interactivity `None`, empty input region (clicks pass through).
-3. Load `index.html` from the project root via `file://`; deny navigation to
-   anything outside that root; disable devtools and persistent storage.
-4. WebKit settings: hardware acceleration on, media playback disabled unless
-   the project asks for it, background throttling relaxed.
-5. Report readiness and failures on its control socket so the daemon can fall
-   back to the HUD renderer.
+WebGL is enabled; WebKit's hardware acceleration policy is `NEVER` because the
+worker renders to an offscreen window and snapshots it — the GPU path buys
+nothing there and costs a second GL context.
 
-## JS bridge
+## Pacing and quality knobs
 
-Wallpaper Engine pages expect two global hooks. The helper injects a user
-script before page load and drives them from the daemon:
+- `web_fps` (default 30, clamped 1..120): snapshot rate. The page is told the
+  same number through `applyGeneralProperties`.
+- `web_scale` (default 1.0, clamped 0.25..1.0): internal render size. The
+  daemon upscales the returned frame; lowering this is the main CPU dial.
+- WebKit drops snapshot callbacks occasionally; the worker has a watchdog that
+  re-requests the snapshot instead of stalling the stream.
+- A worker that exits or times out is reported in `anima status` and
+  `anima verify` (`live=true alive=true` per item).
 
-- `window.wallpaperRegisterAudioListener(cb)` — called at ~30 Hz with
-  `Uint8Array(128)` (left/right channel pairs) derived from
-  `AudioSnapshot.spectrum`. The helper requests audio frames from `animad`
-  over its control socket, so the existing FFT/beat analyzer remains the single
-  source of truth and sleeps when nothing needs audio.
-- `window.wallpaperPropertyListener` — `applyUserProperties({...})` on load and
-  on every `anima prop set`, with Wallpaper Engine value shapes
-  (`{"value": ...}` for sliders/bools, `"r g b"` for colors).
-- Optional: `applyGeneralProperties` for fps, and mouse position via
-  `mousemove` events synthesized from `animad`'s cursor tracking.
+## Dependencies and fallback
 
-## Lifecycle and pacing
+Runtime, not build-time:
 
-- `animad` spawns the helper when a web wallpaper is assigned to an output and
-  kills it on wallpaper change, output removal, or shutdown.
-- Pause integration: on fullscreen / maximized / battery / user pause the
-  daemon sends `suspend`; the helper calls
-  `webkit_web_view_set_is_web_process_suspended(true)` and mutes the view.
-  Resume reverses this. This keeps a paused web wallpaper near 0 % CPU.
-- WebKit drives its own repaint clock; the daemon does not arm frame callbacks
-  for that output. FPS is therefore controlled by
-  `webkit_settings_set_hardware_acceleration_policy` and page `requestAnimationFrame`,
-  not by the engine's `fps` field. Document this explicitly in `anima status`
-  (`kind: web-browser`).
-- Idle static pages still repaint only when the page schedules work; no
-  engine-side timer is needed.
+- `python3` with PyGObject (`python-gobject`)
+- GTK 3 and WebKit2GTK 4.1 (`webkit2gtk-4.1` on Arch,
+  `gir1.2-webkit2-4.1` on Debian/Ubuntu)
 
-## Failure handling
+The daemon only needs `python3` on `PATH`. If the worker cannot start or the
+`gi` module is missing, the renderer logs one warning and keeps the previous
+behaviour: a procedural shader backdrop using the wallpaper's accent colour.
 
-| Failure | Behaviour |
-| --- | --- |
-| helper binary missing | HUD fallback, one warning |
-| `gtk4-layer-shell` missing | helper exits with a clear error, HUD fallback |
-| WebView load error | helper reports URL + error, HUD fallback |
-| helper crash | daemon restarts it up to 3 times, then HUD fallback |
-| output hotplug | helper bound to one output; daemon respawns on the new output |
+## Security
 
-## Milestones
+Pages are local Workshop files but run with browser privileges. The worker
+serves them from a loopback HTTP server bound to `127.0.0.1` so assets and
+WebGL textures load same-origin; pages are trusted input — the same policy the
+engine applies to shaders and scenes (see the README limitations). Do not
+install Workshop web wallpapers from untrusted sources.
 
-1. **PoC** — `--features web` helper that opens a GTK4 layer-shell window with
-   a WebView on one output and renders a local test page. Measure RSS/CPU.
-2. **Supervision** — spawn/kill from `animad`, control socket, readiness and
-   crash/restart handling, HUD fallback.
-3. **Property bridge** — `anima prop` reaches the page; defaults from
-   `project.json`.
-4. **Audio bridge** — 64-band spectrum + beat pumped at ~30 Hz; audio capture
-   sleeps when no web or audio-reactive wallpaper is active.
-5. **Pause/power** — fullscreen, maximized, battery and user pause suspend the
-   web process; overlay character still works above it.
-6. **Multi-monitor + polish** — per-output lifecycle, `status` reporting,
-   documentation, packaging notes for Arch/Fedora.
+## Verification
 
-## Risks / open questions
+`anima verify` spawns the real worker and requires a live frame before the
+timeout, so it covers the whole chain: GTK init, WebKit load, snapshot stream
+and texture upload. The eight web wallpapers in the reference library verify
+with `live=true alive=true`; a missing WebKit install turns them into `WARN`
+items instead of failures.
 
-- **Memory:** WebKit spawns Web/Network/GPU processes; expect 200–400 MB per
-  web wallpaper. Only acceptable because web wallpapers are an explicit opt-in.
-- **GPU sharing:** WebKitGTK renders through its own EGL/GBM path. No texture
-  sharing with the engine's GL context is planned; the compositor blends the
-  layer surface like any other window. Verify on AMD iGPU and NVIDIA.
-- **Pacing:** WebKit ignores the engine fps cap. If needed, throttle with a
-  page-injected `requestAnimationFrame` limiter.
-- **Security:** pages are local files but still run with browser privileges.
-  Disable remote navigation, devtools, storage and downloads; document that
-  Workshop web wallpapers are trusted content.
-- **Packaging:** the optional feature must not break distro builds without
-  WebKitGTK; CI should build both feature sets.
+## Open items
+
+- **Software rasterisation.** WebKit renders these pages on the CPU, so
+  WebGL-heavy wallpapers are limited by `web_fps` × `web_scale`, not by the
+  engine's GPU budget.
+- **No GPU texture sharing.** Frames cross the process boundary as pixels.
+  A DMA-BUF path would remove the copy but adds driver-specific complexity.
+- **One process per output.** Fine for the handful of monitors the daemon
+  targets; a shared browser process would need per-page surfaces.

@@ -1,0 +1,61 @@
+name: verify
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build, tests, headless render
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build deps: libwayland + xkbcommon (compositor IPC, smithay),
+      # EGL/GL (glutin, the engine's GLES context), libmpv (video wallpapers).
+      # Mesa's llvmpipe driver is what makes the GPU-less runner render.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libwayland-dev libxkbcommon-dev \
+            libgl1-mesa-dev libegl-dev \
+            libegl-mesa0 libgl1-mesa-dri \
+            libmpv-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      # Web wallpapers need python3-gi + WebKit2GTK, which are optional at
+      # runtime; the scene example exercises the full native pipeline without
+      # them. See `anima verify --help` for the kind/filter/rss knobs.
+      - name: Headless render verification (llvmpipe)
+        env:
+          MESA_LOADER_DRIVER_OVERRIDE: llvmpipe
+        run: |
+          ./target/release/anima verify \
+            --dir examples/wallpapers/cyber_scene \
+            --frames 2 \
+            --json | tee /tmp/anima-verify.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: /tmp/anima-verify.json
+          if-no-files-found: ignore

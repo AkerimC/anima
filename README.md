@@ -21,8 +21,9 @@ with EGL / OpenGL ES 3.0. No Electron, no Chromium, no XWayland.
 | Animated GIF | ✅ native |
 | Video (mp4/webm/mkv/mov/avi/m4v/ogv) | ✅ libmpv + hardware decode |
 | GLSL shader wallpapers (`.frag`) | ✅ native |
-| Scene wallpapers (`scene.toml`, Wallpaper Engine `.pkg`) | ✅ native renderer: image/text/particle layers, layer effects, puppet skeletons |
-| Web wallpapers (HTML/CSS/JS) | ⚠️ approximated — see [Limitations](#limitations) |
+| Scene wallpapers (`scene.toml`, Wallpaper Engine `.pkg`) | ✅ native renderer: layer graph, effects, puppet skeletons, particles, SceneScript, cameras |
+| Web wallpapers (HTML/CSS/JS/WebGL) | ✅ offscreen WebKit2GTK process (optional runtime deps, see [Limitations](#limitations)) |
+| Headless regression checks (`anima verify`) | ✅ offscreen EGL sweep: shaders, scripts, GL errors, memory |
 | Desktop character / mascot | ✅ procedural presets + sprite images |
 | Audio-reactive wallpapers & characters | ✅ PulseAudio/PipeWire monitor + FFT |
 | Lyrics / viseme lip-sync | ✅ MPRIS + LRCLIB |
@@ -31,7 +32,6 @@ with EGL / OpenGL ES 3.0. No Electron, no Chromium, no XWayland.
 | Pause on fullscreen / maximized / battery | ✅ (Hyprland + niri events; polled elsewhere) |
 | Steam Workshop browsing + `.pkg` / `.tex` unpack | ✅ |
 | Transitions between wallpapers | ❌ not yet (roadmap) |
-| Real HTML/JS web wallpapers | ❌ not yet (roadmap) |
 
 ## Performance model
 
@@ -60,6 +60,14 @@ The engine is built around "do nothing when nothing changes":
 - `libmpv` (for video wallpapers)
 - PulseAudio or PipeWire (for audio-reactive content; optional at build/run time)
 - Rust 1.85+ (edition 2024) to build
+
+Optional, for HTML/CSS/JS web wallpapers:
+
+- `python3` with PyGObject (`python-gobject`)
+- GTK 3 and WebKit2GTK 4.1 (`webkit2gtk-4.1`)
+
+Without those the daemon still runs; web wallpapers fall back to a procedural
+shader backdrop and log a single warning.
 
 ## Build
 
@@ -181,6 +189,7 @@ anima prop [key] [value]           list / get / set user properties
 anima playlist --interval N --shuffle true
 anima char [preset|file|off] [--corner ...] [--placement ...]
 anima workshop [QUERY]             scan Steam Workshop items (AppID 431960)
+anima verify [--kind K] [--dir P]  headless offscreen regression sweep
 anima unpack <file.pkg|file.tex> [out]
 anima tui                          interactive control center
 anima reload | status | monitors | list
@@ -206,6 +215,8 @@ pause_on_battery = false
 battery_fps = 30
 low_battery_pause = 15      # pause under this %, 0 disables
 hwdec = "auto-safe"         # mpv hwdec mode
+web_fps = 30                # snapshot rate for HTML/WebGL wallpapers
+web_scale = 1.0             # internal WebKit render scale (0.25..1.0)
 compositor = "auto"         # auto | hyprland | niri | generic
 playlist_interval_secs = 0
 playlist_shuffle = false
@@ -273,6 +284,26 @@ then `source = "~/.local/share/anima/ba/Airi/Airi.glb"`, or pick it in
   per-layer effect stacks, and bundled `sound` layers (played through libmpv,
   following the global mute/volume settings).
 
+  SceneScripts run in an embedded QuickJS VM and drive layer visibility,
+  alpha, origin/scale/angles, color and text, effect visibility and shader
+  constants, puppet animation layers, particle `instanceoverride` values,
+  texture/video playback, scene layer creation/destruction/sorting, media
+  events and the cursor. Scripts get the standard prelude (`Vec2/3/4`,
+  `WEMath`, `WEColor`, `engine`, `shared`, `localStorage` with persistence,
+  `thisScene`/`thisLayer`/`thisObject`, audio buffers) and `scriptProperties`
+  overrides from the user properties. `createAnimation()` and
+  `getTextureAnimation()`/`getVideoTexture()` are wired to real playback.
+  A script that fails to compile or throws is disabled and logged; it never
+  takes the scene down.
+
+  Cameras are supported: path animations from `camera`/`camerapath`, shake and
+  zoom, plus 2.5D perspective division for layers that author it through
+  world Z. Scene layers can also act as 2D lights: `light` objects feed the
+  layer shader (`u_light_*`, normal maps, `LIGHTING=1`) and the bloom pass
+  handles SDR/HDR glow. Composition targets (`composelayer`,
+  `projectlayer`, `copybackground`) render through offscreen framebuffers when
+  authored with a bounded size.
+
   Puppet meshes use the skeleton's assembled reference pose (the extra MDLS
   matrix array) or, when absent, the first keyframe of the first clip as the
   neutral pose; animation layers are applied as relative motion tracks on top
@@ -284,19 +315,49 @@ then `source = "~/.local/share/anima/ba/Airi/Airi.glb"`, or pick it in
   int/float and vector-width coercion, global initializer hoisting, builtin
   redefinitions, `%`/array-index rules, return-value truncation) rather than
   patching individual shaders, so community effects keep working as new
-  wallpapers are downloaded. The bundled 19-scene Workshop test library
-  currently compiles with zero shader failures.
+  wallpapers are downloaded. Multi-pass effects, dynamic shader constants,
+  `usertextures` and `$mediaThumbnail` are supported. The local 91-item
+  Workshop library currently verifies with zero shader and zero GL failures.
 
-- **Web** — metadata-driven HUD (see below).
+- **Web** — real HTML/CSS/JS/WebGL pages rendered by WebKit2GTK in an
+  offscreen process (see [the web renderer notes](docs/web-renderer-plan.md)).
+  The daemon streams frames from it into a GL texture, forwards user
+  properties through the standard `wallpaperPropertyListener` bridge, feeds
+  the 64-band audio spectrum to `wallpaperRegisterAudioListener`, and replays
+  pointer/mouse events into the page. Snapshot rate and internal resolution
+  are configurable (`web_fps`, `web_scale`); WebKit rasterises in software, so
+  those two values are the CPU dial. If WebKit or PyGObject is missing the
+  wallpaper degrades to a procedural shader backdrop instead of failing.
+
+## Verification
+
+`anima verify` renders wallpapers through a headless EGL pbuffer — no
+compositor and no visible window — and reports what went wrong per item:
+
+```sh
+anima verify                                  # whole Workshop library
+anima verify --kind scene                     # one wallpaper type
+anima verify --filter 3516106265              # Workshop ID or title substring
+anima verify --dir examples/wallpapers/cyber_scene --dump-dir /tmp/frames
+anima verify --json --rss-limit-mb 600        # machine-readable + memory ceiling
+```
+
+Each item reports shader compile failures, SceneScript failures, GL errors,
+rendered coverage and RSS high-water marks; web wallpapers are checked for
+live WebKit frames and video wallpapers for decoded frames. The command exits
+non-zero only when an item actually fails (`WARN` covers author-broken scripts
+and missing optional runtimes). Defaults are 640×360 and 4 frames per scene.
 
 ## Limitations
 
 These are deliberate, documented gaps rather than bugs:
 
-1. **Web wallpapers are not a real browser.** `src/render/web.rs` reads
-   `project.json` / `index.html` metadata and synthesizes a GPU HUD (clock,
-   spectrum bars, accent color). Arbitrary HTML/CSS/JS is **not** executed.
-   A WebKitGTK-based helper process is planned; see
+1. **Web wallpapers need optional runtime packages.** They are real
+   HTML/CSS/JS/WebGL pages rendered by WebKit2GTK 4.1 through the system
+   `python3` + PyGObject, not an embedded browser engine. WebKit rasterises in
+   software (`web_fps` / `web_scale` are the CPU dial), so heavy WebGL pages
+   are CPU-bound rather than GPU-bound. Without WebKitGTK the wallpaper falls
+   back to a procedural shader backdrop. See
    [`docs/web-renderer-plan.md`](docs/web-renderer-plan.md).
 2. **No wallpaper transitions.** Switching applies immediately.
 3. **Wayland only.** X11 and Windows/macOS are out of scope.
@@ -305,25 +366,28 @@ These are deliberate, documented gaps rather than bugs:
    compositors the wallpaper still renders, but the strip is just the screen,
    fullscreen pause is only detected on sway, and character interaction
    depends on evdev only.
-5. **Wallpaper Engine compatibility is partial.** 2D scene, video, and
-   effect-heavy wallpapers work — including skeletal puppet (`.mdl`) animations,
-   bounded `composelayer` / `projectlayer` / `copybackground` render-target
-   composition (`_rt_imageLayerComposite_*`), keyframe / time-of-day /
-   audio-reactive shader constant scripts, and WE particle presets with
-   spritesheet textures and `instanceoverride` parameters. Not yet implemented:
-   arbitrary 3D/perspective scenes, full SceneScript VM execution beyond
-   standard clock/date/time-of-day/audio patterns, and `application` wallpapers.
+5. **Wallpaper Engine compatibility is broad but not total.** 2D scenes,
+   video, web and effect-heavy wallpapers work — including skeletal puppet
+   (`.mdl`) animations, bounded `composelayer` / `projectlayer` /
+   `copybackground` composition, SceneScript (layer properties, effect
+   visibility and constants, puppet layers, particle instance overrides,
+   `createAnimation`, audio buffers, media and cursor events), camera paths,
+   2.5D perspective layers, 2D lighting and bloom. Still missing:
+   `application` wallpapers (Windows `.exe`), and full 3D scene wallpapers that
+   build a real mesh/camera 3D world (layers with authored perspective get
+   2.5D Z division, not a 3D pipeline). Scripts that are broken at the source
+   are reported by `anima verify` and in the log; they are not fixed for you.
 
 6. **Audio analysis is PulseAudio/PipeWire only** (loaded dynamically; the
    daemon still runs without it).
-7. **No per-wallpaper sandboxing.** Shaders and scenes are trusted input.
+7. **No per-wallpaper sandboxing.** Shaders, scenes and web pages are trusted
+   input.
 
 ## Roadmap
 
-- [ ] Real HTML/CSS/JS wallpapers via a WebKitGTK helper process
-      ([plan](docs/web-renderer-plan.md))
 - [ ] Cross-fade / slide transitions between wallpapers
-- [ ] Full Wallpaper Engine `.pkg` scene graph coverage
+- [ ] Full 3D Wallpaper Engine scenes (mesh + camera pipeline)
+- [ ] `application` wallpapers (out of scope on Linux without Wine-style shims)
 - [ ] Multi-pass shader wallpapers (`.json` shader pipelines)
 - [ ] Scene editor / hot-reload while editing
 - [ ] Wayland `ext-session-lock` integration (pause while locked)
@@ -338,17 +402,20 @@ src/
   backend/hyprland.rs  Hyprland IPC, workspace strip, plugin placement
   backend/niri.rs      niri backend entry (implementation in governor.rs)
   backend/governor.rs  compositor events, niri strip and gestures, power state
-  render/              image, video, shader, scene, web, character, gl helpers
+  render/              image, video, shader, scene, scenescript, particles,
+                       effects, web, character, gl helpers
   audio.rs             PulseAudio monitor capture + FFT + beat detection
+  media.rs             MPRIS2 session/media events and album art
   lyrics.rs            MPRIS + LRCLIB lyrics and viseme sequencer
   pkg.rs               Wallpaper Engine .pkg / .tex reader
   wallpaper.rs         wallpaper discovery and metadata
   config.rs            TOML configuration
   ipc.rs               line-delimited JSON protocol
+  verify.rs            headless EGL regression runner
   bin/animad.rs        daemon entry point
   bin/anima.rs         CLI / TUI
-examples/wallpapers/   aurora shader, particle scene, clock HUD project
-docs/                  design notes (web renderer plan)
+examples/wallpapers/   particle scene, clock HUD web project
+docs/                  renderer, compositor and web design notes
 ```
 
 ## License
