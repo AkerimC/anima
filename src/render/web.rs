@@ -173,6 +173,8 @@ import json
 import mimetypes
 import os
 import posixpath
+import random
+import secrets
 import struct
 import sys
 import threading
@@ -245,10 +247,169 @@ class _QuietHttpServer(http.server.ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         pass
 
+_user_file_lock = threading.Lock()
+_user_file_tokens = {}
+_user_file_rev = {}
+_user_prop_paths = {}
+_last_random_pick = {}
+_MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".mp4", ".webm", ".mkv", ".mov")
+
+def _normalize_local_path(val):
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s:
+        return None
+    if s.startswith("file://localhost"):
+        s = urllib.parse.unquote(s[len("file://localhost"):])
+    elif s.startswith("file://"):
+        s = urllib.parse.unquote(s[len("file://"):])
+    elif "%" in s:
+        s = urllib.parse.unquote(s)
+    if s.startswith("~/"):
+        s = os.path.expanduser(s)
+    if not os.path.isabs(s):
+        return None
+    real = os.path.realpath(s)
+    return real if os.path.exists(real) else None
+
+def _register_user_file(abs_path):
+    with _user_file_lock:
+        if abs_path in _user_file_rev:
+            return _user_file_rev[abs_path]
+        tok = secrets.token_hex(16)
+        _user_file_tokens[tok] = abs_path
+        url_path = f"http://127.0.0.1:{_port}/__anima_user_file/{tok}/{urllib.parse.quote(os.path.basename(abs_path))}"
+        _user_file_rev[abs_path] = url_path
+        return url_path
+
+def _pick_random_user_file(prop_name):
+    with _user_file_lock:
+        target = _user_prop_paths.get(prop_name)
+        last = _last_random_pick.get(prop_name)
+    if not target or not os.path.exists(target):
+        return ""
+    if os.path.isfile(target):
+        return _register_user_file(target)
+    if not os.path.isdir(target):
+        return ""
+    try:
+        candidates = sorted(
+            os.path.join(target, fn)
+            for fn in os.listdir(target)
+            if fn.lower().endswith(_MEDIA_EXTS) and os.path.isfile(os.path.join(target, fn))
+        )
+    except OSError:
+        return ""
+    if not candidates:
+        return ""
+    if len(candidates) > 1 and last in candidates:
+        pool = [c for c in candidates if c != last]
+    else:
+        pool = candidates
+    chosen = os.path.realpath(random.choice(pool))
+    with _user_file_lock:
+        _last_random_pick[prop_name] = chosen
+    return _register_user_file(chosen)
+
+def _rewrite_props_for_web(props):
+    if not isinstance(props, dict):
+        return {}
+    out = {}
+    for k, entry in props.items():
+        if isinstance(entry, dict):
+            new_entry = dict(entry)
+            raw_val = entry.get("value")
+            norm = _normalize_local_path(raw_val)
+            if norm is not None:
+                with _user_file_lock:
+                    _user_prop_paths[k] = norm
+                if os.path.isfile(norm):
+                    new_entry["value"] = _register_user_file(norm)
+            out[k] = new_entry
+        else:
+            out[k] = entry
+    return out
+
 class _AnimaWebHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self._content_encoding = None
         super().__init__(*args, directory=root_dir, **kwargs)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/__anima_random_file":
+            qs = urllib.parse.parse_qs(parsed.query)
+            prop = (qs.get("prop") or [""])[0]
+            body = json.dumps({"file": _pick_random_user_file(prop)}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path.startswith("/__anima_user_file/"):
+            rest = parsed.path[len("/__anima_user_file/"):]
+            tok = rest.split("/", 1)[0]
+            with _user_file_lock:
+                abs_path = _user_file_tokens.get(tok)
+            if not abs_path or not os.path.isfile(abs_path):
+                self.send_error(404)
+                return
+            try:
+                size = os.path.getsize(abs_path)
+                ctype = self.guess_type(abs_path) or "application/octet-stream"
+                rng = self.headers.get("Range")
+                start, end = 0, size - 1
+                partial = False
+                if rng and rng.startswith("bytes="):
+                    spec = rng[6:].split(",", 1)[0].strip()
+                    if "-" in spec:
+                        s_str, e_str = spec.split("-", 1)
+                        if s_str:
+                            start = max(0, int(s_str))
+                            end = int(e_str) if e_str else size - 1
+                        elif e_str:
+                            tail = int(e_str)
+                            start = max(0, size - tail)
+                        end = min(end, size - 1)
+                        if start <= end and size > 0:
+                            partial = True
+                if partial:
+                    length = end - start + 1
+                    self.send_response(206)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Content-Length", str(length))
+                    self.end_headers()
+                    with open(abs_path, "rb") as f:
+                        f.seek(start)
+                        rem = length
+                        while rem > 0:
+                            chunk = f.read(min(65536, rem))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            rem -= len(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(size))
+                    self.end_headers()
+                    with open(abs_path, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+            except BrokenPipeError:
+                pass
+            except OSError:
+                self.send_error(404)
+            return
+        super().do_GET()
 
     def guess_type(self, path):
         clean = path.split("?", 1)[0].split("#", 1)[0]
@@ -280,6 +441,7 @@ class _AnimaWebHandler(http.server.SimpleHTTPRequestHandler):
 
 _httpd = _QuietHttpServer(("127.0.0.1", 0), _AnimaWebHandler)
 _port = _httpd.server_address[1]
+init_props = _rewrite_props_for_web(init_props)
 threading.Thread(target=_httpd.serve_forever, daemon=True).start()
 url = f"http://127.0.0.1:{_port}/{urllib.parse.quote(entry_name)}"
 
@@ -324,6 +486,14 @@ shim_js = r"""
   window.wallpaperRegisterMediaPlaybackListener = function(cb) { _regMedia('playback', cb); };
   window.wallpaperRegisterMediaThumbnailListener = function(cb) { _regMedia('thumbnail', cb); };
   window.wallpaperRegisterMediaTimelineListener = function(cb) { _regMedia('timeline', cb); };
+  window.wallpaperRequestRandomFileForProperty = function(propertyName, callback) {
+    if (typeof callback !== 'function') return;
+    const url = '/__anima_random_file?prop=' + encodeURIComponent(String(propertyName || ''));
+    fetch(url)
+      .then(function(r) { return r.ok ? r.json() : { file: '' }; })
+      .then(function(d) { try { callback(propertyName, (d && d.file) || ''); } catch (_e) {} })
+      .catch(function() { try { callback(propertyName, ''); } catch (_e) {} });
+  };
   window.__animaPushMedia = function(kind, ev) {
     window.__animaLastMedia[kind] = ev;
     const list = window.__animaMediaCbs[kind];
@@ -343,7 +513,13 @@ shim_js = r"""
   window.__animaApplyGeneral = function() {
     const l = window.wallpaperPropertyListener;
     if (l && typeof l.applyGeneralProperties === 'function') {
-      try { l.applyGeneralProperties({ fps: 30 }); } catch (_e) {}
+      try { l.applyGeneralProperties({ fps: __ANIMA_TARGET_FPS__ }); } catch (_e) {}
+    }
+  };
+  window.__animaSetPaused = function(paused) {
+    const l = window.wallpaperPropertyListener;
+    if (l && typeof l.setPaused === 'function') {
+      try { l.setPaused(!!paused); } catch (_e) {}
     }
   };
   window.__animaPushAudio = function(arr) {
@@ -445,7 +621,7 @@ shim_js = r"""
   _patchAudioDecode(window.AudioContext);
   _patchAudioDecode(window.webkitAudioContext);
 })();
-""".replace("__ANIMA_INIT_PROPS__", json.dumps(init_props))
+""".replace("__ANIMA_INIT_PROPS__", json.dumps(init_props)).replace("__ANIMA_TARGET_FPS__", str(target_fps))
 ucm.add_script(WebKit2.UserScript.new(
     shim_js,
     WebKit2.UserContentInjectedFrames.TOP_FRAME,
@@ -569,10 +745,12 @@ def on_load_changed(_view, event):
             f"window.__animaPushMedia && window.__animaPushMedia({json.dumps(k)}, {json.dumps(v)});"
             for k, v in state["media_cache"].items()
         )
+        paused_js = "window.__animaSetPaused && window.__animaSetPaused(true);" if state["paused"] else ""
         props_js = (
             f"window.__animaApplyGeneral && window.__animaApplyGeneral();"
             f"window.__animaApplyProps && window.__animaApplyProps({json.dumps(init_props)});"
             f"{replay_media}"
+            f"{paused_js}"
             f"requestAnimationFrame(() => requestAnimationFrame(() => {{}}));"
         )
         webview.run_javascript(props_js, None, None, None)
@@ -595,11 +773,21 @@ def handle_cmd(msg):
         win.queue_resize()
         state["needs_snap"] = True
     elif cmd == "paused":
-        state["paused"] = bool(msg.get("paused", False))
-        if not state["paused"]:
+        paused_flag = bool(msg.get("paused", False))
+        state["paused"] = paused_flag
+        if state["loaded"]:
+            js_paused = "true" if paused_flag else "false"
+            webview.run_javascript(
+                f"window.__animaSetPaused && window.__animaSetPaused({js_paused});",
+                None,
+                None,
+                None,
+            )
+        if not paused_flag:
             state["needs_snap"] = True
     elif cmd == "props":
-        props = msg.get("props") or {}
+        props = _rewrite_props_for_web(msg.get("props") or {})
+        init_props.update(props)
         if state["loaded"]:
             webview.run_javascript(
                 f"window.__animaApplyProps && window.__animaApplyProps({json.dumps(props)});",
@@ -1693,5 +1881,22 @@ mod web_tests {
             "unexpected data url prefix: {}",
             &url[..url.len().min(40)]
         );
+    }
+
+    #[test]
+    fn worker_script_wires_fps_set_paused_and_random_file_api() {
+        for sym in [
+            "__ANIMA_TARGET_FPS__",
+            "__animaSetPaused",
+            "l.setPaused",
+            "wallpaperRequestRandomFileForProperty",
+            "/__anima_random_file",
+            "/__anima_user_file/",
+        ] {
+            assert!(
+                WEBKIT_WORKER_SCRIPT.contains(sym),
+                "missing worker script symbol: {sym}"
+            );
+        }
     }
 }

@@ -59,13 +59,25 @@ uniform vec2 u_canvas;
 uniform vec2 u_origin;
 uniform vec2 u_axis_x;
 uniform vec2 u_axis_y;
+uniform vec2 u_world_origin;
+uniform vec2 u_world_ax;
+uniform vec2 u_world_ay;
+uniform vec4 u_persp_z; // x=origin_z, y=ax_z, z=ay_z, w=fov_dist (<=0.5 disabled)
 uniform vec4 u_uv_rect;
 out vec2 v_uv;
+out vec2 v_world;
 void main() {
     vec2 world = u_origin + a_pos.x * u_axis_x + a_pos.y * u_axis_y;
+    v_world = u_world_origin + a_pos.x * u_world_ax + a_pos.y * u_world_ay;
     vec2 local = world - u_min;
-    gl_Position = vec4(local.x / u_canvas.x * 2.0 - 1.0,
-                       1.0 - local.y / u_canvas.y * 2.0, 0.0, 1.0);
+    vec2 ndc = vec2(local.x / u_canvas.x * 2.0 - 1.0,
+                    1.0 - local.y / u_canvas.y * 2.0);
+    float w_clip = 1.0;
+    if (u_persp_z.w > 0.5) {
+        float wz = u_persp_z.x + a_pos.x * u_persp_z.y + a_pos.y * u_persp_z.z;
+        w_clip = max(u_persp_z.w - wz, 1.0) / u_persp_z.w;
+    }
+    gl_Position = vec4(ndc, 0.0, w_clip);
     v_uv = u_uv_rect.xy + a_uv * u_uv_rect.zw;
 }
 "#;
@@ -73,14 +85,73 @@ void main() {
 const CONTENT_FS: &str = r#"#version 300 es
 precision highp float;
 in vec2 v_uv;
+in vec2 v_world;
 uniform sampler2D u_tex;
+uniform sampler2D u_normal_tex;
 uniform vec4 u_color;
 uniform float u_brightness;
+uniform int u_lit;
+uniform vec3 u_ambient;
+uniform vec3 u_skylight;
+uniform vec4 u_mat_pbr; // x=roughness, y=metallic, z=has_normal, w=layer_z
+uniform vec3 u_spec_tint;
+uniform int u_light_count;
+uniform vec4 u_light_pos_type[12]; // xyz=pos, w=kind (0=point, 1=dir, 2=spot)
+uniform vec4 u_light_dir_inner[12]; // xyz=dir, w=inner_cos
+uniform vec4 u_light_col_int[12];  // rgb=color, w=intensity
+uniform vec4 u_light_params[12];   // x=radius, y=exponent, z=outer_cos, w=unused
 out vec4 fragColor;
 void main() {
     vec4 c = texture(u_tex, v_uv);
     c.rgb *= u_color.rgb * u_brightness;
     c.a *= u_color.a;
+    if (u_lit != 0) {
+        vec3 N = vec3(0.0, 0.0, 1.0);
+        if (u_mat_pbr.z > 0.5) {
+            N = normalize(texture(u_normal_tex, v_uv).rgb * 2.0 - 1.0);
+        }
+        vec3 albedo = c.rgb;
+        vec3 lit = albedo * mix(u_ambient, u_skylight, N.y * 0.5 + 0.5);
+        vec3 frag_pos = vec3(v_world, u_mat_pbr.w);
+        vec3 V = vec3(0.0, 0.0, 1.0);
+        float roughness = clamp(u_mat_pbr.x, 0.02, 1.0);
+        float metallic = clamp(u_mat_pbr.y, 0.0, 1.0);
+        float shininess = mix(128.0, 4.0, roughness);
+        for (int i = 0; i < 12; i++) {
+            if (i >= u_light_count) {
+                break;
+            }
+            vec4 pos_t = u_light_pos_type[i];
+            vec4 dir_in = u_light_dir_inner[i];
+            vec4 col_int = u_light_col_int[i];
+            vec4 par = u_light_params[i];
+            vec3 L;
+            float atten = 1.0;
+            if (pos_t.w < 0.5) {
+                vec3 to_l = pos_t.xyz - frag_pos;
+                float dist = length(to_l);
+                L = to_l / max(dist, 1e-4);
+                atten = pow(clamp(1.0 - dist / max(par.x, 1.0), 0.0, 1.0), max(par.y, 0.1));
+            } else if (pos_t.w < 1.5) {
+                L = normalize(-dir_in.xyz);
+            } else {
+                vec3 to_l = pos_t.xyz - frag_pos;
+                float dist = length(to_l);
+                L = to_l / max(dist, 1e-4);
+                vec3 ldir = normalize(dir_in.xyz);
+                float spot = smoothstep(par.z, dir_in.w, dot(-L, ldir));
+                atten = pow(clamp(1.0 - dist / max(par.x, 1.0), 0.0, 1.0), max(par.y, 0.1)) * spot;
+            }
+            float ndl = max(dot(N, L), 0.0);
+            vec3 H = normalize(L + V);
+            float spec = pow(max(dot(N, H), 0.0), shininess) * (1.0 - roughness * 0.75);
+            vec3 radiance = col_int.rgb * (col_int.w / 3.14159265) * atten;
+            vec3 diff_col = albedo * (1.0 - metallic);
+            vec3 spec_col = mix(vec3(0.04) * u_spec_tint, albedo, metallic);
+            lit += (diff_col + spec_col * spec) * radiance * ndl;
+        }
+        c.rgb = lit;
+    }
     fragColor = c;
 }
 "#;
@@ -93,10 +164,15 @@ uniform vec2 u_canvas;
 uniform vec2 u_origin;
 uniform vec2 u_axis_x;
 uniform vec2 u_axis_y;
+uniform vec2 u_world_origin;
+uniform vec2 u_world_ax;
+uniform vec2 u_world_ay;
 out vec2 v_uv;
+out vec2 v_world;
 void main() {
     // Puppet vertices are corrected to a y-up local space when parsed.
     vec2 world = u_origin + a_pos.x * u_axis_x + a_pos.y * u_axis_y;
+    v_world = u_world_origin + a_pos.x * u_world_ax + a_pos.y * u_world_ay;
     vec2 local = world - u_min;
     gl_Position = vec4(local.x / u_canvas.x * 2.0 - 1.0,
                        1.0 - local.y / u_canvas.y * 2.0, 0.0, 1.0);
@@ -516,8 +592,51 @@ void main() {
 }
 "#;
 
+const VOLUMETRIC_LIGHT_VS: &str = r#"#version 300 es
+layout(location = 0) in vec2 a_pos;
+uniform vec2 u_origin;
+uniform float u_radius;
+uniform vec2 u_ortho;
+out vec2 v_world;
+void main() {
+    vec2 world = u_origin + a_pos * u_radius;
+    vec2 ndc = vec2(world.x / u_ortho.x * 2.0 - 1.0,
+                    1.0 - world.y / u_ortho.y * 2.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    v_world = world;
+}
+"#;
+
+const VOLUMETRIC_LIGHT_FS: &str = r#"#version 300 es
+precision highp float;
+in vec2 v_world;
+uniform vec2 u_origin;
+uniform float u_radius;
+uniform vec2 u_light_dir;
+uniform vec4 u_cone_params; // x=inner_cos, y=outer_cos, z=exponent, w=vol_exponent
+uniform vec4 u_light_col_int; // rgb=color, w=intensity * density * 0.025
+uniform float u_light_kind; // 0=point, 2=spot
+out vec4 fragColor;
+void main() {
+    vec2 rel = v_world - u_origin;
+    float dist = length(rel);
+    if (dist >= u_radius) {
+        discard;
+    }
+    float atten = pow(clamp(1.0 - dist / max(u_radius, 1.0), 0.0, 1.0), max(u_cone_params.z, 0.1));
+    float cone = 1.0;
+    if (u_light_kind > 0.5) {
+        vec2 dir = dist > 1e-4 ? rel / dist : u_light_dir;
+        float c = dot(dir, normalize(u_light_dir));
+        cone = pow(smoothstep(u_cone_params.y, u_cone_params.x, c), max(u_cone_params.w, 0.1));
+        cone *= smoothstep(0.0, max(u_radius * 0.04, 2.0), dist);
+    }
+    fragColor = vec4(u_light_col_int.rgb * (atten * cone * u_light_col_int.a), 1.0);
+}
+"#;
+
 // ---------------------------------------------------------------------------
-// Small affine math (world space: y-up, origin bottom-left)
+// Small affine & 3D matrix math (world space: y-up, origin bottom-left)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
@@ -537,10 +656,12 @@ impl Affine {
     pub(super) fn translate(x: f32, y: f32) -> Self {
         Self { tx: x, ty: y, ..Self::identity() }
     }
+    #[cfg(test)]
     pub(super) fn rotate(r: f32) -> Self {
         let (s, c) = r.sin_cos();
         Self { a: c, b: s, c: -s, d: c, tx: 0.0, ty: 0.0 }
     }
+    #[cfg(test)]
     pub(super) fn scale(x: f32, y: f32) -> Self {
         Self { a: x, b: 0.0, c: 0.0, d: y, tx: 0.0, ty: 0.0 }
     }
@@ -578,12 +699,122 @@ impl Affine {
     }
 }
 
-/// Build the local (parent-relative) transform from Wallpaper Engine's
-/// translation / rotation / scale triple.
+/// Column-major 4×4 transform matrix supporting full 3D Wallpaper Engine Euler
+/// rotations (`R_z * R_y * R_x`) for lights, SceneScript transforms, and 2.5D
+/// perspective layers.
+#[derive(Debug, Clone, Copy)]
+struct Mat4([f32; 16]);
+
+impl Mat4 {
+    fn identity() -> Self {
+        Self([
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ])
+    }
+
+    fn translate(v: [f32; 3]) -> Self {
+        Self([
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            v[0], v[1], v[2], 1.0,
+        ])
+    }
+
+    fn scale(v: [f32; 3]) -> Self {
+        Self([
+            v[0], 0.0, 0.0, 0.0,
+            0.0, v[1], 0.0, 0.0,
+            0.0, 0.0, v[2], 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ])
+    }
+
+    fn rotate_euler(angles: [f32; 3]) -> Self {
+        let (sx, cx) = angles[0].sin_cos();
+        let (sy, cy) = angles[1].sin_cos();
+        let (sz, cz) = angles[2].sin_cos();
+        Self([
+            cz * cy,
+            sz * cy,
+            -sy,
+            0.0,
+            cz * sy * sx - sz * cx,
+            sz * sy * sx + cz * cx,
+            cy * sx,
+            0.0,
+            cz * sy * cx + sz * sx,
+            sz * sy * cx - cz * sx,
+            cy * cx,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ])
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        let mut out = [0.0f32; 16];
+        for col in 0..4 {
+            let c = col * 4;
+            let r0 = rhs.0[c];
+            let r1 = rhs.0[c + 1];
+            let r2 = rhs.0[c + 2];
+            let r3 = rhs.0[c + 3];
+            for row in 0..4 {
+                out[c + row] = self.0[row] * r0
+                    + self.0[4 + row] * r1
+                    + self.0[8 + row] * r2
+                    + self.0[12 + row] * r3;
+            }
+        }
+        Self(out)
+    }
+
+    fn transform_point(self, p: [f32; 3]) -> [f32; 3] {
+        [
+            self.0[0] * p[0] + self.0[4] * p[1] + self.0[8] * p[2] + self.0[12],
+            self.0[1] * p[0] + self.0[5] * p[1] + self.0[9] * p[2] + self.0[13],
+            self.0[2] * p[0] + self.0[6] * p[1] + self.0[10] * p[2] + self.0[14],
+        ]
+    }
+
+    fn transform_vec(self, v: [f32; 3]) -> [f32; 3] {
+        [
+            self.0[0] * v[0] + self.0[4] * v[1] + self.0[8] * v[2],
+            self.0[1] * v[0] + self.0[5] * v[1] + self.0[9] * v[2],
+            self.0[2] * v[0] + self.0[6] * v[1] + self.0[10] * v[2],
+        ]
+    }
+
+    fn to_affine(self) -> Affine {
+        Affine {
+            a: self.0[0],
+            b: self.0[1],
+            c: self.0[4],
+            d: self.0[5],
+            tx: self.0[12],
+            ty: self.0[13],
+        }
+    }
+}
+
+/// Build the full 3D local transform from Wallpaper Engine's
+/// translation / Euler rotation / scale triple.
+fn compose_local_mat4(origin: [f32; 3], scale: [f32; 3], angles: [f32; 3]) -> Mat4 {
+    Mat4::translate(origin)
+        .mul(Mat4::rotate_euler(angles))
+        .mul(Mat4::scale(scale))
+}
+
+/// Build the 2D projection of the local (parent-relative) transform from
+/// Wallpaper Engine's translation / rotation / scale triple.
 fn compose_local(origin: [f32; 3], scale: [f32; 3], angles: [f32; 3]) -> Affine {
-    Affine::translate(origin[0], origin[1])
-        .mul(Affine::rotate(angles[2]))
-        .mul(Affine::scale(scale[0], scale[1]))
+    compose_local_mat4(origin, scale, angles).to_affine()
 }
 
 #[derive(Debug, Clone)]
@@ -1183,6 +1414,158 @@ struct PuppetLayerMeta {
     script_rate: Option<f32>,
 }
 
+const MAX_SCENE_LIGHTS: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraQueueMode {
+    Random,
+    Sequential,
+    Single,
+}
+
+#[derive(Debug, Clone)]
+struct CameraPathPoint {
+    origin: [f32; 3],
+    zoom: f32,
+    duration: f32,
+}
+
+#[derive(Debug, Clone)]
+struct CameraPath {
+    points: Vec<CameraPathPoint>,
+    total_duration: f32,
+}
+
+struct CameraObject {
+    base_zoom: f32,
+    zoom_track: Option<KeyTrack>,
+    fov: f32,
+    has_dynamic_origin: bool,
+    paths: Vec<CameraPath>,
+    queue_mode: CameraQueueMode,
+    active_path: usize,
+    path_time: f32,
+    rng_state: u64,
+}
+
+impl CameraObject {
+    fn next_random(&mut self) -> u64 {
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.rng_state >> 32
+    }
+
+    fn advance(&mut self, dt: f32) -> (Option<[f32; 2]>, f32) {
+        let zoom = if let Some(track) = &mut self.zoom_track {
+            track.advance(dt);
+            track.eval()[0].clamp(0.1, 10.0)
+        } else {
+            self.base_zoom.clamp(0.1, 10.0)
+        };
+        if self.paths.is_empty() {
+            return (None, zoom);
+        }
+        let path_count = self.paths.len();
+        if self.active_path >= path_count {
+            self.active_path = 0;
+        }
+        let total = self.paths[self.active_path].total_duration.max(0.01);
+        if dt > 0.0 {
+            self.path_time += dt;
+            if self.path_time >= total {
+                match self.queue_mode {
+                    CameraQueueMode::Single => {
+                        self.path_time = total;
+                    }
+                    CameraQueueMode::Sequential => {
+                        self.path_time -= total;
+                        self.active_path = (self.active_path + 1) % path_count;
+                    }
+                    CameraQueueMode::Random => {
+                        self.path_time -= total;
+                        if path_count > 1 {
+                            let prev = self.active_path;
+                            let pick = (self.next_random() as usize) % (path_count - 1);
+                            self.active_path = if pick >= prev { pick + 1 } else { pick };
+                        }
+                    }
+                }
+            }
+        }
+        let path = &self.paths[self.active_path];
+        if path.points.is_empty() {
+            return (None, zoom);
+        }
+        if path.points.len() == 1 {
+            let pt = &path.points[0];
+            return (Some([pt.origin[0], pt.origin[1]]), (zoom * pt.zoom).clamp(0.1, 10.0));
+        }
+        let mut accum = 0.0f32;
+        let t = self.path_time.max(0.0);
+        for seg in 0..(path.points.len() - 1) {
+            let p0 = &path.points[seg];
+            let p1 = &path.points[seg + 1];
+            let seg_dur = p0.duration.max(0.01);
+            if t <= accum + seg_dur || seg + 2 == path.points.len() {
+                let u = ((t - accum) / seg_dur).clamp(0.0, 1.0);
+                // Smooth Hermite ease when stepping between authored path keyframes.
+                let s = u * u * (3.0 - 2.0 * u);
+                let x = p0.origin[0] + (p1.origin[0] - p0.origin[0]) * s;
+                let y = p0.origin[1] + (p1.origin[1] - p0.origin[1]) * s;
+                let pz = (p0.zoom + (p1.zoom - p0.zoom) * s).max(0.1);
+                return (Some([x, y]), (zoom * pz).clamp(0.1, 10.0));
+            }
+            accum += seg_dur;
+        }
+        let last = path.points.last().unwrap();
+        (Some([last.origin[0], last.origin[1]]), (zoom * last.zoom).clamp(0.1, 10.0))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LightKind {
+    Point,
+    Directional,
+    Spot,
+}
+
+struct LightObject {
+    kind: LightKind,
+    base_intensity: f32,
+    intensity_track: Option<KeyTrack>,
+    intensity: f32,
+    radius: f32,
+    exponent: f32,
+    inner_cone_cos: f32,
+    outer_cone_cos: f32,
+    cast_volumetrics: bool,
+    density: f32,
+    volumetrics_exponent: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayerLighting {
+    normal_tex: Option<glow::Texture>,
+    roughness: f32,
+    metallic: f32,
+    specular_tint: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackedLight {
+    pos: [f32; 3],
+    kind: f32,
+    dir: [f32; 3],
+    inner_cos: f32,
+    color: [f32; 3],
+    intensity: f32,
+    radius: f32,
+    exponent: f32,
+    outer_cos: f32,
+}
+
 enum ObjectKind {
     Image(glow::Texture),
     Puppet {
@@ -1198,6 +1581,8 @@ enum ObjectKind {
     Solid,
     Particle(usize),
     Sound(usize),
+    Camera(Box<CameraObject>),
+    Light(Box<LightObject>),
     Compose {
         copy_background: bool,
     },
@@ -1209,6 +1594,10 @@ struct SceneObject {
     id: Option<i64>,
     name: String,
     transform: Affine,
+    /// Full 3D column-major world matrix for 3D Euler orientation and lights.
+    world_mat4: Mat4,
+    /// Enable 2.5D perspective division from world Z when authored.
+    perspective: bool,
     /// Local (unscaled) layer size in scene units.
     size: [f32; 2],
     /// Normalized anchor shift (`-0.5..=0.5`) from Wallpaper Engine's
@@ -1228,6 +1617,8 @@ struct SceneObject {
     capture_composite: bool,
     effects: Vec<EffectInstance>,
     kind: ObjectKind,
+    /// Optional 2D lighting material state (`LIGHTING=1` combo + normal map).
+    lighting: Option<LayerLighting>,
     /// Keyframe / script driven transform and alpha.
     anim: Option<Box<ObjAnim>>,
     /// Animated texture (TEXS spritesheet or decoded MP4) for image layers.
@@ -1697,7 +2088,11 @@ impl SceneObject {
         if !self.solid
             || matches!(
                 self.kind,
-                ObjectKind::Post | ObjectKind::Particle(_) | ObjectKind::Sound(_)
+                ObjectKind::Post
+                    | ObjectKind::Particle(_)
+                    | ObjectKind::Sound(_)
+                    | ObjectKind::Camera(_)
+                    | ObjectKind::Light(_)
             )
         {
             return None;
@@ -1778,6 +2173,8 @@ impl SceneObject {
             ObjectKind::Solid => DrawKind::Solid,
             ObjectKind::Particle(_)
             | ObjectKind::Sound(_)
+            | ObjectKind::Camera(_)
+            | ObjectKind::Light(_)
             | ObjectKind::Compose { .. }
             | ObjectKind::CompositeRef(_)
             | ObjectKind::Post => DrawKind::None,
@@ -2023,6 +2420,7 @@ pub struct SceneRenderer {
     copy_prog: Program,
     bloom_prog: Program,
     particle_prog: Program,
+    volumetric_prog: Program,
 
     quad_vao: glow::VertexArray,
     #[allow(dead_code)]
@@ -2048,6 +2446,11 @@ pub struct SceneRenderer {
 
     ortho_size: [f32; 2],
     clear_color: [f32; 3],
+    ambient_color: [f32; 3],
+    skylight_color: [f32; 3],
+    scene_fov: f32,
+    perspective_override_fov: f32,
+    near_z: f32,
     parallax_enabled: bool,
     parallax_amount: f32,
     parallax_mouse_influence: f32,
@@ -2057,6 +2460,9 @@ pub struct SceneRenderer {
     camera_shake_speed: f32,
     camera_shake_roughness: f32,
     camera_zoom: f32,
+    active_cam_pan: [f32; 2],
+    active_cam_zoom: f32,
+    active_cam_fov: Option<f32>,
     smooth_mouse: [f32; 2],
     speed_multiplier: f32,
     /// Horizontal offset applied when a portrait scene is widened to the
@@ -2065,6 +2471,7 @@ pub struct SceneRenderer {
     view_shift: f32,
 
     objects: Vec<SceneObject>,
+    frame_lights: Vec<PackedLight>,
     emitters: Vec<Emitter>,
     /// Wallpaper Engine scene `sound` layers, lazily backed by libmpv after the
     /// first frame so mute/volume settings apply before playback starts.
@@ -2203,6 +2610,11 @@ struct ResolvedModelInfo {
     model_size: Option<[f32; 2]>,
     material_blend: String,
     texture_path: Option<String>,
+    normal_path: Option<String>,
+    lit: bool,
+    roughness: f32,
+    metallic: f32,
+    specular_tint: [f32; 3],
     puppet_path: Option<String>,
     solid_model: bool,
     mat_media_pass: Option<serde_json::Value>,
@@ -2213,6 +2625,11 @@ fn resolve_image_model(pkg: &PackageFs, image_ref: &str) -> ResolvedModelInfo {
         model_size: None,
         material_blend: String::from("normal"),
         texture_path: None,
+        normal_path: None,
+        lit: false,
+        roughness: 0.7,
+        metallic: 0.0,
+        specular_tint: [1.0, 1.0, 1.0],
         puppet_path: None,
         solid_model: false,
         mat_media_pass: None,
@@ -2261,14 +2678,152 @@ fn resolve_image_model(pkg: &PackageFs, image_ref: &str) -> ResolvedModelInfo {
             .and_then(|v| v.as_str())
             .unwrap_or("normal")
             .to_string();
-        out.texture_path = pass
-            .get("textures")
-            .and_then(|t| t.as_array())
-            .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        if let Some(texs) = pass.get("textures").and_then(|t| t.as_array()) {
+            out.texture_path = texs.first().and_then(|v| v.as_str()).map(str::to_string);
+            out.normal_path = texs
+                .get(1)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+        if pass
+            .get("combos")
+            .and_then(|c| c.get("LIGHTING"))
+            .and_then(value_f32)
+            .is_some_and(|v| v >= 0.5)
+        {
+            out.lit = true;
+        }
+        if let Some(csv) = pass.get("constantshadervalues").and_then(|v| v.as_object()) {
+            if let Some(r) = csv.get("roughness").and_then(value_f32) {
+                out.roughness = r.clamp(0.02, 1.0);
+            }
+            if let Some(m) = csv.get("metallic").and_then(value_f32) {
+                out.metallic = m.clamp(0.0, 1.0);
+            }
+            if let Some(st) = csv.get("speculartint") {
+                out.specular_tint = parse_color(st, [1.0, 1.0, 1.0]);
+            }
+        }
     }
     out
+}
+
+fn parse_camera_paths_json(json_text: &str) -> Vec<CameraPath> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json_text) else {
+        return Vec::new();
+    };
+    let Some(arr) = doc.get("paths").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in arr {
+        let Some(pts_raw) = entry.get("points").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if pts_raw.is_empty() {
+            continue;
+        }
+        let path_dur = entry.get("duration").and_then(value_f32);
+        let fallback_seg = path_dur
+            .map(|d| (d / (pts_raw.len().saturating_sub(1).max(1)) as f32).max(0.05))
+            .unwrap_or(2.0);
+        let mut points = Vec::with_capacity(pts_raw.len());
+        for pt in pts_raw {
+            let origin = pt
+                .get("origin")
+                .or_else(|| pt.get("eye"))
+                .map(|v| value_vec(v, 3, [0.0, 0.0, 0.0]))
+                .unwrap_or([0.0, 0.0, 0.0]);
+            let zoom = pt
+                .get("zoom")
+                .and_then(value_f32)
+                .unwrap_or(1.0)
+                .clamp(0.1, 10.0);
+            let duration = pt
+                .get("duration")
+                .and_then(value_f32)
+                .unwrap_or(fallback_seg)
+                .max(0.01);
+            points.push(CameraPathPoint {
+                origin,
+                zoom,
+                duration,
+            });
+        }
+        let total_duration = if points.len() <= 1 {
+            path_dur.unwrap_or(points[0].duration).max(0.01)
+        } else {
+            points[..points.len() - 1]
+                .iter()
+                .map(|p| p.duration)
+                .sum::<f32>()
+                .max(0.01)
+        };
+        out.push(CameraPath {
+            points,
+            total_duration,
+        });
+    }
+    out
+}
+
+fn parse_camera_paths(pkg: &PackageFs, path_ref: &str) -> Vec<CameraPath> {
+    let trimmed = path_ref.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let Some(txt) = read_scene_text(pkg, trimmed) else {
+        return Vec::new();
+    };
+    parse_camera_paths_json(&txt)
+}
+
+fn parse_light_object(
+    obj: &serde_json::Value,
+    props: &HashMap<String, serde_json::Value>,
+) -> Option<LightObject> {
+    let kind_str = obj.get("light").and_then(|v| v.as_str())?;
+    let kind = match kind_str.to_ascii_lowercase().as_str() {
+        "lpoint" | "point" => LightKind::Point,
+        "ldirectional" | "directional" => LightKind::Directional,
+        "lspot" | "spot" => LightKind::Spot,
+        _ => return None,
+    };
+    let resolve_f = |k: &str, d: f32| {
+        obj.get(k)
+            .map(|v| resolve_prop(v, props))
+            .and_then(|v| value_f32(&v))
+            .unwrap_or(d)
+    };
+    let resolve_b = |k: &str, d: bool| {
+        obj.get(k)
+            .map(|v| resolve_prop(v, props))
+            .and_then(|v| value_bool(&v))
+            .unwrap_or(d)
+    };
+    let intensity_track = obj.get("intensity").and_then(KeyTrack::parse);
+    let base_intensity = resolve_f("intensity", 1.0).max(0.0);
+    let intensity = intensity_track
+        .as_ref()
+        .map(|t| t.eval()[0].max(0.0))
+        .unwrap_or(base_intensity);
+    let inner_deg = resolve_f("innercone", 15.0).clamp(0.1, 179.0);
+    let outer_deg = resolve_f("outercone", 35.0).clamp(inner_deg + 0.5, 179.5);
+    Some(LightObject {
+        kind,
+        base_intensity,
+        intensity_track,
+        intensity,
+        radius: resolve_f("radius", 500.0).max(1.0),
+        exponent: resolve_f("exponent", 2.0).clamp(0.1, 16.0),
+        inner_cone_cos: inner_deg.to_radians().cos(),
+        outer_cone_cos: outer_deg.to_radians().cos(),
+        cast_volumetrics: resolve_b("castvolumetrics", false),
+        density: resolve_f("density", 1.0).max(0.0),
+        volumetrics_exponent: resolve_f("volumetricsexponent", 1.0).clamp(0.1, 8.0),
+    })
 }
 
 fn emitter_image_dep_id(obj: &serde_json::Value) -> Option<i64> {
@@ -2348,6 +2903,7 @@ impl SceneRenderer {
         let copy_prog = Program::new(gl, COPY_VS, COPY_FS)?;
         let bloom_prog = Program::new(gl, BLOOM_VS, BLOOM_FS)?;
         let particle_prog = Program::new(gl, PARTICLE_VS, PARTICLE_FS)?;
+        let volumetric_prog = Program::new(gl, VOLUMETRIC_LIGHT_VS, VOLUMETRIC_LIGHT_FS)?;
         let (quad_vao, quad_vbo) = create_quad(gl)?;
         let (particle_vao, particle_quad_vbo, particle_inst_vbo) = create_particle_buffers(gl)?;
         if trace {
@@ -2362,6 +2918,7 @@ impl SceneRenderer {
             copy_prog,
             bloom_prog,
             particle_prog,
+            volumetric_prog,
             quad_vao,
             quad_vbo,
             particle_vao,
@@ -2381,6 +2938,11 @@ impl SceneRenderer {
             bloom_mips: Vec::new(),
             ortho_size: [1920.0, 1080.0],
             clear_color: [0.04, 0.05, 0.08],
+            ambient_color: [0.3, 0.3, 0.3],
+            skylight_color: [0.3, 0.3, 0.3],
+            scene_fov: 50.0,
+            perspective_override_fov: 0.0,
+            near_z: 0.01,
             parallax_enabled: false,
             parallax_amount: 0.5,
             parallax_mouse_influence: 0.4,
@@ -2390,10 +2952,14 @@ impl SceneRenderer {
             camera_shake_speed: 1.5,
             camera_shake_roughness: 0.0,
             camera_zoom: 1.0,
+            active_cam_pan: [0.0, 0.0],
+            active_cam_zoom: 1.0,
+            active_cam_fov: None,
             smooth_mouse: [0.0, 0.0],
             speed_multiplier: 1.0,
             view_shift: 0.0,
             objects: Vec::new(),
+            frame_lights: Vec::with_capacity(MAX_SCENE_LIGHTS),
             emitters: Vec::new(),
             sounds: Vec::new(),
             sound_temp_dir: None,
@@ -2526,6 +3092,21 @@ impl SceneRenderer {
                 .map(|v| resolve_prop(v, &self.properties))
                 .and_then(|v| value_bool(&v))
         };
+        if let Some(ac) = general.get("ambientcolor") {
+            self.ambient_color = eval_color_field(Some(ac), &self.properties, [0.3, 0.3, 0.3]);
+        }
+        if let Some(sc) = general.get("skylightcolor") {
+            self.skylight_color = eval_color_field(Some(sc), &self.properties, [0.3, 0.3, 0.3]);
+        }
+        if let Some(v) = resolve_f32("fov") {
+            self.scene_fov = v.clamp(10.0, 150.0);
+        }
+        if let Some(v) = resolve_f32("perspectiveoverridefov") {
+            self.perspective_override_fov = v.max(0.0);
+        }
+        if let Some(v) = resolve_f32("nearz") {
+            self.near_z = v.max(0.001);
+        }
         if let Some(v) = resolve_bool("cameraparallax") {
             self.parallax_enabled = v;
         }
@@ -2555,6 +3136,21 @@ impl SceneRenderer {
         }
     }
 
+    fn effective_perspective_fov_dist(&self) -> f32 {
+        let fov = self
+            .active_cam_fov
+            .unwrap_or_else(|| {
+                if self.perspective_override_fov > 1.0 {
+                    self.perspective_override_fov
+                } else {
+                    self.scene_fov
+                }
+            })
+            .clamp(10.0, 150.0);
+        let dist = (self.ortho_size[1].max(1.0) * 0.5) / (fov.to_radians() * 0.5).tan();
+        dist.max(self.near_z + 1.0)
+    }
+
     fn load_we_scene(&mut self, gl: &glow::Context, pkg: &PackageFs, json_text: &str) -> Result<()> {
         let root: serde_json::Value =
             serde_json::from_str(json_text).context("parsing Wallpaper Engine scene.json")?;
@@ -2562,6 +3158,11 @@ impl SceneRenderer {
         // Per-scene camera state: `view_shift` is only set by the portrait
         // widening branch below, so it must never leak in from a previous load.
         self.view_shift = 0.0;
+        self.ambient_color = [0.3, 0.3, 0.3];
+        self.skylight_color = [0.3, 0.3, 0.3];
+        self.scene_fov = 50.0;
+        self.perspective_override_fov = 0.0;
+        self.near_z = 0.01;
         self.parallax_enabled = false;
         self.parallax_amount = 0.5;
         self.parallax_mouse_influence = 0.4;
@@ -2571,6 +3172,10 @@ impl SceneRenderer {
         self.camera_shake_speed = 1.5;
         self.camera_shake_roughness = 0.0;
         self.camera_zoom = 1.0;
+        self.active_cam_pan = [0.0, 0.0];
+        self.active_cam_zoom = 1.0;
+        self.active_cam_fov = None;
+        self.frame_lights.clear();
         self.sounds.clear();
         self.sounds_started = false;
         self.scene_general = root.get("general").cloned();
@@ -2600,7 +3205,7 @@ impl SceneRenderer {
         struct Raw {
             obj: serde_json::Value,
             parent: Option<String>,
-            local: Affine,
+            local_mat4: Mat4,
             origin: [f32; 3],
             scale: [f32; 3],
             angles: [f32; 3],
@@ -2641,66 +3246,58 @@ impl SceneRenderer {
                 .get("angles")
                 .map(|v| value_vec(&resolve_prop(v, &self.properties), 3, [0.0, 0.0, 0.0]))
                 .unwrap_or([0.0, 0.0, 0.0]);
-            let local = Affine::translate(origin[0], origin[1])
-                .mul(Affine::rotate(angles[2]))
-                .mul(Affine::scale(
+            let local_mat4 = compose_local_mat4(
+                origin,
+                [
                     if scale[0] == 0.0 { 1.0 } else { scale[0] },
                     if scale[1] == 0.0 { 1.0 } else { scale[1] },
-                ));
+                    if scale[2] == 0.0 { 1.0 } else { scale[2] },
+                ],
+                angles,
+            );
             raws.push(Raw {
                 obj: obj.clone(),
                 parent,
-                local,
+                local_mat4,
                 origin,
                 scale,
                 angles,
             });
         }
 
-        // Resolve world transforms with parent chains.
+        // Resolve 3D world transforms with parent chains.
         let mut id_index: HashMap<String, usize> = HashMap::new();
         for (i, r) in raws.iter().enumerate() {
             if let Some(id) = r.obj.get("id") {
                 id_index.insert(value_to_string(id), i);
             }
         }
-        let mut resolved: Vec<Option<Affine>> = vec![None; raws.len()];
-        fn resolve(
+        let mut resolved_mat4: Vec<Option<Mat4>> = vec![None; raws.len()];
+        fn resolve_m4(
             i: usize,
-            raws: &[impl RawLike],
+            raws: &[Raw],
             index: &HashMap<String, usize>,
-            out: &mut Vec<Option<Affine>>,
+            out: &mut Vec<Option<Mat4>>,
             depth: usize,
-        ) -> Affine {
+        ) -> Mat4 {
             if let Some(t) = out[i] {
                 return t;
             }
             if depth > 32 {
-                return Affine::identity();
+                return Mat4::identity();
             }
             let parent = raws[i]
-                .parent_id()
-                .and_then(|id| index.get(&id).copied())
-                .map(|p| resolve(p, raws, index, out, depth + 1))
-                .unwrap_or_else(Affine::identity);
-            let t = parent.mul(raws[i].local_transform());
+                .parent
+                .as_deref()
+                .and_then(|id| index.get(id).copied())
+                .map(|p| resolve_m4(p, raws, index, out, depth + 1))
+                .unwrap_or_else(Mat4::identity);
+            let t = parent.mul(raws[i].local_mat4);
             out[i] = Some(t);
             t
         }
-        trait RawLike {
-            fn parent_id(&self) -> Option<String>;
-            fn local_transform(&self) -> Affine;
-        }
-        impl RawLike for Raw {
-            fn parent_id(&self) -> Option<String> {
-                self.parent.clone()
-            }
-            fn local_transform(&self) -> Affine {
-                self.local
-            }
-        }
         for i in 0..raws.len() {
-            resolved[i] = Some(resolve(i, &raws, &id_index, &mut resolved, 0));
+            resolved_mat4[i] = Some(resolve_m4(i, &raws, &id_index, &mut resolved_mat4, 0));
         }
 
         // Portrait ("phone") scenes on a landscape output: instead of cropping
@@ -2713,14 +3310,18 @@ impl SceneRenderer {
             let win_aspect = self.width as f32 / self.height as f32;
             let view_w = authored_ortho[1] * win_aspect;
             let shift = (view_w - authored_ortho[0]) * 0.5;
-            let root = Affine::translate(shift, 0.0);
-            for t in resolved.iter_mut().flatten() {
-                *t = root.mul(*t);
+            let root_m4 = Mat4::translate([shift, 0.0, 0.0]);
+            for t in resolved_mat4.iter_mut().flatten() {
+                *t = root_m4.mul(*t);
             }
             self.view_shift = shift;
             self.ortho_size = [view_w, authored_ortho[1]];
             self.clear_color = [0.0, 0.0, 0.0];
         }
+        let resolved: Vec<Affine> = resolved_mat4
+            .iter()
+            .map(|m| m.unwrap_or_else(Mat4::identity).to_affine())
+            .collect();
         let now = text::local_time();
         let parent_index = |i: usize| -> Option<usize> {
             raws[i].parent.as_ref().and_then(|p| id_index.get(p).copied())
@@ -2755,7 +3356,9 @@ impl SceneRenderer {
         }
         for (i, raw) in raws.iter().enumerate() {
             let obj = &raw.obj;
-            let transform = resolved[i].unwrap_or_else(Affine::identity);
+            let world_mat4 = resolved_mat4[i].unwrap_or_else(Mat4::identity);
+            let transform = resolved[i];
+            let perspective = obj.get("perspective").and_then(value_bool).unwrap_or(false);
             let obj_id = obj
                 .get("id")
                 .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
@@ -2794,7 +3397,7 @@ impl SceneRenderer {
                             load_emitter_image_mask(
                                 pkg,
                                 &raws[dep_idx].obj,
-                                resolved[dep_idx].unwrap_or_else(Affine::identity),
+                                resolved[dep_idx],
                                 transform,
                                 &self.properties,
                             )
@@ -2838,6 +3441,8 @@ impl SceneRenderer {
                     id: obj_id,
                     name,
                     transform,
+                    world_mat4,
+                    perspective,
                     size: [1.0, 1.0],
                     align: [0.0, 0.0],
                     color: [1.0, 1.0, 1.0, 0.0],
@@ -2851,6 +3456,111 @@ impl SceneRenderer {
                     effects: Vec::new(),
                     color_blend: object_color_blend(obj),
                     kind: ObjectKind::Particle(idx),
+                    lighting: None,
+                    anim: None,
+                    sprite: None,
+                    attach: None,
+                    raw_idx: Some(i),
+                    raw_obj: obj.clone(),
+                    parent_obj: None,
+                    local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
+                    script_visible: None,
+                    script_text_override: None,
+                    script_sprite_frame: None,
+                    user_tex: None,
+                });
+                continue;
+            }
+
+            if obj.get("camera").is_some() {
+                let base_zoom = obj
+                    .get("zoom")
+                    .map(|v| resolve_prop(v, &self.properties))
+                    .and_then(|v| value_f32(&v))
+                    .unwrap_or(1.0)
+                    .clamp(0.1, 10.0);
+                let zoom_track = obj.get("zoom").and_then(KeyTrack::parse);
+                let fov = obj.get("fov").and_then(value_f32).unwrap_or(0.0);
+                let has_dynamic_origin = obj
+                    .get("origin")
+                    .is_some_and(|v| v.get("script").is_some() || v.get("animation").is_some());
+                let paths = obj
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| parse_camera_paths(pkg, p))
+                    .unwrap_or_default();
+                let queue_mode = match obj.get("queuemode").and_then(|v| v.as_str()) {
+                    Some(s) if s.eq_ignore_ascii_case("sequential") => CameraQueueMode::Sequential,
+                    Some(s) if s.eq_ignore_ascii_case("single") => CameraQueueMode::Single,
+                    _ => CameraQueueMode::Random,
+                };
+                self.objects.push(SceneObject {
+                    id: obj_id,
+                    name,
+                    transform,
+                    world_mat4,
+                    perspective,
+                    size: [0.0, 0.0],
+                    align: [0.0, 0.0],
+                    color: [1.0, 1.0, 1.0, 0.0],
+                    brightness: 1.0,
+                    blend: LayerBlend::Normal,
+                    color_blend: 0,
+                    parallax: [0.0, 0.0],
+                    visible,
+                    solid: false,
+                    dependencies,
+                    capture_composite: false,
+                    effects: Vec::new(),
+                    kind: ObjectKind::Camera(Box::new(CameraObject {
+                        base_zoom,
+                        zoom_track,
+                        fov,
+                        has_dynamic_origin,
+                        paths,
+                        queue_mode,
+                        active_path: 0,
+                        path_time: 0.0,
+                        rng_state: obj_id.unwrap_or(1) as u64 ^ 0x9E37_79B9_7F4A_7C15,
+                    })),
+                    lighting: None,
+                    anim: None,
+                    sprite: None,
+                    attach: None,
+                    raw_idx: Some(i),
+                    raw_obj: obj.clone(),
+                    parent_obj: None,
+                    local_parts: ([0.0; 3], [1.0; 3], [0.0; 3]),
+                    script_visible: None,
+                    script_text_override: None,
+                    script_sprite_frame: None,
+                    user_tex: None,
+                });
+                continue;
+            }
+
+            if let Some(light) = parse_light_object(obj, &self.properties) {
+                let c = eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]);
+                self.objects.push(SceneObject {
+                    id: obj_id,
+                    name,
+                    transform,
+                    world_mat4,
+                    perspective,
+                    size: [0.0, 0.0],
+                    align: [0.0, 0.0],
+                    color: [c[0], c[1], c[2], 1.0],
+                    brightness: 1.0,
+                    blend: LayerBlend::Additive,
+                    color_blend: 0,
+                    parallax: eval_parallax_field(obj.get("parallaxDepth"), &self.properties),
+                    visible,
+                    solid: false,
+                    dependencies,
+                    capture_composite: false,
+                    effects: Vec::new(),
+                    kind: ObjectKind::Light(Box::new(light)),
+                    lighting: None,
                     anim: None,
                     sprite: None,
                     attach: None,
@@ -2878,6 +3588,8 @@ impl SceneRenderer {
                         id: obj_id,
                         name,
                         transform,
+                        world_mat4,
+                        perspective,
                         size,
                         align,
                         color: [
@@ -2896,6 +3608,7 @@ impl SceneRenderer {
                         capture_composite,
                         effects: load_effects(gl, pkg, obj, &self.properties, now),
                         kind: ObjectKind::Text(Box::new(layer)),
+                        lighting: None,
                         anim: None,
                         sprite: None,
                         attach: None,
@@ -2971,6 +3684,8 @@ impl SceneRenderer {
                         id: obj_id,
                         name,
                         transform,
+                        world_mat4,
+                        perspective,
                         size: [0.0, 0.0],
                         align: [0.0, 0.0],
                         color: [1.0, 1.0, 1.0, 0.0],
@@ -2984,6 +3699,7 @@ impl SceneRenderer {
                         capture_composite: false,
                         effects: Vec::new(),
                         kind: ObjectKind::Sound(sidx),
+                        lighting: None,
                         anim: None,
                         sprite: None,
                         attach: None,
@@ -3009,13 +3725,16 @@ impl SceneRenderer {
                 if effects.is_empty() && !capture_composite {
                     continue;
                 }
+                let post_t = Affine::translate(
+                    self.ortho_size[0] * 0.5,
+                    self.ortho_size[1] * 0.5,
+                );
                 self.objects.push(SceneObject {
                     id: obj_id,
                     name,
-                    transform: Affine::translate(
-                        self.ortho_size[0] * 0.5,
-                        self.ortho_size[1] * 0.5,
-                    ),
+                    transform: post_t,
+                    world_mat4: Mat4::translate([self.ortho_size[0] * 0.5, self.ortho_size[1] * 0.5, 0.0]),
+                    perspective: false,
                     size: [self.ortho_size[0], self.ortho_size[1]],
                     align: [0.0, 0.0],
                     color: [1.0, 1.0, 1.0, 1.0],
@@ -3029,6 +3748,7 @@ impl SceneRenderer {
                     effects,
                     color_blend: object_color_blend(obj),
                     kind: ObjectKind::Post,
+                    lighting: None,
                     anim: None,
                     sprite: None,
                     attach: None,
@@ -3062,6 +3782,8 @@ impl SceneRenderer {
                     id: obj_id,
                     name,
                     transform,
+                    world_mat4,
+                    perspective,
                     size,
                     align,
                     color: [
@@ -3080,6 +3802,7 @@ impl SceneRenderer {
                     capture_composite,
                     effects,
                     kind: ObjectKind::Compose { copy_background },
+                    lighting: None,
                     anim: None,
                     sprite: None,
                     attach: None,
@@ -3104,6 +3827,8 @@ impl SceneRenderer {
                     id: obj_id,
                     name,
                     transform,
+                    world_mat4,
+                    perspective,
                     size: [size[0], size[1]],
                     align,
                     color: [
@@ -3122,6 +3847,7 @@ impl SceneRenderer {
                     capture_composite,
                     effects: load_effects(gl, pkg, obj, &self.properties, now),
                     kind: ObjectKind::Solid,
+                    lighting: None,
                     anim: None,
                     sprite: None,
                     attach: None,
@@ -3142,6 +3868,11 @@ impl SceneRenderer {
                 model_size,
                 material_blend,
                 texture_path,
+                normal_path,
+                lit,
+                roughness,
+                metallic,
+                specular_tint,
                 puppet_path,
                 solid_model,
                 mat_media_pass,
@@ -3196,6 +3927,8 @@ impl SceneRenderer {
                     id: obj_id,
                     name,
                     transform,
+                    world_mat4,
+                    perspective,
                     size: [size[0], size[1]],
                     align,
                     color: [
@@ -3214,6 +3947,7 @@ impl SceneRenderer {
                     capture_composite,
                     effects,
                     kind,
+                    lighting: None,
                     anim: None,
                     sprite: None,
                     attach: None,
@@ -3388,11 +4122,27 @@ impl SceneRenderer {
                     );
                 }
             }
+            let lighting = if lit {
+                let normal_tex = normal_path
+                    .as_deref()
+                    .and_then(|np| Self::load_texture(gl, pkg, &mut self.textures, np))
+                    .map(|(t, _, _, _)| t);
+                Some(LayerLighting {
+                    normal_tex,
+                    roughness,
+                    metallic,
+                    specular_tint,
+                })
+            } else {
+                None
+            };
             let c = eval_color_field(obj.get("color"), &self.properties, [1.0, 1.0, 1.0]);
             self.objects.push(SceneObject {
                 id: obj_id,
                 name,
                 transform,
+                world_mat4,
+                perspective,
                 size,
                 align,
                 color: [
@@ -3411,6 +4161,7 @@ impl SceneRenderer {
                 capture_composite,
                 effects: load_effects(gl, pkg, obj, &self.properties, now),
                 kind,
+                lighting,
                 anim: None,
                 sprite: None,
                 attach: None,
@@ -3449,7 +4200,9 @@ impl SceneRenderer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("object")
                     .to_string(),
-                transform: resolved[i].unwrap_or_else(Affine::identity),
+                transform: resolved[i],
+                world_mat4: resolved_mat4[i].unwrap_or_else(Mat4::identity),
+                perspective: false,
                 size: [0.0, 0.0],
                 align: parse_alignment(obj),
                 color: [
@@ -3468,6 +4221,7 @@ impl SceneRenderer {
                 capture_composite: false,
                 effects: Vec::new(),
                 kind: ObjectKind::Solid,
+                lighting: None,
                 anim: None,
                 sprite: None,
                 attach: None,
@@ -3567,14 +4321,15 @@ impl SceneRenderer {
                 tx: bone[4],
                 ty: bone[5],
             };
+            let local_att = raws[i].local_mat4.to_affine();
             let parent_transform = self.objects[parent_obj].transform;
             self.objects[child_obj].transform =
-                parent_transform.mul(bone_aff).mul(raws[i].local);
+                parent_transform.mul(bone_aff).mul(local_att);
             // Keep the binding so the layer can follow the animated bone pose.
             self.objects[child_obj].attach = Some(AttachPoint {
                 parent: parent_obj,
                 bone: att.to_string(),
-                local: raws[i].local,
+                local: local_att,
             });
         }
 
@@ -3612,6 +4367,8 @@ impl SceneRenderer {
                     ObjectKind::Solid => "solid",
                     ObjectKind::Particle(_) => "particle",
                     ObjectKind::Sound(_) => "sound",
+                    ObjectKind::Camera(_) => "camera",
+                    ObjectKind::Light(_) => "light",
                     ObjectKind::Compose { .. } => "compose",
                     ObjectKind::CompositeRef(_) => "composite_ref",
                     ObjectKind::Post => "post",
@@ -3652,8 +4409,8 @@ impl SceneRenderer {
         if n == 0 {
             return;
         }
-        let root = Affine::translate(self.view_shift, 0.0);
-        let mut world: Vec<Option<Affine>> = vec![None; n];
+        let root = Mat4::translate([self.view_shift, 0.0, 0.0]);
+        let mut world: Vec<Option<Mat4>> = vec![None; n];
         for i in 0..n {
             let mut chain = [0usize; 32];
             let mut depth = 0usize;
@@ -3675,10 +4432,10 @@ impl SceneRenderer {
             for &idx in chain[..depth].iter().rev() {
                 let obj = &self.objects[idx];
                 if matches!(obj.kind, ObjectKind::Post) || obj.attach.is_some() {
-                    acc = obj.transform;
+                    acc = obj.world_mat4;
                 } else {
                     let (origin, scale, angles) = obj.local_parts;
-                    acc = acc.mul(compose_local(origin, scale, angles));
+                    acc = acc.mul(compose_local_mat4(origin, scale, angles));
                 }
                 world[idx] = Some(acc);
             }
@@ -3688,7 +4445,9 @@ impl SceneRenderer {
             if matches!(obj.kind, ObjectKind::Post) || obj.attach.is_some() {
                 continue;
             }
-            if let Some(w) = world[i] {
+            if let Some(wm4) = world[i] {
+                let w = wm4.to_affine();
+                obj.world_mat4 = wm4;
                 obj.transform = w;
                 if let ObjectKind::Particle(pidx) = obj.kind {
                     emitter_roots.push((pidx, w));
@@ -4144,6 +4903,8 @@ impl SceneRenderer {
                 ObjectKind::Solid => "solid",
                 ObjectKind::Particle(_) => "particle",
                 ObjectKind::Sound(_) => "sound",
+                ObjectKind::Camera(_) => "camera",
+                ObjectKind::Light(_) => "light",
                 ObjectKind::Compose { .. } | ObjectKind::CompositeRef(_) | ObjectKind::Post => {
                     "group"
                 }
@@ -4808,6 +5569,8 @@ impl SceneRenderer {
             id: Some(id),
             name,
             transform: local,
+            world_mat4: compose_local_mat4(origin, scale, angles),
+            perspective: cfg.get("perspective").and_then(value_bool).unwrap_or(false),
             size,
             align,
             color: [color_rgb[0], color_rgb[1], color_rgb[2], alpha],
@@ -4821,6 +5584,7 @@ impl SceneRenderer {
             capture_composite: false,
             effects: Vec::new(),
             kind,
+            lighting: None,
             anim: None,
             sprite,
             attach: None,
@@ -5776,14 +6540,16 @@ impl SceneRenderer {
                 0.0,
             ]);
             let scale = l.scale.unwrap_or([1.0, 1.0]);
-            let transform = Affine::translate(origin[0], origin[1])
-                .mul(Affine::rotate(l.rotation.unwrap_or(0.0)))
-                .mul(Affine::scale(scale[0], scale[1]));
+            let rot = l.rotation.unwrap_or(0.0);
+            let world_mat4 = compose_local_mat4(origin, [scale[0], scale[1], 1.0], [0.0, 0.0, rot]);
+            let transform = world_mat4.to_affine();
             let c = l.color.unwrap_or([1.0, 1.0, 1.0]);
             self.objects.push(SceneObject {
                 id: None,
                 name: l.name.unwrap_or_else(|| "layer".into()),
                 transform,
+                world_mat4,
+                perspective: false,
                 size,
                 align: [0.0, 0.0],
                 color: [c[0], c[1], c[2], l.alpha.unwrap_or(1.0)],
@@ -5797,6 +6563,7 @@ impl SceneRenderer {
                 capture_composite: false,
                 effects: Vec::new(),
                 kind: ObjectKind::Image(texture),
+                lighting: None,
                 anim: None,
                 sprite: None,
                 attach: None,
@@ -5806,7 +6573,7 @@ impl SceneRenderer {
                 local_parts: (
                     origin,
                     [scale[0], scale[1], 1.0],
-                    [0.0, 0.0, l.rotation.unwrap_or(0.0)],
+                    [0.0, 0.0, rot],
                 ),
                 script_visible: None,
                 script_text_override: None,
@@ -5830,6 +6597,8 @@ impl SceneRenderer {
                 id: None,
                 name: "particles".into(),
                 transform: Affine::identity(),
+                world_mat4: Mat4::identity(),
+                perspective: false,
                 size: [1.0, 1.0],
                 align: [0.0, 0.0],
                 color: [1.0, 1.0, 1.0, 0.0],
@@ -5843,6 +6612,7 @@ impl SceneRenderer {
                 effects: Vec::new(),
                 color_blend: 0,
                 kind: ObjectKind::Particle(idx),
+                lighting: None,
                 anim: None,
                 sprite: None,
                 attach: None,
@@ -5889,12 +6659,15 @@ fn recompute_raw_transforms(
             .get("angles")
             .map(|v| value_vec(&resolve_prop(v, props), 3, [0.0, 0.0, 0.0]))
             .unwrap_or([0.0, 0.0, 0.0]);
-        let local = Affine::translate(origin[0], origin[1])
-            .mul(Affine::rotate(angles[2]))
-            .mul(Affine::scale(
+        let local = compose_local(
+            origin,
+            [
                 if scale[0] == 0.0 { 1.0 } else { scale[0] },
                 if scale[1] == 0.0 { 1.0 } else { scale[1] },
-            ));
+                scale[2],
+            ],
+            angles,
+        );
         locals.push(local);
         origins.push(origin);
         scales.push(scale);
@@ -6102,6 +6875,34 @@ impl SceneRenderer {
                         }
                     }
                 }
+                ObjectKind::Camera(cam) => {
+                    if let Some(z) = raw
+                        .get("zoom")
+                        .map(|v| resolve_prop(v, &self.properties))
+                        .and_then(|v| value_f32(&v))
+                    {
+                        cam.base_zoom = z.clamp(0.1, 10.0);
+                    }
+                }
+                ObjectKind::Light(light) => {
+                    if !has_binding(obj_id, ScriptField::Color) {
+                        let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
+                        obj.color[0] = c[0];
+                        obj.color[1] = c[1];
+                        obj.color[2] = c[2];
+                    }
+                    if let Some(iv) = raw
+                        .get("intensity")
+                        .map(|v| resolve_prop(v, &self.properties))
+                        .and_then(|v| value_f32(&v))
+                    {
+                        light.base_intensity = iv.max(0.0);
+                        if light.intensity_track.is_none() {
+                            light.intensity = light.base_intensity;
+                        }
+                    }
+                    obj.parallax = eval_parallax_field(raw.get("parallaxDepth"), &self.properties);
+                }
                 ObjectKind::Text(layer) => {
                     if !has_binding(obj_id, ScriptField::Color) {
                         let c = eval_color_field(raw.get("color"), &self.properties, [1.0, 1.0, 1.0]);
@@ -6234,12 +7035,15 @@ impl SceneRenderer {
                         transforms_dirty = true;
                     }
                     if let Some(att) = &mut obj.attach {
-                        att.local = Affine::translate(origin[0], origin[1])
-                            .mul(Affine::rotate(angles[2]))
-                            .mul(Affine::scale(
+                        att.local = compose_local(
+                            origin,
+                            [
                                 if scale[0] == 0.0 { 1.0 } else { scale[0] },
                                 if scale[1] == 0.0 { 1.0 } else { scale[1] },
-                            ));
+                                scale[2],
+                            ],
+                            angles,
+                        );
                     } else if !matches!(
                         obj.kind,
                         ObjectKind::Post | ObjectKind::Particle(_) | ObjectKind::Sound(_)
@@ -6276,11 +7080,17 @@ impl SceneRenderer {
     }
 
     fn cover_uv_transform(&self) -> ([f32; 2], [f32; 2]) {
-        cover_uv_with_zoom(self.ortho_size, [self.width, self.height], self.camera_zoom)
+        cover_uv_with_camera(
+            self.ortho_size,
+            [self.width, self.height],
+            self.active_cam_zoom,
+            self.active_cam_pan,
+        )
     }
 
     fn ensure_scene(&mut self, gl: &glow::Context) -> Result<()> {
-        let (uv_scale, _) = self.cover_uv_transform();
+        let (uv_scale, _) =
+            cover_uv_with_zoom(self.ortho_size, [self.width, self.height], self.camera_zoom);
         let w = ((self.width.max(1) as f32 / uv_scale[0]).round() as i32).clamp(1, 4096);
         let h = ((self.height.max(1) as f32 / uv_scale[1]).round() as i32).clamp(1, 4096);
         let want_hdr = self.bloom.hdr && self.hdr_supported;
@@ -6629,11 +7439,144 @@ impl SceneRenderer {
         offset
     }
 
+    fn update_active_camera(&mut self, dt: f32) {
+        for i in 0..self.objects.len() {
+            if !self.is_obj_visible(i) {
+                continue;
+            }
+            if matches!(self.objects[i].kind, ObjectKind::Camera(_)) {
+                let dyn_xy = [self.objects[i].local_parts.0[0], self.objects[i].local_parts.0[1]];
+                if let ObjectKind::Camera(cam) = &mut self.objects[i].kind {
+                    let (path_pan, cam_zoom) = cam.advance(dt);
+                    let pan = path_pan.unwrap_or_else(|| {
+                        if cam.has_dynamic_origin {
+                            dyn_xy
+                        } else {
+                            [0.0, 0.0]
+                        }
+                    });
+                    self.active_cam_pan = pan;
+                    self.active_cam_zoom = (self.camera_zoom * cam_zoom).clamp(0.1, 10.0);
+                    self.active_cam_fov = (cam.fov > 1.0).then_some(cam.fov);
+                    return;
+                }
+            }
+        }
+        self.active_cam_pan = [0.0, 0.0];
+        self.active_cam_zoom = self.camera_zoom;
+        self.active_cam_fov = None;
+    }
+
+    fn collect_scene_lights(&self, time: f32) -> Vec<PackedLight> {
+        let mut out = Vec::new();
+        for (i, obj) in self.objects.iter().enumerate() {
+            if out.len() >= MAX_SCENE_LIGHTS {
+                break;
+            }
+            let ObjectKind::Light(light) = &obj.kind else {
+                continue;
+            };
+            if !self.is_obj_visible(i) || light.intensity <= 0.0 {
+                continue;
+            }
+            let eff_p = self.effective_parallax(i);
+            let off = self.parallax_offset(eff_p, time);
+            let mut pos = obj.world_mat4.transform_point([0.0, 0.0, 0.0]);
+            pos[0] += off[0];
+            pos[1] += off[1];
+            let raw_dir = obj.world_mat4.transform_vec([1.0, 0.0, 0.0]);
+            let dlen = (raw_dir[0] * raw_dir[0] + raw_dir[1] * raw_dir[1] + raw_dir[2] * raw_dir[2]).sqrt();
+            let dir = if dlen > 1e-5 {
+                [raw_dir[0] / dlen, raw_dir[1] / dlen, raw_dir[2] / dlen]
+            } else {
+                [1.0, 0.0, 0.0]
+            };
+            let world_scale =
+                0.5 * (obj.transform.a.hypot(obj.transform.b) + obj.transform.c.hypot(obj.transform.d));
+            let radius = (light.radius * world_scale.max(0.01)).max(1.0);
+            let kind = match light.kind {
+                LightKind::Point => 0.0,
+                LightKind::Directional => 1.0,
+                LightKind::Spot => 2.0,
+            };
+            out.push(PackedLight {
+                pos,
+                kind,
+                dir,
+                inner_cos: light.inner_cone_cos,
+                color: [obj.color[0], obj.color[1], obj.color[2]],
+                intensity: light.intensity,
+                radius,
+                exponent: light.exponent,
+                outer_cos: light.outer_cone_cos,
+            });
+        }
+        out
+    }
+
+    fn draw_volumetric_light(&mut self, gl: &glow::Context, idx: usize, offset: [f32; 2]) {
+        let ObjectKind::Light(light) = &self.objects[idx].kind else {
+            return;
+        };
+        if !light.cast_volumetrics
+            || light.kind == LightKind::Directional
+            || light.intensity <= 0.0
+            || light.density <= 0.0
+        {
+            return;
+        }
+        let obj = &self.objects[idx];
+        let p3 = obj.world_mat4.transform_point([0.0, 0.0, 0.0]);
+        let origin = [p3[0] + offset[0], p3[1] + offset[1]];
+        let d3 = obj.world_mat4.transform_vec([1.0, 0.0, 0.0]);
+        let d2_len = d3[0].hypot(d3[1]);
+        let light_dir = if d2_len > 1e-5 {
+            [d3[0] / d2_len, d3[1] / d2_len]
+        } else {
+            [1.0, 0.0]
+        };
+        let world_scale =
+            0.5 * (obj.transform.a.hypot(obj.transform.b) + obj.transform.c.hypot(obj.transform.d));
+        let radius = (light.radius * world_scale.max(0.01)).max(1.0);
+        let kind_f = if light.kind == LightKind::Spot { 2.0 } else { 0.0 };
+        let cone_params = [
+            light.inner_cone_cos,
+            light.outer_cone_cos,
+            light.exponent,
+            light.volumetrics_exponent,
+        ];
+        let col_int = [
+            obj.color[0],
+            obj.color[1],
+            obj.color[2],
+            light.intensity * light.density * 0.025,
+        ];
+        let ortho = self.ortho_size;
+        unsafe {
+            apply_blend(gl, LayerBlend::Additive);
+            let p = &mut self.volumetric_prog;
+            p.bind(gl);
+            p.set_vec2(gl, "u_origin", origin[0], origin[1]);
+            p.set_f32(gl, "u_radius", radius);
+            p.set_vec2(gl, "u_ortho", ortho[0], ortho[1]);
+            p.set_vec2(gl, "u_light_dir", light_dir[0], light_dir[1]);
+            p.set_vec4(gl, "u_cone_params", cone_params);
+            p.set_vec4(gl, "u_light_col_int", col_int);
+            p.set_f32(gl, "u_light_kind", kind_f);
+            gl.bind_vertex_array(Some(self.quad_vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_textured_quad(
         &mut self,
         gl: &glow::Context,
         transform: Affine,
+        world_transform: Affine,
+        layer_z: f32,
+        lighting: Option<LayerLighting>,
+        persp_z: [f32; 4],
         size: [f32; 2],
         canvas_min: [f32; 2],
         canvas_size: [f32; 2],
@@ -6645,6 +7588,11 @@ impl SceneRenderer {
     ) {
         let axis_x = transform.apply_vec([size[0] * 0.5, 0.0]);
         let axis_y = transform.apply_vec([0.0, size[1] * 0.5]);
+        let world_ax = world_transform.apply_vec([size[0] * 0.5, 0.0]);
+        let world_ay = world_transform.apply_vec([0.0, size[1] * 0.5]);
+        let lights = &self.frame_lights;
+        let ambient = self.ambient_color;
+        let skylight = self.skylight_color;
         let p = &mut self.content_prog;
         unsafe {
             p.bind(gl);
@@ -6653,11 +7601,16 @@ impl SceneRenderer {
             p.set_vec2(gl, "u_origin", transform.tx, transform.ty);
             p.set_vec2(gl, "u_axis_x", axis_x[0], axis_x[1]);
             p.set_vec2(gl, "u_axis_y", axis_y[0], axis_y[1]);
+            p.set_vec2(gl, "u_world_origin", world_transform.tx, world_transform.ty);
+            p.set_vec2(gl, "u_world_ax", world_ax[0], world_ax[1]);
+            p.set_vec2(gl, "u_world_ay", world_ay[0], world_ay[1]);
+            p.set_vec4(gl, "u_persp_z", persp_z);
             p.set_vec4(gl, "u_color", color);
             p.set_f32(gl, "u_brightness", brightness);
             p.set_vec4(gl, "u_uv_rect", uv_rect);
             p.set_i32(gl, "u_premul", i32::from(premul));
             p.set_i32(gl, "u_tex", 0);
+            upload_lighting_uniforms(gl, p, lighting, layer_z, lights, ambient, skylight);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             gl.bind_vertex_array(Some(self.quad_vao));
@@ -6671,6 +7624,10 @@ impl SceneRenderer {
         gl: &glow::Context,
         info: &DrawInfo,
         transform: Affine,
+        world_transform: Affine,
+        layer_z: f32,
+        lighting: Option<LayerLighting>,
+        persp_z: [f32; 4],
         canvas_min: [f32; 2],
         canvas_size: [f32; 2],
     ) {
@@ -6681,6 +7638,10 @@ impl SceneRenderer {
                     self.draw_textured_quad(
                         gl,
                         transform,
+                        world_transform,
+                        layer_z,
+                        lighting,
+                        persp_z,
                         info.size,
                         canvas_min,
                         canvas_size,
@@ -6697,6 +7658,10 @@ impl SceneRenderer {
                             self.draw_textured_quad(
                                 gl,
                                 transform,
+                                world_transform,
+                                layer_z,
+                                None,
+                                persp_z,
                                 info.size,
                                 canvas_min,
                                 canvas_size,
@@ -6722,6 +7687,10 @@ impl SceneRenderer {
                         self.draw_textured_quad(
                             gl,
                             transform,
+                            world_transform,
+                            layer_z,
+                            lighting,
+                            persp_z,
                             info.size,
                             canvas_min,
                             canvas_size,
@@ -6742,6 +7711,9 @@ impl SceneRenderer {
                     index_count,
                     texture,
                 } => {
+                    let lights = &self.frame_lights;
+                    let ambient = self.ambient_color;
+                    let skylight = self.skylight_color;
                     let p = &mut self.puppet_prog;
                     p.bind(gl);
                     p.set_vec2(gl, "u_min", canvas_min[0], canvas_min[1]);
@@ -6749,10 +7721,14 @@ impl SceneRenderer {
                     p.set_vec2(gl, "u_origin", transform.tx, transform.ty);
                     p.set_vec2(gl, "u_axis_x", transform.a, transform.b);
                     p.set_vec2(gl, "u_axis_y", transform.c, transform.d);
+                    p.set_vec2(gl, "u_world_origin", world_transform.tx, world_transform.ty);
+                    p.set_vec2(gl, "u_world_ax", world_transform.a, world_transform.b);
+                    p.set_vec2(gl, "u_world_ay", world_transform.c, world_transform.d);
                     p.set_vec4(gl, "u_color", info.color);
                     p.set_f32(gl, "u_brightness", info.brightness);
                     p.set_i32(gl, "u_premul", i32::from(info.premul));
                     p.set_i32(gl, "u_tex", 0);
+                    upload_lighting_uniforms(gl, p, lighting, layer_z, lights, ambient, skylight);
                     gl.active_texture(glow::TEXTURE0);
                     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                     gl.bind_vertex_array(Some(vao));
@@ -6767,6 +7743,10 @@ impl SceneRenderer {
                     self.draw_textured_quad(
                         gl,
                         transform,
+                        world_transform,
+                        layer_z,
+                        lighting,
+                        persp_z,
                         info.size,
                         canvas_min,
                         canvas_size,
@@ -7441,6 +8421,93 @@ fn cover_uv_with_zoom(
     ([sx, sy], [(1.0 - sx) * 0.5, (1.0 - sy) * 0.5])
 }
 
+fn cover_uv_with_camera(
+    ortho_size: [f32; 2],
+    win_size: [i32; 2],
+    zoom: f32,
+    pan: [f32; 2],
+) -> ([f32; 2], [f32; 2]) {
+    let ([sx, sy], [ox, oy]) = cover_uv_with_zoom(ortho_size, win_size, zoom);
+    let du = pan[0] / ortho_size[0].max(1.0);
+    let dv = -pan[1] / ortho_size[1].max(1.0);
+    ([sx, sy], [ox + du, oy + dv])
+}
+
+fn upload_lighting_uniforms(
+    gl: &glow::Context,
+    prog: &mut Program,
+    lighting: Option<LayerLighting>,
+    layer_z: f32,
+    lights: &[PackedLight],
+    ambient: [f32; 3],
+    skylight: [f32; 3],
+) {
+    let Some(mat) = lighting else {
+        prog.set_i32(gl, "u_lit", 0);
+        return;
+    };
+    if lights.is_empty() {
+        prog.set_i32(gl, "u_lit", 0);
+        return;
+    }
+    prog.set_i32(gl, "u_lit", 1);
+    prog.set_vec3(gl, "u_ambient", ambient[0], ambient[1], ambient[2]);
+    prog.set_vec3(gl, "u_skylight", skylight[0], skylight[1], skylight[2]);
+    prog.set_vec4(
+        gl,
+        "u_mat_pbr",
+        [
+            mat.roughness,
+            mat.metallic,
+            if mat.normal_tex.is_some() { 1.0 } else { 0.0 },
+            layer_z,
+        ],
+    );
+    prog.set_vec3(
+        gl,
+        "u_spec_tint",
+        mat.specular_tint[0],
+        mat.specular_tint[1],
+        mat.specular_tint[2],
+    );
+    if let Some(ntex) = mat.normal_tex {
+        prog.set_i32(gl, "u_normal_tex", 1);
+        unsafe {
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(ntex));
+            gl.active_texture(glow::TEXTURE0);
+        }
+    }
+    let count = lights.len().min(MAX_SCENE_LIGHTS);
+    let mut pos_type = [0.0f32; MAX_SCENE_LIGHTS * 4];
+    let mut dir_inner = [0.0f32; MAX_SCENE_LIGHTS * 4];
+    let mut col_int = [0.0f32; MAX_SCENE_LIGHTS * 4];
+    let mut params = [0.0f32; MAX_SCENE_LIGHTS * 4];
+    for (idx, l) in lights.iter().take(count).enumerate() {
+        let base = idx * 4;
+        pos_type[base] = l.pos[0];
+        pos_type[base + 1] = l.pos[1];
+        pos_type[base + 2] = l.pos[2];
+        pos_type[base + 3] = l.kind;
+        dir_inner[base] = l.dir[0];
+        dir_inner[base + 1] = l.dir[1];
+        dir_inner[base + 2] = l.dir[2];
+        dir_inner[base + 3] = l.inner_cos;
+        col_int[base] = l.color[0];
+        col_int[base + 1] = l.color[1];
+        col_int[base + 2] = l.color[2];
+        col_int[base + 3] = l.intensity;
+        params[base] = l.radius;
+        params[base + 1] = l.exponent;
+        params[base + 2] = l.outer_cos;
+    }
+    prog.set_i32(gl, "u_light_count", count as i32);
+    prog.set_vec4_array(gl, "u_light_pos_type[0]", &pos_type[..count * 4]);
+    prog.set_vec4_array(gl, "u_light_dir_inner[0]", &dir_inner[..count * 4]);
+    prog.set_vec4_array(gl, "u_light_col_int[0]", &col_int[..count * 4]);
+    prog.set_vec4_array(gl, "u_light_params[0]", &params[..count * 4]);
+}
+
 fn eval_visible_script(
     v: &serde_json::Value,
     clean_script: &str,
@@ -7744,6 +8811,12 @@ impl Renderer for SceneRenderer {
                         mdl.advance_layers(dt, anim_layers);
                     }
                 }
+                if let ObjectKind::Light(light) = &mut self.objects[i].kind {
+                    if let Some(track) = &mut light.intensity_track {
+                        track.advance(dt);
+                        light.intensity = track.eval()[0].max(0.0);
+                    }
+                }
                 if !self.is_obj_visible(i) && !self.objects[i].capture_composite {
                     if let Some(anim) = &mut self.objects[i].anim {
                         anim.advance_tracks(dt);
@@ -7805,6 +8878,8 @@ impl Renderer for SceneRenderer {
         );
         self.sync_sounds();
         self.capture_and_flush_storage(false);
+        self.update_active_camera(dt);
+        self.frame_lights = self.collect_scene_lights(time);
 
         // Refresh text and skeletal puppet meshes before computing layer bounds.
         for i in 0..self.objects.len() {
@@ -7937,7 +9012,22 @@ impl Renderer for SceneRenderer {
                 continue;
             }
 
-            if matches!(self.objects[i].kind, ObjectKind::Sound(_)) {
+            if matches!(
+                self.objects[i].kind,
+                ObjectKind::Sound(_) | ObjectKind::Camera(_)
+            ) {
+                continue;
+            }
+
+            if matches!(self.objects[i].kind, ObjectKind::Light(_)) {
+                if is_vis {
+                    let scene = self.scene.as_ref().unwrap();
+                    unsafe {
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene.fbo));
+                        gl.viewport(0, 0, scene.w, scene.h);
+                    }
+                    self.draw_volumetric_light(gl, i, offset);
+                }
                 continue;
             }
 
@@ -8129,7 +9219,17 @@ impl Renderer for SceneRenderer {
                             premul: is_premul_blend(blend),
                         };
                         apply_blend(gl, blend);
-                        self.draw_content(gl, &draw, transform, [0.0, 0.0], ortho);
+                        self.draw_content(
+                            gl,
+                            &draw,
+                            transform,
+                            transform,
+                            0.0,
+                            None,
+                            [0.0; 4],
+                            [0.0, 0.0],
+                            ortho,
+                        );
                     }
                     continue;
                 }
@@ -8241,6 +9341,9 @@ impl Renderer for SceneRenderer {
                 _ => None,
             };
 
+            let layer_z = self.objects[i].world_mat4.transform_point([0.0, 0.0, 0.0])[2];
+            let lighting = self.objects[i].lighting;
+
             if let Some((raw_tex, tex_size, bounds)) = puppet_info {
                 let mut effect_canvases: Option<(Canvas, Canvas, bool)> = None;
                 if has_effects {
@@ -8277,6 +9380,10 @@ impl Renderer for SceneRenderer {
                         gl,
                         &raw_draw,
                         Affine::identity(),
+                        transform,
+                        0.0,
+                        None,
+                        [0.0; 4],
                         [-tex_world[0] * 0.5, -tex_world[1] * 0.5],
                         tex_world,
                     );
@@ -8314,7 +9421,17 @@ impl Renderer for SceneRenderer {
                         }
                         apply_blend(gl, blend);
                         draw.premul = is_premul_blend(blend);
-                        self.draw_content(gl, &draw, transform, [0.0, 0.0], ortho);
+                        self.draw_content(
+                            gl,
+                            &draw,
+                            transform,
+                            transform,
+                            layer_z,
+                            lighting,
+                            [0.0; 4],
+                            [0.0, 0.0],
+                            ortho,
+                        );
                     }
                 } else {
                     let (pmin_raw, pmax_raw) = transformed_aabb(transform, bounds.0, bounds.1);
@@ -8337,7 +9454,17 @@ impl Renderer for SceneRenderer {
                         );
                     }
                     draw.premul = false;
-                    self.draw_content(gl, &draw, transform, pmin, psize);
+                    self.draw_content(
+                        gl,
+                        &draw,
+                        transform,
+                        transform,
+                        layer_z,
+                        lighting,
+                        [0.0; 4],
+                        pmin,
+                        psize,
+                    );
                     if capture_comp {
                         if let Some(id) = obj_id {
                             self.capture_layer_composite(gl, id, &out_canvas)?;
@@ -8370,7 +9497,27 @@ impl Renderer for SceneRenderer {
                     }
                     apply_blend(gl, blend);
                     draw.premul = is_premul_blend(blend);
-                    self.draw_content(gl, &draw, quad_transform, [0.0, 0.0], ortho);
+                    let persp_z = if self.objects[i].perspective {
+                        let [cx, cy] = self.objects[i].local_center();
+                        let wm = self.objects[i].world_mat4;
+                        let oz = wm.transform_point([cx, cy, 0.0])[2];
+                        let ax_z = wm.transform_vec([draw.size[0] * 0.5, 0.0, 0.0])[2];
+                        let ay_z = wm.transform_vec([0.0, draw.size[1] * 0.5, 0.0])[2];
+                        [oz, ax_z, ay_z, self.effective_perspective_fov_dist()]
+                    } else {
+                        [0.0; 4]
+                    };
+                    self.draw_content(
+                        gl,
+                        &draw,
+                        quad_transform,
+                        quad_transform,
+                        layer_z,
+                        lighting,
+                        persp_z,
+                        [0.0, 0.0],
+                        ortho,
+                    );
                 }
                 continue;
             }
@@ -8406,6 +9553,10 @@ impl Renderer for SceneRenderer {
                 gl,
                 &draw,
                 Affine::identity(),
+                quad_transform,
+                layer_z,
+                lighting,
+                [0.0; 4],
                 [-local_size[0] * 0.5, -local_size[1] * 0.5],
                 local_size,
             );
@@ -8466,6 +9617,7 @@ impl Renderer for SceneRenderer {
         // Blit the composed scene to the surface with aspect-ratio cover scaling.
         {
             let scene_tex = self.scene.as_ref().unwrap().tex;
+            let (cover_scale, cover_offset) = self.cover_uv_transform();
             unsafe {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.viewport(0, 0, self.width.max(1), self.height.max(1));
@@ -8614,6 +9766,7 @@ impl Renderer for SceneRenderer {
         self.copy_prog.destroy(gl);
         self.bloom_prog.destroy(gl);
         self.particle_prog.destroy(gl);
+        self.volumetric_prog.destroy(gl);
         unsafe {
             gl.delete_vertex_array(self.quad_vao);
             gl.delete_buffer(self.quad_vbo);
@@ -9299,6 +10452,9 @@ mod tests {
             script_text_override: None,
             script_sprite_frame: None,
             user_tex: None,
+            world_mat4: Mat4::identity(),
+            perspective: false,
+            lighting: None,
         };
         // With align=[0.5, 0], local_center=(50, 0); scaled by (2,1) -> (100,0);
         // rotated +90 deg -> (0, +100), so quad center is at (200, 400), covering
@@ -9526,5 +10682,103 @@ mod tests {
         let (s2, o2) = cover_uv_with_zoom([1920.0, 1080.0], [1920, 1080], 2.0);
         assert!((s2[0] - 0.5).abs() < 1e-5 && (s2[1] - 0.5).abs() < 1e-5);
         assert!((o2[0] - 0.25).abs() < 1e-5 && (o2[1] - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mat4_euler_flips_and_3d_light_direction() {
+        let m_pi_x = Mat4::rotate_euler([std::f32::consts::PI, 0.0, 0.0]);
+        let y_flipped = m_pi_x.transform_vec([0.0, 1.0, 0.0]);
+        assert!((y_flipped[0]).abs() < 1e-5);
+        assert!((y_flipped[1] + 1.0).abs() < 1e-5);
+
+        let m_pi_y = Mat4::rotate_euler([0.0, std::f32::consts::PI, 0.0]);
+        let x_flipped = m_pi_y.transform_vec([1.0, 0.0, 0.0]);
+        assert!((x_flipped[0] + 1.0).abs() < 1e-5);
+        assert!((x_flipped[2]).abs() < 1e-5);
+
+        let dir_y90 = Mat4::rotate_euler([0.0, std::f32::consts::FRAC_PI_2, 0.0])
+            .transform_vec([1.0, 0.0, 0.0]);
+        assert!(dir_y90[0].abs() < 1e-5);
+        assert!((dir_y90[2] + 1.0).abs() < 1e-5);
+
+        let combined = Mat4::translate([10.0, 20.0, 30.0])
+            .mul(Mat4::rotate_euler([0.3, -0.4, 0.7]))
+            .mul(Mat4::scale([2.0, 3.0, 4.0]));
+        let aff = combined.to_affine();
+        assert!((aff.tx - 10.0).abs() < 1e-5);
+        assert!((aff.ty - 20.0).abs() < 1e-5);
+        let p2d = aff.apply([1.0, 1.0]);
+        let p3d = combined.transform_point([1.0, 1.0, 0.0]);
+        assert!((p2d[0] - p3d[0]).abs() < 1e-4 && (p2d[1] - p3d[1]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cover_uv_with_camera_applies_zoom_and_pan() {
+        let (s0, o0) = cover_uv_with_camera([1920.0, 1080.0], [1920, 1080], 1.0, [0.0, 0.0]);
+        assert!((s0[0] - 1.0).abs() < 1e-5 && (s0[1] - 1.0).abs() < 1e-5);
+        assert!(o0[0].abs() < 1e-5 && o0[1].abs() < 1e-5);
+
+        let (sz, oz) = cover_uv_with_camera([1920.0, 1080.0], [1920, 1080], 2.0, [192.0, -108.0]);
+        assert!((sz[0] - 0.5).abs() < 1e-5 && (sz[1] - 0.5).abs() < 1e-5);
+        assert!((oz[0] - 0.35).abs() < 1e-5 && (oz[1] - 0.35).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parse_light_object_and_camera_paths_handle_all_we_variants() {
+        let mut props = HashMap::new();
+        props.insert("spot_int".to_string(), serde_json::json!(2.75));
+        let spot_json = serde_json::json!({
+            "light": "lspot",
+            "intensity": { "user": "spot_int", "value": 1.0 },
+            "radius": 640.0,
+            "exponent": 3.0,
+            "innercone": 20.0,
+            "outercone": 45.0,
+            "castvolumetrics": true,
+            "density": 0.8,
+            "volumetricsexponent": 1.5
+        });
+        let spot = parse_light_object(&spot_json, &props).expect("spot light parsed");
+        assert_eq!(spot.kind, LightKind::Spot);
+        assert!((spot.intensity - 2.75).abs() < 1e-5);
+        assert!((spot.radius - 640.0).abs() < 1e-5);
+        assert!((spot.exponent - 3.0).abs() < 1e-5);
+        assert!((spot.inner_cone_cos - 20.0f32.to_radians().cos()).abs() < 1e-5);
+        assert!((spot.outer_cone_cos - 45.0f32.to_radians().cos()).abs() < 1e-5);
+        assert!(spot.cast_volumetrics);
+        assert!((spot.density - 0.8).abs() < 1e-5);
+        assert!((spot.volumetrics_exponent - 1.5).abs() < 1e-5);
+
+        let point = parse_light_object(&serde_json::json!({ "light": "lpoint" }), &props)
+            .expect("point light parsed");
+        assert_eq!(point.kind, LightKind::Point);
+
+        let dir = parse_light_object(&serde_json::json!({ "light": "ldirectional" }), &props)
+            .expect("directional light parsed");
+        assert_eq!(dir.kind, LightKind::Directional);
+
+        assert!(parse_light_object(&serde_json::json!({ "light": "unknown" }), &props).is_none());
+
+        let paths = parse_camera_paths_json(
+            r#"{
+                "paths": [
+                    {
+                        "points": [
+                            { "origin": "100 50 0", "zoom": 1.25, "duration": 2.5 },
+                            { "eye": "-40 20 0", "zoom": 2.0, "duration": 1.5 }
+                        ]
+                    },
+                    { "points": [] }
+                ]
+            }"#,
+        );
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].points.len(), 2);
+        assert!((paths[0].points[0].origin[0] - 100.0).abs() < 1e-5);
+        assert!((paths[0].points[1].origin[0] + 40.0).abs() < 1e-5);
+        assert!((paths[0].points[1].zoom - 2.0).abs() < 1e-5);
+        assert!((paths[0].total_duration - 2.5).abs() < 1e-5);
+        assert!(parse_camera_paths_json(r#"{ "paths": [] }"#).is_empty());
+        assert!(parse_camera_paths_json("not json").is_empty());
     }
 }

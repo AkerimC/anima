@@ -89,6 +89,15 @@ impl Program {
         }
     }
 
+    pub fn set_vec4_array(&mut self, gl: &glow::Context, name: &str, values: &[f32]) {
+        if values.is_empty() {
+            return;
+        }
+        if let Some(loc) = self.uniform(gl, name) {
+            unsafe { gl.uniform_4_f32_slice(Some(&loc), values) };
+        }
+    }
+
     /// Delete the GL program.  Requires a current context.
     pub fn destroy(&self, gl: &glow::Context) {
         unsafe { gl.delete_program(self.id) };

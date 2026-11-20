@@ -2331,39 +2331,45 @@ const PRELUDE: &str = r#"
       chain.push(cur);
       cur = cur.__parent;
     }
-    var a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;
-    var sz = 1, tz = 0;
+    var m = [
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1
+    ];
     for (var i = chain.length - 1; i >= 0; i--) {
       var node = chain[i];
       var o = safe3(node.origin);
       var sc = safe3(node.scale);
       var ang = safe3(node.angles);
       var ox = num(o.x, 0), oy = num(o.y, 0), oz = num(o.z, 0);
-      var sx = num(sc.x, 1), sy = num(sc.y, 1), nodeSz = num(sc.z, 1);
-      var rad = num(ang.z, 0) * Math.PI / 180;
-      var cs = Math.cos(rad), sn = Math.sin(rad);
-      var la = cs * sx;
-      var lb = sn * sx;
-      var lc = -sn * sy;
-      var ld = cs * sy;
-      var ntx = a * ox + c * oy + tx;
-      var nty = b * ox + d * oy + ty;
-      var na = a * la + c * lb;
-      var nb = b * la + d * lb;
-      var nc = a * lc + c * ld;
-      var nd = b * lc + d * ld;
-      a = na; b = nb; c = nc; d = nd; tx = ntx; ty = nty;
-      tz += sz * oz;
-      sz *= nodeSz;
+      var sx = num(sc.x, 1), sy = num(sc.y, 1), sz = num(sc.z, 1);
+      var rx = num(ang.x, 0) * Math.PI / 180;
+      var ry = num(ang.y, 0) * Math.PI / 180;
+      var rz = num(ang.z, 0) * Math.PI / 180;
+      var cx = Math.cos(rx), sinx = Math.sin(rx);
+      var cy = Math.cos(ry), siny = Math.sin(ry);
+      var cz = Math.cos(rz), sinz = Math.sin(rz);
+      var l0 = (cz * cy) * sx;
+      var l1 = (sinz * cy) * sx;
+      var l2 = (-siny) * sx;
+      var l4 = (cz * siny * sinx - sinz * cx) * sy;
+      var l5 = (sinz * siny * sinx + cz * cx) * sy;
+      var l6 = (cy * sinx) * sy;
+      var l8 = (cz * siny * cx + sinz * sinx) * sz;
+      var l9 = (sinz * siny * cx - cz * sinx) * sz;
+      var l10 = (cy * cx) * sz;
+      var n = new Array(16);
+      for (var r = 0; r < 4; r++) {
+        var mr0 = m[r], mr1 = m[4 + r], mr2 = m[8 + r], mr3 = m[12 + r];
+        n[r]      = mr0 * l0 + mr1 * l1 + mr2 * l2;
+        n[4 + r]  = mr0 * l4 + mr1 * l5 + mr2 * l6;
+        n[8 + r]  = mr0 * l8 + mr1 * l9 + mr2 * l10;
+        n[12 + r] = mr0 * ox + mr1 * oy + mr2 * oz + mr3;
+      }
+      m = n;
     }
-    return {
-      m: [
-        a, b, 0, 0,
-        c, d, 0, 0,
-        0, 0, sz, 0,
-        tx, ty, tz, 1
-      ]
-    };
+    return { m: m };
   }
 
   function makeLayer(id, name) {
@@ -5137,6 +5143,49 @@ export function update(value) { return value; }",
             .and_then(|v| v.as_f64())
             .expect("pointsize output");
         assert!((ps - 48.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn transform_matrix_includes_3d_euler_rotations() {
+        let props = serde_json::Map::new();
+        let mut host = SceneScripts::new(&props).expect("host");
+        let mut parent = seed(551, "flip_y");
+        parent.origin = [10.0, 20.0, 30.0];
+        parent.angles = [0.0, 180.0, 0.0];
+        parent.scale = [1.0, 1.0, 1.0];
+
+        let mut child = seed(552, "tilt_x");
+        child.parent = Some(551);
+        child.origin = [5.0, 0.0, 10.0];
+        child.angles = [60.0, 0.0, 0.0];
+
+        host.add_layer(&parent);
+        host.add_layer(&child);
+        host.link_parents();
+        host.add_property_script(
+            552,
+            ScriptField::Alpha,
+            "'use strict';
+export function init(value) {
+  var m = thisLayer.getTransformMatrix().m;
+  if (Math.abs(m[0] + 1) > 1e-4 || Math.abs(m[5] - 0.5) > 1e-4 || Math.abs(m[6] + 0.8660254) > 1e-4) {
+    throw new Error('bad 3d basis: ' + m.join(','));
+  }
+  if (Math.abs(m[9] + 0.8660254) > 1e-4 || Math.abs(m[10] + 0.5) > 1e-4) {
+    throw new Error('bad z col: ' + m[8] + ',' + m[9] + ',' + m[10]);
+  }
+  if (Math.abs(m[12] - 5) > 1e-4 || Math.abs(m[13] - 20) > 1e-4 || Math.abs(m[14] - 20) > 1e-4) {
+    throw new Error('bad 3d origin: ' + m[12] + ',' + m[13] + ',' + m[14]);
+  }
+  return value;
+}
+export function update(value) { return value; }",
+            json!(1.0),
+            &serde_json::Map::new(),
+            None,
+        );
+        let _ = host.finalize_init();
+        assert_eq!(host.failures(), 0, "failed: {:?}", host.errors());
     }
 
     #[test]
