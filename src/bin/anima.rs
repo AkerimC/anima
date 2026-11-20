@@ -181,6 +181,39 @@ enum Cmd {
     Ping,
     /// Ask the daemon to exit.
     Quit,
+    /// Run headless offscreen regression verification across installed wallpapers.
+    Verify {
+        /// Restrict to one wallpaper type (`scene`, `web`, `video`, `shader`, `image`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Substring filter matched against Workshop ID or title.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Optional single wallpaper or directory instead of the Workshop library.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Render width in pixels.
+        #[arg(long, default_value_t = 640)]
+        width: i32,
+        /// Render height in pixels.
+        #[arg(long, default_value_t = 360)]
+        height: i32,
+        /// Number of frames rendered per scene/image/shader wallpaper.
+        #[arg(long, default_value_t = 4)]
+        frames: usize,
+        /// Hardware decode mode passed to libmpv (`auto-safe`, `vaapi`, `no`, ...).
+        #[arg(long, default_value = "auto-safe")]
+        hwdec: String,
+        /// Optional directory to dump final PNG screenshots.
+        #[arg(long)]
+        dump_dir: Option<PathBuf>,
+        /// Optional RSS memory ceiling per item in MiB (marks exceedances as WARN).
+        #[arg(long)]
+        rss_limit_mb: Option<f64>,
+        /// Emit machine-readable JSON instead of human-readable progress.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -275,6 +308,61 @@ fn run() -> Result<()> {
         Cmd::Quit => {
             let response = ipc::request(&socket, &Request::Quit)?;
             println!("{}", response.message);
+            return Ok(());
+        }
+        Cmd::Verify {
+            kind,
+            filter,
+            dir,
+            width,
+            height,
+            frames,
+            hwdec,
+            dump_dir,
+            rss_limit_mb,
+            json,
+        } => {
+            use_compositor_gpu();
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+                .format_timestamp_millis()
+                .init();
+            let parsed_kind = kind.as_deref().map(anima::verify::parse_kind).transpose()?;
+            let opts = anima::verify::VerifyOptions {
+                kind: parsed_kind,
+                filter: filter.clone(),
+                dir: dir.clone(),
+                width: *width,
+                height: *height,
+                scene_frames: *frames,
+                hwdec: hwdec.clone(),
+                dump_dir: dump_dir.clone(),
+                rss_limit_mb: *rss_limit_mb,
+                json: *json,
+                ..Default::default()
+            };
+            let report = anima::verify::run_verify(&opts)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "\nSummary ({} items in {:.2}s | GL: {}): ok={} warn={} fail={} skip={} | shaders_failed={} script_failures={} gl_errors={} | peak_rss={:.1} MiB hwm={:.1} MiB",
+                    report.total,
+                    report.elapsed_ms as f64 / 1000.0,
+                    report.gl_renderer,
+                    report.passed,
+                    report.warned,
+                    report.failed,
+                    report.skipped,
+                    report.total_shader_failures,
+                    report.total_script_failures,
+                    report.total_gl_errors,
+                    report.peak_rss_mb,
+                    report.peak_hwm_mb,
+                );
+            }
+            if report.failed > 0 {
+                std::process::exit(1);
+            }
             return Ok(());
         }
         _ => {}
@@ -405,7 +493,8 @@ fn run() -> Result<()> {
         | Cmd::Tui
         | Cmd::Gui
         | Cmd::Ping
-        | Cmd::Quit => unreachable!(),
+        | Cmd::Quit
+        | Cmd::Verify { .. } => unreachable!(),
     };
 
     let response = ipc::request(&socket, &request)?;
@@ -874,4 +963,21 @@ fn run_tui(socket: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Prefer Mesa EGL for offscreen verification on hybrid laptops unless ANIMA_GPU=nvidia.
+fn use_compositor_gpu() {
+    if std::env::var("ANIMA_GPU").is_ok_and(|v| v == "nvidia") {
+        return;
+    }
+    let mesa = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+    if !std::path::Path::new(mesa).exists() {
+        return;
+    }
+    // Single-threaded here before any EGL call or worker spawn.
+    unsafe {
+        std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", mesa);
+        std::env::remove_var("__NV_PRIME_RENDER_OFFLOAD");
+        std::env::remove_var("__GLX_VENDOR_LIBRARY_NAME");
+    }
 }

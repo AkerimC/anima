@@ -933,6 +933,11 @@ impl SceneScripts {
         })
     }
 
+    /// Number of compiled property/effect/layer/particle bindings.
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
     /// Number of bindings disabled by a compile or runtime failure.
     pub fn failures(&self) -> usize {
         self.bindings.iter().filter(|b| !b.enabled).count()

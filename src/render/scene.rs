@@ -2412,6 +2412,23 @@ impl SceneSound {
     }
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SceneDiagnostics {
+    pub objects: usize,
+    pub effects_loaded: usize,
+    pub shader_failures: Vec<String>,
+    pub particles: usize,
+    pub puppets: usize,
+    pub lights: usize,
+    pub cameras: usize,
+    pub sounds: usize,
+    pub script_bindings: usize,
+    pub script_failures: usize,
+    pub script_errors: Vec<String>,
+    pub uses_audio: bool,
+    pub uses_media: bool,
+}
+
 pub struct SceneRenderer {
     content_prog: Program,
     puppet_prog: Program,
@@ -2520,6 +2537,8 @@ pub struct SceneRenderer {
     last_media_pos: f32,
     last_media_dur: f32,
     media_events: Vec<MediaEventInput>,
+    shader_failures: Vec<String>,
+    persist_storage: bool,
     pkg: PackageFs,
 
     width: i32,
@@ -2996,6 +3015,8 @@ impl SceneRenderer {
             last_media_pos: 0.0,
             last_media_dur: 0.0,
             media_events: Vec::new(),
+            shader_failures: Vec::new(),
+            persist_storage: true,
             pkg: PackageFs::default(),
             width,
             height,
@@ -3180,6 +3201,8 @@ impl SceneRenderer {
         self.sounds_started = false;
         self.scene_general = root.get("general").cloned();
         self.raw_nodes.clear();
+        self.shader_failures.clear();
+        let mut shader_failures = Vec::new();
         self.bloom = BloomConfig::default();
 
         if let Some(general) = root.get("general") {
@@ -3606,7 +3629,7 @@ impl SceneRenderer {
                         solid,
                         dependencies,
                         capture_composite,
-                        effects: load_effects(gl, pkg, obj, &self.properties, now),
+                        effects: load_effects(gl, pkg, obj, &self.properties, now, &mut shader_failures),
                         kind: ObjectKind::Text(Box::new(layer)),
                         lighting: None,
                         anim: None,
@@ -3721,7 +3744,7 @@ impl SceneRenderer {
             };
             let lower = image_ref.to_ascii_lowercase();
             if lower.contains("util/fullscreenlayer") {
-                let effects = load_effects(gl, pkg, obj, &self.properties, now);
+                let effects = load_effects(gl, pkg, obj, &self.properties, now, &mut shader_failures);
                 if effects.is_empty() && !capture_composite {
                     continue;
                 }
@@ -3764,7 +3787,7 @@ impl SceneRenderer {
                 continue;
             }
             if lower.contains("util/projectlayer") || lower.contains("util/composelayer") {
-                let effects = load_effects(gl, pkg, obj, &self.properties, now);
+                let effects = load_effects(gl, pkg, obj, &self.properties, now, &mut shader_failures);
                 let default_copy_bg = lower.contains("util/projectlayer");
                 let copy_background = obj
                     .get("copybackground")
@@ -3845,7 +3868,7 @@ impl SceneRenderer {
                     solid,
                     dependencies,
                     capture_composite,
-                    effects: load_effects(gl, pkg, obj, &self.properties, now),
+                    effects: load_effects(gl, pkg, obj, &self.properties, now, &mut shader_failures),
                     kind: ObjectKind::Solid,
                     lighting: None,
                     anim: None,
@@ -3907,7 +3930,7 @@ impl SceneRenderer {
                     .get("size")
                     .map(|v| value_vec(v, 3, default_size))
                     .unwrap_or(default_size);
-                let effects = load_effects(gl, pkg, obj, &self.properties, now);
+                let effects = load_effects(gl, pkg, obj, &self.properties, now, &mut shader_failures);
                 let kind = if let Some(ref_id) = inst_composite_ref {
                     ObjectKind::CompositeRef(ref_id)
                 } else if let Some((tex, _)) = loaded_tex {
@@ -4159,7 +4182,7 @@ impl SceneRenderer {
                 solid,
                 dependencies,
                 capture_composite,
-                effects: load_effects(gl, pkg, obj, &self.properties, now),
+                effects: load_effects(gl, pkg, obj, &self.properties, now, &mut shader_failures),
                 kind,
                 lighting,
                 anim: None,
@@ -4351,6 +4374,7 @@ impl SceneRenderer {
                 o.anim = Some(a);
             }
         }
+        self.shader_failures = shader_failures;
         self.load_scene_scripts(gl, Some(pkg));
         log::debug!(
             "scene: ortho={:?} objects={} emitters={}",
@@ -5313,7 +5337,51 @@ impl SceneRenderer {
         }
     }
 
+    pub fn set_persist_storage(&mut self, persist: bool) {
+        self.persist_storage = persist;
+    }
+
+    pub fn diagnostics(&self) -> SceneDiagnostics {
+        let mut effects_loaded = 0usize;
+        let mut particles = 0usize;
+        let mut puppets = 0usize;
+        let mut lights = 0usize;
+        let mut cameras = 0usize;
+        for obj in &self.objects {
+            effects_loaded += obj.effects.len();
+            match obj.kind {
+                ObjectKind::Particle(_) => particles += 1,
+                ObjectKind::Puppet { .. } => puppets += 1,
+                ObjectKind::Light(_) => lights += 1,
+                ObjectKind::Camera(_) => cameras += 1,
+                _ => {}
+            }
+        }
+        let (script_bindings, script_failures, script_errors) = match self.scripts.as_ref() {
+            Some(s) => (s.binding_count(), s.failures(), s.errors().to_vec()),
+            None => (0, 0, Vec::new()),
+        };
+        SceneDiagnostics {
+            objects: self.objects.len(),
+            effects_loaded,
+            shader_failures: self.shader_failures.clone(),
+            particles,
+            puppets,
+            lights,
+            cameras,
+            sounds: self.sounds.len(),
+            script_bindings,
+            script_failures,
+            script_errors,
+            uses_audio: self.uses_audio(),
+            uses_media: self.uses_media(),
+        }
+    }
+
     fn capture_and_flush_storage(&mut self, force: bool) {
+        if !self.persist_storage {
+            return;
+        }
         if let Some(snapshot) = self
             .scripts
             .as_mut()
@@ -8663,6 +8731,7 @@ fn load_effects(
     obj: &serde_json::Value,
     _props: &HashMap<String, serde_json::Value>,
     _now: text::LocalTime,
+    failed_shaders: &mut Vec<String>,
 ) -> Vec<EffectInstance> {
     if std::env::var_os("ANIMA_NO_EFFECTS").is_some() {
         return Vec::new();
@@ -8680,7 +8749,9 @@ fn load_effects(
         let Some(file) = effect.get("file").and_then(|v| v.as_str()) else {
             continue;
         };
-        if let Some(mut instance) = EffectInstance::load(gl, pkg, file, effect) {
+        if let Some(mut instance) =
+            EffectInstance::load_with_diagnostics(gl, pkg, file, effect, failed_shaders)
+        {
             instance.scene_idx = effect_idx;
             out.push(instance);
         }

@@ -315,6 +315,29 @@ impl VideoRenderer {
             }
         }
     }
+
+    pub fn frames_drawn(&self) -> u32 {
+        self.frames_drawn
+    }
+
+    /// Return `(video_codec, hwdec_current)` reported by libmpv once playback starts.
+    pub fn video_info(&self) -> (Option<String>, Option<String>) {
+        let query = |prop: &str| -> Option<String> {
+            let Ok(name) = CString::new(prop) else {
+                return None;
+            };
+            unsafe {
+                let value = mpv_get_property_string(self.handle, name.as_ptr());
+                if value.is_null() {
+                    return None;
+                }
+                let s = cstr(value);
+                mpv_free(value as *mut c_void);
+                Some(s)
+            }
+        };
+        (query("video-codec"), query("hwdec-current"))
+    }
 }
 
 impl Renderer for VideoRenderer {

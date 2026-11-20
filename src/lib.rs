@@ -19,6 +19,7 @@ pub mod pkg;
 pub mod render;
 pub mod tempo;
 pub mod util;
+pub mod verify;
 pub mod voice;
 pub mod wallpaper;
 

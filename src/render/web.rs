@@ -1044,6 +1044,10 @@ impl WebWorker {
         }
         guard.latest_frame.take()
     }
+
+    fn has_exited(&self) -> bool {
+        self.shared.0.lock().map(|g| g.exited).unwrap_or(true)
+    }
 }
 
 impl Drop for WebWorker {
@@ -1366,6 +1370,14 @@ impl WebRenderer {
             self.last_media_pos_sec = pos_sec;
             self.last_media_dur_sec = dur_sec;
         }
+    }
+
+    pub fn has_live_frame(&self) -> bool {
+        self.has_live_frame
+    }
+
+    pub fn worker_alive(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| !w.has_exited())
     }
 }
 

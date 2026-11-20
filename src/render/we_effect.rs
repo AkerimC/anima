@@ -4354,7 +4354,7 @@ fn replace_word(src: &str, from: &str, to: &str) -> String {
 // Uniform reflection
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum UniformKind {
     Float,
     Int,
@@ -4472,6 +4472,24 @@ impl CompiledProgram {
                 }
             } else {
                 all.push(u);
+            }
+        }
+
+        // Authoring macros or cross-stage uniform reconciliation can widen a
+        // declared uniform (e.g. `vec2` in source -> `vec4` after linking).
+        // Sync each spec's upload kind to the actual linked GL active uniform.
+        unsafe {
+            let active_count = gl.get_active_uniforms(prog.id);
+            for idx in 0..active_count {
+                let Some(au) = gl.get_active_uniform(prog.id, idx) else {
+                    continue;
+                };
+                let base_name = au.name.split('[').next().unwrap_or(&au.name);
+                if let Some(gl_kind) = uniform_kind_from_gl(au.utype, au.size) {
+                    if let Some(spec) = all.iter_mut().find(|u| u.name == base_name) {
+                        spec.kind = gl_kind;
+                    }
+                }
             }
         }
 
@@ -4932,6 +4950,18 @@ impl EffectInstance {
         effect_file: &str,
         scene_effect: &Value,
     ) -> Option<Self> {
+        let mut ignored = Vec::new();
+        Self::load_with_diagnostics(gl, pkg, effect_file, scene_effect, &mut ignored)
+    }
+
+    /// Build an effect while collecting any shader compilation failure reasons.
+    pub fn load_with_diagnostics(
+        gl: &glow::Context,
+        pkg: &PackageFs,
+        effect_file: &str,
+        scene_effect: &Value,
+        failed_shaders: &mut Vec<String>,
+    ) -> Option<Self> {
         let def = read_json(pkg, effect_file)?;
         let def_passes = def.get("passes")?.as_array()?;
         let scene_passes = scene_effect
@@ -5077,6 +5107,7 @@ impl EffectInstance {
                 Ok(p) => Some(p),
                 Err(err) => {
                     log::warn!("effect shader {shader} failed: {err}");
+                    failed_shaders.push(format!("{effect_file} ({shader}): {err}"));
                     bail!()
                 }
             };
@@ -5910,6 +5941,24 @@ fn eval_dynamic_constant(val: &Value, ctx: &EffectContext) -> Value {
     val.clone()
 }
 
+fn uniform_kind_from_gl(utype: u32, size: i32) -> Option<UniformKind> {
+    match utype {
+        glow::FLOAT if size > 1 => Some(UniformKind::FloatArray(size as usize)),
+        glow::FLOAT => Some(UniformKind::Float),
+        glow::FLOAT_VEC2 => Some(UniformKind::Vec2),
+        glow::FLOAT_VEC3 => Some(UniformKind::Vec3),
+        glow::FLOAT_VEC4 => Some(UniformKind::Vec4),
+        glow::INT => Some(UniformKind::Int),
+        glow::BOOL => Some(UniformKind::Bool),
+        glow::FLOAT_MAT3 => Some(UniformKind::Mat3),
+        glow::FLOAT_MAT4 => Some(UniformKind::Mat4),
+        glow::SAMPLER_2D | glow::SAMPLER_CUBE | glow::SAMPLER_3D | glow::SAMPLER_2D_ARRAY => {
+            Some(UniformKind::Sampler)
+        }
+        _ => None,
+    }
+}
+
 fn set_uniform_value(
     gl: &glow::Context,
     prog: &mut Program,
@@ -6517,5 +6566,45 @@ void main() {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn uniform_kind_from_gl_maps_scalar_vector_array_and_sampler_types() {
+        assert_eq!(uniform_kind_from_gl(glow::FLOAT, 1), Some(UniformKind::Float));
+        assert_eq!(
+            uniform_kind_from_gl(glow::FLOAT, 8),
+            Some(UniformKind::FloatArray(8))
+        );
+        assert_eq!(
+            uniform_kind_from_gl(glow::FLOAT_VEC2, 1),
+            Some(UniformKind::Vec2)
+        );
+        assert_eq!(
+            uniform_kind_from_gl(glow::FLOAT_VEC3, 1),
+            Some(UniformKind::Vec3)
+        );
+        assert_eq!(
+            uniform_kind_from_gl(glow::FLOAT_VEC4, 1),
+            Some(UniformKind::Vec4)
+        );
+        assert_eq!(uniform_kind_from_gl(glow::INT, 1), Some(UniformKind::Int));
+        assert_eq!(uniform_kind_from_gl(glow::BOOL, 1), Some(UniformKind::Bool));
+        assert_eq!(
+            uniform_kind_from_gl(glow::FLOAT_MAT3, 1),
+            Some(UniformKind::Mat3)
+        );
+        assert_eq!(
+            uniform_kind_from_gl(glow::FLOAT_MAT4, 1),
+            Some(UniformKind::Mat4)
+        );
+        assert_eq!(
+            uniform_kind_from_gl(glow::SAMPLER_2D, 1),
+            Some(UniformKind::Sampler)
+        );
+        assert_eq!(
+            uniform_kind_from_gl(glow::SAMPLER_2D_ARRAY, 1),
+            Some(UniformKind::Sampler)
+        );
+        assert_eq!(uniform_kind_from_gl(0xFFFF, 1), None);
     }
 }

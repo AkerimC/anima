@@ -1566,8 +1566,10 @@ fn extract_we_properties(project: &serde_json::Value) -> Vec<WallpaperProperty> 
             None => String::new(),
         };
 
-        // Skip internal non-UI types (`usershortcut` keybinds and empty `scenetexture` slots).
+        // Skip internal non-UI types (`usershortcut` keybinds, decorative `divider`s,
+        // and empty `scenetexture` slots).
         if prop_type == "usershortcut"
+            || prop_type == "divider"
             || (prop_type == "scenetexture" && default_value.trim().is_empty())
         {
             continue;
@@ -2310,6 +2312,10 @@ mod tests {
                         "type": "usershortcut",
                         "text": "Hotkey",
                         "order": 1
+                    },
+                    "ui_d01": {
+                        "type": "divider",
+                        "order": 101
                     },
                     "tex": {
                         "type": "scenetexture",
