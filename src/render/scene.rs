@@ -38,7 +38,8 @@ use super::scenescript::{
 };
 use super::text;
 use super::we_effect::{
-    parse_usertexture_slot, Canvas, EffectContext, EffectInstance, SystemTexture, TextureCache,
+    parse_usertexture_binding, Canvas, EffectContext, EffectInstance, SystemTexture, TextureCache,
+    UserTextureSlot,
 };
 use super::we_model::{parse_mdl, Mesh, MeshVertex, ParsedMdl, PuppetAnimLayer};
 use super::we_particle::{
@@ -1247,24 +1248,58 @@ struct SceneObject {
     script_text_override: Option<String>,
     /// Explicit spritesheet frame set by `thisLayer.getTextureAnimation()`.
     script_sprite_frame: Option<u32>,
-    /// Dynamic system media texture bound via slot 0 `usertextures` (`$mediaThumbnail`, etc.).
-    media_tex: Option<SystemTexture>,
+    /// Dynamic system or user-property texture bound via slot 0 `usertextures`.
+    user_tex: Option<UserTextureSlot>,
 }
 
-fn detect_layer_media_tex(
+fn detect_layer_user_tex(
     obj: &serde_json::Value,
     mat_pass: Option<&serde_json::Value>,
-) -> Option<SystemTexture> {
+) -> Option<UserTextureSlot> {
     let slot0 = |v: &serde_json::Value| {
         v.get("usertextures")
             .and_then(|a| a.as_array())
             .and_then(|a| a.first())
-            .and_then(parse_usertexture_slot)
+            .and_then(parse_usertexture_binding)
     };
     obj.get("instanceoverride")
         .and_then(slot0)
         .or_else(|| obj.get("instance").and_then(slot0))
         .or_else(|| mat_pass.and_then(slot0))
+}
+
+fn remap_indices_after_move(len: usize, from: usize, to: usize) -> Vec<Option<usize>> {
+    let mut map: Vec<Option<usize>> = (0..len).map(Some).collect();
+    if from >= len || to >= len || from == to {
+        return map;
+    }
+    for (old, slot) in map.iter_mut().enumerate() {
+        let new = if old == from {
+            to
+        } else if from < to && old > from && old <= to {
+            old - 1
+        } else if to < from && old >= to && old < from {
+            old + 1
+        } else {
+            old
+        };
+        *slot = Some(new);
+    }
+    map
+}
+
+fn remap_indices_after_remove(len: usize, removed: usize) -> Vec<Option<usize>> {
+    (0..len)
+        .map(|old| {
+            if old == removed {
+                None
+            } else if old > removed {
+                Some(old - 1)
+            } else {
+                Some(old)
+            }
+        })
+        .collect()
 }
 
 fn sync_media_tex_slot(
@@ -2826,7 +2861,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
-                    media_tex: None,
+                    user_tex: None,
                 });
                 continue;
             }
@@ -2871,7 +2906,7 @@ impl SceneRenderer {
                         script_visible: None,
                         script_text_override: None,
                         script_sprite_frame: None,
-                        media_tex: None,
+                        user_tex: None,
                     });
                 }
                 continue;
@@ -2959,7 +2994,7 @@ impl SceneRenderer {
                         script_visible: None,
                         script_text_override: None,
                         script_sprite_frame: None,
-                        media_tex: None,
+                        user_tex: None,
                     });
                 }
                 continue;
@@ -3004,7 +3039,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
-                    media_tex: None,
+                    user_tex: None,
                 });
                 continue;
             }
@@ -3055,7 +3090,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
-                    media_tex: None,
+                    user_tex: None,
                 });
                 continue;
             }
@@ -3097,7 +3132,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
-                    media_tex: None,
+                    user_tex: None,
                 });
                 continue;
             }
@@ -3111,7 +3146,7 @@ impl SceneRenderer {
                 solid_model,
                 mat_media_pass,
             } = resolve_image_model(pkg, image_ref);
-            let media_tex = detect_layer_media_tex(obj, mat_media_pass.as_ref());
+            let user_tex = detect_layer_user_tex(obj, mat_media_pass.as_ref());
 
             if solid_model {
                 let inst_tex_ref = obj
@@ -3189,7 +3224,7 @@ impl SceneRenderer {
                     script_visible: None,
                     script_text_override: None,
                     script_sprite_frame: None,
-                    media_tex,
+                    user_tex,
                 });
                 continue;
             }
@@ -3206,7 +3241,7 @@ impl SceneRenderer {
                     (t, w, h)
                 })
             });
-            if loaded.is_none() && (media_tex.is_none() || puppet_path.is_some()) {
+            if loaded.is_none() && (user_tex.is_none() || puppet_path.is_some()) {
                 if let Some(tp) = texture_path.as_deref() {
                     log::debug!("scene object {name}: missing texture {tp}");
                 } else {
@@ -3386,7 +3421,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
-                media_tex,
+                user_tex,
             });
         }
 
@@ -3443,7 +3478,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
-                media_tex: None,
+                user_tex: None,
             });
         }
 
@@ -3561,7 +3596,7 @@ impl SceneRenderer {
                 o.anim = Some(a);
             }
         }
-        self.load_scene_scripts();
+        self.load_scene_scripts(gl, Some(pkg));
         log::debug!(
             "scene: ortho={:?} objects={} emitters={}",
             self.ortho_size,
@@ -3987,7 +4022,7 @@ impl SceneRenderer {
 
     /// Compile every SceneScript bound to a layer or effect property and register
     /// the layer/effect tables the scripts see through `thisLayer`/`thisObject`/`thisScene`.
-    fn load_scene_scripts(&mut self) {
+    fn load_scene_scripts(&mut self, gl: &glow::Context, pkg_override: Option<&PackageFs>) {
         self.capture_and_flush_storage(true);
         self.scripts_dirty = false;
         self.scripts = None;
@@ -4163,6 +4198,12 @@ impl SceneRenderer {
                 ),
                 _ => ("center".to_string(), "center".to_string(), 32.0, String::new()),
             };
+            let authored_image = obj
+                .raw_obj
+                .get("image")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             host.add_layer(&LayerSeed {
                 id,
                 name: obj.name.clone(),
@@ -4184,6 +4225,7 @@ impl SceneRenderer {
                 vertical_align,
                 point_size,
                 font,
+                image: authored_image,
                 text,
                 parent,
                 tex_anim,
@@ -4505,7 +4547,7 @@ impl SceneRenderer {
                 host.uses_audio()
             );
             self.scripts = Some(host);
-            self.apply_script_outputs(init_outputs);
+            self.apply_script_outputs(gl, pkg_override, init_outputs);
             self.capture_and_flush_storage(false);
         }
     }
@@ -4542,9 +4584,307 @@ impl SceneRenderer {
         }
     }
 
+    fn apply_object_index_remap(&mut self, old_to_new: &[Option<usize>]) {
+        for obj in &mut self.objects {
+            if let Some(p) = obj.parent_obj {
+                obj.parent_obj = old_to_new.get(p).copied().flatten();
+            }
+            if let Some(att) = &mut obj.attach {
+                match old_to_new.get(att.parent).copied().flatten() {
+                    Some(np) => att.parent = np,
+                    None => obj.attach = None,
+                }
+            }
+        }
+        let mut remapped_scripts = Vec::with_capacity(self.script_objs.len());
+        for &old_idx in &self.script_objs {
+            if let Some(new_idx) = old_to_new.get(old_idx).copied().flatten() {
+                remapped_scripts.push(new_idx);
+            }
+        }
+        self.script_objs = remapped_scripts;
+        self.script_ids.clear();
+        for (idx, obj) in self.objects.iter().enumerate() {
+            if let Some(id) = obj.id {
+                self.script_ids.insert(id, idx);
+            }
+        }
+    }
+
+    fn create_dynamic_layer(
+        &mut self,
+        gl: &glow::Context,
+        pkg_override: Option<&PackageFs>,
+        id: i64,
+        cfg: &serde_json::Value,
+    ) -> bool {
+        if self.objects.len() >= 1024 || self.script_ids.contains_key(&id) {
+            return false;
+        }
+        let name = cfg
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("dynamic")
+            .to_string();
+        let kind_str = cfg
+            .get("kind")
+            .or_else(|| cfg.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let image_ref = cfg
+            .get("image")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let origin = cfg
+            .get("origin")
+            .map(|v| value_vec(v, 3, [0.0, 0.0, 0.0]))
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let scale = cfg
+            .get("scale")
+            .map(|v| value_vec(v, 3, [1.0, 1.0, 1.0]))
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let angles_deg = cfg
+            .get("angles")
+            .map(|v| value_vec(v, 3, [0.0, 0.0, 0.0]))
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let angles = [
+            angles_deg[0].to_radians(),
+            angles_deg[1].to_radians(),
+            angles_deg[2].to_radians(),
+        ];
+        let local = compose_local(origin, scale, angles);
+        let color_rgb = cfg
+            .get("color")
+            .map(|v| parse_color(v, [1.0, 1.0, 1.0]))
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let alpha = cfg
+            .get("alpha")
+            .and_then(value_f32)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let visible = cfg.get("visible").and_then(value_bool).unwrap_or(true);
+        let solid = cfg.get("solid").and_then(value_bool).unwrap_or(true);
+        let align = parse_alignment_str(
+            cfg.get("alignment")
+                .and_then(|v| v.as_str())
+                .unwrap_or("center"),
+        );
+        let parallax = cfg
+            .get("parallaxDepth")
+            .map(|v| {
+                let p = value_vec(v, 2, [0.0, 0.0, 0.0]);
+                [p[0], p[1]]
+            })
+            .unwrap_or([0.0, 0.0]);
+        let parent_obj = cfg
+            .get("parent")
+            .and_then(|v| v.as_i64())
+            .and_then(|pid| self.script_ids.get(&pid).copied());
+        let raw_size = cfg
+            .get("size")
+            .map(|v| {
+                let s = value_vec(v, 2, [0.0, 0.0, 0.0]);
+                [s[0].abs(), s[1].abs()]
+            })
+            .unwrap_or([0.0, 0.0]);
+
+        let pkg = pkg_override.unwrap_or(&self.pkg);
+        let has_text_field = cfg
+            .get("text")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+        let (kind, size, blend, sprite) = if (kind_str == "text" || has_text_field)
+            && kind_str != "solid"
+        {
+            let authored = cfg
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let point_size = cfg
+                .get("pointsize")
+                .and_then(value_f32)
+                .unwrap_or(32.0)
+                .clamp(1.0, 2048.0);
+            let font_path = cfg
+                .get("font")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let h_align = parse_h_align(
+                cfg.get("horizontalalign")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("center"),
+            );
+            let v_align = parse_v_align(
+                cfg.get("verticalalign")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("center"),
+            );
+            let box_size = [
+                if raw_size[0] > 0.0 { raw_size[0] } else { 512.0 },
+                if raw_size[1] > 0.0 { raw_size[1] } else { 128.0 },
+            ];
+            let font = text::load_font(pkg, &font_path);
+            let layer = TextLayer {
+                script: None,
+                authored,
+                raw_text_def: serde_json::Value::Null,
+                props: HashMap::new(),
+                font,
+                font_path,
+                point_size,
+                spacing: [0.0, 0.0],
+                padding: [0.0, 0.0],
+                max_width: 0.0,
+                limit_width: false,
+                limit_rows: false,
+                max_rows: 1,
+                limit_use_ellipsis: false,
+                opaque_background: false,
+                background_color: [0.0, 0.0, 0.0],
+                background_brightness: 1.0,
+                h_align,
+                v_align,
+                box_size,
+                world_size: box_size,
+                current: String::new(),
+                texture: None,
+                raster_size: [0, 0],
+                raster_ppw: 0.0,
+            };
+            (
+                ObjectKind::Text(Box::new(layer)),
+                box_size,
+                LayerBlend::Normal,
+                None,
+            )
+        } else if kind_str == "solid"
+            || image_ref.to_ascii_lowercase().contains("util/solidlayer")
+            || image_ref.is_empty()
+        {
+            let size = [
+                if raw_size[0] > 0.0 { raw_size[0] } else { 100.0 },
+                if raw_size[1] > 0.0 { raw_size[1] } else { 100.0 },
+            ];
+            (ObjectKind::Solid, size, LayerBlend::Normal, None)
+        } else {
+            let info = resolve_image_model(pkg, &image_ref);
+            let loaded = info
+                .texture_path
+                .as_deref()
+                .and_then(|tp| Self::load_texture(gl, pkg, &mut self.textures, tp));
+            if let Some((tex, tw, th, ss)) = loaded {
+                let (fw, fh) = match ss {
+                    Some(s) => (tw / s.cols.max(1), th / s.rows.max(1)),
+                    None => (tw, th),
+                };
+                let def_sz = info.model_size.unwrap_or([fw as f32, fh as f32]);
+                let size = [
+                    if raw_size[0] > 0.0 { raw_size[0] } else { def_sz[0] },
+                    if raw_size[1] > 0.0 { raw_size[1] } else { def_sz[1] },
+                ];
+                (
+                    ObjectKind::Image(tex),
+                    size,
+                    LayerBlend::from_material(&info.material_blend),
+                    ss,
+                )
+            } else {
+                let size = [
+                    if raw_size[0] > 0.0 { raw_size[0] } else { 100.0 },
+                    if raw_size[1] > 0.0 { raw_size[1] } else { 100.0 },
+                ];
+                (ObjectKind::Solid, size, LayerBlend::Normal, None)
+            }
+        };
+
+        self.objects.push(SceneObject {
+            id: Some(id),
+            name,
+            transform: local,
+            size,
+            align,
+            color: [color_rgb[0], color_rgb[1], color_rgb[2], alpha],
+            brightness: 1.0,
+            blend,
+            color_blend: 0,
+            parallax,
+            visible: VisibleRule::Always,
+            solid,
+            dependencies: Vec::new(),
+            capture_composite: false,
+            effects: Vec::new(),
+            kind,
+            anim: None,
+            sprite,
+            attach: None,
+            raw_idx: None,
+            raw_obj: serde_json::Value::Null,
+            parent_obj,
+            local_parts: (origin, scale, angles),
+            script_visible: Some(visible),
+            script_text_override: None,
+            script_sprite_frame: None,
+            user_tex: None,
+        });
+        let new_idx = self.objects.len() - 1;
+        self.script_ids.insert(id, new_idx);
+        self.script_objs.push(new_idx);
+        true
+    }
+
+    fn destroy_dynamic_layer(&mut self, gl: &glow::Context, id: i64) {
+        let Some(&idx) = self.script_ids.get(&id) else {
+            return;
+        };
+        let old_len = self.objects.len();
+        let mut obj = self.objects.remove(idx);
+        for eff in obj.effects.drain(..) {
+            eff.destroy(gl);
+        }
+        if let ObjectKind::Text(layer) = &mut obj.kind {
+            if let Some(tex) = layer.texture.take() {
+                unsafe { gl.delete_texture(tex) };
+            }
+        }
+        self.cursor_hovered.remove(&id);
+        self.cursor_pressed.remove(&id);
+        let map = remap_indices_after_remove(old_len, idx);
+        self.apply_object_index_remap(&map);
+    }
+
+    fn sort_scene_layer(&mut self, id: i64, target_idx: usize) {
+        let Some(&from) = self.script_ids.get(&id) else {
+            return;
+        };
+        let len = self.objects.len();
+        if len == 0 {
+            return;
+        }
+        let to = target_idx.min(len - 1);
+        if from == to {
+            return;
+        }
+        let obj = self.objects.remove(from);
+        self.objects.insert(to, obj);
+        let map = remap_indices_after_move(len, from, to);
+        self.apply_object_index_remap(&map);
+    }
+
     /// Apply SceneScript outputs (layer fields, effect visibility, shader constants)
     /// and propagate any transform updates down the parent chain.
-    fn apply_script_outputs(&mut self, outputs: Vec<ScriptOutput>) {
+    fn apply_script_outputs(
+        &mut self,
+        gl: &glow::Context,
+        pkg_override: Option<&PackageFs>,
+        outputs: Vec<ScriptOutput>,
+    ) {
         if outputs.is_empty() {
             return;
         }
@@ -4556,7 +4896,7 @@ impl SceneRenderer {
                     let Some(&idx) = self.script_ids.get(&id) else {
                         continue;
                     };
-                    let pkg = &self.pkg;
+                    let pkg = pkg_override.unwrap_or(&self.pkg);
                     let obj = &mut self.objects[idx];
                     match field {
                         ScriptField::Visible => {
@@ -4889,6 +5229,23 @@ impl SceneRenderer {
                         }
                     }
                 }
+                ScriptTarget::SceneCreateLayer { id } => {
+                    if self.create_dynamic_layer(gl, pkg_override, id, &out.value) {
+                        transforms_dirty = true;
+                    }
+                }
+                ScriptTarget::SceneDestroyLayer { id } => {
+                    self.destroy_dynamic_layer(gl, id);
+                }
+                ScriptTarget::SceneSortLayer { id } => {
+                    if let Some(target_idx) = out
+                        .value
+                        .as_u64()
+                        .or_else(|| out.value.as_i64().filter(|&v| v >= 0).map(|v| v as u64))
+                    {
+                        self.sort_scene_layer(id, target_idx as usize);
+                    }
+                }
             }
         }
         if transforms_dirty {
@@ -5104,6 +5461,7 @@ impl SceneRenderer {
     #[allow(clippy::too_many_arguments)]
     fn tick_scripts(
         &mut self,
+        gl: &glow::Context,
         time: f32,
         dt: f32,
         daytime: f32,
@@ -5185,7 +5543,7 @@ impl SceneRenderer {
                 &self.media_events,
             )
         };
-        self.apply_script_outputs(outputs);
+        self.apply_script_outputs(gl, None, outputs);
     }
 
     fn resolve_sound_file(
@@ -5453,7 +5811,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
-                media_tex: None,
+                user_tex: None,
             });
         }
         for p in doc.particles {
@@ -5495,7 +5853,7 @@ impl SceneRenderer {
                 script_visible: None,
                 script_text_override: None,
                 script_sprite_frame: None,
-                media_tex: None,
+                user_tex: None,
             });
         }
         Ok(())
@@ -7267,7 +7625,7 @@ impl Renderer for SceneRenderer {
     fn render(&mut self, gl: &glow::Context, info: &FrameInfo) -> Result<bool> {
         self.ensure_scene(gl)?;
         if self.scripts_dirty {
-            self.load_scene_scripts();
+            self.load_scene_scripts(gl, None);
         } else if !self.pending_user_props.is_empty() {
             let changed = std::mem::take(&mut self.pending_user_props);
             if self.scripts.is_some() {
@@ -7281,7 +7639,7 @@ impl Renderer for SceneRenderer {
                     .as_mut()
                     .map(|host| host.apply_user_properties(&changed, &binding_props))
                     .unwrap_or_default();
-                self.apply_script_outputs(outputs);
+                self.apply_script_outputs(gl, None, outputs);
                 self.capture_and_flush_storage(false);
             }
         }
@@ -7434,6 +7792,7 @@ impl Renderer for SceneRenderer {
         self.collect_media_events(info.media.as_ref());
         self.collect_cursor_events(cursor_world, raw_win_uv, info.mouse_down, time);
         self.tick_scripts(
+            gl,
             time,
             dt,
             daytime,
@@ -7837,15 +8196,25 @@ impl Renderer for SceneRenderer {
             let has_effects = !self.objects[i].effects.is_empty();
             let mut draw = self.objects[i].draw_info();
             draw.uv_rect = self.objects[i].sprite_rect(time);
-            if let Some(slot) = self.objects[i].media_tex {
-                let media_tex = match slot {
-                    SystemTexture::MediaThumbnail => self.media_thumb_tex.map(|(_, t, _, _)| t),
-                    SystemTexture::MediaPreviousThumbnail => self
+            if let Some(slot) = self.objects[i].user_tex.clone() {
+                let override_tex = match slot {
+                    UserTextureSlot::System(SystemTexture::MediaThumbnail) => {
+                        self.media_thumb_tex.map(|(_, t, _, _)| t)
+                    }
+                    UserTextureSlot::System(SystemTexture::MediaPreviousThumbnail) => self
                         .media_prev_thumb_tex
                         .or(self.media_thumb_tex)
                         .map(|(_, t, _, _)| t),
+                    UserTextureSlot::Property(ref prop_key) => prop_get(&self.properties, prop_key)
+                        .and_then(|v| {
+                            v.as_str()
+                                .or_else(|| v.get("value").and_then(|s| s.as_str()))
+                        })
+                        .map(str::to_string)
+                        .and_then(|path| self.textures.get_user_texture(gl, &self.pkg, &path))
+                        .map(|(t, _, _)| t),
                 };
-                if let Some(tex) = media_tex {
+                if let Some(tex) = override_tex {
                     if matches!(draw.kind, DrawKind::Image(_) | DrawKind::Solid) {
                         draw.kind = DrawKind::Image(tex);
                         draw.uv_rect = [0.0, 0.0, 1.0, 1.0];
@@ -8175,10 +8544,10 @@ impl Renderer for SceneRenderer {
     }
 
     fn uses_media(&self) -> bool {
-        self.objects
-            .iter()
-            .any(|o| o.media_tex.is_some() || o.effects.iter().any(|e| e.uses_media()))
-            || self.scripts.as_ref().is_some_and(|s| s.uses_media())
+        self.objects.iter().any(|o| {
+            matches!(o.user_tex, Some(UserTextureSlot::System(_)))
+                || o.effects.iter().any(|e| e.uses_media())
+        }) || self.scripts.as_ref().is_some_and(|s| s.uses_media())
     }
 
     fn describe(&self) -> String {
@@ -8929,7 +9298,7 @@ mod tests {
             script_visible: None,
             script_text_override: None,
             script_sprite_frame: None,
-            media_tex: None,
+            user_tex: None,
         };
         // With align=[0.5, 0], local_center=(50, 0); scaled by (2,1) -> (100,0);
         // rotated +90 deg -> (0, +100), so quad center is at (200, 400), covering
@@ -8957,16 +9326,16 @@ mod tests {
             "instanceoverride": { "usertextures": [thumb_entry] }
         });
         assert_eq!(
-            detect_layer_media_tex(&obj_override, None),
-            Some(SystemTexture::MediaThumbnail)
+            detect_layer_user_tex(&obj_override, None),
+            Some(UserTextureSlot::System(SystemTexture::MediaThumbnail))
         );
 
         let obj_instance = serde_json::json!({
             "instance": { "usertextures": [prev_entry] }
         });
         assert_eq!(
-            detect_layer_media_tex(&obj_instance, None),
-            Some(SystemTexture::MediaPreviousThumbnail)
+            detect_layer_user_tex(&obj_instance, None),
+            Some(UserTextureSlot::System(SystemTexture::MediaPreviousThumbnail))
         );
 
         let obj_plain = serde_json::json!({
@@ -8977,8 +9346,8 @@ mod tests {
             "usertextures": [thumb_entry]
         });
         assert_eq!(
-            detect_layer_media_tex(&obj_plain, Some(&mat_pass)),
-            Some(SystemTexture::MediaThumbnail)
+            detect_layer_user_tex(&obj_plain, Some(&mat_pass)),
+            Some(UserTextureSlot::System(SystemTexture::MediaThumbnail))
         );
 
         let obj_both = serde_json::json!({
@@ -8986,12 +9355,40 @@ mod tests {
             "instance": { "usertextures": [thumb_entry] }
         });
         assert_eq!(
-            detect_layer_media_tex(&obj_both, Some(&mat_pass)),
-            Some(SystemTexture::MediaPreviousThumbnail)
+            detect_layer_user_tex(&obj_both, Some(&mat_pass)),
+            Some(UserTextureSlot::System(SystemTexture::MediaPreviousThumbnail))
+        );
+
+        let mat_custom = serde_json::json!({
+            "shader": "genericimage4",
+            "usertextures": ["newproperty"]
+        });
+        assert_eq!(
+            detect_layer_user_tex(&obj_plain, Some(&mat_custom)),
+            Some(UserTextureSlot::Property("newproperty".into()))
         );
 
         let obj_none = serde_json::json!({ "name": "bg" });
-        assert_eq!(detect_layer_media_tex(&obj_none, None), None);
+        assert_eq!(detect_layer_user_tex(&obj_none, None), None);
+    }
+
+    #[test]
+    fn object_index_remap_preserves_order_for_move_and_remove() {
+        // Move element at index 4 up behind index 1 (like sortLayer moving a shadow behind target).
+        assert_eq!(
+            remap_indices_after_move(5, 4, 1),
+            vec![Some(0), Some(2), Some(3), Some(4), Some(1)]
+        );
+        // Move element down from index 1 to index 3.
+        assert_eq!(
+            remap_indices_after_move(5, 1, 3),
+            vec![Some(0), Some(3), Some(1), Some(2), Some(4)]
+        );
+        // Removing index 1 drops parent pointer at 1 and shifts indices >= 2 down by 1.
+        assert_eq!(
+            remap_indices_after_remove(4, 1),
+            vec![Some(0), None, Some(1), Some(2)]
+        );
     }
 
     #[test]

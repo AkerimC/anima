@@ -182,6 +182,7 @@ pub struct LayerSeed {
     pub vertical_align: String,
     pub point_size: f32,
     pub font: String,
+    pub image: String,
     pub text: String,
     pub parent: Option<i64>,
     pub tex_anim: Option<TexAnimSeed>,
@@ -386,6 +387,15 @@ pub enum ScriptTarget {
     SoundControl {
         layer_id: i64,
     },
+    SceneCreateLayer {
+        id: i64,
+    },
+    SceneDestroyLayer {
+        id: i64,
+    },
+    SceneSortLayer {
+        id: i64,
+    },
 }
 
 /// Result of one scripted property (or side-effect write) for this frame.
@@ -549,6 +559,7 @@ impl SceneScripts {
             "verticalalign": seed.vertical_align,
             "pointsize": seed.point_size,
             "font": seed.font,
+            "image": seed.image,
             "text": seed.text,
             "parent": seed.parent,
         });
@@ -790,7 +801,10 @@ impl SceneScripts {
                             let lid = match &target {
                                 ScriptTarget::Layer { id, .. }
                                 | ScriptTarget::LayerAnimControl { id, .. }
-                                | ScriptTarget::LayerSolid { id } => *id,
+                                | ScriptTarget::LayerSolid { id }
+                                | ScriptTarget::SceneCreateLayer { id }
+                                | ScriptTarget::SceneDestroyLayer { id }
+                                | ScriptTarget::SceneSortLayer { id } => *id,
                                 ScriptTarget::EffectVisible { layer_id, .. }
                                 | ScriptTarget::EffectConstant { layer_id, .. }
                                 | ScriptTarget::EffectConstAnimControl { layer_id, .. }
@@ -1168,6 +1182,9 @@ impl SceneScripts {
                 "sound_ctrl" => ScriptTarget::SoundControl {
                     layer_id: entry.layer_id,
                 },
+                "scene_create_layer" => ScriptTarget::SceneCreateLayer { id: entry.id },
+                "scene_destroy_layer" => ScriptTarget::SceneDestroyLayer { id: entry.id },
+                "scene_sort_layer" => ScriptTarget::SceneSortLayer { id: entry.id },
                 _ => continue,
             };
             out.push(ScriptOutput {
@@ -1252,6 +1269,15 @@ impl SceneScripts {
                 }
                 ScriptTarget::SoundControl { layer_id } => {
                     log::warn!("scenescript: sound_ctrl on object {layer_id}: {err}");
+                }
+                ScriptTarget::SceneCreateLayer { id } => {
+                    log::warn!("scenescript: createLayer({id}): {err}");
+                }
+                ScriptTarget::SceneDestroyLayer { id } => {
+                    log::warn!("scenescript: destroyLayer({id}): {err}");
+                }
+                ScriptTarget::SceneSortLayer { id } => {
+                    log::warn!("scenescript: sortLayer({id}): {err}");
                 }
             }
         } else {
@@ -1847,6 +1873,31 @@ const PRELUDE: &str = r#"
     }
     return new Vec3(0, 0, 0);
   }
+  function parseScaleVec(v) {
+    if (typeof v === 'number') {
+      var n = num(v, 1);
+      return new Vec3(n, n, n);
+    }
+    if (Array.isArray(v)) return new Vec3(num(v[0], 1), num(v[1], 1), num(v[2], 1));
+    if (v && typeof v === 'object') {
+      return new Vec3(
+        num(v.x !== undefined ? v.x : v.r, 1),
+        num(v.y !== undefined ? v.y : v.g, 1),
+        num(v.z !== undefined ? v.z : v.b, 1)
+      );
+    }
+    if (typeof v === 'string') {
+      var p = v.trim().split(/\s+/).filter(Boolean).map(parseFloat);
+      if (p.length === 1) {
+        var s = num(p[0], 1);
+        return new Vec3(s, s, s);
+      }
+      if (p.length >= 2) {
+        return new Vec3(num(p[0], 1), num(p[1], 1), num(p[2], 1));
+      }
+    }
+    return new Vec3(1, 1, 1);
+  }
   function toArr3(v) {
     if (Array.isArray(v)) return [num(v[0], 0), num(v[1], 0), num(v[2], 0)];
     if (v && typeof v === 'object') return [num(v.x !== undefined ? v.x : v.r, 0), num(v.y !== undefined ? v.y : v.g, 0), num(v.z !== undefined ? v.z : v.b, 0)];
@@ -1935,6 +1986,10 @@ const PRELUDE: &str = r#"
 
   var layers = {};
   var layerOrder = [];
+  var nextDynLayerId = -1000;
+  var dynLayerCount = 0;
+  var pendingSceneOps = [];
+  var createdThisTick = {};
   var allEffects = [];
   var allAnimLayers = [];
   var allKeyAnims = [];
@@ -2318,7 +2373,7 @@ const PRELUDE: &str = r#"
       origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
       color: new Vec3(1, 1, 1),
       alignment: 'center', horizontalalign: 'center', verticalalign: 'center',
-      pointsize: 32, font: '',
+      pointsize: 32, font: '', image: '',
       text: '', cursorDetected: false, clicked: false, kind: '',
       _origOrigin: new Vec3(0, 0, 0),
       _origScale: new Vec3(1, 1, 1),
@@ -2411,9 +2466,103 @@ const PRELUDE: &str = r#"
     getLayer: function (ref) { return layerByRef(ref); },
     enumerateLayers: function () { return layerOrder.map(function (id) { return layers[id]; }); },
     getLayerIndex: function (l) { var i = layerOrder.indexOf(String(l && l.id)); return i < 0 ? -1 : i; },
-    sortLayer: function () { return true; },
-    destroyLayer: function () { return true; },
-    createLayer: function (cfg) { return makeLayer(-1, cfg && cfg.name); },
+    sortLayer: function (ref, targetIdx) {
+      var l = layerByRef(ref);
+      if (!l || layers[String(l.id)] !== l) return false;
+      var idStr = String(l.id);
+      var from = layerOrder.indexOf(idStr);
+      if (from < 0) return false;
+      var to = Math.max(0, Math.min(layerOrder.length - 1, Math.floor(num(targetIdx, from))));
+      if (from !== to) {
+        layerOrder.splice(from, 1);
+        layerOrder.splice(to, 0, idStr);
+        pendingSceneOps.push({ kind: 'scene_sort_layer', id: l.id, value: to });
+      }
+      return true;
+    },
+    destroyLayer: function (ref) {
+      var l = layerByRef(ref);
+      if (!l || layers[String(l.id)] !== l) return false;
+      var idStr = String(l.id);
+      delete layers[idStr];
+      delete createdThisTick[idStr];
+      var pos = layerOrder.indexOf(idStr);
+      if (pos >= 0) layerOrder.splice(pos, 1);
+      if (l.id <= -1000 && dynLayerCount > 0) dynLayerCount--;
+      pendingSceneOps.push({ kind: 'scene_destroy_layer', id: l.id, value: null });
+      return true;
+    },
+    createLayer: function (cfg) {
+      cfg = cfg && typeof cfg === 'object' ? cfg : {};
+      if (dynLayerCount >= 256) {
+        return makeLayer(-1, cfg.name ? String(cfg.name) : '');
+      }
+      var dynId = nextDynLayerId--;
+      dynLayerCount++;
+      var idStr = String(dynId);
+      var l = makeLayer(dynId, cfg.name ? String(cfg.name) : ('dyn_' + (-dynId)));
+      l.kind = cfg.type ? String(cfg.type) : (cfg.kind ? String(cfg.kind) : '');
+      l.image = cfg.image ? String(cfg.image) : '';
+      l.text = cfg.text !== undefined && cfg.text !== null ? String(cfg.text) : '';
+      l.color = cfg.color !== undefined ? parseVec(cfg.color) : new Vec3(1, 1, 1);
+      l.alpha = cfg.alpha !== undefined ? num(cfg.alpha, 1) : 1;
+      l.visible = cfg.visible !== false;
+      l.solid = cfg.solid !== false;
+      l.origin = cfg.origin !== undefined ? parseVec(cfg.origin) : new Vec3(0, 0, 0);
+      l.scale = cfg.scale !== undefined ? parseScaleVec(cfg.scale) : new Vec3(1, 1, 1);
+      l.angles = cfg.angles !== undefined ? parseVec(cfg.angles) : new Vec3(0, 0, 0);
+      var sv = cfg.size !== undefined ? parseVec(cfg.size) : new Vec3(0, 0, 0);
+      l.size = new Vec2(sv.x, sv.y);
+      l.alignment = cfg.alignment ? String(cfg.alignment) : 'center';
+      l.horizontalalign = cfg.horizontalalign ? String(cfg.horizontalalign) : 'center';
+      l.verticalalign = cfg.verticalalign ? String(cfg.verticalalign) : 'center';
+      l.pointsize = cfg.pointsize !== undefined ? num(cfg.pointsize, 32) : 32;
+      l.font = cfg.font ? String(cfg.font) : '';
+      var pd = cfg.parallaxDepth !== undefined ? parseVec(cfg.parallaxDepth) : new Vec3(0, 0, 0);
+      var parentLayer = cfg.parent !== undefined ? layerByRef(cfg.parent) : null;
+      var parentId = parentLayer && typeof parentLayer.id === 'number' && layers[String(parentLayer.id)] === parentLayer
+        ? parentLayer.id
+        : null;
+      if (parentId !== null) {
+        l.__parentId = parentId;
+        l.__parent = parentLayer;
+      }
+      l._origOrigin = l.origin.copy();
+      l._origScale = l.scale.copy();
+      l._origAngles = l.angles.copy();
+      l._origSize = l.size.copy();
+      l._origColor = l.color.copy();
+      l._origAlpha = l.alpha;
+      layers[idStr] = l;
+      layerOrder.push(idStr);
+      createdThisTick[idStr] = true;
+      pendingSceneOps.push({
+        kind: 'scene_create_layer',
+        id: dynId,
+        value: {
+          name: l.name,
+          kind: l.kind,
+          image: l.image,
+          text: l.text,
+          color: toArr3(l.color),
+          alpha: l.alpha,
+          visible: l.visible,
+          solid: l.solid,
+          origin: toArr3(l.origin),
+          scale: toArr3(l.scale),
+          angles: toArr3(l.angles),
+          size: [l.size.x, l.size.y],
+          alignment: l.alignment,
+          horizontalalign: l.horizontalalign,
+          verticalalign: l.verticalalign,
+          pointsize: l.pointsize,
+          font: l.font,
+          parallaxDepth: [pd.x, pd.y],
+          parent: parentId
+        }
+      });
+      return l;
+    },
     getInitialLayerConfig: function (ref) {
       var l = layerByRef(ref);
       if (!l) return {};
@@ -2558,26 +2707,28 @@ const PRELUDE: &str = r#"
   }
 
   function collectOutputs(preLayers, preEffects, preAnimLayers, forcedLayers, forcedEffects, forcedAnimLayers, errors) {
-    var outputs = [];
+    var outputs = pendingSceneOps.slice();
+    pendingSceneOps = [];
     for (var i = 0; i < layerOrder.length; i++) {
       var idStr = layerOrder[i];
       var l = layers[idStr];
       var prev = preLayers[idStr];
-      if (!prev) continue;
+      var isNew = !prev && !!createdThisTick[idStr];
+      if (!prev && !isNew) continue;
       var numId = l.id;
       var curVis = !!l.visible;
-      if (curVis !== prev.visible || forcedLayers[idStr + ':visible']) {
+      if (isNew || curVis !== prev.visible || forcedLayers[idStr + ':visible']) {
         outputs.push({ kind: 'layer', id: numId, field: 'visible', value: curVis });
       }
       var curAlpha = num(l.alpha, 1);
-      if (curAlpha !== prev.alpha || forcedLayers[idStr + ':alpha']) {
+      if (isNew || curAlpha !== prev.alpha || forcedLayers[idStr + ':alpha']) {
         outputs.push({ kind: 'layer', id: numId, field: 'alpha', value: curAlpha });
       }
       var vecFields = ['origin', 'scale', 'angles', 'color'];
       for (var fi = 0; fi < vecFields.length; fi++) {
         var f = vecFields[fi];
         var curVec = toArr3(l[f]);
-        if (!vec3Eq(curVec, prev[f]) || forcedLayers[idStr + ':' + f]) {
+        if (isNew || !vec3Eq(curVec, prev[f]) || forcedLayers[idStr + ':' + f]) {
           outputs.push({ kind: 'layer', id: numId, field: f, value: curVec });
         }
       }
@@ -2585,19 +2736,19 @@ const PRELUDE: &str = r#"
       for (var si = 0; si < strFields.length; si++) {
         var sf = strFields[si];
         var curStr = l[sf] === undefined || l[sf] === null ? '' : String(l[sf]);
-        if (curStr !== prev[sf] || forcedLayers[idStr + ':' + sf]) {
+        if (isNew || curStr !== prev[sf] || forcedLayers[idStr + ':' + sf]) {
           outputs.push({ kind: 'layer', id: numId, field: sf, value: curStr });
         }
       }
       var curPs = num(l.pointsize, 32);
-      if (curPs !== prev.pointsize || forcedLayers[idStr + ':pointsize']) {
+      if (isNew || curPs !== prev.pointsize || forcedLayers[idStr + ':pointsize']) {
         outputs.push({ kind: 'layer', id: numId, field: 'pointsize', value: curPs });
       }
       var curSolid = !!l.solid;
-      if (curSolid !== prev.solid) {
+      if (isNew || curSolid !== prev.solid) {
         outputs.push({ kind: 'layer_solid', id: numId, value: curSolid });
       }
-      if (l.__isSound) {
+      if (l.__isSound && prev) {
         var curVol = num(l.volume, 1);
         if (curVol !== prev.volume || forcedLayers[idStr + ':volume']) {
           outputs.push({ kind: 'layer', id: numId, field: 'volume', value: curVol });
@@ -2612,6 +2763,7 @@ const PRELUDE: &str = r#"
         }
       }
     }
+    createdThisTick = {};
 
     for (var e = 0; e < allEffects.length; e++) {
       var eff = allEffects[e];
@@ -2819,6 +2971,7 @@ const PRELUDE: &str = r#"
       l.verticalalign = typeof d.verticalalign === 'string' && d.verticalalign ? d.verticalalign : 'center';
       l.pointsize = num(d.pointsize, 32);
       l.font = typeof d.font === 'string' ? d.font : '';
+      l.image = typeof d.image === 'string' ? d.image : '';
       l.text = d.text || '';
       l._origOrigin = l.origin.copy();
       l._origScale = l.scale.copy();
@@ -3479,6 +3632,7 @@ mod tests {
             vertical_align: "center".into(),
             point_size: 32.0,
             font: String::new(),
+            image: String::new(),
             text: String::new(),
             parent: None,
             tex_anim: None,
@@ -4985,6 +5139,101 @@ export function update(value) { return value; }",
         assert!((ps - 48.0).abs() < 1e-3);
     }
 
+    #[test]
+    fn scene_create_sort_and_destroy_layer_emit_ordered_ops() {
+        let props = serde_json::Map::new();
+        let mut host = SceneScripts::new(&props).expect("host");
+        let mut bg = seed(601, "bg");
+        bg.image = "models/bg.json".into();
+        let mut main_l = seed(602, "clock");
+        main_l.kind = "text".into();
+        main_l.image = "models/clock.json".into();
+        main_l.origin = [500.0, 300.0, 0.0];
+        host.add_layer(&bg);
+        host.add_layer(&main_l);
+        host.link_parents();
+        host.add_property_script(
+            602,
+            ScriptField::Visible,
+            "'use strict';
+let shadow = null;
+export function init(value) {
+  let cfg = thisScene.getInitialLayerConfig(thisLayer);
+  if (cfg.image !== 'models/clock.json') throw new Error('missing initial image: ' + cfg.image);
+  shadow = thisScene.createLayer({
+    type: 'solid',
+    name: 'clock_shadow',
+    scale: new Vec2(4, 120),
+    origin: new Vec3(10, 20, 0),
+    color: '0 0 0'
+  });
+  shadow.visible = false;
+  shadow.origin = thisLayer.origin;
+  thisScene.sortLayer(shadow, thisScene.getLayerIndex(thisLayer));
+  if (thisScene.getLayerIndex(shadow) !== 1 || thisScene.getLayerIndex(thisLayer) !== 2) {
+    throw new Error('unexpected sort indices: shadow=' + thisScene.getLayerIndex(shadow) + ' self=' + thisScene.getLayerIndex(thisLayer));
+  }
+  return value;
+}
+export function update(value) {
+  if (shadow) {
+    thisScene.destroyLayer(shadow);
+    shadow = null;
+  }
+  return value;
+}",
+            json!(true),
+            &serde_json::Map::new(),
+            None,
+        );
+        let init_out = host.finalize_init();
+        assert_eq!(host.failures(), 0, "init failed: {:?}", host.errors());
+
+        let create_pos = init_out
+            .iter()
+            .position(|o| matches!(o.target, ScriptTarget::SceneCreateLayer { .. }))
+            .expect("createLayer op");
+        let sort_pos = init_out
+            .iter()
+            .position(|o| matches!(o.target, ScriptTarget::SceneSortLayer { .. }))
+            .expect("sortLayer op");
+        assert!(create_pos < sort_pos, "create must precede sort");
+
+        let dyn_id = match init_out[create_pos].target {
+            ScriptTarget::SceneCreateLayer { id } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!(prop_vec3(&init_out[create_pos].value["scale"], [0.0; 3]), [4.0, 120.0, 1.0]);
+        assert_eq!(init_out[sort_pos].value, json!(1));
+        let vis_pos = init_out
+            .iter()
+            .position(|o| {
+                o.target
+                    == ScriptTarget::Layer {
+                        id: dyn_id,
+                        field: ScriptField::Visible,
+                    }
+            })
+            .expect("initial post-create visible");
+        assert!(sort_pos < vis_pos, "ops must precede post-create field writes");
+        assert_eq!(init_out[vis_pos].value, json!(false));
+
+        let tick_out = host.tick(
+            0.016,
+            0.016,
+            0.5,
+            [0.0, 0.0],
+            [1920.0, 1080.0],
+            [1920.0, 1080.0],
+            None,
+            &[frame(601), frame(602)],
+        );
+        assert_eq!(host.failures(), 0, "tick failed: {:?}", host.errors());
+        assert!(tick_out
+            .iter()
+            .any(|o| o.target == ScriptTarget::SceneDestroyLayer { id: dyn_id }));
+    }
+
     /// Compile and tick every SceneScript (layer properties, effect visibility,
     /// effect constant shaders, puppet animation layers, and particle instance
     /// overrides) in the local Wallpaper Engine Workshop library.
@@ -5112,6 +5361,11 @@ export function update(value) { return value; }",
                         .unwrap_or(32.0) as f32,
                     font: obj
                         .get("font")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    image: obj
+                        .get("image")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),

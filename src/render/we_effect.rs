@@ -363,6 +363,105 @@ impl TextureCache {
             .and_then(|v| v.as_ref())
             .map(|t| (t.tex, t.w, t.h, t.spritesheet, t.is_r8))
     }
+
+    /// Load a user-selected `scenetexture`/`file` texture (external filesystem
+    /// path, `file://` URI, `~/...`, or package-relative asset), caching hits and misses.
+    pub fn get_user_texture(
+        &mut self,
+        gl: &glow::Context,
+        pkg: &PackageFs,
+        raw: &str,
+    ) -> Option<(glow::Texture, u32, u32)> {
+        let cleaned = resolve_user_texture_path(raw)?;
+        if std::path::Path::new(&cleaned).is_absolute() {
+            let key = format!("@ext:{cleaned}");
+            if let Some(cached) = self.map.get(&key) {
+                return cached.as_ref().map(|t| (t.tex, t.w, t.h));
+            }
+            let loaded = std::fs::read(&cleaned).ok().and_then(|bytes| {
+                let (w, h, rgba, filter, clamp) = if bytes.starts_with(b"TEXV")
+                    || cleaned.to_ascii_lowercase().ends_with(".tex")
+                {
+                    let d = crate::pkg::decode_tex(&bytes).ok()?;
+                    let (w, h) = (d.image.width(), d.image.height());
+                    let f = if d.no_interpolation {
+                        Filter::Nearest
+                    } else {
+                        Filter::Linear
+                    };
+                    (w, h, d.image.into_raw(), f, d.clamp_uvs)
+                } else {
+                    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+                    let (w, h) = (img.width(), img.height());
+                    (w, h, img.into_raw(), Filter::Linear, false)
+                };
+                if w == 0 || h == 0 {
+                    return None;
+                }
+                create_texture_ex(gl, w, h, &rgba, filter, !clamp, clamp)
+                    .ok()
+                    .map(|tex| CachedTexture {
+                        tex,
+                        w,
+                        h,
+                        spritesheet: None,
+                        is_r8: false,
+                        video: false,
+                    })
+            });
+            self.map.insert(key.clone(), loaded);
+            return self
+                .map
+                .get(&key)
+                .and_then(|v| v.as_ref())
+                .map(|t| (t.tex, t.w, t.h));
+        }
+        self.get(gl, pkg, &cleaned)
+    }
+}
+
+/// Normalize a user-supplied texture path (`file://` URI, percent-encoding, `~/`).
+pub fn resolve_user_texture_path(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let s = s
+        .strip_prefix("file://localhost")
+        .or_else(|| s.strip_prefix("file://"))
+        .unwrap_or(s);
+    let decoded = if s.contains('%') {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                    if let Ok(b) = u8::from_str_radix(hex, 16) {
+                        out.push(b);
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    } else {
+        s.to_string()
+    };
+    let expanded = if let Some(rest) = decoded.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            format!("{}/{}", home.trim_end_matches('/'), rest)
+        } else {
+            decoded
+        }
+    } else {
+        decoded
+    };
+    let trimmed = expanded.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn normalize(path: &str) -> String {
@@ -4624,18 +4723,41 @@ pub enum SystemTexture {
     MediaPreviousThumbnail,
 }
 
-/// Parses one entry of a WE `usertextures` array into a known [`SystemTexture`].
-pub fn parse_usertexture_slot(val: &Value) -> Option<SystemTexture> {
+/// Slot binding parsed from a Wallpaper Engine `usertextures` array entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserTextureSlot {
+    System(SystemTexture),
+    Property(String),
+}
+
+/// Parse one entry of a WE `usertextures` array into a [`UserTextureSlot`].
+pub fn parse_usertexture_binding(val: &Value) -> Option<UserTextureSlot> {
     let raw = match val {
         Value::String(s) => s.as_str(),
         Value::Object(map) => map.get("name").and_then(|v| v.as_str())?,
         _ => return None,
     };
-    let lower = raw.trim().to_ascii_lowercase();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "$mediathumbnail" => Some(SystemTexture::MediaThumbnail),
-        "$mediapreviousthumbnail" => Some(SystemTexture::MediaPreviousThumbnail),
-        _ => None,
+        "$mediathumbnail" => Some(UserTextureSlot::System(SystemTexture::MediaThumbnail)),
+        "$mediapreviousthumbnail" => {
+            Some(UserTextureSlot::System(SystemTexture::MediaPreviousThumbnail))
+        }
+        s if s.starts_with('$') => None,
+        _ => Some(UserTextureSlot::Property(trimmed.to_string())),
+    }
+}
+
+/// Parses one entry of a WE `usertextures` array into a known [`SystemTexture`].
+#[cfg(test)]
+pub fn parse_usertexture_slot(val: &Value) -> Option<SystemTexture> {
+    match parse_usertexture_binding(val)? {
+        UserTextureSlot::System(sys) => Some(sys),
+        UserTextureSlot::Property(_) => None,
     }
 }
 
@@ -4646,8 +4768,8 @@ struct EffectPass {
     target: Option<String>,
     /// Declared textures for this pass (index -> material texture path).
     textures: Vec<Option<String>>,
-    /// System `usertextures` bindings for this pass (e.g. `$mediaThumbnail`).
-    user_textures: Vec<Option<SystemTexture>>,
+    /// Dynamic `usertextures` bindings for this pass (system or user property).
+    user_textures: Vec<Option<UserTextureSlot>>,
     /// constant key -> value.
     constants: HashMap<String, Value>,
     /// Keyframe animation tracks parsed from `constants` (`key` lowercased).
@@ -4711,7 +4833,9 @@ impl EffectInstance {
     /// Whether any pass binds a media system texture or a `media*Changed` script.
     pub fn uses_media(&self) -> bool {
         self.passes.iter().any(|p| {
-            p.user_textures.iter().any(|u| u.is_some())
+            p.user_textures
+                .iter()
+                .any(|u| matches!(u, Some(UserTextureSlot::System(_))))
                 || p.constants.values().any(|v| {
                     v.get("script")
                         .and_then(|s| s.as_str())
@@ -4888,10 +5012,10 @@ impl EffectInstance {
                     }
                 }
             }
-            let mut user_textures: Vec<Option<SystemTexture>> = mat_pass
+            let mut user_textures: Vec<Option<UserTextureSlot>> = mat_pass
                 .get("usertextures")
                 .and_then(|t| t.as_array())
-                .map(|a| a.iter().map(parse_usertexture_slot).collect())
+                .map(|a| a.iter().map(parse_usertexture_binding).collect())
                 .unwrap_or_default();
             if let Some(ut) = scene_pass
                 .and_then(|p| p.get("usertextures"))
@@ -4901,8 +5025,8 @@ impl EffectInstance {
                     if idx >= user_textures.len() {
                         user_textures.resize(idx + 1, None);
                     }
-                    if let Some(sys) = parse_usertexture_slot(v) {
-                        user_textures[idx] = Some(sys);
+                    if let Some(binding) = parse_usertexture_binding(v) {
+                        user_textures[idx] = Some(binding);
                     }
                 }
             }
@@ -4912,7 +5036,7 @@ impl EffectInstance {
             for spec in parse_uniforms(&combined_src) {
                 if let Some(slot) = spec.slot {
                     let has_slot_tex = textures.get(slot).and_then(|t| t.as_deref()).is_some()
-                        || user_textures.get(slot).and_then(|u| *u).is_some();
+                        || user_textures.get(slot).is_some_and(|u| u.is_some());
                     if has_slot_tex {
                         for line in combined_src.lines() {
                             if line.contains(&format!("uniform sampler2D {}", spec.name)) {
@@ -5280,10 +5404,16 @@ impl EffectInstance {
                         .get(name)
                         .map(|c| (c.tex, c.w as u32, c.h as u32)),
                     None => {
-                        let sys_tex = match pass.user_textures.get(slot).and_then(|u| *u) {
-                            Some(SystemTexture::MediaThumbnail) => ctx.media_thumbnail,
-                            Some(SystemTexture::MediaPreviousThumbnail) => {
-                                ctx.media_prev_thumbnail.or(ctx.media_thumbnail)
+                        let sys_tex = match pass.user_textures.get(slot).and_then(|u| u.as_ref()) {
+                            Some(UserTextureSlot::System(SystemTexture::MediaThumbnail)) => {
+                                ctx.media_thumbnail
+                            }
+                            Some(UserTextureSlot::System(
+                                SystemTexture::MediaPreviousThumbnail,
+                            )) => ctx.media_prev_thumbnail.or(ctx.media_thumbnail),
+                            Some(UserTextureSlot::Property(prop_key)) => {
+                                lookup_prop_str(ctx.props, prop_key)
+                                    .and_then(|path| cache.get_user_texture(gl, pkg, &path))
                             }
                             None => None,
                         };
@@ -5558,19 +5688,30 @@ fn lookup_uniform_constant(spec: &UniformSpec, map: &HashMap<String, Value>) -> 
     lookup_uniform_map(spec, map).cloned()
 }
 
+fn lookup_prop<'a>(props: &'a HashMap<String, Value>, name: &str) -> Option<&'a Value> {
+    props.get(name).or_else(|| {
+        props
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    })
+}
+
+fn lookup_prop_str(props: &HashMap<String, Value>, name: &str) -> Option<String> {
+    let val = lookup_prop(props, name)?;
+    let s = val
+        .as_str()
+        .or_else(|| val.get("value").and_then(|v| v.as_str()))?;
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn resolve_effect_user_prop(val: &Value, props: &HashMap<String, Value>) -> Value {
     let Some(obj) = val.as_object() else {
         return val.clone();
     };
     if let Some(user) = obj.get("user") {
-        let lookup = |name: &str| -> Option<&Value> {
-            props.get(name).or_else(|| {
-                props
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                    .map(|(_, v)| v)
-            })
-        };
+        let lookup = |name: &str| lookup_prop(props, name);
         match user {
             Value::String(name) => {
                 if let Some(actual) = lookup(name) {
@@ -6334,5 +6475,47 @@ void main() {
             parse_usertexture_slot(&serde_json::json!({ "name": "$otherTexture", "type": "system" })),
             None
         );
+    }
+
+    #[test]
+    fn parse_usertexture_binding_and_resolve_external_path() {
+        assert_eq!(
+            parse_usertexture_binding(&serde_json::json!({ "name": "$mediaThumbnail", "type": "system" })),
+            Some(UserTextureSlot::System(SystemTexture::MediaThumbnail))
+        );
+        assert_eq!(
+            parse_usertexture_binding(&serde_json::json!("usertexture1")),
+            Some(UserTextureSlot::Property("usertexture1".into()))
+        );
+        assert_eq!(
+            parse_usertexture_binding(&serde_json::json!({ "name": "custom_bg", "type": "user" })),
+            Some(UserTextureSlot::Property("custom_bg".into()))
+        );
+        assert_eq!(
+            parse_usertexture_binding(&serde_json::json!("$otherSystem")),
+            None
+        );
+        assert_eq!(parse_usertexture_binding(&serde_json::json!("")), None);
+
+        assert_eq!(
+            resolve_user_texture_path("file:///tmp/my%20wall/cover%2B1.png"),
+            Some("/tmp/my wall/cover+1.png".into())
+        );
+        assert_eq!(
+            resolve_user_texture_path("file://localhost/tmp/icon.tex"),
+            Some("/tmp/icon.tex".into())
+        );
+        assert_eq!(
+            resolve_user_texture_path("workshop/123/default_dock_icon"),
+            Some("workshop/123/default_dock_icon".into())
+        );
+        assert_eq!(resolve_user_texture_path("   "), None);
+        if let Ok(home) = std::env::var("HOME") {
+            let expected = format!("{}/Pictures/wp.png", home.trim_end_matches('/'));
+            assert_eq!(
+                resolve_user_texture_path("~/Pictures/wp.png"),
+                Some(expected)
+            );
+        }
     }
 }
