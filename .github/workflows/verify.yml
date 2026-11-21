@@ -14,7 +14,7 @@ jobs:
   test:
     name: build, tests, headless render
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 70
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
@@ -23,11 +23,14 @@ jobs:
       # Build deps: libwayland + xkbcommon (compositor IPC, smithay),
       # EGL/GL (glutin, the engine's GLES context), libmpv (video wallpapers).
       # Mesa's llvmpipe driver is what makes the GPU-less runner render.
+      # libmpv-dev drags in the ffmpeg runtime tree (~60 packages); the Azure
+      # mirror can be slow, so this step gets a generous timeout.
       - name: Install system dependencies
-        timeout-minutes: 12
+        timeout-minutes: 40
         run: |
-          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=5 -o Acquire::http::Timeout=60 \
             build-essential pkg-config \
             libwayland-dev libxkbcommon-dev \
             libgl1-mesa-dev libegl-dev \
