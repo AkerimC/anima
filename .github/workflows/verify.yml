@@ -18,7 +18,7 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Build deps: libwayland + xkbcommon (compositor IPC, smithay),
       # EGL/GL (glutin, the engine's GLES context), libmpv (video wallpapers).
@@ -61,7 +61,7 @@ jobs:
 
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: verify-report
           path: /tmp/anima-verify.json
